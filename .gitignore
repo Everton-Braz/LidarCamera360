@@ -1,8 +1,9 @@
-__pycache__/
-*.py[cod]
+
 *.calib_cache.npz
 *.log
-build/
-dist/
+*.py[cod]
 *.spec
 .venv/
+__pycache__/
+build/
+dist/

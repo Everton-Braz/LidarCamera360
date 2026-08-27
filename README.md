@@ -66,12 +66,20 @@ the moment the frame is taken from.
 
 ## Running it
 
-Double-click **`calibrate.bat`**.
+### Windows, no install
 
-The launcher finds Python, checks the libraries and opens the window. A console
-appears only if something is missing, and tells you what to install.
+Download **`LidarCameraCalibrator.exe`** from the
+[Releases](https://github.com/Werdna0107/Lidar-Camera-calibrator/releases) page
+and double-click it. Nothing else is needed - no Python, no libraries. The first
+start takes a few seconds while it unpacks itself.
 
-Manual install, if you prefer:
+### From source
+
+Double-click **`calibrate.bat`**. The launcher finds Python, checks the
+libraries and opens the window; a console appears only if something is missing
+and tells you what to install.
+
+Or manually:
 
 ```
 pip install -r requirements.txt
@@ -79,6 +87,11 @@ python gui.py
 ```
 
 Requires Python 3.9+.
+
+### Building the exe yourself
+
+Run **`build.bat`**. It installs PyInstaller if needed and writes
+`dist\LidarCameraCalibrator.exe` (about 100 MB, everything bundled).
 
 ---
 
@@ -277,7 +290,8 @@ Two further limits are worth knowing:
 
 | | |
 |---|---|
-| `calibrate.bat` | launcher |
+| `calibrate.bat` | launcher (source install) |
+| `build.bat` | builds the standalone exe |
 | `gui.py` | interface |
 | `solver.py` | joint search, cross-check, screening, least-squares merge |
 | `core.py` | geometry, data loading, edge extraction, optimisation |
