@@ -68,10 +68,12 @@ the moment the frame is taken from.
 
 ### Windows, no install
 
-Download **`LidarCameraCalibrator.exe`** from the
-[Releases](https://github.com/Werdna0107/Lidar-Camera-calibrator/releases) page
+**[Download LidarCameraCalibrator.exe](PUT_GOOGLE_DRIVE_LINK_HERE)** (~100 MB)
 and double-click it. Nothing else is needed - no Python, no libraries. The first
 start takes a few seconds while it unpacks itself.
+
+Windows SmartScreen may warn about an unsigned application: choose *More info*
+then *Run anyway*, or build it yourself as described below.
 
 ### From source
 
