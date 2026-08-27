@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.calib_cache.npz
+*.log
+build/
+dist/
+*.spec
+.venv/
