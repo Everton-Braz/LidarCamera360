@@ -853,3 +853,46 @@ def build_json(R, C, T, sets, stats, prior):
             "per_set": per,
         },
     }
+
+
+def get_cand03_extrinsics(camera_height_m=0.185):
+    """
+    Returns the confirmed Candidate 03 (Physical Lever Arm) calibration:
+      - Orthogonal Gram-Schmidt axes aligned with IMU gravity UP (u_L)
+      - Swapped lens assignment (Stream 0 = Right [+X_L], Stream 1 = Left [-X_L])
+      - Physical lever arm c_L = camera_height_m * u_L = [0.0006, -0.0934, -0.1597] m
+    Returns: (R_stream0, R_stream1, c_L, T_stream0, T_stream1)
+    """
+    imu_a = np.array([-0.03, 4.9335, 8.4338])
+    u_L = -imu_a / np.linalg.norm(imu_a)
+    right_L = np.array([1.0, 0.0, 0.0])
+    right_L = right_L - np.dot(right_L, u_L) * u_L
+    right_L = right_L / np.linalg.norm(right_L)
+
+    # Stream 0: Right lens (+X_L)
+    Z0 = right_L
+    Y0 = u_L - np.dot(u_L, Z0) * Z0
+    Y0 /= np.linalg.norm(Y0)
+    X0 = np.cross(Y0, Z0)
+    R0 = np.stack([X0, Y0, Z0], axis=0)
+
+    # Stream 1: Left lens (-X_L)
+    Z1 = -right_L
+    Y1 = u_L - np.dot(u_L, Z1) * Z1
+    Y1 /= np.linalg.norm(Y1)
+    X1 = np.cross(Y1, Z1)
+    R1 = np.stack([X1, Y1, Z1], axis=0)
+
+    c_L = camera_height_m * u_L
+    t0 = -R0 @ c_L
+    t1 = -R1 @ c_L
+
+    T0 = np.eye(4)
+    T0[:3, :3] = R0
+    T0[:3, 3] = t0
+
+    T1 = np.eye(4)
+    T1[:3, :3] = R1
+    T1[:3, 3] = t1
+
+    return R0, R1, c_L, T0, T1

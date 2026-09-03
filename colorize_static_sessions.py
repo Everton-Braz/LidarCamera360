@@ -114,14 +114,14 @@ def get_extrinsics(mode="swapped"):
     X_l = np.cross(Y_l, Z_l)
     R_left = np.stack([X_l, Y_l, Z_l], axis=0)
 
-    t_cam = np.array([0.0, -0.185, 0.0])
+    c_L_phys = 0.185 * u_L  # True physical camera center in LiDAR frame
 
     if mode == "swapped":
         # Lens 1 (Stream 0) = Right, Lens 2 (Stream 1) = Left
-        return R_right, t_cam, R_left, t_cam
+        return R_right, c_L_phys, R_left, c_L_phys
     else:
         # Lens 1 (Stream 0) = Left, Lens 2 (Stream 1) = Right
-        return R_left, t_cam, R_right, t_cam
+        return R_left, c_L_phys, R_right, c_L_phys
 
 
 def colorize_static_session(session_id, mode="swapped"):
@@ -143,14 +143,14 @@ def colorize_static_session(session_id, mode="swapped"):
     img1 = cv2.imread(img1_p)
     img2 = cv2.imread(img2_p)
 
-    R1, t1, R2, t2 = get_extrinsics(mode=mode)
+    R1, c_L1, R2, c_L2 = get_extrinsics(mode=mode)
     projector = FisheyeProjector(width=3840, height=3840, fov_deg=196.0)
 
     color_accum = np.zeros((N, 3), dtype=np.uint8)
     best_cost = np.full(N, 1e9, dtype=np.float32)
 
-    # 1. Project Lens 1
-    P_cam1 = pts @ R1.T + t1
+    # 1. Project Lens 1 (Candidate 03: P_cam = (pts - c_L) @ R.T)
+    P_cam1 = (pts - c_L1) @ R1.T
     u1, v1, mask1, dist1, r1 = projector.project(P_cam1)
     cost1 = dist1 + (r1 / 1920.0) * 1.5
     better1 = mask1 & (cost1 < best_cost)
@@ -161,8 +161,8 @@ def colorize_static_session(session_id, mode="swapped"):
         color_accum[better1] = bgr1[:, ::-1]
         best_cost[better1] = cost1[better1]
 
-    # 2. Project Lens 2
-    P_cam2 = pts @ R2.T + t2
+    # 2. Project Lens 2 (Candidate 03: P_cam = (pts - c_L) @ R.T)
+    P_cam2 = (pts - c_L2) @ R2.T
     u2, v2, mask2, dist2, r2 = projector.project(P_cam2)
     cost2 = dist2 + (r2 / 1920.0) * 1.5
     better2 = mask2 & (cost2 < best_cost)

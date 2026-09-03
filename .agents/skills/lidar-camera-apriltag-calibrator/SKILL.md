@@ -79,13 +79,36 @@ Instead of guessing or manual trial-and-error:
 
 ## 3. Workflow 1: Static Target Calibration
 
-Use static scans when zeroing out motion blur and verifying raw spatial extrinsics:
+### Confirmed Reference Architecture: Candidate 03 (Physical Lever Arm)
+> [!TIP]
+> **Validated as Most Correct Candidate**:
+> In physical validation across the static AprilTag scans (`C:\Users\User\Downloads\Lidou\20260902092520`), **Candidate 03 (Physical Lever Arm)** was confirmed as the most accurate alignment.
+> Unconstrained SVD or local non-linear optimizers can overfit to peripheral tag centroids and distort global wall orthogonality. Candidate 03 preserves pure geometric orthogonality aligned with the IMU gravity UP vector $\vec{u}_L$ while strictly enforcing the physical mount offset.
+
+#### Mathematical Formulation (Candidate 03):
+1. **Camera Position in LiDAR Body Frame**:
+   $$\mathbf{c}_L = h \cdot \vec{u}_L = 0.185 \cdot [0.0031,\ -0.5049,\ -0.8632] = [0.0006,\ -0.0934,\ -0.1597]\text{ meters}$$
+2. **Point Transformation into Camera Frame**:
+   $$P_{\text{cam}} = R \cdot (P_L - \mathbf{c}_L)$$
+   *(Translates each LiDAR point relative to the true physical camera optical center before rotation).*
+3. **Rigid Rotation Matrices**:
+   - **Stream 0 (Right Lens, $+X_L$)**:
+     $$R_{\text{s0}} = \begin{bmatrix} 0.0 & -0.8632 & 0.5049 \\ 0.0031 & -0.5049 & -0.8632 \\ 1.0 & 0.0016 & 0.0027 \end{bmatrix}$$
+   - **Stream 1 (Left Lens, $-X_L$)**:
+     $$R_{\text{s1}} = \begin{bmatrix} 0.0 & 0.8632 & -0.5049 \\ 0.0031 & -0.5049 & -0.8632 \\ -1.0 & -0.0016 & -0.0027 \end{bmatrix}$$
+4. **4x4 Extrinsic Matrices**:
+   In camera coordinates, the translation vector is $\mathbf{t}_{\text{cam}} = -R \mathbf{c}_L = [0.0,\ -0.185,\ 0.0]^T$.
+
+---
+
+### Step-by-Step Static Verification Protocol:
 1. Place 2 to 4 AprilTags (family `tag36h11`, $150\text{ mm}$ or $200\text{ mm}$) firmly on walls.
 2. Rest scanner and camera stationary on a tripod or desk.
 3. Record a short LiDAR scan (`.bag`) and capture static dual-fisheye frames (`lens1_front.jpg`, `lens2_back.jpg`).
 4. Detect tag centers in 2D image using `cv2.aruco.ArucoDetector(DICT_APRILTAG_36h11)`.
 5. Segment the corresponding 3D retroreflective planar cluster in the LiDAR point cloud.
-6. Optimize 6-DoF transformation using non-linear least squares (`scipy.optimize.minimize` or Levenberg-Marquardt).
+6. Verify angular separation between targets (e.g. Tag 0 to Tag 1 angle in LiDAR vs camera rays should match within $< 1^\circ$).
+7. Colorize point cloud using Candidate 03 approach and inspect in CloudCompare.
 
 ---
 

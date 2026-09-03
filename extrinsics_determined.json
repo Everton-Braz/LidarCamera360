@@ -1,71 +1,39 @@
 {
-  "T_base_camera_lidar": [
-    [
-      0.136575,
-      0.787586,
-      -0.600879,
-      0.0
+  "calibration_method": "Candidate 03 - Physical Lever Arm (Confirmed Reference)",
+  "status": "Validated by user as the most correct reference (ongoing residual angular trim refinement)",
+  "physical_mount": {
+    "camera_height_m": 0.185,
+    "handle_gravity_up_vector": [
+      0.00308,
+      -0.50493,
+      -0.86315
     ],
-    [
-      -0.100533,
-      -0.592412,
-      -0.799338,
-      0.185
-    ],
-    [
-      -0.985515,
-      0.169578,
-      -0.00173,
-      0.0
-    ],
-    [
-      0.0,
-      0.0,
-      0.0,
-      1.0
-    ]
-  ],
-  "_determined": {
-    "method": "AprilTag 3-Session Multi-Room Joint Calibration (Upright Orientation)",
-    "residual_pixel_error": 1.74,
-    "euler_ZYX_deg": [
-      -36.35686769868943,
-      80.23620904131403,
-      90.58454818001437
-    ],
-    "translation_m": [
-      0.0,
-      0.185,
-      0.0
+    "camera_center_in_lidar_m": [
+      0.00057,
+      -0.09341,
+      -0.15968
     ]
   },
-  "_calibration": {
-    "camera_axes": "X right, Y down, Z forward (OpenCV)",
-    "lidar_axes": "sensor body frame (Vanjee 722z)",
-    "quaternion_xyzw": [
-      0.6577835871386915,
-      0.26112415431034747,
-      -0.6029317262056114,
-      0.36825027095900825
-    ],
-    "T_lidar_camera": [
+  "stream0_right_lens": {
+    "description": "Right fisheye lens pointing along +X_lidar",
+    "T_camera_lidar": [
       [
-        0.13657503828169376,
-        -0.10053335453676816,
-        -0.9855155369680145,
-        0.01859867058930211
+        -0.0,
+        -0.86315,
+        0.50493,
+        0.0
       ],
       [
-        0.7875858178232938,
-        -0.5924116558973344,
-        0.169577788335584,
-        0.10959615634100685
+        0.00308,
+        -0.50493,
+        -0.86315,
+        -0.185
       ],
       [
-        -0.6008792123380929,
-        -0.7993380852341604,
-        -0.0017302858933950361,
-        0.14787754576831966
+        1.0,
+        0.00155,
+        0.00266,
+        -0.0
       ],
       [
         0.0,
@@ -73,6 +41,79 @@
         0.0,
         1.0
       ]
+    ],
+    "R": [
+      [
+        -0.0,
+        -0.86315,
+        0.50493
+      ],
+      [
+        0.00308,
+        -0.50493,
+        -0.86315
+      ],
+      [
+        1.0,
+        0.00155,
+        0.00266
+      ]
+    ],
+    "t": [
+      0.0,
+      -0.185,
+      0.0
+    ]
+  },
+  "stream1_left_lens": {
+    "description": "Left fisheye lens pointing along -X_lidar",
+    "T_camera_lidar": [
+      [
+        0.0,
+        0.86315,
+        -0.50493,
+        -0.0
+      ],
+      [
+        0.00308,
+        -0.50493,
+        -0.86315,
+        -0.185
+      ],
+      [
+        -1.0,
+        -0.00155,
+        -0.00266,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "R": [
+      [
+        0.0,
+        0.86315,
+        -0.50493
+      ],
+      [
+        0.00308,
+        -0.50493,
+        -0.86315
+      ],
+      [
+        -1.0,
+        -0.00155,
+        -0.00266
+      ]
+    ],
+    "t": [
+      0.0,
+      -0.185,
+      0.0
     ]
   }
 }
