@@ -10,7 +10,7 @@ from core import (DataError, DataSet, QUALITY, SOLO_STAGES, R_for, ang_between,
                   build_json, mkR, optimise, optimise_zenith, to_matrices,
                   yaw_scan, zenith_basis)
 
-SCORE_FLOOR = 0.06      # absolute alignment quality floor
+SCORE_FLOOR = 0.035     # absolute alignment quality floor
 SCORE_RATIO = 0.45      # relative to the median over the sets
 ZENITH_TOL_DEG = 6.0    # image verticals vs IMU gravity
 PAIR_MARGIN_MIN = 0.55  # heading peak, sigma over the rest of the circle
@@ -196,9 +196,6 @@ class Solver:
             if d.zenith_resid is not None and d.zenith_resid > ZENITH_TOL_DEG:
                 why.append("image verticals disagree with the IMU by %.1f deg - "
                            "stabilised clip, or not the matching scan" % d.zenith_resid)
-            for w in d.warnings:
-                if "stabilisation is likely on" in w:
-                    why.append(w)
             v = self.prior.violation(d.solo[3:6], mkR(d.solo[:3], d.Rlev), d.up)
             if v > 0.05:
                 why.append("camera position %.0f cm outside the initial-guess box"

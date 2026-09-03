@@ -246,9 +246,9 @@ class App(ctk.CTk):
         make_logo(h).pack(side="left", padx=(0, 12))
         t = ctk.CTkFrame(h, fg_color=C_BG)
         t.pack(side="left")
-        ctk.CTkLabel(t, text="Lidar-Camera calibrator", font=(FONT, 21, "bold"),
+        ctk.CTkLabel(t, text="Raven LiDAR & Insta360 Calibrator", font=(FONT, 21, "bold"),
                      text_color=C_LIGHT).pack(anchor="w")
-        ctk.CTkLabel(t, text="360 panoramic camera to lidar extrinsics",
+        ctk.CTkLabel(t, text="3DMakerPro Raven (Vanjee 722z) to Insta360 X4 360° extrinsics",
                      font=(FONT, 12), text_color=C_HINT).pack(anchor="w")
 
         right = ctk.CTkFrame(h, fg_color=C_BG)
@@ -304,10 +304,10 @@ class App(ctk.CTk):
                      font=(FONT, 11), text_color=C_DIM).pack(anchor="w", padx=22, pady=(0, 4))
         p = ctk.CTkFrame(self, fg_color=C_PANEL, corner_radius=6)
         p.pack(fill="x", padx=22, pady=(0, 8))
-        self.e_up = self._num(p, "up  (m)", "0.175", 0, "above the lidar", "up")
+        self.e_up = self._num(p, "up  (m)", "0.18", 0, "above the lidar", "up")
         self.e_back = self._num(p, "back  (m)", "0.07", 1, "behind the lidar", "back")
         self.e_right = self._num(p, "right  (m)", "0.00", 2, "right of the lidar", "right")
-        self.e_tol = self._num(p, "tolerance  (m)", "0.10", 3, "half-width of the box", "tol")
+        self.e_tol = self._num(p, "tolerance  (m)", "0.12", 3, "half-width of the box", "tol")
 
     def _num(self, parent, label, default, col, hint, key):
         f = ctk.CTkFrame(parent, fg_color=C_PANEL)
@@ -345,6 +345,12 @@ class App(ctk.CTk):
                                     border_width=1, border_color=C_BORDER,
                                     state="disabled", command=self.save)
         self.b_save.pack(side="left", padx=10)
+        self.b_tags = ctk.CTkButton(a, text="APRILTAG TARGETS", width=160, height=38,
+                                    font=(FONT, 12, "bold"), fg_color=C_BTN,
+                                    hover_color=C_HOVER, text_color=C_SILVER, corner_radius=5,
+                                    border_width=1, border_color=C_BORDER,
+                                    command=self.open_apriltag_targets)
+        self.b_tags.pack(side="left", padx=(0, 10))
         self.prog = ctk.CTkProgressBar(a, height=8, corner_radius=3, fg_color=C_PANEL2,
                                        progress_color=C_GREEN)
         self.prog.set(0)
@@ -352,6 +358,16 @@ class App(ctk.CTk):
         self.lbl_state = ctk.CTkLabel(a, text="idle", font=(FONT, 11),
                                       text_color=C_HINT, width=200)
         self.lbl_state.pack(side="right")
+
+    def open_apriltag_targets(self):
+        target_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apriltags_to_print")
+        if not os.path.exists(target_dir):
+            import generate_apriltags
+            os.system(f'python "{os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate_apriltags.py")}" --count 12 --size 150 --out "{target_dir}"')
+        try:
+            os.startfile(target_dir)
+        except Exception:
+            messagebox.showinfo("AprilTag Targets", f"Printable targets generated at:\n{target_dir}")
 
     def _output(self):
         self._line()

@@ -19,12 +19,12 @@ MAX_CAM_TILT_DEG = 30.0
 
 QUALITY = {
     "Fast": [(512, 256, 3.0, 120000), (1024, 512, 2.5, 200000),
-             (2048, 1024, 1.8, 220000)],
+             (2048, 1024, 2.2, 220000)],
     "Normal": [(512, 256, 3.0, 150000), (1024, 512, 2.5, 250000),
-               (2048, 1024, 1.8, 300000), (3072, 1536, 1.5, 320000)],
+               (2048, 1024, 2.2, 300000), (3072, 1536, 2.0, 320000)],
     "High": [(512, 256, 3.0, 150000), (1024, 512, 2.5, 250000),
-             (2048, 1024, 1.8, 300000), (3072, 1536, 1.5, 320000),
-             (4096, 2048, 1.3, 320000)],
+             (2048, 1024, 2.2, 300000), (3072, 1536, 2.0, 320000),
+             (4096, 2048, 1.8, 320000)],
 }
 SOLO_STAGES = 3
 
@@ -140,7 +140,8 @@ def _pointcloud2(m):
         if key in names:
             a[:, 3] = arr[key]
             break
-    return a
+    finite = np.isfinite(a[:, 0]) & np.isfinite(a[:, 1]) & np.isfinite(a[:, 2])
+    return a[finite]
 
 
 def read_bag(path, progress=None):
@@ -152,13 +153,18 @@ def read_bag(path, progress=None):
     from pathlib import Path
 
     chunks, imu_a, imu_g = [], [], []
+    lidar_keywords = ("lidar", "point", "vanjee", "722z", "cloud", "velodyne", "hesai", "rslidar", "ouster")
     with AnyReader([Path(path)]) as r:
         lc = [c for c in r.connections
-              if ("lidar" in c.topic.lower() or "point" in c.topic.lower())
+              if (any(k in c.topic.lower() for k in lidar_keywords)
+                  or "pointcloud2" in c.msgtype.lower()
+                  or "custommsg" in c.msgtype.lower())
               and "imu" not in c.topic.lower()]
-        ic = [c for c in r.connections if "imu" in c.topic.lower()]
+        ic = [c for c in r.connections
+              if "imu" in c.topic.lower()
+              or "imu" in c.msgtype.lower()]
         if not lc:
-            raise DataError("no lidar topic in bag (looked for 'lidar' or 'point')")
+            raise DataError("no lidar topic in bag (looked for 'vanjee', '722z', 'lidar', 'point', 'PointCloud2')")
         total = sum(c.msgcount for c in lc) or 1
         done = 0
         for conn, ts, raw in r.messages(connections=lc):
@@ -171,13 +177,16 @@ def read_bag(path, progress=None):
                 a[:, 2] = [p.z for p in pts]
                 a[:, 3] = [p.reflectivity for p in pts]
                 a[:, 4] = [p.tag for p in pts]
+                valid = ((a[:, 4].astype(np.uint8) & 0x03) == 0) & np.isfinite(a[:, 0])
+                a = a[valid]
             elif hasattr(m, "fields") and hasattr(m, "data"):   # PointCloud2
                 a = _pointcloud2(m)
                 if a is None:
                     raise DataError("PointCloud2 without x/y/z fields")
             else:
                 raise DataError("unsupported lidar message: %s" % conn.msgtype)
-            chunks.append(a)
+            if len(a) > 0:
+                chunks.append(a)
             done += 1
             if progress and done % 20 == 0:
                 progress(done / total)
@@ -192,8 +201,10 @@ def read_bag(path, progress=None):
     if not chunks:
         raise DataError("bag contains no lidar points")
     P = np.concatenate(chunks, 0)
+    finite = np.isfinite(P[:, 0]) & np.isfinite(P[:, 1]) & np.isfinite(P[:, 2])
+    P = P[finite]
     d = np.linalg.norm(P[:, :3], axis=1)
-    P = P[(d > 0.05) & ((P[:, 4].astype(np.uint8) & 0x03) == 0)]
+    P = P[d > 0.05]
     if len(P) < 20000:
         raise DataError("too few valid lidar points (%d)" % len(P))
     if not imu_a:
@@ -224,6 +235,24 @@ def grab_frame(path, rel):
     if not ok:
         raise DataError("cannot read frame at %.2f" % rel)
     return img
+
+
+def grab_frames(path, rels):
+    """Grab multiple frames in a single video capture pass."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise DataError("cannot open video")
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames = []
+    for rel in rels:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(n - 1, int(n * rel))))
+        ok, img = cap.read()
+        if not ok:
+            cap.release()
+            raise DataError("cannot read frame at %.2f" % rel)
+        frames.append(img)
+    cap.release()
+    return frames
 
 
 # ----------------------------------------------------------------- checks --
@@ -297,7 +326,7 @@ def zenith_from_image(img, W=2048, H=1024):
 
 def video_frame_spread(path, n=3):
     """Frame-to-frame difference at spread positions: high on a moving rig."""
-    fr = [grab_frame(path, r) for r in np.linspace(0.3, 0.7, n)]
+    fr = grab_frames(path, np.linspace(0.3, 0.7, n))
     sm = [cv2.cvtColor(cv2.resize(f, (512, 256)), cv2.COLOR_BGR2GRAY).astype(np.float32)
           for f in fr]
     return max(float(np.mean(np.abs(sm[i] - sm[0]))) for i in range(1, n))
@@ -306,10 +335,11 @@ def video_frame_spread(path, n=3):
 def zenith_drift(path, n=3):
     """Spread of the scene zenith across the clip. Steady on a static
     unstabilised capture; wanders when stabilisation is active."""
+    fr = grab_frames(path, np.linspace(0.3, 0.7, n))
     zs = []
-    for rel in np.linspace(0.3, 0.7, n):
+    for f in fr:
         try:
-            z = zenith_from_image(grab_frame(path, rel))
+            z = zenith_from_image(f)
         except Exception:
             z = None
         if z:
@@ -323,7 +353,8 @@ def zenith_drift(path, n=3):
 # ------------------------------------------------------------------ edges --
 def build_lidar_edges(P3, refl, up_L, W=2048, H=1024):
     """Render the cloud as an equirect panorama and pull edges out of it:
-    depth discontinuities, normal breaks and reflectivity gradients."""
+    depth discontinuities, normal breaks and reflectivity gradients.
+    Handles both dense solid-state scan patterns and spinning multi-beam rings."""
     X = P3 @ level_rot(up_L).T
     u, v = sph_uv(X, W, H)
     r = np.linalg.norm(X, axis=1)
@@ -339,33 +370,57 @@ def build_lidar_edges(P3, refl, up_L, W=2048, H=1024):
     Rimg, Fimg, SRC = Rimg.reshape(H, W), Fimg.reshape(H, W), SRC.reshape(H, W)
     valid = np.isfinite(Rimg)
 
+    # 1. 2D depth discontinuities (for solid-state / dense regions)
     Rs = np.where(valid, cv2.medianBlur(np.where(valid, Rimg, 0).astype(np.float32), 3),
                   np.nan)
+    disc2d = np.zeros((H, W), np.float32)
+    for dy, dx in ((0, 2), (0, -2), (2, 0), (-2, 0), (2, 2), (-2, -2), (2, -2), (2, 2)):
+        disc2d = np.fmax(disc2d, np.nan_to_num(np.roll(np.roll(Rs, dy, 0), dx, 1) - Rs))
 
-    disc = np.zeros((H, W), np.float32)
-    for dy, dx in ((0, 2), (0, -2), (2, 0), (-2, 0), (2, 2), (-2, -2), (2, -2), (-2, 2)):
-        disc = np.fmax(disc, np.nan_to_num(np.roll(np.roll(Rs, dy, 0), dx, 1) - Rs))
-    depth_e = np.clip(disc / np.clip(np.nan_to_num(Rs, nan=1.0), 0.5, None) / 0.25,
+    # 2. Along-ring (azimuth) depth discontinuities (crucial for 16/32-line spinning LiDARs like Raven)
+    disc1d = np.zeros((H, W), np.float32)
+    for dx in (-4, -3, -2, -1, 1, 2, 3, 4):
+        rolled_r = np.roll(Rimg, dx, axis=1)
+        valid_pair = valid & np.isfinite(rolled_r)
+        diff_r = np.where(valid_pair, np.abs(rolled_r - Rimg), 0.0)
+        disc1d = np.maximum(disc1d, diff_r)
+
+    disc = np.maximum(disc2d, disc1d)
+    depth_e = np.clip(disc / np.clip(np.nan_to_num(Rimg, nan=1.0), 0.5, None) / 0.18,
                       0, 1) * valid
 
+    # 3. Surface normal breaks
     inv = 1.0 / np.clip(np.nan_to_num(Rs, nan=1e3), 0.1, None)
     lap = np.abs(cv2.Laplacian(cv2.GaussianBlur(inv, (0, 0), 1.6), cv2.CV_32F, ksize=5))
     norm_e = np.clip(lap * np.clip(np.nan_to_num(Rs), 0, 20) / 1.2, 0, 1) * valid
     norm_e = np.where(depth_e > 0.08, 0, norm_e)    # do not count occlusions twice
 
-    Fs = cv2.GaussianBlur(cv2.medianBlur(
-        np.clip(np.nan_to_num(Fimg), 0, 255).astype(np.uint8), 5).astype(np.float32),
-        (0, 0), 1.0)
-    refl_e = np.clip(np.hypot(cv2.Sobel(Fs, cv2.CV_32F, 1, 0, ksize=3),
-                              cv2.Sobel(Fs, cv2.CV_32F, 0, 1, ksize=3)) / 90.0,
-                     0, 1) * valid
+    # 4. Reflectivity gradients (both 2D and along-ring)
+    refl_val = np.clip(np.nan_to_num(Fimg), 0, 255)
+    refl_max = float(np.percentile(refl_val[valid], 99.0)) if valid.any() else 255.0
+    refl_scale = max(refl_max, 50.0)
+
+    Fs = cv2.GaussianBlur(cv2.medianBlur(refl_val.astype(np.uint8), 5).astype(np.float32),
+                          (0, 0), 1.0)
+    refl_2d = np.clip(np.hypot(cv2.Sobel(Fs, cv2.CV_32F, 1, 0, ksize=3),
+                               cv2.Sobel(Fs, cv2.CV_32F, 0, 1, ksize=3)) / (0.35 * refl_scale),
+                      0, 1) * valid
+
+    refl_1d = np.zeros((H, W), np.float32)
+    for dx in (-3, -2, -1, 1, 2, 3):
+        rolled_f = np.roll(Fimg, dx, axis=1)
+        valid_pair = valid & np.isfinite(rolled_f)
+        diff_f = np.where(valid_pair, np.abs(rolled_f - Fimg), 0.0)
+        refl_1d = np.maximum(refl_1d, diff_f)
+    refl_1d = np.clip(refl_1d / (0.30 * refl_scale), 0, 1) * valid
+    refl_e = np.maximum(refl_2d, refl_1d)
 
     E = np.clip((depth_e + 0.7 * norm_e + refl_e) * valid, 0, 2.0)
-    ys, xs = np.nonzero(E > 0.15)
+    ys, xs = np.nonzero(E > 0.10)
     ay, ax = np.nonzero(valid)
     return (P3[SRC[ys, xs]].astype(np.float64),
             E[ys, xs].astype(np.float64),
-            P3[SRC[ay, ax]].astype(np.float64)[::3])
+            P3[SRC[ay, ax]].astype(np.float64))
 
 
 def image_edge(img_bgr, W, H, sigma):
@@ -435,7 +490,7 @@ class Prior:
     camera right axis. Used only to reject grossly wrong minima, within +/- tol.
     """
 
-    def __init__(self, up=0.175, back=0.07, right=0.0, tol=0.10):
+    def __init__(self, up=0.18, back=0.07, right=0.0, tol=0.12):
         self.up, self.back, self.right, self.tol = up, back, right, tol
 
     @staticmethod

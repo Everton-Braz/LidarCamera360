@@ -281,10 +281,16 @@ Two further limits are worth knowing:
 
 ## Supported data
 
-- **lidar**: Livox `CustomMsg` and standard `sensor_msgs/PointCloud2`. The topic is
-  found by name (containing `lidar` or `point`).
-- **IMU**: any topic with `imu` in the name. Required — it provides gravity.
-- **camera**: any 2:1 equirectangular video readable by OpenCV.
+- **lidar**:
+  - **3DMakerPro Raven LiDAR Scanner** (`/vanjee_722z`, 16-line spinning mechanical LiDAR).
+  - Standard `sensor_msgs/PointCloud2` (topics matching `vanjee`, `722z`, `lidar`, `point`, `cloud`, `velodyne`, `hesai`, `rslidar`, `ouster`).
+  - Livox `CustomMsg` (`livox_ros_driver/CustomMsg`, `livox_ros_driver2/CustomMsg`).
+- **IMU**:
+  - Raven Vanjee internal IMU (`/vanjee_imu_packets`).
+  - Any ROS topic matching `imu` (`sensor_msgs/Imu`). Required — it provides the gravity reference vector.
+- **camera**:
+  - **Insta360 X4** (and Insta360 X3 / ONE RS 1-Inch 360 / ONE X2 / etc.).
+  - Any 2:1 equirectangular 360° video (`.mp4`) exported **without stabilisation / horizon lock**, readable by OpenCV.
 
 ---
 
@@ -292,9 +298,64 @@ Two further limits are worth knowing:
 
 | | |
 |---|---|
+| `generate_apriltags.py` | generates print-ready AprilTags & calibration boards |
+| `apriltag_calib.py` | AprilTag-based LiDAR-Camera extrinsic calibrator |
+| `apriltags_to_print/` | folder containing generated high-res printable tags & boards |
 | `calibrate.bat` | launcher (source install) |
 | `build.bat` | builds the standalone exe |
 | `gui.py` | interface |
 | `solver.py` | joint search, cross-check, screening, least-squares merge |
 | `core.py` | geometry, data loading, edge extraction, optimisation |
+| `colorize.py` | point cloud colorizer (exports .ply, .pcd, .las, .laz) |
 | `selftest.py` | headless run, paths set inside the file |
+
+---
+
+## AprilTag-Based Calibration
+
+In addition to targetless edge alignment, you can perform target-based calibration using printable **AprilTags (family `tag36h11`)** and dual-modality calibration boards:
+
+### 1. Generating & Printing Targets
+To generate high-resolution print-ready targets:
+```bash
+# Generate 12 targets (family tag36h11, nominal size 150 mm)
+python generate_apriltags.py --count 12 --size 150 --out apriltags_to_print
+```
+All targets are saved in `apriltags_to_print/`.
+- **Print at 100% scale (No scaling / 'Fit to page')**.
+- Use the printed **100 mm reference ruler** at the bottom of each sheet to verify exact scale with a physical ruler.
+- (Optional): Add 10 mm retroreflective tape along the crosshair guidelines for dual-modality LiDAR stripe detection.
+- Affix boards firmly to flat surfaces (walls, poles, cardboard) around the capture area.
+
+### 2. Running AprilTag Calibration
+```bash
+# Verify the solver with built-in synthetic self-test:
+python apriltag_calib.py --selftest
+
+# Calibrate using video and ROS bag:
+python apriltag_calib.py --video path/to/video.mp4 \
+                         --bag path/to/lidar.bag \
+                         --tag-size 0.150 \
+                         --out extrinsics_determined.json \
+                         --overlay
+```
+
+---
+
+## Point Cloud Colorization
+
+Once you have calibrated the extrinsics (`extrinsics_determined.json`), colorize any point cloud directly with `colorize.py`:
+
+```bash
+# Export colorized PLY (binary format, viewable in CloudCompare / MeshLab / Blender)
+python colorize.py --bag path/to/lidar.bag \
+                   --video path/to/video.mp4 \
+                   --calib path/to/extrinsics_determined.json \
+                   --out colorized_cloud.ply
+
+# Export colorized PCD format
+python colorize.py --bag path/to/lidar.bag \
+                   --video path/to/video.mp4 \
+                   --calib path/to/extrinsics_determined.json \
+                   --out colorized_cloud.pcd
+```

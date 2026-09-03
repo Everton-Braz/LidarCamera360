@@ -1,4 +1,3 @@
-
 *.calib_cache.npz
 *.log
 *.py[cod]
@@ -7,3 +6,17 @@
 __pycache__/
 build/
 dist/
+
+# Large binary scan & media files
+dataset-test/
+*.bag
+*.insv
+*.lrv
+*.mp4
+*.pcd
+*.las
+*.laz
+*.zip
+*.tar.gz
+*.bin
+node_modules/
