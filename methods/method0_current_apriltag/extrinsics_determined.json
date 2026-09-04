@@ -1,0 +1,119 @@
+{
+  "calibration_method": "Candidate 03 - Physical Lever Arm (Confirmed Reference)",
+  "status": "Validated by user as the most correct reference (ongoing residual angular trim refinement)",
+  "physical_mount": {
+    "camera_height_m": 0.185,
+    "handle_gravity_up_vector": [
+      0.00308,
+      -0.50493,
+      -0.86315
+    ],
+    "camera_center_in_lidar_m": [
+      0.00057,
+      -0.09341,
+      -0.15968
+    ]
+  },
+  "stream0_right_lens": {
+    "description": "Right fisheye lens pointing along +X_lidar",
+    "T_camera_lidar": [
+      [
+        -0.0,
+        -0.86315,
+        0.50493,
+        0.0
+      ],
+      [
+        0.00308,
+        -0.50493,
+        -0.86315,
+        -0.185
+      ],
+      [
+        1.0,
+        0.00155,
+        0.00266,
+        -0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "R": [
+      [
+        -0.0,
+        -0.86315,
+        0.50493
+      ],
+      [
+        0.00308,
+        -0.50493,
+        -0.86315
+      ],
+      [
+        1.0,
+        0.00155,
+        0.00266
+      ]
+    ],
+    "t": [
+      0.0,
+      -0.185,
+      0.0
+    ]
+  },
+  "stream1_left_lens": {
+    "description": "Left fisheye lens pointing along -X_lidar",
+    "T_camera_lidar": [
+      [
+        0.0,
+        0.86315,
+        -0.50493,
+        -0.0
+      ],
+      [
+        0.00308,
+        -0.50493,
+        -0.86315,
+        -0.185
+      ],
+      [
+        -1.0,
+        -0.00155,
+        -0.00266,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "R": [
+      [
+        0.0,
+        0.86315,
+        -0.50493
+      ],
+      [
+        0.00308,
+        -0.50493,
+        -0.86315
+      ],
+      [
+        -1.0,
+        -0.00155,
+        -0.00266
+      ]
+    ],
+    "t": [
+      0.0,
+      -0.185,
+      0.0
+    ]
+  }
+}

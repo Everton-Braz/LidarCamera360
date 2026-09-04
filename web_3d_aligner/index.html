@@ -1,0 +1,1262 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LiDAR–Fisheye Realtime 3D Calibrator | Raven + Insta360 X4</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <!-- Three.js Local Fallback / CDN -->
+  <script src="js/three.min.js"></script>
+  <script>
+    if (typeof THREE === 'undefined') {
+      document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"><\/script>');
+    }
+  </script>
+  <style>
+    :root {
+      --bg-base: #0a0d14;
+      --bg-panel: rgba(15, 23, 42, 0.85);
+      --bg-panel-sub: rgba(30, 41, 59, 0.7);
+      --border-panel: rgba(148, 163, 184, 0.15);
+      --accent-primary: #38bdf8;
+      --accent-emerald: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      font-family: var(--font-ui);
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #viewport-container {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+    }
+
+    /* Top Bar */
+    header {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      background: var(--bg-panel);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--border-panel);
+      border-radius: 12px;
+      z-index: 10;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-icon {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, #0284c7, #38bdf8);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 16px;
+      color: #fff;
+    }
+
+    .brand-title {
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .brand-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      margin-left: 8px;
+      padding: 2px 8px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 6px;
+    }
+
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-family: var(--font-mono);
+      color: var(--accent-emerald);
+      padding: 4px 12px;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+      border-radius: 20px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-emerald);
+      box-shadow: 0 0 8px var(--accent-emerald);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.8); }
+    }
+
+    /* Floating Left Control Panel */
+    .control-panel {
+      position: absolute;
+      top: 88px;
+      left: 16px;
+      bottom: 16px;
+      width: 380px;
+      background: var(--bg-panel);
+      backdrop-filter: blur(20px);
+      border: 1px solid var(--border-panel);
+      border-radius: 16px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      z-index: 10;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+      overflow-y: auto;
+    }
+
+    .control-panel::-webkit-scrollbar {
+      width: 6px;
+    }
+    .control-panel::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.2);
+      border-radius: 3px;
+    }
+
+    .section-title {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--accent-primary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .card {
+      background: var(--bg-panel-sub);
+      border: 1px solid var(--border-panel);
+      border-radius: 12px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* Sliders */
+    .control-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .control-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .value-badge {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      color: var(--accent-primary);
+      background: rgba(56, 189, 248, 0.1);
+      padding: 2px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(56, 189, 248, 0.2);
+    }
+
+    .slider-container {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .btn-nudge {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: var(--text-main);
+      cursor: pointer;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s ease;
+    }
+
+    .btn-nudge:hover {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+
+    input[type="range"] {
+      flex: 1;
+      accent-color: var(--accent-primary);
+      height: 5px;
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.15);
+      cursor: pointer;
+    }
+
+    /* Preset Buttons */
+    .preset-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+
+    .preset-btn {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-panel);
+      color: var(--text-main);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      text-align: left;
+    }
+
+    .preset-btn:hover {
+      background: rgba(56, 189, 248, 0.12);
+      border-color: var(--accent-primary);
+      transform: translateX(2px);
+    }
+
+    .preset-btn.active {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: var(--accent-primary);
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.2);
+    }
+
+    .preset-name {
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .preset-angles {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* Radio Group */
+    .radio-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    .radio-btn {
+      flex: 1;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-panel);
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      text-align: center;
+      transition: all 0.2s ease;
+    }
+
+    .radio-btn.active {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+
+    /* Action Buttons */
+    .action-btn {
+      width: 100%;
+      padding: 12px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      border: none;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #0284c7, #0ea5e9);
+      color: #fff;
+      box-shadow: 0 4px 16px rgba(14, 165, 233, 0.3);
+    }
+
+    .btn-primary:hover {
+      background: linear-gradient(135deg, #0369a1, #0284c7);
+      box-shadow: 0 6px 20px rgba(14, 165, 233, 0.5);
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border-panel);
+      color: var(--text-main);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.14);
+      border-color: rgba(255, 255, 255, 0.25);
+    }
+
+    /* HUD (Bottom Right) */
+    .hud {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      background: var(--bg-panel);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--border-panel);
+      border-radius: 12px;
+      padding: 14px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-muted);
+      z-index: 10;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    .hud-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+    }
+
+    .hud-val {
+      color: var(--text-main);
+      font-weight: 600;
+    }
+
+    /* Toast Notification */
+    #toast {
+      position: absolute;
+      top: 88px;
+      right: 24px;
+      background: rgba(15, 23, 42, 0.95);
+      border: 1px solid var(--accent-emerald);
+      color: var(--text-main);
+      padding: 14px 20px;
+      border-radius: 10px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      font-size: 13px;
+      z-index: 100;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      animation: slideIn 0.3s ease;
+    }
+
+    @keyframes slideIn {
+      from { transform: translateY(-20px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+
+    /* Loading Overlay */
+    #loading-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg-base);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      z-index: 1000;
+      transition: opacity 0.5s ease;
+    }
+
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 4px solid rgba(56, 189, 248, 0.1);
+      border-top-color: var(--accent-primary);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Loading Overlay -->
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <div style="font-size: 15px; font-weight: 500; color: var(--text-muted);" id="loading-text">Carregando nuvem de pontos (389,454 pts)...</div>
+  </div>
+
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon">3D</div>
+      <div>
+        <span class="brand-title">Calibrador Interativo LiDAR–Fisheye</span>
+        <span class="brand-sub">Raven + Insta360 X4</span>
+      </div>
+    </div>
+    <div class="header-status">
+      <div class="status-pill">
+        <div class="status-dot"></div>
+        <span id="status-text">Servidor Ativo :8080</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Viewport -->
+  <div id="viewport-container"></div>
+
+  <!-- Control Panel -->
+  <div class="control-panel">
+    
+    <!-- Presets Section -->
+    <div>
+      <div class="section-title">⭐ Predefinições Comparativas</div>
+      <div class="preset-grid">
+        <button class="preset-btn active" id="btn-cand07" onclick="applyPreset(-1.24, +2.43, 0.00, 'btn-cand07')">
+          <div>
+            <div class="preset-name">⭐ Cand 07 (CloudCompare)</div>
+            <div class="preset-angles">Pitch -1.24° | Yaw +2.43° | Roll 0.0°</div>
+          </div>
+        </button>
+
+        <button class="preset-btn" id="btn-m0enh" onclick="applyPreset(-1.37, +0.30, 0.00, 'btn-m0enh')">
+          <div>
+            <div class="preset-name">🔬 Método 0+ (Kannala-Brandt)</div>
+            <div class="preset-angles">Pitch -1.37° | Yaw +0.30° | Roll 0.0°</div>
+          </div>
+        </button>
+
+        <button class="preset-btn" id="btn-m3ba" onclick="applyPreset(-2.97, +0.43, 0.00, 'btn-m3ba')">
+          <div>
+            <div class="preset-name">🌐 Método 3 (Global Bundle)</div>
+            <div class="preset-angles">Pitch -2.97° | Yaw +0.43° | Roll 0.0°</div>
+          </div>
+        </button>
+
+        <button class="preset-btn" id="btn-m2nid" onclick="applyPreset(+0.13, -1.60, 0.00, 'btn-m2nid')">
+          <div>
+            <div class="preset-name">⚡ Método 2 (Target-less NID)</div>
+            <div class="preset-angles">Pitch +0.13° | Yaw -1.60° | Roll 0.0°</div>
+          </div>
+        </button>
+
+        <button class="preset-btn" id="btn-nominal" onclick="applyPreset(0.00, 0.00, 0.00, 'btn-nominal')">
+          <div>
+            <div class="preset-name">⚪ Baseline Nominal (Cand 03)</div>
+            <div class="preset-angles">Pitch 0.00° | Yaw 0.00° | Roll 0.0°</div>
+          </div>
+        </button>
+      </div>
+    </div>
+
+    <!-- Fine Trims Section -->
+    <div class="card">
+      <div class="section-title">📐 Ajuste Fino de Ângulos (Graus)</div>
+
+      <!-- Pitch -->
+      <div class="control-row">
+        <div class="control-header">
+          <span>Pitch (Elevação / Vertical)</span>
+          <span class="value-badge" id="val-pitch">-1.24°</span>
+        </div>
+        <div class="slider-container">
+          <button class="btn-nudge" onclick="nudge('pitch', -0.05)">−</button>
+          <input type="range" id="slider-pitch" min="-10.0" max="10.0" step="0.02" value="-1.24">
+          <button class="btn-nudge" onclick="nudge('pitch', +0.05)">+</button>
+        </div>
+      </div>
+
+      <!-- Yaw -->
+      <div class="control-row">
+        <div class="control-header">
+          <span>Yaw (Giro Horizontal)</span>
+          <span class="value-badge" id="val-yaw">+2.43°</span>
+        </div>
+        <div class="slider-container">
+          <button class="btn-nudge" onclick="nudge('yaw', -0.05)">−</button>
+          <input type="range" id="slider-yaw" min="-10.0" max="10.0" step="0.02" value="2.43">
+          <button class="btn-nudge" onclick="nudge('yaw', +0.05)">+</button>
+        </div>
+      </div>
+
+      <!-- Roll -->
+      <div class="control-row">
+        <div class="control-header">
+          <span>Roll (Inclinação Lateral)</span>
+          <span class="value-badge" id="val-roll">0.00°</span>
+        </div>
+        <div class="slider-container">
+          <button class="btn-nudge" onclick="nudge('roll', -0.05)">−</button>
+          <input type="range" id="slider-roll" min="-10.0" max="10.0" step="0.02" value="0.00">
+          <button class="btn-nudge" onclick="nudge('roll', +0.05)">+</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Lens Model & Focal Length -->
+    <div class="card">
+      <div class="section-title">🔍 Modelo Ótico & Distância Focal</div>
+      <div class="radio-group" style="flex-direction: column; gap: 6px;">
+        <button class="radio-btn active" id="btn-model-spirula" onclick="setLensModel(2)">🌟 Spirula Studio (Thin Prism Calibrado - f=1080.2)</button>
+        <div style="display: flex; gap: 6px;">
+          <button class="radio-btn" id="btn-model-kb" onclick="setLensModel(0)">Kannala-Brandt</button>
+          <button class="radio-btn" id="btn-model-lin" onclick="setLensModel(1)">Equidistante Linear</button>
+        </div>
+      </div>
+
+      <!-- Focal Length Slider -->
+      <div class="control-row" style="margin-top: 6px;">
+        <div class="control-header">
+          <span>Distância Focal (f)</span>
+          <span class="value-badge" id="val-focal">1080.2px</span>
+        </div>
+        <div class="slider-container">
+          <button class="btn-nudge" onclick="nudgeFocal(-2.0)">−</button>
+          <input type="range" id="slider-focal" min="1000.0" max="1200.0" step="0.5" value="1080.2">
+          <button class="btn-nudge" onclick="nudgeFocal(+2.0)">+</button>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; margin-top: 2px;">
+          <span style="cursor: pointer; text-decoration: underline;" onclick="setFocal(1080.19)">Spirula: 1080.2px</span>
+          <span style="cursor: pointer; text-decoration: underline;" onclick="setFocal(1122.53)">Nominal: 1122.5px</span>
+        </div>
+      </div>
+
+      <!-- Max Radius Cutoff (Peripheral crop) -->
+      <div class="control-row">
+        <div class="control-header">
+          <span>Raio Útil (Cortar Borda Esticada)</span>
+          <span class="value-badge" id="val-radius">1650px</span>
+        </div>
+        <input type="range" id="slider-radius" min="1200" max="1900" step="10" value="1650">
+      </div>
+    </div>
+
+    <!-- Visual Options -->
+    <div class="card">
+      <div class="section-title">🎨 Exibição dos Pontos</div>
+      
+      <div class="control-row">
+        <div class="control-header">
+          <span>Modo de Tamanho</span>
+        </div>
+        <div class="radio-group" style="margin-bottom: 4px;">
+          <button class="radio-btn active" id="btn-size-fixed" onclick="setSizeMode(0)">Fixo (Nítido / CloudCompare)</button>
+          <button class="radio-btn" id="btn-size-atten" onclick="setSizeMode(1)">Atenuação 3D</button>
+        </div>
+      </div>
+
+      <div class="control-row">
+        <div class="control-header">
+          <span>Tamanho do Ponto</span>
+          <span class="value-badge" id="val-size">2.0px</span>
+        </div>
+        <input type="range" id="slider-size" min="1.0" max="6.0" step="0.5" value="2.0">
+      </div>
+
+      <div class="control-row">
+        <div class="control-header">
+          <span>Pontos Não Projetados (Fundo)</span>
+        </div>
+        <div class="radio-group" style="margin-bottom: 4px;">
+          <button class="radio-btn active" id="btn-unproj-hide" onclick="setUnprojMode(1)">Ocultar Fundo</button>
+          <button class="radio-btn" id="btn-unproj-dim" onclick="setUnprojMode(0)">Mostrar Esmaecido</button>
+        </div>
+      </div>
+
+      <div class="control-row">
+        <div class="control-header">
+          <span>Opacidade</span>
+          <span class="value-badge" id="val-opacity">1.0</span>
+        </div>
+        <input type="range" id="slider-opacity" min="0.2" max="1.0" step="0.05" value="1.0">
+      </div>
+
+      <div class="control-row" style="margin-top: 4px;">
+        <button class="action-btn btn-secondary" onclick="snapToCameraView()">🎥 Visão da Câmera (1:1)</button>
+      </div>
+      <div class="control-row">
+        <button class="action-btn btn-secondary" onclick="resetOrbitView()">🔄 Resetar Órbita 3D</button>
+      </div>
+    </div>
+
+    <!-- Export Action -->
+    <div style="margin-top: auto;">
+      <button class="action-btn btn-primary" id="btn-save" onclick="saveAndExportPcd()">
+        💾 Salvar e Exportar PCD
+      </button>
+    </div>
+
+  </div>
+
+  <!-- HUD -->
+  <div class="hud">
+    <div class="hud-row"><span>Status:</span><span class="hud-val" id="hud-fps">60 FPS</span></div>
+    <div class="hud-row"><span>Pontos:</span><span class="hud-val" id="hud-points">389,454</span></div>
+    <div class="hud-row"><span>Dist. Focal f:</span><span class="hud-val">1122.5 px</span></div>
+    <div class="hud-row"><span>Alavanca c_L:</span><span class="hud-val">18.5 cm (UP)</span></div>
+    <div style="margin-top: 4px; font-size: 11px; color: var(--text-dim);">
+      🖱️ Botão Esquerdo: Girar | Direito: Mover | Scroll: Zoom
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast">
+    <span style="font-size: 18px;">✅</span>
+    <span id="toast-msg">Operação realizada com sucesso!</span>
+  </div>
+
+  <!-- Main Logic -->
+  <script>
+    // State
+    const state = {
+      pitch: -1.24,
+      yaw: 2.43,
+      roll: 0.0,
+      model: 2, // 2 = Spirula Studio (Thin Prism Calibrado), 0 = KB4, 1 = Linear
+      focalLength: 1080.19, // Calibrado pelo Spirula Studio (COLMAP)
+      maxRadius: 1650.0,    // Corte periférico de borda esticada
+      pointSize: 2.0,       // Tamanho nítido de 2 pixels
+      sizeMode: 0,          // 0 = Fixo (CloudCompare), 1 = Atenuado 3D
+      opacity: 1.0,
+      unprojMode: 1,        // 1 = Ocultar fundo (foco total na textura da sala)
+      pose: null,
+      points: null,
+      texture: null
+    };
+
+    let scene, camera, renderer, pointsMesh, shaderMaterial;
+    let cameraAnchor = new THREE.Vector3(1.576, -0.174, 0.389);
+    let lookTarget = new THREE.Vector3(6.54, 0.25, 0.25); // wall frame
+
+    // Lightweight Orbit Controls
+    class OrbitControlsLight {
+      constructor(camera, domElement) {
+        this.camera = camera;
+        this.dom = domElement;
+        this.target = lookTarget.clone();
+        this.isDragging = false;
+        this.button = 0;
+        this.prevX = 0;
+        this.prevY = 0;
+
+        this.dom.addEventListener('mousedown', (e) => {
+          this.isDragging = true;
+          this.button = e.button;
+          this.prevX = e.clientX;
+          this.prevY = e.clientY;
+        });
+
+        window.addEventListener('mouseup', () => { this.isDragging = false; });
+
+        window.addEventListener('mousemove', (e) => {
+          if (!this.isDragging) return;
+          const dx = e.clientX - this.prevX;
+          const dy = e.clientY - this.prevY;
+          this.prevX = e.clientX;
+          this.prevY = e.clientY;
+
+          if (this.button === 0) {
+            // Rotate around target
+            const offset = this.camera.position.clone().sub(this.target);
+            let radius = offset.length();
+            let theta = Math.atan2(offset.x, offset.y);
+            let phi = Math.acos(Math.max(-1, Math.min(1, offset.z / radius)));
+
+            theta -= dx * 0.005;
+            phi = Math.max(0.01, Math.min(Math.PI - 0.01, phi - dy * 0.005));
+
+            offset.x = radius * Math.sin(phi) * Math.sin(theta);
+            offset.y = radius * Math.sin(phi) * Math.cos(theta);
+            offset.z = radius * Math.cos(phi);
+
+            this.camera.position.copy(this.target).add(offset);
+            this.camera.lookAt(this.target);
+          } else if (this.button === 2) {
+            // Pan
+            const forward = new THREE.Vector3();
+            this.camera.getWorldDirection(forward);
+            const right = new THREE.Vector3().crossVectors(forward, this.camera.up).normalize();
+            const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+
+            const panDist = this.camera.position.distanceTo(this.target) * 0.0015;
+            const pan = right.clone().multiplyScalar(-dx * panDist).add(up.clone().multiplyScalar(dy * panDist));
+            this.camera.position.add(pan);
+            this.target.add(pan);
+          }
+        });
+
+        this.dom.addEventListener('wheel', (e) => {
+          e.preventDefault();
+          const factor = e.deltaY > 0 ? 1.08 : 0.92;
+          const offset = this.camera.position.clone().sub(this.target).multiplyScalar(factor);
+          this.camera.position.copy(this.target).add(offset);
+        }, { passive: false });
+
+        this.dom.addEventListener('contextmenu', (e) => e.preventDefault());
+      }
+
+      setTarget(tgt, camPos) {
+        this.target.copy(tgt);
+        this.camera.position.copy(camPos);
+        this.camera.lookAt(this.target);
+      }
+    }
+
+    let controls;
+
+    // GLSL Shaders
+    const vertexShader = `
+      uniform mat3 uRwl;
+      uniform vec3 utwl;
+      uniform mat3 uRbase0;
+      uniform vec3 ucL;
+      uniform mat3 uRtrim;
+      uniform float uF;
+      uniform float uK1;
+      uniform float uK2;
+      uniform int uModel;
+      uniform int uSizeMode;
+      uniform float uMaxRadius;
+      uniform float uW;
+      uniform float uH;
+      uniform float uPointSize;
+
+      varying vec2 vUv;
+      varying float vValid;
+      varying float vDist;
+
+      void main() {
+        // 1. World to LiDAR: P_l = R_wl^T * (position - utwl)
+        vec3 diff = position - utwl;
+        vec3 P_l = transpose(uRwl) * diff;
+
+        // 2. LiDAR to Camera: P_c = uRtrim * (uRbase0 * (P_l - ucL))
+        vec3 P_c = uRtrim * (uRbase0 * (P_l - ucL));
+
+        // 3. Fisheye projection
+        float X = P_c.x;
+        float Y = P_c.y;
+        float Z = P_c.z;
+        float dist = length(P_c);
+        vDist = dist;
+
+        float r_xy = length(P_c.xy);
+        float theta = atan(r_xy, Z);
+
+        float u_px = 0.0;
+        float v_px = 0.0;
+
+        if (uModel == 2) {
+          // Model 2: Thin Prism Fisheye (Spirula Studio Calibrado COLMAP)
+          float theta2 = theta * theta;
+          float theta4 = theta2 * theta2;
+          float theta6 = theta4 * theta2;
+          float theta8 = theta4 * theta4;
+          // k1=0.084684, k2=-0.032074, k3=0.012301, k4=-0.002990
+          float thetad = theta * (1.0 + 0.084684 * theta2 - 0.032074 * theta4 + 0.012301 * theta6 - 0.002990 * theta8);
+          float scale = (r_xy > 1e-7) ? (thetad / r_xy) : 1.0;
+          // p1=-0.000413, p2=0.001235, sx1=-0.002747, sy1=0.000407
+          float du = 2.0 * (-0.000413) * X * Y + 0.001235 * (r_xy * r_xy + 2.0 * X * X) + (-0.002747) * r_xy * r_xy;
+          float dv = (-0.000413) * (r_xy * r_xy + 2.0 * Y * Y) + 2.0 * 0.001235 * X * Y + 0.000407 * r_xy * r_xy;
+          u_px = uF * (X * scale + du) + (uW / 2.0);
+          v_px = uF * (Y * scale + dv) + (uH / 2.0);
+        } else if (uModel == 0) {
+          // Model 0: Kannala-Brandt
+          float theta2 = theta * theta;
+          float r_img = uF * (theta + uK1 * theta * theta2 + uK2 * theta * theta2 * theta2);
+          float cos_p = (r_xy > 1e-7) ? (X / r_xy) : 1.0;
+          float sin_p = (r_xy > 1e-7) ? (Y / r_xy) : 0.0;
+          u_px = (uW / 2.0) + r_img * cos_p;
+          v_px = (uH / 2.0) + r_img * sin_p;
+        } else {
+          // Model 1: Equidistante Linear
+          float r_img = uF * theta;
+          float cos_p = (r_xy > 1e-7) ? (X / r_xy) : 1.0;
+          float sin_p = (r_xy > 1e-7) ? (Y / r_xy) : 0.0;
+          u_px = (uW / 2.0) + r_img * cos_p;
+          v_px = (uH / 2.0) + r_img * sin_p;
+        }
+
+        float r_center = length(vec2(u_px - uW / 2.0, v_px - uH / 2.0));
+
+        if (Z > 0.1 && dist > 0.3 && dist < 30.0 && r_center <= uMaxRadius && r_xy > 1e-6) {
+          if (u_px >= 0.0 && u_px < uW && v_px >= 0.0 && v_px < uH) {
+            vUv = vec2(u_px / uW, 1.0 - (v_px / uH));
+            vValid = 1.0;
+          } else {
+            vValid = 0.0;
+          }
+        } else {
+          vValid = 0.0;
+        }
+
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        if (uSizeMode == 0) {
+          gl_PointSize = uPointSize;
+        } else {
+          gl_PointSize = clamp(uPointSize * (12.0 / -mvPosition.z), 1.0, 16.0);
+        }
+        gl_Position = projectionMatrix * mvPosition;
+      }
+    `;
+
+    const fragmentShader = `
+      uniform sampler2D uTexture;
+      uniform int uUnprojMode;
+      uniform float uOpacity;
+
+      varying vec2 vUv;
+      varying float vValid;
+      varying float vDist;
+
+      void main() {
+        // Formato circular suave (elimina bordas duras de blocos)
+        vec2 coord = gl_PointCoord - vec2(0.5);
+        if (length(coord) > 0.5) discard;
+
+        if (vValid > 0.5) {
+          vec4 tex = texture2D(uTexture, vUv);
+          gl_FragColor = vec4(tex.rgb, uOpacity);
+        } else {
+          if (uUnprojMode == 1) {
+            discard; // Ocultar fundo
+          } else if (uUnprojMode == 2) {
+            float d = clamp(vDist / 12.0, 0.0, 1.0);
+            vec3 col = mix(vec3(0.1, 0.6, 1.0), vec3(1.0, 0.2, 0.1), d);
+            gl_FragColor = vec4(col, uOpacity * 0.35);
+          } else {
+            gl_FragColor = vec4(0.2, 0.25, 0.35, uOpacity * 0.25);
+          }
+        }
+      }
+    `;
+
+    // Euler xyz to 3x3 rotation matrix (column-major array for WebGL)
+    function eulerToMatrix3(pitchDeg, yawDeg, rollDeg) {
+      const p = pitchDeg * Math.PI / 180;
+      const y = yawDeg * Math.PI / 180;
+      const r = rollDeg * Math.PI / 180;
+
+      const cp = Math.cos(p), sp = Math.sin(p);
+      const cy = Math.cos(y), sy = Math.sin(y);
+      const cr = Math.cos(r), sr = Math.sin(r);
+
+      // Rx * Ry * Rz
+      const m00 = cy * cr;
+      const m01 = -cy * sr;
+      const m02 = sy;
+
+      const m10 = sp * sy * cr + cp * sr;
+      const m11 = -sp * sy * sr + cp * cr;
+      const m12 = -sp * cy;
+
+      const m20 = -cp * sy * cr + sp * sr;
+      const m21 = cp * sy * sr + sp * cr;
+      const m22 = cp * cy;
+
+      // WebGL column-major order: [col0, col1, col2]
+      return new THREE.Matrix3().set(
+        m00, m01, m02,
+        m10, m11, m12,
+        m20, m21, m22
+      );
+    }
+
+    async function init() {
+      const container = document.getElementById('viewport-container');
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+
+      // Scene & Camera
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(65, width / height, 0.1, 100);
+      camera.up.set(0, 0, 1); // Z is up
+
+      // Renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+      renderer.setSize(width, height);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setClearColor(0x0a0d14, 1);
+      container.appendChild(renderer.domElement);
+
+      controls = new OrbitControlsLight(camera, renderer.domElement);
+
+      // Fetch assets
+      document.getElementById('loading-text').innerText = 'Carregando parâmetros de pose...';
+      const poseResp = await fetch('/pose.json');
+      state.pose = await poseResp.json();
+
+      document.getElementById('loading-text').innerText = 'Carregando textura fisheye (3840x3840)...';
+      const texLoader = new THREE.TextureLoader();
+      state.texture = await new Promise((resolve) => {
+        texLoader.load('/texture.jpg', resolve);
+      });
+      state.texture.minFilter = THREE.LinearFilter;
+      state.texture.magFilter = THREE.LinearFilter;
+
+      document.getElementById('loading-text').innerText = 'Carregando nuvem de pontos binária (4.6 MB)...';
+      const ptsResp = await fetch('/points.bin');
+      const ptsBuf = await ptsResp.arrayBuffer();
+      state.points = new Float32Array(ptsBuf);
+
+      // Build Geometry
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(state.points, 3));
+
+      // Setup Uniforms
+      const p = state.pose;
+      const RwlMat = new THREE.Matrix3().set(
+        p.R_w_l[0][0], p.R_w_l[0][1], p.R_w_l[0][2],
+        p.R_w_l[1][0], p.R_w_l[1][1], p.R_w_l[1][2],
+        p.R_w_l[2][0], p.R_w_l[2][1], p.R_w_l[2][2]
+      );
+
+      const Rbase0Mat = new THREE.Matrix3().set(
+        p.R_base0[0][0], p.R_base0[0][1], p.R_base0[0][2],
+        p.R_base0[1][0], p.R_base0[1][1], p.R_base0[1][2],
+        p.R_base0[2][0], p.R_base0[2][1], p.R_base0[2][2]
+      );
+
+      const RtrimMat = eulerToMatrix3(state.pitch, state.yaw, state.roll);
+
+      shaderMaterial = new THREE.ShaderMaterial({
+        vertexShader,
+        fragmentShader,
+        transparent: true,
+        depthWrite: true,
+        uniforms: {
+          uRwl: { value: RwlMat },
+          utwl: { value: new THREE.Vector3(...p.t_w_l) },
+          uRbase0: { value: Rbase0Mat },
+          ucL: { value: new THREE.Vector3(...p.t_cam) },
+          uRtrim: { value: RtrimMat },
+          uF: { value: state.focalLength },
+          uK1: { value: -0.04268 },
+          uK2: { value: 0.00242 },
+          uModel: { value: state.model },
+          uSizeMode: { value: state.sizeMode },
+          uMaxRadius: { value: state.maxRadius },
+          uW: { value: p.W },
+          uH: { value: p.H },
+          uPointSize: { value: state.pointSize },
+          uOpacity: { value: state.opacity },
+          uUnprojMode: { value: state.unprojMode },
+          uTexture: { value: state.texture }
+        }
+      });
+
+      pointsMesh = new THREE.Points(geometry, shaderMaterial);
+      scene.add(pointsMesh);
+
+      // Add a subtle ground grid
+      const grid = new THREE.GridHelper(20, 20, 0x1e293b, 0x0f172a);
+      grid.position.set(1.5, 0, -1.0);
+      grid.rotation.x = Math.PI / 2;
+      scene.add(grid);
+
+      // Initial View: looking from camera towards picture frame
+      resetOrbitView();
+
+      // UI Listeners
+      setupUI();
+
+      // Hide loading
+      document.getElementById('loading-overlay').style.opacity = '0';
+      setTimeout(() => {
+        document.getElementById('loading-overlay').style.display = 'none';
+      }, 500);
+
+      window.addEventListener('resize', onWindowResize);
+      animate();
+    }
+
+    function setupUI() {
+      // Sliders
+      const sp = document.getElementById('slider-pitch');
+      const sy = document.getElementById('slider-yaw');
+      const sr = document.getElementById('slider-roll');
+
+      sp.addEventListener('input', (e) => {
+        state.pitch = parseFloat(e.target.value);
+        updateUniforms();
+      });
+
+      sy.addEventListener('input', (e) => {
+        state.yaw = parseFloat(e.target.value);
+        updateUniforms();
+      });
+
+      sr.addEventListener('input', (e) => {
+        state.roll = parseFloat(e.target.value);
+        updateUniforms();
+      });
+
+      document.getElementById('slider-size').addEventListener('input', (e) => {
+        state.pointSize = parseFloat(e.target.value);
+        document.getElementById('val-size').innerText = state.pointSize.toFixed(1) + 'px';
+        shaderMaterial.uniforms.uPointSize.value = state.pointSize;
+      });
+
+      document.getElementById('slider-opacity').addEventListener('input', (e) => {
+        state.opacity = parseFloat(e.target.value);
+        document.getElementById('val-opacity').innerText = state.opacity.toFixed(2);
+        shaderMaterial.uniforms.uOpacity.value = state.opacity;
+      });
+
+      document.getElementById('slider-focal').addEventListener('input', (e) => {
+        state.focalLength = parseFloat(e.target.value);
+        document.getElementById('val-focal').innerText = state.focalLength.toFixed(1) + 'px';
+        shaderMaterial.uniforms.uF.value = state.focalLength;
+      });
+
+      document.getElementById('slider-radius').addEventListener('input', (e) => {
+        state.maxRadius = parseFloat(e.target.value);
+        document.getElementById('val-radius').innerText = state.maxRadius.toFixed(0) + 'px';
+        shaderMaterial.uniforms.uMaxRadius.value = state.maxRadius;
+      });
+    }
+
+    function updateUniforms() {
+      document.getElementById('slider-pitch').value = state.pitch;
+      document.getElementById('slider-yaw').value = state.yaw;
+      document.getElementById('slider-roll').value = state.roll;
+
+      document.getElementById('val-pitch').innerText = (state.pitch >= 0 ? '+' : '') + state.pitch.toFixed(2) + '°';
+      document.getElementById('val-yaw').innerText = (state.yaw >= 0 ? '+' : '') + state.yaw.toFixed(2) + '°';
+      document.getElementById('val-roll').innerText = (state.roll >= 0 ? '+' : '') + state.roll.toFixed(2) + '°';
+
+      const mat = eulerToMatrix3(state.pitch, state.yaw, state.roll);
+      shaderMaterial.uniforms.uRtrim.value = mat;
+    }
+
+    function nudge(axis, delta) {
+      if (axis === 'pitch') state.pitch = Math.round((state.pitch + delta) * 100) / 100;
+      if (axis === 'yaw') state.yaw = Math.round((state.yaw + delta) * 100) / 100;
+      if (axis === 'roll') state.roll = Math.round((state.roll + delta) * 100) / 100;
+
+      // Deselect presets
+      document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+      updateUniforms();
+    }
+
+    function nudgeFocal(delta) {
+      state.focalLength = Math.round((state.focalLength + delta) * 10) / 10;
+      document.getElementById('slider-focal').value = state.focalLength;
+      document.getElementById('val-focal').innerText = state.focalLength.toFixed(1) + 'px';
+      shaderMaterial.uniforms.uF.value = state.focalLength;
+    }
+
+    function setFocal(val) {
+      state.focalLength = val;
+      document.getElementById('slider-focal').value = val;
+      document.getElementById('val-focal').innerText = val.toFixed(1) + 'px';
+      shaderMaterial.uniforms.uF.value = val;
+      showToast(`Distância Focal: ${val.toFixed(1)} px`);
+    }
+
+    function applyPreset(pitch, yaw, roll, btnId) {
+      state.pitch = pitch;
+      state.yaw = yaw;
+      state.roll = roll;
+
+      document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+      if (btnId) document.getElementById(btnId).classList.add('active');
+
+      updateUniforms();
+      showToast(`Predefinição aplicada: Pitch ${pitch}°, Yaw ${yaw}°, Roll ${roll}°`);
+    }
+
+    function setLensModel(modelIdx) {
+      state.model = modelIdx;
+      shaderMaterial.uniforms.uModel.value = modelIdx;
+      document.getElementById('btn-model-spirula').classList.toggle('active', modelIdx === 2);
+      document.getElementById('btn-model-kb').classList.toggle('active', modelIdx === 0);
+      document.getElementById('btn-model-lin').classList.toggle('active', modelIdx === 1);
+
+      if (modelIdx === 2) {
+        setFocal(1080.19);
+        showToast('🌟 Modelo Thin Prism (Spirula Studio) com f=1080.2px ativado!');
+      } else if (modelIdx === 0) {
+        setFocal(1122.53);
+        showToast('Modelo Kannala-Brandt (KB4) ativado');
+      } else {
+        setFocal(1122.53);
+        showToast('Modelo Equidistante Linear ativado');
+      }
+    }
+
+    function setSizeMode(mode) {
+      state.sizeMode = mode;
+      shaderMaterial.uniforms.uSizeMode.value = mode;
+      document.getElementById('btn-size-fixed').classList.toggle('active', mode === 0);
+      document.getElementById('btn-size-atten').classList.toggle('active', mode === 1);
+      showToast(mode === 0 ? 'Tamanho Fixo em Pixels (Nítido / CloudCompare)' : 'Modo Atenuação 3D Ativado');
+    }
+
+    function setUnprojMode(mode) {
+      state.unprojMode = mode;
+      shaderMaterial.uniforms.uUnprojMode.value = mode;
+      document.getElementById('btn-unproj-hide').classList.toggle('active', mode === 1);
+      document.getElementById('btn-unproj-dim').classList.toggle('active', mode === 0);
+      showToast(mode === 1 ? 'Fundo Ocultado (Foco na Textura)' : 'Fundo Esmaecido Visível');
+    }
+
+    function snapToCameraView() {
+      // Physical camera position in world space
+      const p = state.pose;
+      const camWorld = new THREE.Vector3(1.576, -0.174, 0.389);
+      const frameWall = new THREE.Vector3(6.54, 0.25, 0.25);
+      controls.setTarget(frameWall, camWorld);
+      showToast('Perspectiva 1:1 alinhada ao centro ótico da câmera');
+    }
+
+    function resetOrbitView() {
+      const target = new THREE.Vector3(4.0, 0.1, 0.3);
+      const camPos = new THREE.Vector3(1.5, -2.5, 1.8);
+      controls.setTarget(target, camPos);
+    }
+
+    async function saveAndExportPcd() {
+      const btn = document.getElementById('btn-save');
+      btn.innerText = '⏳ Gerando Nuvem PCD...';
+      btn.disabled = true;
+
+      try {
+        const resp = await fetch('/api/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pitch: state.pitch,
+            yaw: state.yaw,
+            roll: state.roll,
+            model: state.model === 2 ? 'thin_prism' : (state.model === 0 ? 'kannala_brandt' : 'linear'),
+            focal_length: state.focalLength,
+            max_radius: state.maxRadius
+          })
+        });
+        const res = await resp.json();
+        if (res.success) {
+          showToast(`Nuvem exportada com sucesso!`);
+          alert(`✅ Calibração salva com sucesso!\n\nArquivo gerado:\n${res.pcd_path}\n\nVocê já pode abri-lo no CloudCompare para inspecionar!`);
+        } else {
+          alert(`Erro ao salvar: ${res.error}`);
+        }
+      } catch (err) {
+        alert(`Erro de conexão com o servidor: ${err.message}`);
+      } finally {
+        btn.innerText = '💾 Salvar e Exportar PCD';
+        btn.disabled = false;
+      }
+    }
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      document.getElementById('toast-msg').innerText = msg;
+      t.style.display = 'flex';
+      clearTimeout(window._toastTimeout);
+      window._toastTimeout = setTimeout(() => {
+        t.style.display = 'none';
+      }, 3500);
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    let lastTime = performance.now();
+    let frameCount = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+
+      frameCount++;
+      const now = performance.now();
+      if (now - lastTime >= 1000) {
+        document.getElementById('hud-fps').innerText = `${frameCount} FPS`;
+        frameCount = 0;
+        lastTime = now;
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>

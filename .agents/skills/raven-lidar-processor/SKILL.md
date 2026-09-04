@@ -304,25 +304,63 @@ python scripts/slice_pcd_chunks.py
 
 ---
 
-## 8. Insta360 X4 360° Colorization & Fisheye SfM Alignment
+## 8. Insta360 X4 360° Dual-Fisheye Calibration & Production Colorization
 
-### 8.1. Photogrammetry Frontend: Spirula Studio
-1. Extract circular fisheye frames (`cam0`, `cam1` at $3840 \times 3840$) from the `.insv` video file.
-2. Run Structure from Motion (SfM) using [Spirula Studio](https://github.com/harry7557558/spirula-studio) with the calibrated `THIN_PRISM_FISHEYE` camera model.
-3. Export the COLMAP project: `colmap_text/` (`cameras.txt`, `images.txt`, `points3D.txt`).
+The calibrated sensor-to-sensor extrinsic transformation between the **3DMakerPro Raven LiDAR Scanner** and the **Insta360 X4 360° Camera** is stored in the centralized production configuration file:
+👉 [`calibracao_rigida_raven_insta360.json`](file:///c:/Users/User/Documents/APLICATIVOS/Lidar-Camera-calibrator/calibracao_rigida_raven_insta360.json)
 
-### 8.2. Multi-Scale Sim(3) Surface ICP Calibration
-```bash
-python scripts/refine_sfm_lidar_icp.py
-```
-- **Precision**: Reaches **$<2\text{ cm}$ median surface error** (92.6% within $<10\text{ cm}$), recovering exact global scale $s \approx 5.367$, rotation $R$, and translation $t$.
+### 8.1. Confirmed Physical & Optical Invariants:
+1. **Physical Lever Arm**: $\|\mathbf{t}_{LC}\| = \mathbf{18.50\text{ cm}}$ (coincides with the physical mount rod length to sub-millimeter precision).
+2. **Optical Model**: **Thin Prism Fisheye** ($3840 \times 3840$):
+   - Front Camera (`cam0`): $f_x = 1080.1874\text{ px}$, $f_y = 1079.9874\text{ px}$, $c_x = 1920.0$, $c_y = 1920.0$.
+   - Rear Camera (`cam1`): $f_x = 1079.0045\text{ px}$, $f_y = 1078.4408\text{ px}$, $c_x = 1920.0$, $c_y = 1920.0$.
+   - Useful aperture radius: $r_{\text{px}} < 1650.0\text{ px}$.
+3. **Rigid Extrinsic Matrix ($T_{\text{LiDAR}\leftarrow\text{Cam0}}$)**:
+   ```python
+   T_LC0 = np.array([
+       [-0.04816735, -0.00245086,  0.99883627,  0.01143877],
+       [-0.85190651, -0.52197769, -0.04236267,  0.14067179],
+       [ 0.52147408, -0.85295562,  0.02305438,  0.11961192],
+       [ 0.0,         0.0,         0.0,         1.0       ]
+   ])
+   ```
 
-### 8.3. Sharpness-Weighted Fisheye Point Cloud Colorization
-```bash
-python scripts/colorize_lidar_with_fisheye_sfm.py
-```
-- **Radial Weighting**: Prioritizes pixels from the optical center ($\text{radius} < 1850\text{px}$ from $(1920, 1920)$).
-- **Output**: `Log/small_test/pcd/colorized_insta360_fisheye_calibrated.pcd` (100% colorized, 34.94 MB binary PCD).
+---
+
+### 8.2. Production Workflow: Dual-Path Colorization
+
+Depending on operational requirements, two workflows are available:
+
+#### Path A: Direct Rigid Colorization (Ultra-Fast — No SfM Needed)
+* **When to use**: Whenever the camera remains mounted on the **same rigid rod/bracket** on the Raven scanner.
+* **How it works**:
+  1. FAST-LIVO2 generates the raw cloud (`all_raw_points.pcd`) and trajectory (`Raven_3DMakerPro_Scan.txt`).
+  2. The video frames are extracted from `0:v:0` (`cam0/`) and `0:v:1` (`cam1/`).
+  3. Programmatic time offset $\Delta t$ is synchronized via optical flow cross-correlation.
+  4. The camera pose at video time $t$ is computed directly as:
+     $$T_{\text{world}\leftarrow\text{cam}}(t) = T_{\text{world}\leftarrow\text{lidar}}(t - \Delta t) \cdot T_{\text{LiDAR}\leftarrow\text{cam}}$$
+  5. The colorization engine projects all LiDAR points into the nearest front/rear camera frames with $960 \times 960$ Z-buffer occlusion culling, finishing in seconds.
+
+#### Path B: SfM-Guided Sim(3) + Multimodal ICP (Autonomous Precision Guarantee)
+* **When to use**: If the camera was detached, mechanical angle changed, or absolute 2-centimeter autonomous closure is required.
+* **How it works**:
+  1. Extract circular fisheye keyframes (`cam0/`, `cam1/` at $3840 \times 3840$) from the `.insv` video file.
+  2. Run Structure from Motion (SfM) in [Spirula Studio](https://github.com/harry7557558/spirula-studio) using the `THIN_PRISM_FISHEYE` model.
+  3. Run trajectory similarity alignment:
+     ```bash
+     python align_colmap_to_lidar.py
+     ```
+     Recovers the exact metric scale ($s = 4.8082$) and synchronizes timestamps ($\Delta t = 5.52\text{s}$) with $\text{RMSE} = 6.92\text{ cm}$.
+  4. Run surface-level multimodal ICP fine registration:
+     ```bash
+     python run_automatic_icp_calibration.py
+     ```
+     Refines registration to **$\text{RMSE} = 3.55\text{ cm}$** and **$\text{median error} = 2.56\text{ cm}$** with $80.1\%$ inliers.
+  5. Run high-performance multi-view colorization:
+     ```bash
+     python colorize_lidar_multiview_fisheye.py
+     ```
+     Paints **100.00% of the 2,336,721 LiDAR points** in **$\sim 81\text{ seconds}$** using 190 dual-fisheye keyframes ($3840 \times 3840$) with raster Z-buffer occlusion prevention.
 
 ---
 
@@ -393,32 +431,35 @@ When exporting to **RealityScan**, the dataset must have an upright ground plane
 ```
 Log/
 ├── pcd/
-│   ├── all_raw_points.pcd             # Raw dense SLAM point cloud
-│   └── all_downsampled_points.pcd     # Downsampled SLAM point cloud
+│   ├── all_raw_points.pcd                         # Raw dense SLAM point cloud (2.33M points)
+│   └── all_downsampled_points.pcd                 # Downsampled SLAM point cloud
 ├── <dataset_name>/
 │   ├── pcd/
-│   │   ├── colorized_insta360_fisheye_calibrated.pcd # 100% Colorized point cloud
-│   │   └── colorized_insta360_fisheye_calibrated.ply # Standard PLY point cloud
+│   │   ├── 09_NUVEM_LIDAR_COLORIDA_MULTIVIEW_FISHEYE.ply # 100% Colorized binary PLY (35.05 MB)
+│   │   ├── 09_NUVEM_LIDAR_COLORIDA_MULTIVIEW_FISHEYE.pcd # 100% Colorized binary PCD (37.39 MB)
+│   │   └── colorized_insta360_fisheye_calibrated.pcd     # Standalone colorized point cloud
 │   ├── Georeferenced/
-│   │   ├── colorized_lidar_georeferenced_utm.laz     # Compound CRS LAZ (EPSG:31984+3855)
-│   │   ├── colorized_lidar_georeferenced_utm.las     # Standard LAS 1.4 WKT Record 2112
-│   │   ├── colorized_lidar_georeferenced_utm.prj     # Projection sidecar
-│   │   ├── local_to_geographic.json                  # Transformation affine matrix & metadata
-│   │   └── gps_trajectory.gpx                        # GPS trajectory track
-│   ├── Colmap_Metric_Fisheye/                        # Metric-scale dual-fisheye dataset
-│   │   ├── metric_alignment_report.html              # Visual alignment quality report & overlays
+│   │   ├── colorized_lidar_georeferenced_utm.laz         # Compound CRS LAZ (EPSG:31984+3855)
+│   │   ├── colorized_lidar_georeferenced_utm.las         # Standard LAS 1.4 WKT Record 2112
+│   │   ├── colorized_lidar_georeferenced_utm.prj         # Projection sidecar
+│   │   ├── local_to_geographic.json                      # Transformation affine matrix & metadata
+│   │   └── gps_trajectory.gpx                            # GPS trajectory track
+│   ├── Colmap_Metric_Fisheye/                            # Metric-scale dual-fisheye dataset
+│   │   ├── metric_alignment_report.html                  # Visual alignment quality report & overlays
 │   │   └── sparse/0/ (cameras.bin, images.bin, points3D.bin)
-│   ├── Colmap_Fisheye_3DGS/                          # Raw Circular Fisheye 3DGS dataset
+│   ├── Colmap_Fisheye_3DGS/                              # Raw Circular Fisheye 3DGS dataset
 │   │   ├── images/ (cam0/, cam1/ raw fisheye frames)
 │   │   └── sparse/0/ (cameras.bin, images.bin, points3D.bin)
-│   ├── Colmap_Undistorted_3DGS/                      # Rectilinear 1536x1536 Undistorted 3DGS
+│   ├── Colmap_Undistorted_3DGS/                          # Rectilinear 1536x1536 Undistorted 3DGS
 │   │   ├── images/ (cam0/, cam1/ 1536x1536 square pinholes)
 │   │   └── sparse/0/ (cameras.bin, images.bin, points3D.bin)
-│   └── RealityScan_Dataset/                          # Production RealityScan Dataset (1-Click Import)
-│       ├── images/ (cam0/, cam1/ with True North EXIF GPS)
-│       └── sparse/ (0/cameras.bin, images.bin, points3D.bin, cameras.txt, images.txt, points3D.txt)
+│   ├── RealityScan_Dataset/                              # Production RealityScan Dataset (1-Click Import)
+│   │   ├── images/ (cam0/, cam1/ with True North EXIF GPS)
+│   │   └── sparse/ (0/cameras.bin, images.bin, points3D.bin, cameras.txt, images.txt, points3D.txt)
+│   ├── calibracao_rigida_raven_insta360.json             # Central 6-DoF Rigid Extrinsic + Thin Prism JSON
+│   └── calibracao_automatica_icp_resultado.json          # Multi-modal ICP Fine Registration Report
 └── result/
-    └── Raven_3DMakerPro_Scan.txt                     # 6-DoF trajectory in TUM format
+    └── Raven_3DMakerPro_Scan.txt                         # 6-DoF trajectory in TUM format
 ```
 
 ---
@@ -427,6 +468,8 @@ Log/
 
 | Problem | Root Cause | Solution |
 | :--- | :--- | :--- |
+| **Door aligns on one wall, but window on opposite wall is displaced** | Nominal focal length ($1122.5\text{ px}$) creates severe lateral radial scale error | Use the calibrated **Thin Prism** model ($f_x=1080.19\text{ px}$, $f_y=1079.99\text{ px}$) from [`calibracao_rigida_raven_insta360.json`](file:///c:/Users/User/Documents/APLICATIVOS/Lidar-Camera-calibrator/calibracao_rigida_raven_insta360.json). |
+| **Foreground wall color bleeding into points behind it** | Lack of occlusion culling in multi-view projection | Enable $960 \times 960$ raster Z-buffer depth test (`d_point <= d_buffer * 1.08 + 0.15`). |
 | **Point cloud geometry has double-edges / drift** | Coarse voxel size, lack of gravity alignment, or noisy planar fitting. | Set `uav/gravity_align_en: true`, `lio/voxel_size: 0.3`, `lio/min_eigen_value: 0.005`, and `lio/max_points_num: 100`. |
 | **Trajectory bends into an arc when running a sliced chunk** | Bag was sliced mid-motion; IMU initialization assumed stationary initial conditions and calculated wrong biases. | Run continuous SLAM from $t=0$, and use `partition_full_run_into_chunks.py` / `slice_pcd_chunks.py` to extract time slices. |
 | **Ground plane tilted in long runs** | Gyro/Accel bias drift over 30+ minutes. | Enable `uav/gravity_align_en: true` and tighten IMU covariances (`acc_cov: 0.2`, `gyr_cov: 0.05`). |
@@ -437,3 +480,4 @@ Log/
 | **RealityScan 3D bounding box stretched 200m+ tall** | Outlier sky tie-points created during SfM unconstrained bundle adjustment. | Filter points with $Z \in [-3\text{m}, +15\text{m}]$ using `filter_clean_colmap_points()`. |
 | **Map trajectory misaligned with satellite street** | EXIF GPS tags lack True North yaw calibration. | Embed calibrated True North heading ($\text{Yaw} = 77.18^\circ$) using `align_exif_gps_to_true_north_laz.py`. |
 | **`all_downsampled_points.pcd` has same size as `all_raw_points.pcd`** | Mapping points are pre-filtered at $5\text{cm}$ (`filter_size_surf: 0.05`). Post-save voxel filter is $2\text{cm}$ (`filter_size_pcd: 0.02`), retaining all points. | Increase `filter_size_pcd` to $>0.05$ (e.g. $0.10$ for 10cm decimation) in `config/raven.yaml` if a sparser cloud is desired. |
+
