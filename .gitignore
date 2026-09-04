@@ -19,4 +19,6 @@ dataset-test/
 *.zip
 *.tar.gz
 *.bin
+*.exe
+*.ply
 node_modules/
