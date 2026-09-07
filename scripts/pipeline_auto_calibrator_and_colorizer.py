@@ -31,7 +31,7 @@ from scipy.spatial.transform import Slerp
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-WORKSPACE_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 SPIRULA_EXE = WORKSPACE_DIR / "spirula" / "spirula.exe"
 DEFAULT_CALIB_JSON = WORKSPACE_DIR / "calibracao_rigida_raven_insta360.json"
 

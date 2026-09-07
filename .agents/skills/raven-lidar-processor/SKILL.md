@@ -177,25 +177,25 @@ flowchart TD
 
 ---
 
-## 5. Master Pipeline Execution (`pipeline_auto_calibrator_and_colorizer.py`)
+## 5. Master Pipeline Execution (`scripts/pipeline_auto_calibrator_and_colorizer.py`)
 
 The entire dual-method workflow is orchestrated through the master CLI:
 
 ```bash
 # Method 1: SfM Spirula (Padrão Ouro)
-python pipeline_auto_calibrator_and_colorizer.py \
+python scripts/pipeline_auto_calibrator_and_colorizer.py \
   --dataset "D:\APLICATIVOS\FAST-LIVO2\AZURE-DATASET" \
   --method sfm \
   --fps 1.0
 
 # Method 2: Direto com Ajuda do SfM (Rápido & Calibrado)
-python pipeline_auto_calibrator_and_colorizer.py \
+python scripts/pipeline_auto_calibrator_and_colorizer.py \
   --dataset "D:\APLICATIVOS\FAST-LIVO2\AZURE-DATASET" \
   --method direct \
   --fps 1.0
 
 # Forcing auto-recalibration from SfM keyframes:
-python pipeline_auto_calibrator_and_colorizer.py \
+python scripts/pipeline_auto_calibrator_and_colorizer.py \
   --dataset "D:\APLICATIVOS\FAST-LIVO2\AZURE-DATASET" \
   --method direct \
   --recalibrate-from-sfm
@@ -242,7 +242,7 @@ python georeference.py pipeline \
 | Symptom | Root Cause | Solution |
 | :--- | :--- | :--- |
 | **Dark streaks or shadow bleeding behind cars/boats** | Winner-take-all projection picking single occluded camera frames. | Use **Top-3 Multi-View Consensus** with median outlier filter ($|c - \text{med}| < 45$). Built into both methods. |
-| **Yellow lines slightly blurry or doubled in Direct Method** | LiDAR SLAM has 0.87° angular wobble on featureless flat asphalt. | Enable SfM drift spline correction: run `pipeline_auto_calibrator_and_colorizer.py --method direct` (automatically samples SfM keyframes). |
+| **Yellow lines slightly blurry or doubled in Direct Method** | LiDAR SLAM has 0.87° angular wobble on featureless flat asphalt. | Enable SfM drift spline correction: run `scripts/pipeline_auto_calibrator_and_colorizer.py --method direct` (automatically samples SfM keyframes). |
 | **Trajectory bends into an arc during SLAM** | Bag was sliced before SLAM; static initial IMU conditions were violated. | Never slice bags prior to SLAM. Run continuous SLAM from $t=0$, then partition point clouds post-run. |
 | **Color alignment shifts laterally away from image center** | Using nominal equidistant focal length ($1122.5\text{ px}$) instead of Thin Prism model. | Use calibrated Thin Prism parameters ($f \approx 1080.19\text{ px}$) from `calibracao_rigida_raven_insta360.json`. |
 | **Corrupted PCD headers on SLAM termination** | Terminal killed abruptly without flushing octree buffer. | Follow clean shutdown protocol: send `SIGINT` to `fastlivo_mapping` and wait until process exits cleanly. |

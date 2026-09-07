@@ -151,11 +151,11 @@ open3d>=0.17
 
 ## 5. Como Executar
 
-O orquestrador mestre unificado é o [`pipeline_auto_calibrator_and_colorizer.py`](pipeline_auto_calibrator_and_colorizer.py):
+O orquestrador mestre unificado está localizado em [`scripts/pipeline_auto_calibrator_and_colorizer.py`](scripts/pipeline_auto_calibrator_and_colorizer.py):
 
 ### 5.1 Executar o Método 1 (SfM Spirula - Padrão Ouro)
 ```bash
-python pipeline_auto_calibrator_and_colorizer.py \
+python scripts/pipeline_auto_calibrator_and_colorizer.py \
   --dataset "D:\APLICATIVOS\FAST-LIVO2\AZURE-DATASET" \
   --method sfm \
   --fps 1.0
@@ -163,7 +163,7 @@ python pipeline_auto_calibrator_and_colorizer.py \
 
 ### 5.2 Executar o Método 2 (Direto com Ajuda do SfM - Rápido)
 ```bash
-python pipeline_auto_calibrator_and_colorizer.py \
+python scripts/pipeline_auto_calibrator_and_colorizer.py \
   --dataset "D:\APLICATIVOS\FAST-LIVO2\AZURE-DATASET" \
   --method direct \
   --fps 1.0
@@ -171,7 +171,7 @@ python pipeline_auto_calibrator_and_colorizer.py \
 
 ### 5.3 Forçar Recalibração Extrínseca a partir do SfM
 ```bash
-python pipeline_auto_calibrator_and_colorizer.py \
+python scripts/pipeline_auto_calibrator_and_colorizer.py \
   --dataset "D:\APLICATIVOS\FAST-LIVO2\AZURE-DATASET" \
   --method direct \
   --recalibrate-from-sfm
@@ -201,23 +201,24 @@ Lidar-camera-calibrator/
 │       ├── insv-processing/                # Decodificação de containers INSV e telemetria
 │       └── raven-lidar-processor/          # Skill mestre ponta a ponta (FAST-LIVO2 até coloração)
 ├── docs/
-│   ├── images/                             # Imagens oficiais de validação e comparativos
-│   │   ├── compare_direct_assisted_vs_sfm.png
-│   │   ├── compare_sfm_old_vs_new.png
-│   │   ├── compare_sfm_vs_direct_sidebyside.png
-│   │   └── triptych_comparison.png
-│   └── LiDAR Fisheye Calibration Research.md
+│   └── images/                             # Imagens oficiais de validação e comparativos
+│       ├── compare_direct_assisted_vs_sfm.png
+│       ├── compare_sfm_old_vs_new.png
+│       ├── compare_sfm_vs_direct_sidebyside.png
+│       └── triptych_comparison.png
+├── scripts/                                # SCRIPTS EXECUTÁVEIS DO PIPELINE
+│   ├── pipeline_auto_calibrator_and_colorizer.py # Orquestrador mestre unificado
+│   ├── align_colmap_to_lidar.py            # Alinhamento Sim(3) de Horn standalone
+│   ├── colorize_direct_rigid_method.py     # Módulo standalone de projeção direta
+│   ├── colorize_lidar_multiview_fisheye.py # Módulo standalone de projeção multi-view
+│   ├── colorize_sfm_spirula_method.py      # Módulo standalone de projeção SfM
+│   ├── correlate_imu_gyro.py               # Sincronização temporal por correlação de giroscópio
+│   ├── parse_insv_telemetry.py             # Extrator de telemetria INSV
+│   └── run_automatic_icp_calibration.py    # Calibração ICP fina ponto-a-plano
 ├── spirula/                                # Motor Structure from Motion (Spirula Studio)
 │   └── spirula.exe
-├── align_colmap_to_lidar.py                # Alinhamento Sim(3) de Horn standalone
 ├── calibracao_rigida_raven_insta360.json   # Matriz de calibração e parâmetros Thin Prism
-├── colorize_direct_rigid_method.py         # Módulo standalone de projeção direta
-├── colorize_lidar_multiview_fisheye.py     # Módulo standalone de projeção multi-view
-├── colorize_sfm_spirula_method.py          # Módulo standalone de projeção SfM
-├── correlate_imu_gyro.py                   # Sincronização temporal por correlação de giroscópio
 ├── extrinsics_determined.json              # Registro de parâmetros extrínsecos
-├── parse_insv_telemetry.py                 # Extrator de telemetria INSV
-├── pipeline_auto_calibrator_and_colorizer.py # ORQUESTRADOR MESTRE UNIFICADO
 ├── requirements.txt                        # Dependências Python enxutas
 └── README.md                               # Este documento
 ```

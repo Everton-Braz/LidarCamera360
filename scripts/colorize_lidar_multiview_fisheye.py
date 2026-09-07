@@ -24,7 +24,7 @@ from scipy.spatial.transform import Rotation as Rot
 sys.stdout.reconfigure(encoding='utf-8')
 
 # Caminhos principais
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = Path(r"C:\Users\User\Downloads\Lidou\DinamicAprilTagCalib")
 COLMAP_DIR = DATASET_DIR / "VID_20260902_143757_00_277_dataset" / "sparse" / "0"
 IMG_ROOT = DATASET_DIR / "VID_20260902_143757_00_277_dataset" / "images"
