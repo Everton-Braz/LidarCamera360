@@ -22,13 +22,16 @@ from scipy.spatial.transform import Rotation as Rot
 sys.stdout.reconfigure(encoding='utf-8')
 
 # Caminhos
-DATASET_DIR = Path(r"C:\Users\User\Downloads\Lidou\DinamicAprilTagCalib")
-COLMAP_DIR = DATASET_DIR / "VID_20260902_143757_00_277_dataset" / "sparse" / "0"
+if len(sys.argv) > 1:
+    DATASET_DIR = Path(sys.argv[1])
+else:
+    DATASET_DIR = Path(r"D:\APLICATIVOS\FAST-LIVO2\AZURE-DATASET")
+COLMAP_DIR = DATASET_DIR / "VID_dataset" / "sparse" / "0"
 SLAM_PCD = DATASET_DIR / "slam_out" / "pcd" / "all_raw_points.pcd"
 SLAM_TRJ = DATASET_DIR / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
 
-ICP_FOLDER = Path(r"C:\Users\User\Downloads\Lidou\TESTE_ICP_CLOUDCOMPARE")
-OUT_COMPARATIVO = Path(r"C:\Users\User\Downloads\Lidou\COMPARATIVO_NUVENS_TODOS_METODOS")
+ICP_FOLDER = DATASET_DIR / "deliverables" / "TESTE_ICP_CLOUDCOMPARE"
+OUT_COMPARATIVO = DATASET_DIR / "deliverables"
 ICP_FOLDER.mkdir(parents=True, exist_ok=True)
 OUT_COMPARATIVO.mkdir(parents=True, exist_ok=True)
 

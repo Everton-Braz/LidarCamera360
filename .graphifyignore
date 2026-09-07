@@ -1,0 +1,30 @@
+# Ignore vendor / third-party libraries
+*.min.js
+*.bundle.js
+web_3d_aligner/js/
+node_modules/
+
+# Ignore printable tag targets and test dataset media
+apriltags_to_print/
+dataset-test/
+*.bag
+*.insv
+*.lrv
+*.pcd
+*.las
+*.laz
+*.png
+*.pdf
+*.jpg
+*.jpeg
+*.zip
+*.tar.gz
+*.bin
+*.exe
+
+# Python caches
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/

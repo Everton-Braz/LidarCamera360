@@ -6,12 +6,12 @@ Pipeline Unificado: Auto-Calibração, Sincronização Temporal e Coloração Li
 Integração completa:
 1. Executa o Spirula Studio SfM (spirula.exe) de forma headless (se solicitado ou se sparse não existir).
 2. Realiza o alinhamento de alta precisão Sim(3) + ICP dos tie-points do COLMAP contra a nuvem LiDAR.
-3. Auto-sincroniza o tempo exato (Δt) entre o vídeo INSV e o SLAM (0 ms de erro).
-4. Auto-compensa micro-variações mecânicas de aperto do suporte (Yaw/Roll).
+3. Auto-sincroniza o tempo exato (Δt) entre o vídeo INSV e o SLAM (0 ms de erro) via SfM ou IMU Gyro.
+4. Auto-recalibra e compensa variações mecânicas de aperto do suporte (Yaw/Roll/Pitch).
 5. Colore a nuvem com oclusão via Z-Buffer (960x960) e ponderação de nitidez óptica.
 6. Suporta os dois métodos:
    - Método A: SfM Spirula Alinhado (Padrão Ouro, 100% autônomo e aprumado).
-   - Método B: Direto Rígido (Sem SfM, utilizando matriz de montagem e auto-sincronização).
+   - Método B: Direto Rígido (Rápido, universal para qualquer dataset com o mesmo rig fixo).
 """
 
 import os
@@ -249,6 +249,99 @@ def write_pcd(path, points, colors_rgb):
 
 
 # ==============================================================================
+# SINCRONIZAÇÃO AUTOMÁTICA VIA IMU GYRO (INSV + ROS BAG)
+# ==============================================================================
+
+def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
+    """Sincronização temporal automática sub-milissegundo entre INSV e ROS Bag via IMU Gyro"""
+    try:
+        from rosbags.highlevel import AnyReader
+        HEADER_SIZE = 72
+        with open(insv_path, "rb") as fin:
+            fin.seek(-HEADER_SIZE, 2)
+            header = fin.read(HEADER_SIZE)
+            extra_size = struct.unpack('<I', header[32:36])[0]
+            file_size = fin.seek(0, 2)
+            extra_start = file_size - extra_size
+
+            fin.seek(-(HEADER_SIZE + 6 + 250), 2)
+            offsets_data = fin.read(250)
+            offsets = {}
+            for i in range(0, len(offsets_data), 10):
+                oid, ofmt, osize, ooff = struct.unpack('<BBII', offsets_data[i:i+10])
+                if oid > 0:
+                    offsets[oid] = (ofmt, osize, ooff)
+
+            if 3 not in offsets or 4 not in offsets:
+                return None
+            _, g_size, g_off = offsets[3]
+            fin.seek(extra_start + g_off)
+            gyro_bytes = fin.read(g_size)
+
+            _, e_size, e_off = offsets[4]
+            fin.seek(extra_start + e_off)
+            exp_bytes = fin.read(e_size)
+
+        cam_imu = np.frombuffer(gyro_bytes, dtype=[('t', '<u8'), ('ax', '<u2'), ('ay', '<u2'), ('az', '<u2'), ('gx', '<u2'), ('gy', '<u2'), ('gz', '<u2')])
+        cam_exp = np.frombuffer(exp_bytes, dtype=[('t', '<u8'), ('exp', '<f8')])
+        t_exp0 = cam_exp['t'][0]
+        t_cam_s = (cam_imu['t'].astype(np.float64) - t_exp0) / 1e6
+
+        gx = cam_imu['gx'].astype(np.float64) - 32768.0
+        gy = cam_imu['gy'].astype(np.float64) - 32768.0
+        gz = cam_imu['gz'].astype(np.float64) - 32768.0
+        cam_gyro_norm = np.sqrt(gx**2 + gy**2 + gz**2)
+
+        lidar_t, lidar_wx, lidar_wy, lidar_wz = [], [], [], []
+        with AnyReader([bag_path]) as reader:
+            for conn, ts, raw in reader.messages():
+                if 'imu' in conn.topic.lower():
+                    msg = reader.deserialize(raw, conn.msgtype)
+                    t_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                    lidar_t.append(t_sec)
+                    lidar_wx.append(msg.angular_velocity.x)
+                    lidar_wy.append(msg.angular_velocity.y)
+                    lidar_wz.append(msg.angular_velocity.z)
+
+        lidar_t = np.array(lidar_t)
+        lidar_norm = np.sqrt(np.array(lidar_wx)**2 + np.array(lidar_wy)**2 + np.array(lidar_wz)**2)
+
+        trj = np.loadtxt(trj_path)
+        t_slam_start = trj[0, 0]
+        t_lidar_rel = lidar_t - t_slam_start
+
+        fs = 200.0
+        t_eval = np.arange(1.0, min(80.0, t_cam_s[-1] - 1.0), 1.0 / fs)
+        cam_interp = np.interp(t_eval, t_cam_s, cam_gyro_norm)
+        cam_interp -= np.median(cam_interp)
+
+        shifts = np.arange(-30.0, 30.0, 0.005)
+        corrs = []
+        for shift in shifts:
+            t_l_q = t_eval - shift
+            valid = (t_l_q >= t_lidar_rel[0]) & (t_l_q <= t_lidar_rel[-1])
+            if np.sum(valid) > 1000:
+                lid_interp = np.interp(t_l_q[valid], t_lidar_rel, lidar_norm)
+                lid_interp -= np.median(lid_interp)
+                c = np.corrcoef(cam_interp[valid], lid_interp)[0, 1]
+                corrs.append(c)
+            else:
+                corrs.append(0.0)
+
+        corrs = np.array(corrs)
+        best_idx = np.argmax(corrs)
+        best_dt = shifts[best_idx]
+        best_r = corrs[best_idx]
+        if best_r > 0.5:
+            print(f"[+] Sincronização IMU Gyro Cross-Correlation bem-sucedida: Δt = {best_dt:.4f}s (Pearson r = {best_r:.4f})")
+            return float(best_dt)
+        return None
+    except Exception as e:
+        print(f"[*] Sincronização via giroscópio indisponível ({e}), prosseguindo...")
+        return None
+
+
+# ==============================================================================
 # PIPELINE MÉTODO 1: SPIRULA SFM ALINHADO (PADRÃO OURO)
 # ==============================================================================
 
@@ -290,7 +383,7 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
     return True
 
 
-def align_colmap_to_lidar(dataset_dir):
+def align_colmap_to_lidar(dataset_dir, fps=1.0):
     """Executa o alinhamento de alta precisão Sim(3) + ICP entre COLMAP e LiDAR"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
@@ -308,24 +401,27 @@ def align_colmap_to_lidar(dataset_dir):
 
     # Filtrar cam0 para busca temporal
     cam0 = [im for im in col_imgs if im["name"].startswith("cam0/")]
-    cam0.sort(key=lambda x: int(x["name"].split("/")[1].split(".")[0]))
+    def get_frame_num(name):
+        digits = "".join(filter(str.isdigit, Path(name).stem))
+        return int(digits) if digits else 0
+    cam0.sort(key=lambda x: get_frame_num(x["name"]))
 
-    fps = 2.0  # Taxa de extração
     t0_slam = t_slam[0]
     t1_slam = t_slam[-1]
 
-    # Busca ótima do dt
-    print("[*] Buscando sincronização temporal ótima Δt...")
+    # Busca ótima do dt (coarse-to-fine adaptativa)
+    print(f"[*] Buscando sincronização temporal ótima Δt (FPS = {fps:.1f})...")
     best_rmse = 1e9
     best_dt = 0
     best_sim3 = None
 
-    dts = np.linspace(-15.0, 15.0, 601)
+    # Coarse search de -200s a +50s
+    dts = np.linspace(-200.0, 50.0, 1001)
     for dt in dts:
         X_trj = []
         Y_trj = []
         for im in cam0:
-            frame_num = int(im["name"].split("/")[1].split(".")[0])
+            frame_num = get_frame_num(im["name"])
             t_vid = (frame_num - 1) / fps
             t_q = t0_slam + (t_vid - dt)
             if t0_slam <= t_q <= t1_slam:
@@ -336,20 +432,20 @@ def align_colmap_to_lidar(dataset_dir):
                 X_trj.append(im["C"])
                 Y_trj.append(p_L)
 
-        if len(X_trj) >= 25:
+        if len(X_trj) >= 20:
             s, R, t_trans, rmse = solve_umeyama_sim3(np.array(X_trj), np.array(Y_trj))
             if rmse < best_rmse:
                 best_rmse = rmse
                 best_dt = dt
                 best_sim3 = (s, R, t_trans)
 
-    # Refinar dt a 10 ms
-    fine_dts = np.linspace(best_dt - 0.2, best_dt + 0.2, 41)
+    # Refinar dt a 2 ms
+    fine_dts = np.linspace(best_dt - 1.0, best_dt + 1.0, 501)
     for dt in fine_dts:
         X_trj = []
         Y_trj = []
         for im in cam0:
-            frame_num = int(im["name"].split("/")[1].split(".")[0])
+            frame_num = get_frame_num(im["name"])
             t_vid = (frame_num - 1) / fps
             t_q = t0_slam + (t_vid - dt)
             if t0_slam <= t_q <= t1_slam:
@@ -360,7 +456,7 @@ def align_colmap_to_lidar(dataset_dir):
                 X_trj.append(im["C"])
                 Y_trj.append(p_L)
 
-        if len(X_trj) >= 25:
+        if len(X_trj) >= 20:
             s, R, t_trans, rmse = solve_umeyama_sim3(np.array(X_trj), np.array(Y_trj))
             if rmse < best_rmse:
                 best_rmse = rmse
@@ -407,14 +503,243 @@ def align_colmap_to_lidar(dataset_dir):
     return align_data
 
 
-def colorize_via_spirula_sfm(dataset_dir):
+def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
+    """Calcula automaticamente com precisão de milissegundos o offset temporal Δt via correlação de giro IMU"""
+    try:
+        from rosbags.highlevel import AnyReader
+    except ImportError:
+        print("[!] rosbags não instalado para leitura direta de IMU.")
+        return None
+
+    HEADER_SIZE = 72
+    try:
+        with open(insv_path, "rb") as fin:
+            fin.seek(-HEADER_SIZE, 2)
+            header = fin.read(HEADER_SIZE)
+            extra_size = struct.unpack('<I', header[32:36])[0]
+            file_size = fin.seek(0, 2)
+            extra_start = file_size - extra_size
+
+            fin.seek(-(HEADER_SIZE + 6 + 250), 2)
+            offsets_data = fin.read(250)
+            offsets = {}
+            for i in range(0, len(offsets_data), 10):
+                oid, ofmt, osize, ooff = struct.unpack('<BBII', offsets_data[i:i+10])
+                if oid > 0:
+                    offsets[oid] = (ofmt, osize, ooff)
+
+            if 3 not in offsets or 4 not in offsets:
+                print("[!] Registros de Gyro/Exposure não encontrados no trailer INSV.")
+                return None
+
+            _, g_size, g_off = offsets[3]
+            fin.seek(extra_start + g_off)
+            gyro_bytes = fin.read(g_size)
+
+            _, e_size, e_off = offsets[4]
+            fin.seek(extra_start + e_off)
+            exp_bytes = fin.read(e_size)
+
+        cam_imu_raw = np.frombuffer(gyro_bytes, dtype=[
+            ('t', '<u8'), ('ax', '<u2'), ('ay', '<u2'), ('az', '<u2'),
+            ('gx', '<u2'), ('gy', '<u2'), ('gz', '<u2')
+        ])
+        cam_exp_raw = np.frombuffer(exp_bytes, dtype=[('t', '<u8'), ('exp', '<f8')])
+
+        t_exp0_us = cam_exp_raw['t'][0]
+        t_cam_s = (cam_imu_raw['t'].astype(np.float64) - t_exp0_us) / 1e6
+        cam_gx = cam_imu_raw['gx'].astype(np.float64) - 32768.0
+        cam_gy = cam_imu_raw['gy'].astype(np.float64) - 32768.0
+        cam_gz = cam_imu_raw['gz'].astype(np.float64) - 32768.0
+        cam_gyro_norm = np.sqrt(cam_gx**2 + cam_gy**2 + cam_gz**2)
+
+        lidar_t = []
+        lidar_wx = []
+        lidar_wy = []
+        lidar_wz = []
+
+        with AnyReader([Path(bag_path)]) as reader:
+            for conn, ts, raw in reader.messages():
+                if 'imu' in conn.topic.lower():
+                    msg = reader.deserialize(raw, conn.msgtype)
+                    t_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                    lidar_t.append(t_sec)
+                    lidar_wx.append(msg.angular_velocity.x)
+                    lidar_wy.append(msg.angular_velocity.y)
+                    lidar_wz.append(msg.angular_velocity.z)
+
+        if len(lidar_t) == 0:
+            print("[!] Nenhuma mensagem de IMU encontrada no arquivo .bag.")
+            return None
+
+        lidar_t = np.array(lidar_t)
+        lidar_gyro_norm = np.sqrt(np.array(lidar_wx)**2 + np.array(lidar_wy)**2 + np.array(lidar_wz)**2)
+
+        trj = np.loadtxt(trj_path)
+        t_slam_start = trj[0, 0]
+        t_lidar_rel_slam = lidar_t - t_slam_start
+
+        fs = 200.0
+        t_eval = np.arange(1.0, min(90.0, t_cam_s[-1] - 1.0), 1.0 / fs)
+        cam_norm_interp = np.interp(t_eval, t_cam_s, cam_gyro_norm)
+        cam_norm_interp -= np.median(cam_norm_interp)
+
+        shifts = np.arange(-5.0, 15.0, 0.01)
+        corrs = []
+        for shift in shifts:
+            t_q = t_eval - shift
+            valid = (t_q >= t_lidar_rel_slam[0]) & (t_q <= t_lidar_rel_slam[-1])
+            if np.sum(valid) > 500:
+                lid_interp = np.interp(t_q[valid], t_lidar_rel_slam, lidar_gyro_norm)
+                lid_interp -= np.median(lid_interp)
+                c = np.corrcoef(cam_norm_interp[valid], lid_interp)[0, 1]
+                corrs.append(c)
+            else:
+                corrs.append(0.0)
+
+        best_shift = shifts[np.argmax(corrs)]
+        fine_shifts = np.arange(best_shift - 0.1, best_shift + 0.1, 0.0005)
+        fine_corrs = []
+        for shift in fine_shifts:
+            t_q = t_eval - shift
+            valid = (t_q >= t_lidar_rel_slam[0]) & (t_q <= t_lidar_rel_slam[-1])
+            lid_interp = np.interp(t_q[valid], t_lidar_rel_slam, lidar_gyro_norm)
+            lid_interp -= np.median(lid_interp)
+            c = np.corrcoef(cam_norm_interp[valid], lid_interp)[0, 1]
+            fine_corrs.append(c)
+
+        best_exact = fine_shifts[np.argmax(fine_corrs)]
+        max_corr = np.max(fine_corrs)
+        print(f"  [+] Sincronização IMU Gyro Ótima: Δt = {best_exact:.4f}s (Pearson r = {max_corr:.4f})")
+        return float(best_exact)
+    except Exception as e:
+        print(f"[!] Erro no cálculo de sincronização IMU: {e}")
+        return None
+
+
+def recalibrate_from_sfm(dataset_dir, fps=1.0):
+    """Recalibra com alta precisão os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
+    sparse_dir = dataset_dir / "sparse" / "0"
+    slam_trj = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+    align_json = dataset_dir / "colmap_to_lidar_alignment.json"
+
+    if not align_json.exists():
+        align_colmap_to_lidar(dataset_dir, fps=fps)
+
+    with open(align_json, "r", encoding="utf-8") as f:
+        al = json.load(f)
+    s_sim = al["scale"]
+    R_sim = np.array(al["R"])
+    t_sim = np.array(al["t"])
+    dt_sync = al.get("dt_sync_seconds", 0.0)
+
+    t_slam, pos_slam, rot_slam = load_trajectory(slam_trj)
+    slerp = Slerp(t_slam, rot_slam)
+    images = load_colmap_images(sparse_dir / "images.bin")
+
+    def get_fn(name):
+        return int("".join(filter(str.isdigit, Path(name).stem)))
+
+    def solve_lens(cam_prefix):
+        cam_imgs = [im for im in images if im["name"].startswith(cam_prefix)]
+        cam_imgs.sort(key=lambda x: get_fn(x["name"]))
+        R_list, t_list = [], []
+        for im in cam_imgs:
+            fn = get_fn(im["name"])
+            t_vid = (fn - 1) / fps
+            t_q = t_slam[0] + (t_vid - dt_sync)
+            if t_slam[0] <= t_q <= t_slam[-1]:
+                R_L = slerp(t_q).as_matrix()
+                idx = np.searchsorted(t_slam, t_q)
+                w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
+                p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
+
+                C_lidar = s_sim * (R_sim @ im["C"]) + t_sim
+                R_cw_lidar = im["R_cw"] @ R_sim.T
+                R_wc_sfm = R_cw_lidar.T
+
+                R_LC = R_L.T @ R_wc_sfm
+                t_LC = R_L.T @ (C_lidar - p_L)
+                R_list.append(R_LC)
+                t_list.append(t_LC)
+        mean_rot = Rot.from_matrix(R_list).mean()
+        median_t = np.median(t_list, axis=0)
+        return mean_rot, median_t
+
+    R0, t0 = solve_lens("cam0/")
+    R1, t1 = solve_lens("cam1/")
+
+    T_LC0 = np.eye(4)
+    T_LC0[:3, :3] = R0.as_matrix()
+    T_LC0[:3, 3] = t0
+
+    T_LC1 = np.eye(4)
+    T_LC1[:3, :3] = R1.as_matrix()
+    T_LC1[:3, 3] = t1
+
+    rel_ang = np.linalg.norm((R0.inv() * R1).as_rotvec(degrees=True))
+    e0 = R0.as_euler("xyz", degrees=True)
+    e1 = R1.as_euler("xyz", degrees=True)
+
+    print("\n" + "=" * 80)
+    print(" RE-CALIBRAÇÃO FÍSICA A PARTIR DO SFM/SPIRULA CONCLUÍDA:")
+    print(f" Cam0: Euler XYZ={e0} | Braço={t0*100} cm (norma {np.linalg.norm(t0)*100:.2f} cm)")
+    print(f" Cam1: Euler XYZ={e1} | Braço={t1*100} cm (norma {np.linalg.norm(t1)*100:.2f} cm)")
+    print(f" Ângulo relativo entre lentes: {rel_ang:.2f}° (Teórico: 180°)")
+    print("=" * 80)
+
+    calib_dict = {
+        "scanner": "3DMakerPro_Raven_LiDAR",
+        "camera": "Insta360_X4_DualFisheye",
+        "lens_model": "THIN_PRISM_FISHEYE",
+        "cam0_front_intrinsics": {
+            "fx": 1081.46958, "fy": 1081.54143, "cx": 1920.0, "cy": 1920.0,
+            "k1": 0.083654, "k2": -0.031306, "p1": -0.000387, "p2": 0.001724,
+            "k3": 0.012000, "k4": -0.002967, "sx1": -0.003401, "sy1": 0.000687
+        },
+        "cam1_rear_intrinsics": {
+            "fx": 1079.49331, "fy": 1079.54918, "cx": 1920.0, "cy": 1920.0,
+            "k1": 0.080167, "k2": -0.027667, "p1": -0.000449, "p2": 0.000715,
+            "k3": 0.010155, "k4": -0.002635, "sx1": 0.000645, "sy1": 0.002474
+        },
+        "T_lidar_to_cam0_rigid_4x4": T_LC0.tolist(),
+        "T_lidar_to_cam1_rigid_4x4": T_LC1.tolist(),
+        "lever_arm_cam0_meters": {
+            "dx": float(t0[0]), "dy": float(t0[1]), "dz": float(t0[2]), "norm_distance_cm": float(np.linalg.norm(t0) * 100)
+        },
+        "lever_arm_cam1_meters": {
+            "dx": float(t1[0]), "dy": float(t1[1]), "dz": float(t1[2]), "norm_distance_cm": float(np.linalg.norm(t1) * 100)
+        },
+        "rotation_euler_xyz_deg_cam0": {
+            "roll": float(e0[0]), "pitch": float(e0[1]), "yaw": float(e0[2])
+        },
+        "rotation_euler_xyz_deg_cam1": {
+            "roll": float(e1[0]), "pitch": float(e1[1]), "yaw": float(e1[2])
+        },
+        "relative_lens_angle_deg": float(rel_ang),
+        "dt_sync_seconds": float(dt_sync)
+    }
+
+    with open(dataset_dir / "calibracao_rigida_auto.json", "w", encoding="utf-8") as f:
+        json.dump(calib_dict, f, indent=2)
+    with open(dataset_dir / "calibracao_rigida_recalibrada.json", "w", encoding="utf-8") as f:
+        json.dump(calib_dict, f, indent=2)
+    with open(DEFAULT_CALIB_JSON, "w", encoding="utf-8") as f:
+        json.dump(calib_dict, f, indent=2)
+
+    print(f"  [+] Calibração salva em: {dataset_dir / 'calibracao_rigida_auto.json'}")
+    print(f"  [+] Calibração mestre atualizada: {DEFAULT_CALIB_JSON}")
+    return calib_dict
+
+
+def colorize_via_spirula_sfm(dataset_dir, fps=1.0):
     """Executa a coloração de alta precisão projetando as poses alinhadas do SfM"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
     if not align_json.exists():
-        align_colmap_to_lidar(dataset_dir)
+        align_colmap_to_lidar(dataset_dir, fps=fps)
 
     with open(align_json, "r", encoding="utf-8") as f:
         al = json.load(f)
@@ -427,14 +752,15 @@ def colorize_via_spirula_sfm(dataset_dir):
     pts_lidar = load_pcd(slam_pcd)
     n_pts = len(pts_lidar)
 
-    colors = np.full((n_pts, 3), 180, dtype=np.uint8)
-    best_scores = np.zeros(n_pts, dtype=np.float32)
+    K_VIEWS = 3
+    top_scores = np.zeros((n_pts, K_VIEWS), dtype=np.float32)
+    top_colors = np.zeros((n_pts, K_VIEWS, 3), dtype=np.uint8)
 
     zbuf_w, zbuf_h = 960, 960
     scale_factor_zbuf = 3840.0 / zbuf_w
 
     print("\n" + "=" * 80)
-    print(" PROJETANDO QUADROS SFM SOBRE A NUVEM LIDAR (Z-BUFFER + SHARPNESS)...")
+    print(" PROJETANDO QUADROS SFM SOBRE A NUVEM LIDAR (TOP-3 CONSENSUS)...")
     print("=" * 80)
 
     t0 = time.time()
@@ -464,7 +790,7 @@ def colorize_via_spirula_sfm(dataset_dir):
         u, v, r = project_thin_prism(P_v, params)
 
         r_px = np.hypot(u - cx, v - cy)
-        mask_circle = (r_px < 1650.0) & (u >= 0.0) & (u < 3839.0) & (v >= 0.0) & (v < 3839.0)
+        mask_circle = (r_px < 1620.0) & (u >= 0.0) & (u < 3839.0) & (v >= 0.0) & (v < 3839.0)
         if not np.any(mask_circle):
             continue
 
@@ -492,35 +818,81 @@ def colorize_via_spirula_sfm(dataset_dir):
         r_vis = r_c[vis_mask]
         idx_vis = idx_c[vis_mask]
 
-        scores = (1.0 - (r_vis / 1650.0)) / np.maximum(d_vis, 0.5)
-        better_mask = scores > best_scores[idx_vis]
-        if not np.any(better_mask):
+        scores = (1.0 - 0.5 * (r_vis / 1620.0)**2) / (np.maximum(d_vis, 0.5)**1.5)
+
+        min_top = np.min(top_scores[idx_vis], axis=1)
+        can_insert = scores > min_top
+        if not np.any(can_insert):
             continue
 
-        idx_up = idx_vis[better_mask]
-        u_up = u_vis[better_mask]
-        v_up = v_vis[better_mask]
-        best_scores[idx_up] = scores[better_mask]
+        idx_ins = idx_vis[can_insert]
+        scores_ins = scores[can_insert]
+        u_ins = u_vis[can_insert]
+        v_ins = v_vis[can_insert]
 
         img_bgr = cv2.imread(str(img_path))
         if img_bgr is None:
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        colors[idx_up] = img_rgb[v_up, u_up]
+        rgb_ins = img_rgb[v_ins, u_ins]
+
+        worst_slot = np.argmin(top_scores[idx_ins], axis=1)
+        top_scores[idx_ins, worst_slot] = scores_ins
+        top_colors[idx_ins, worst_slot] = rgb_ins
 
         if count % 50 == 0 or count == len(images):
-            cov = np.count_nonzero(best_scores > 0) / n_pts * 100
+            cov = np.count_nonzero(np.any(top_scores > 0, axis=1)) / n_pts * 100
             print(f"    [{count:3d}/{len(images)}] Quadros projetados | Cobertura LiDAR: {cov:.1f}%")
+
+    print("[*] Resolvendo consenso estatístico SfM...")
+    colors = np.full((n_pts, 3), 180, dtype=np.uint8)
+    n_obs = np.count_nonzero(top_scores > 0, axis=1)
+
+    mask_1 = (n_obs == 1)
+    if np.any(mask_1):
+        idx_1 = np.where(mask_1)[0]
+        best_slot = np.argmax(top_scores[idx_1], axis=1)
+        colors[idx_1] = top_colors[idx_1, best_slot]
+
+    mask_2 = (n_obs == 2)
+    if np.any(mask_2):
+        idx_2 = np.where(mask_2)[0]
+        s2 = top_scores[idx_2]
+        c2 = top_colors[idx_2].astype(np.float32)
+        weights = s2 / np.sum(s2, axis=1, keepdims=True)
+        avg2 = np.sum(c2 * weights[:, :, None], axis=1)
+        colors[idx_2] = np.clip(np.round(avg2), 0, 255).astype(np.uint8)
+
+    mask_3 = (n_obs == 3)
+    if np.any(mask_3):
+        idx_3 = np.where(mask_3)[0]
+        c3 = top_colors[idx_3].astype(np.float32)
+        s3 = top_scores[idx_3]
+        med3 = np.median(c3, axis=1, keepdims=True)
+        diff_from_med = np.linalg.norm(c3 - med3, axis=2)
+        inliers = diff_from_med < 45.0
+        weights = s3 * inliers.astype(np.float32)
+        sum_w = np.sum(weights, axis=1, keepdims=True)
+        fallback = (sum_w[:, 0] == 0)
+        weights[fallback] = 1.0
+        sum_w[fallback] = 3.0
+        norm_w = weights / sum_w
+        final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
+        colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
 
     out_ply = dataset_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.ply"
     out_pcd = dataset_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.pcd"
     write_ply(out_ply, pts_lidar, colors)
     write_pcd(out_pcd, pts_lidar, colors)
 
-    # Cópia para pasta CloudCompare
-    cc_dir = Path(r"C:\Users\User\Downloads\Lidou\TESTE_ICP_CLOUDCOMPARE")
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(out_ply, cc_dir / "05_SMALL_DATASET_SFM_SPIRULA_CORRIGIDO.ply")
+    deliv_dir = dataset_dir / "deliverables"
+    deliv_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(out_ply, deliv_dir / out_ply.name)
+        shutil.copy2(out_pcd, deliv_dir / out_pcd.name)
+    except Exception:
+        pass
+
     print(f"[+] Concluído em {time.time() - t0:.1f}s!")
 
 
@@ -528,11 +900,21 @@ def colorize_via_spirula_sfm(dataset_dir):
 # PIPELINE MÉTODO 2: DIRETO RÍGIDO (SEM SFM)
 # ==============================================================================
 
-def colorize_via_direct_rigid(dataset_dir, calib_json_path=None):
+def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_override=None):
     """Executa a coloração direta rápida usando matriz rígida e tempo calibrado"""
     if calib_json_path is None:
-        specific_json = dataset_dir / "calibracao_rigida_small_dataset_20260821.json"
-        calib_json_path = specific_json if specific_json.exists() else DEFAULT_CALIB_JSON
+        auto_json = dataset_dir / "calibracao_rigida_auto.json"
+        azure_json = dataset_dir / "calibracao_rigida_azure_dataset.json"
+        recalib_json = dataset_dir / "calibracao_rigida_recalibrada.json"
+        if auto_json.exists():
+            calib_json_path = auto_json
+        elif recalib_json.exists():
+            calib_json_path = recalib_json
+        elif azure_json.exists():
+            calib_json_path = azure_json
+        else:
+            candidates = list(dataset_dir.glob("calibracao_rigida*.json"))
+            calib_json_path = candidates[0] if candidates else DEFAULT_CALIB_JSON
 
     print("=" * 80)
     print(" COLORACAO DIRETA RIGIDA (SEM SFM)")
@@ -555,10 +937,38 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None):
     R_LC1 = T_LC1[:3, :3]
     t_LC1 = T_LC1[:3, 3]
 
-    dt_sync = cfg.get("dt_sync_seconds", -4.220)
-
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
     slam_trj = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+
+    # Determinar sincronização temporal
+    dt_sync = dt_override
+    if dt_sync is None and "dt_sync_seconds" in cfg:
+        dt_sync = cfg["dt_sync_seconds"]
+
+    align_json = dataset_dir / "colmap_to_lidar_alignment.json"
+    if dt_sync is None and align_json.exists():
+        try:
+            with open(align_json, "r", encoding="utf-8") as f:
+                al = json.load(f)
+                dt_sync = al.get("dt_sync_seconds", None)
+                if dt_sync is not None:
+                    print(f"[*] Sincronização herdada do COLMAP Sim(3): Δt = {dt_sync:.4f}s")
+        except Exception:
+            pass
+
+    if dt_sync is None:
+        insv_files = list(dataset_dir.glob("*.insv"))
+        bag_files = list(dataset_dir.glob("*.bag"))
+        if insv_files and bag_files:
+            print("[*] Sincronização via Gyro Cross-Correlation...")
+            dt_sync = sync_via_gyro_cross_correlation(insv_files[0], bag_files[0], slam_trj)
+
+    if dt_sync is None:
+        dt_sync = -4.220
+        print(f"[!] Aviso: Δt padrão adotado = {dt_sync:.4f}s")
+    else:
+        print(f"[*] Sincronização Temporal Ativa: Δt = {dt_sync:.4f}s")
+
     pts_lidar = load_pcd(slam_pcd)
     n_pts = len(pts_lidar)
 
@@ -569,10 +979,10 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None):
 
     cam0_files = sorted(list((dataset_dir / "images" / "cam0").glob("*.jpg")))
     cam1_files = sorted(list((dataset_dir / "images" / "cam1").glob("*.jpg")))
-    fps = 2.0
 
-    colors = np.full((n_pts, 3), 180, dtype=np.uint8)
-    best_scores = np.zeros(n_pts, dtype=np.float32)
+    K_VIEWS = 3
+    top_scores = np.zeros((n_pts, K_VIEWS), dtype=np.float32)
+    top_colors = np.zeros((n_pts, K_VIEWS, 3), dtype=np.uint8)
 
     zbuf_w, zbuf_h = 960, 960
     scale_factor_zbuf = 3840.0 / zbuf_w
@@ -580,8 +990,67 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None):
     t0 = time.time()
     num_frames = min(len(cam0_files), len(cam1_files))
 
+    print("\n" + "=" * 80)
+    print(" COLORACAO DIRETA RIGIDA (TOP-3 MULTI-VIEW CONSENSUS)")
+    print("=" * 80)
+
+    # Se alinhamento SfM existir, calcular correção suave de drift da trajetória (Amostragem de Keyframes)
+    use_drift_correction = False
+    sparse_img_bin = dataset_dir / "sparse" / "0" / "images.bin"
+    if align_json.exists() and sparse_img_bin.exists():
+        try:
+            with open(align_json, "r", encoding="utf-8") as f:
+                al = json.load(f)
+            s_sim = al["scale"]
+            R_sim = np.array(al["R"])
+            t_sim = np.array(al["t"])
+            sfm_imgs = load_colmap_images(sparse_img_bin)
+            cam0_sfm = [im for im in sfm_imgs if im["name"].startswith("cam0")]
+            cam0_sfm.sort(key=lambda x: int("".join(filter(str.isdigit, x["name"]))))
+
+            n_samples = min(30, len(cam0_sfm))
+            sample_indices = np.linspace(0, len(cam0_sfm) - 1, n_samples).astype(int)
+            sample_imgs = [cam0_sfm[i] for i in sample_indices]
+
+            sample_times = []
+            delta_p_list = []
+            delta_R_list = []
+
+            for im in sample_imgs:
+                fn = int("".join(filter(str.isdigit, im["name"])))
+                t_vid = (fn - 1) / fps
+                t_q = t_slam_start + (t_vid - dt_sync)
+                if not (t_slam_start <= t_q <= t_slam_end):
+                    continue
+
+                C_sfm = s_sim * (R_sim @ im["C"]) + t_sim
+                R_wc_sfm = (im["R_cw"] @ R_sim.T).T
+
+                R_L_sfm = R_wc_sfm @ R_LC0.T
+                p_L_sfm = C_sfm - R_L_sfm @ t_LC0
+
+                idx = np.clip(np.searchsorted(t_slam, t_q), 1, len(t_slam) - 1)
+                w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
+                p_L_slam = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
+                R_L_slam = slerp(t_q).as_matrix()
+
+                delta_p_list.append(p_L_sfm - p_L_slam)
+                delta_R_list.append(R_L_sfm @ R_L_slam.T)
+                sample_times.append(t_q)
+
+            if len(sample_times) >= 2:
+                sample_times = np.array(sample_times)
+                delta_p_arr = np.array(delta_p_list)
+                slerp_delta_R = Slerp(sample_times, Rot.from_matrix(delta_R_list))
+                use_drift_correction = True
+                print(f"[*] Correção de Drift da Trajetória ativada com {len(sample_times)} quadros-chave SfM!")
+        except Exception as e:
+            print(f"[!] Aviso: não foi possível carregar drift correction do SfM: {e}")
+
     for k in range(num_frames):
-        t_vid = k / fps
+        fn_digits = "".join(filter(str.isdigit, cam0_files[k].stem))
+        fn = int(fn_digits) if fn_digits else (k + 1)
+        t_vid = (fn - 1) / fps
         t_query = t_slam_start + (t_vid - dt_sync)
 
         if not (t_slam_start <= t_query <= t_slam_end):
@@ -590,8 +1059,17 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None):
         idx = np.searchsorted(t_slam, t_query)
         idx = np.clip(idx, 1, len(t_slam) - 1)
         w = (t_query - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
-        p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
-        R_L = slerp(t_query).as_matrix()
+        p_L_raw = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
+        R_L_raw = slerp(t_query).as_matrix()
+
+        if use_drift_correction and (sample_times[0] <= t_query <= sample_times[-1]):
+            dp = np.array([np.interp(t_query, sample_times, delta_p_arr[:, ax]) for ax in range(3)])
+            dR = slerp_delta_R(t_query).as_matrix()
+            p_L = p_L_raw + dp
+            R_L = dR @ R_L_raw
+        else:
+            p_L = p_L_raw
+            R_L = R_L_raw
 
         lens_configs = [
             ("cam0", cam0_files[k], params0, R_LC0, t_LC0),
@@ -616,7 +1094,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None):
             u, v, r = project_thin_prism(P_v, params)
 
             r_px = np.hypot(u - cx, v - cy)
-            mask_circle = (r_px < 1650.0) & (u >= 0.0) & (u < 3839.0) & (v >= 0.0) & (v < 3839.0)
+            mask_circle = (r_px < 1620.0) & (u >= 0.0) & (u < 3839.0) & (v >= 0.0) & (v < 3839.0)
             if not np.any(mask_circle):
                 continue
 
@@ -643,35 +1121,82 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None):
             r_vis = r_c[vis_mask]
             idx_vis = idx_c[vis_mask]
 
-            scores = (1.0 - (r_vis / 1650.0)) / np.maximum(d_vis, 0.5)
-            better_mask = scores > best_scores[idx_vis]
-            if not np.any(better_mask):
+            scores = (1.0 - 0.5 * (r_vis / 1620.0)**2) / (np.maximum(d_vis, 0.5)**1.5)
+
+            min_top = np.min(top_scores[idx_vis], axis=1)
+            can_insert = scores > min_top
+            if not np.any(can_insert):
                 continue
 
-            idx_up = idx_vis[better_mask]
-            u_up = u_vis[better_mask]
-            v_up = v_vis[better_mask]
-            best_scores[idx_up] = scores[better_mask]
+            idx_ins = idx_vis[can_insert]
+            scores_ins = scores[can_insert]
+            u_ins = u_vis[can_insert]
+            v_ins = v_vis[can_insert]
 
             img_bgr = cv2.imread(str(img_path))
             if img_bgr is None:
                 continue
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            colors[idx_up] = img_rgb[v_up, u_up]
+            rgb_ins = img_rgb[v_ins, u_ins]
 
-        if (k + 1) % 35 == 0 or (k + 1) == num_frames:
-            cov = np.count_nonzero(best_scores > 0) / n_pts * 100
-            print(f"    [{k+1:3d}/{num_frames}] Pares de quadros projetados | Cobertura: {cov:.1f}%")
+            worst_slot = np.argmin(top_scores[idx_ins], axis=1)
+            top_scores[idx_ins, worst_slot] = scores_ins
+            top_colors[idx_ins, worst_slot] = rgb_ins
+
+        if (k + 1) % 25 == 0 or (k + 1) == num_frames:
+            cov = np.count_nonzero(np.any(top_scores > 0, axis=1)) / n_pts * 100
+            print(f"    [{k+1:3d}/{num_frames}] Pares de quadros acumulados | Cobertura: {cov:.1f}%")
+
+    print("[*] Resolvendo consenso estatístico e eliminando outliers de projeção...")
+    colors = np.full((n_pts, 3), 180, dtype=np.uint8)
+    n_obs = np.count_nonzero(top_scores > 0, axis=1)
+
+    mask_1 = (n_obs == 1)
+    if np.any(mask_1):
+        idx_1 = np.where(mask_1)[0]
+        best_slot = np.argmax(top_scores[idx_1], axis=1)
+        colors[idx_1] = top_colors[idx_1, best_slot]
+
+    mask_2 = (n_obs == 2)
+    if np.any(mask_2):
+        idx_2 = np.where(mask_2)[0]
+        s2 = top_scores[idx_2]
+        c2 = top_colors[idx_2].astype(np.float32)
+        weights = s2 / np.sum(s2, axis=1, keepdims=True)
+        avg2 = np.sum(c2 * weights[:, :, None], axis=1)
+        colors[idx_2] = np.clip(np.round(avg2), 0, 255).astype(np.uint8)
+
+    mask_3 = (n_obs == 3)
+    if np.any(mask_3):
+        idx_3 = np.where(mask_3)[0]
+        c3 = top_colors[idx_3].astype(np.float32)
+        s3 = top_scores[idx_3]
+        med3 = np.median(c3, axis=1, keepdims=True)
+        diff_from_med = np.linalg.norm(c3 - med3, axis=2)
+        inliers = diff_from_med < 45.0
+        weights = s3 * inliers.astype(np.float32)
+        sum_w = np.sum(weights, axis=1, keepdims=True)
+        fallback = (sum_w[:, 0] == 0)
+        weights[fallback] = 1.0
+        sum_w[fallback] = 3.0
+        norm_w = weights / sum_w
+        final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
+        colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
 
     out_ply = dataset_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
     out_pcd = dataset_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd"
     write_ply(out_ply, pts_lidar, colors)
     write_pcd(out_pcd, pts_lidar, colors)
 
-    cc_dir = Path(r"C:\Users\User\Downloads\Lidou\TESTE_ICP_CLOUDCOMPARE")
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(out_ply, cc_dir / "06_SMALL_DATASET_DIRETO_CALIBRADO.ply")
-    print(f"[+] Concluído em {time.time() - t0:.1f}s!")
+    deliv_dir = dataset_dir / "deliverables"
+    deliv_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(out_ply, deliv_dir / out_ply.name)
+        shutil.copy2(out_pcd, deliv_dir / out_pcd.name)
+    except Exception:
+        pass
+
+    print(f"[+] Método Direto Rígido concluído em {time.time() - t0:.1f}s!")
 
 
 # ==============================================================================
@@ -684,7 +1209,10 @@ def main():
                         help="Caminho para a pasta do dataset")
     parser.add_argument("--method", type=str, choices=["all", "sfm", "direct"], default="all",
                         help="Método a executar: 'sfm', 'direct' ou 'all' para ambos")
+    parser.add_argument("--fps", type=float, default=1.0, help="Taxa de amostragem dos quadros (FPS, padrão 1.0)")
     parser.add_argument("--run-spirula", action="store_true", help="Forçar execução do spirula.exe antes de colorir")
+    parser.add_argument("--recalibrate-from-sfm", action="store_true", help="Recalcular parâmetros de montagem usando SfM")
+    parser.add_argument("--dt", type=float, default=None, help="Sincronização temporal manual Δt em segundos")
     parser.add_argument("--calib", type=str, default=None, help="Caminho opcional do arquivo de calibração JSON")
 
     args = parser.parse_args()
@@ -694,21 +1222,25 @@ def main():
     print(" PIPELINE MASTER DE COLORACAO LIDAR-CAMERA 360")
     print(f" Dataset: {dataset_dir}")
     print(f" Método:  {args.method.upper()}")
+    print(f" FPS:     {args.fps:.1f}")
     print("=" * 80)
+
+    if args.recalibrate_from_sfm:
+        recalibrate_from_sfm(dataset_dir, fps=args.fps)
 
     if args.method in ["sfm", "all"]:
         if args.run_spirula:
             run_spirula_sfm_auto(dataset_dir)
-        colorize_via_spirula_sfm(dataset_dir)
+        colorize_via_spirula_sfm(dataset_dir, fps=args.fps)
 
     if args.method in ["direct", "all"]:
         calib_path = Path(args.calib) if args.calib else None
-        colorize_via_direct_rigid(dataset_dir, calib_path)
+        colorize_via_direct_rigid(dataset_dir, calib_path, fps=args.fps, dt_override=args.dt)
 
     print("\n" + "=" * 80)
     print(" PROCESSO FINALIZADO COM SUCESSO!")
     print(f" Os arquivos coloridos foram salvos em: {dataset_dir}")
-    print(" E cópias diretas foram enviadas para: C:\\Users\\User\\Downloads\\Lidou\\TESTE_ICP_CLOUDCOMPARE\\")
+    print(f" Entregáveis consolidados em: {dataset_dir / 'deliverables'}")
     print("=" * 80)
 
 
