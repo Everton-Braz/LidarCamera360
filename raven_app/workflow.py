@@ -28,6 +28,20 @@ from raven_app.cli import engine, resources
 from raven_app.bag_io import export_bags
 
 
+def _detect_ffmpeg_hwaccel() -> list[str]:
+    """Detect available GPU hardware acceleration for FFmpeg video decoding."""
+    try:
+        res = subprocess.run(["ffmpeg", "-hwaccels"], capture_output=True, text=True, timeout=5)
+        hw = res.stdout.lower()
+        if "cuda" in hw:
+            return ["-hwaccel", "cuda"]
+        elif "d3d11va" in hw:
+            return ["-hwaccel", "d3d11va"]
+    except Exception:
+        pass
+    return []
+
+
 def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 1.0) -> bool:
     """Extract dual-fisheye frames from .insv into output_dir/images/cam0 and cam1."""
     images_dir = output_dir / "images"
@@ -43,16 +57,20 @@ def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 1.0) -> 
         print(f"[*] Frames already extracted: {len(existing_c0)} in cam0, {len(existing_c1)} in cam1.")
         return True
 
+    hw_args = _detect_ffmpeg_hwaccel()
+    if hw_args:
+        print(f"[*] GPU Hardware Video Acceleration active ({hw_args[1].upper()})")
+
     print(f"[*] Extracting dual-fisheye frames from {insv_path.name} at {fps:.1f} FPS via ffmpeg...")
-    cmd_c0 = [
-        "ffmpeg", "-y", "-i", str(insv_path),
+    cmd_c0 = ["ffmpeg", "-y"] + hw_args + [
+        "-i", str(insv_path),
         "-map", "0:v:0",
         "-vf", f"fps={fps}",
         "-q:v", "2",
         str(cam0_dir / "frame_%06d.jpg")
     ]
-    cmd_c1 = [
-        "ffmpeg", "-y", "-i", str(insv_path),
+    cmd_c1 = ["ffmpeg", "-y"] + hw_args + [
+        "-i", str(insv_path),
         "-map", "0:v:1",
         "-vf", f"fps={fps}",
         "-q:v", "2",
@@ -61,9 +79,18 @@ def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 1.0) -> 
 
     try:
         p0 = subprocess.run(cmd_c0, capture_output=True, text=True)
+        if p0.returncode != 0 and hw_args:
+            print("[!] GPU decode notice on cam0; retrying with CPU decode fallback...")
+            cmd_c0 = ["ffmpeg", "-y", "-i", str(insv_path), "-map", "0:v:0", "-vf", f"fps={fps}", "-q:v", "2", str(cam0_dir / "frame_%06d.jpg")]
+            p0 = subprocess.run(cmd_c0, capture_output=True, text=True)
         if p0.returncode != 0:
             print(f"[!] Warning: Front lens extraction: {p0.stderr[-300:]}")
+
         p1 = subprocess.run(cmd_c1, capture_output=True, text=True)
+        if p1.returncode != 0 and hw_args:
+            print("[!] GPU decode notice on cam1; retrying with CPU decode fallback...")
+            cmd_c1 = ["ffmpeg", "-y", "-i", str(insv_path), "-map", "0:v:1", "-vf", f"fps={fps}", "-q:v", "2", str(cam1_dir / "frame_%06d.jpg")]
+            p1 = subprocess.run(cmd_c1, capture_output=True, text=True)
         if p1.returncode != 0:
             print(f"[!] Warning: Rear lens extraction: {p1.stderr[-300:]}")
 

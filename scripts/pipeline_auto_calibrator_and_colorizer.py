@@ -368,6 +368,33 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
 # PIPELINE MÉTODO 1: SPIRULA SFM ALINHADO (PADRÃO OURO)
 # ==============================================================================
 
+def get_best_vulkan_device() -> int:
+    """Retorna o índice do melhor dispositivo Vulkan (priorizando GPU discreta dedicada como NVIDIA/AMD)."""
+    try:
+        res = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, timeout=5)
+        current_dev = -1
+        dev_scores = {}
+        for line in res.stdout.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("GPU") and line_str.endswith(":") and len(line_str) <= 6:
+                digits = "".join(filter(str.isdigit, line_str))
+                if digits:
+                    current_dev = int(digits)
+                    dev_scores[current_dev] = 0
+            elif current_dev >= 0:
+                if "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU" in line_str:
+                    dev_scores[current_dev] += 100
+                if any(k in line_str.lower() for k in ("nvidia", "geforce", "rtx", "radeon")):
+                    dev_scores[current_dev] += 50
+        if dev_scores:
+            best = max(dev_scores, key=dev_scores.get)
+            if dev_scores[best] > 0:
+                return best
+    except Exception:
+        pass
+    return -1
+
+
 def run_spirula_sfm_auto(dataset_dir, quality="medium"):
     """Executa o Spirula Studio via CLI se a pasta sparse/0 não existir"""
     img_dir = dataset_dir / "images"
@@ -381,8 +408,9 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
         print(f"[!] spirula.exe não encontrado em: {SPIRULA_EXE}")
         return False
 
+    vulkan_dev = get_best_vulkan_device()
     print("=" * 80)
-    print(" INICIANDO SPIRULA STUDIO SFM (VULKAN GPU HEADLESS)...")
+    print(f" INICIANDO SPIRULA STUDIO SFM (VULKAN GPU HEADLESS, DEVICE: {vulkan_dev if vulkan_dev >= 0 else 'DEFAULT'})...")
     print(f" Imagens:   {img_dir}")
     print(f" Qualidade: {quality}")
     print("=" * 80)
@@ -395,6 +423,8 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
         "--quality", quality,
         "--camera-model", "thin-prism-fisheye"
     ]
+    if vulkan_dev >= 0:
+        cmd.extend(["--device", str(vulkan_dev)])
 
     t0 = time.time()
     ret = subprocess.run(cmd)
