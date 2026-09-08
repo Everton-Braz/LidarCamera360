@@ -81,6 +81,9 @@ def parse(argv=None):
     wf.add_argument('--method',choices=['direct','sfm','all'],default='direct')
     wf.add_argument('--calib','--calib-json',type=Path)
     wf.add_argument('--dt',type=finite)
+    wf.add_argument('--recalibrate',action='store_true',default=True,help='Auto-recalibrate spatial extrinsics from SfM')
+    wf.add_argument('--no-recalibrate',action='store_false',dest='recalibrate')
+    wf.add_argument('--run-spirula',action='store_true',default=False,help='Run Spirula SfM if not already built')
     wf.add_argument('--export-ply',action='store_true',default=False)
     wf.add_argument('--export-pcd',action='store_true',default=False)
     wf.add_argument('--export-colmap',action='store_true',default=False)
@@ -157,6 +160,8 @@ def run(a):
             method=a.method,
             calib_json=a.calib,
             dt_override=a.dt,
+            recalibrate=a.recalibrate,
+            run_spirula=a.run_spirula,
             export_ply=a.export_ply,
             export_pcd=a.export_pcd,
             export_colmap=a.export_colmap

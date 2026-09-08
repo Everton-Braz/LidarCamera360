@@ -178,19 +178,26 @@ class UnifiedWorkflowView(QWidget):
 
         config_layout.addLayout(sync_row)
 
-        # Colorization Method
+        # Colorization & Recalibration Method
         method_row = QHBoxLayout()
-        method_row.addWidget(BodyLabel("Colorization Method:"))
+        method_row.addWidget(BodyLabel("Colorization & Recalibration:"))
         self.method_combo = ComboBox()
         self.method_combo.addItems([
-            "Direct Calibrated Rigid (Fast, Sub-Millimeter Sync)",
-            "Spirula SfM Consensus (Bundle Adjustment + ICP)",
+            "Spirula SfM Multi-View (Gold Standard, Metric 3DGS & Dynamic Recalibration)",
+            "Direct Projection (SfM-Recalibrated Extrinsics)",
             "All / Dual-Method Comparison"
         ])
         self.method_combo.setCurrentIndex(0)
         method_row.addWidget(self.method_combo)
         method_row.addStretch()
         config_layout.addLayout(method_row)
+
+        recalib_row = QHBoxLayout()
+        self.recalibrate_chk = CheckBox("Auto-Recalibrate Spatial Extrinsics (T_LC0, T_LC1) from SfM Alignment")
+        self.recalibrate_chk.setChecked(True)
+        recalib_row.addWidget(self.recalibrate_chk)
+        recalib_row.addStretch()
+        config_layout.addLayout(recalib_row)
 
         layout.addWidget(config_card)
 
@@ -213,7 +220,7 @@ class UnifiedWorkflowView(QWidget):
         self.chk_pcd.setChecked(True)
         output_layout.addWidget(self.chk_pcd)
 
-        self.chk_colmap = CheckBox("COLMAP Dataset Ready for 3DGS Training  •  cameras.txt, images.txt, points3D.txt, points3D.ply")
+        self.chk_colmap = CheckBox("Metric-Scaled 3DGS COLMAP Dataset  •  Spirula SfM converted to LiDAR Metric Ground Truth (Nerfstudio/PostShot/LichtFeld)")
         self.chk_colmap.setChecked(True)
         output_layout.addWidget(self.chk_colmap)
 
@@ -354,7 +361,7 @@ class UnifiedWorkflowView(QWidget):
             )
             return
 
-        method_key = ["direct", "sfm", "all"][self.method_combo.currentIndex()]
+        method_key = ["sfm", "direct", "all"][self.method_combo.currentIndex()]
 
         args = [
             "workflow",
@@ -367,6 +374,14 @@ class UnifiedWorkflowView(QWidget):
             "--fps", str(self.fps_spin.value()),
             "--method", method_key
         ]
+
+        if self.recalibrate_chk.isChecked():
+            args.append("--recalibrate")
+        else:
+            args.append("--no-recalibrate")
+
+        if method_key in ("sfm", "all"):
+            args.append("--run-spirula")
 
         if self.lio_switch.isChecked():
             args.append("--lio")

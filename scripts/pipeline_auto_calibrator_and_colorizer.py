@@ -406,7 +406,7 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
     return True
 
 
-def align_colmap_to_lidar(dataset_dir, fps=1.0):
+def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
     """Executa o alinhamento de alta precisão Sim(3) + ICP entre COLMAP e LiDAR"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
@@ -431,15 +431,23 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0):
 
     t0_slam = t_slam[0]
     t1_slam = t_slam[-1]
+    min_overlap = max(10, int(len(cam0) * 0.40))
+
+    # Nominal physical camera arm offset for initial camera center approximation
+    u_L = np.array([0.003102, -0.504937, -0.863152])
+    c_L_phys = 0.185 * u_L
 
     # Busca ótima do dt (coarse-to-fine adaptativa)
-    print(f"[*] Buscando sincronização temporal ótima Δt (FPS = {fps:.1f})...")
+    print(f"[*] Buscando sincronização temporal ótima Δt (FPS = {fps:.1f}, hint = {dt_hint})...")
     best_rmse = 1e9
     best_dt = 0
     best_sim3 = None
 
-    # Coarse search de -200s a +50s
-    dts = np.linspace(-200.0, 50.0, 1001)
+    if dt_hint is not None:
+        dts = np.linspace(dt_hint - 2.0, dt_hint + 2.0, 401)
+    else:
+        dts = np.linspace(-100.0, 50.0, 1501)
+
     for dt in dts:
         X_trj = []
         Y_trj = []
@@ -453,41 +461,45 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0):
                 w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
                 p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
                 X_trj.append(im["C"])
-                Y_trj.append(p_L)
+                Y_trj.append(p_L + rot_slam[idx].as_matrix() @ c_L_phys)
 
-        if len(X_trj) >= 20:
+        if len(X_trj) >= min_overlap:
             s, R, t_trans, rmse = solve_umeyama_sim3(np.array(X_trj), np.array(Y_trj))
             if rmse < best_rmse:
                 best_rmse = rmse
                 best_dt = dt
                 best_sim3 = (s, R, t_trans)
 
-    # Refinar dt a 2 ms
-    fine_dts = np.linspace(best_dt - 1.0, best_dt + 1.0, 501)
-    for dt in fine_dts:
-        X_trj = []
-        Y_trj = []
-        for im in cam0:
-            frame_num = get_frame_num(im["name"])
-            t_vid = (frame_num - 1) / fps
-            t_q = t0_slam + (t_vid - dt)
-            if t0_slam <= t_q <= t1_slam:
-                idx = np.searchsorted(t_slam, t_q)
-                idx = np.clip(idx, 1, len(t_slam) - 1)
-                w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
-                p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
-                X_trj.append(im["C"])
-                Y_trj.append(p_L)
+    if best_sim3 is None:
+        # Fallback if window was too tight
+        print("[!] Aviso: Janela restrita não encontrou alinhamento suficiente. Ampliando busca...")
+        dts = np.linspace(-150.0, 50.0, 2001)
+        for dt in dts:
+            X_trj, Y_trj = [], []
+            for im in cam0:
+                frame_num = get_frame_num(im["name"])
+                t_vid = (frame_num - 1) / fps
+                t_q = t0_slam + (t_vid - dt)
+                if t0_slam <= t_q <= t1_slam:
+                    idx = np.searchsorted(t_slam, t_q)
+                    idx = np.clip(idx, 1, len(t_slam) - 1)
+                    w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
+                    p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
+                    X_trj.append(im["C"])
+                    Y_trj.append(p_L + rot_slam[idx].as_matrix() @ c_L_phys)
 
-        if len(X_trj) >= 20:
-            s, R, t_trans, rmse = solve_umeyama_sim3(np.array(X_trj), np.array(Y_trj))
-            if rmse < best_rmse:
-                best_rmse = rmse
-                best_dt = dt
-                best_sim3 = (s, R, t_trans)
+            if len(X_trj) >= min_overlap:
+                s, R, t_trans, rmse = solve_umeyama_sim3(np.array(X_trj), np.array(Y_trj))
+                if rmse < best_rmse:
+                    best_rmse = rmse
+                    best_dt = dt
+                    best_sim3 = (s, R, t_trans)
+
+    if best_sim3 is None:
+        raise RuntimeError("Não foi possível alinhar a trajetória COLMAP contra o SLAM LiDAR.")
 
     s_init, R_init, t_init = best_sim3
-    print(f"    Sincronização Ótima: Δt = {best_dt:.4f}s | RMSE Trajetória: {best_rmse*100:.2f} cm")
+    print(f"    Sincronização Ótima: Δt = {best_dt:.4f}s | RMSE Trajetória: {best_rmse*100:.2f} cm (Escala s = {s_init:.4f})")
 
     # Refinamento Trimmed ICP nos tie-points 3D
     step_lidar = max(1, len(pts_lidar) // 200000)
@@ -500,16 +512,24 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0):
 
     print(f"[*] Executando Refinamento Trimmed ICP ({len(raw_sub_col):,} tie-points)...")
     s_comp, R_comp, t_comp = s_init, R_init.copy(), t_init.copy()
+    rmse_icp = best_rmse
 
     for it in range(1, 11):
         dists, idxs = tree.query(current_pts, k=1)
-        thresh = min(0.25, np.percentile(dists, 70))
+        thresh = min(0.35, float(np.percentile(dists, 70)))
         mask = dists < thresh
+        if np.sum(mask) < 20:
+            break
         match_c = raw_sub_col[mask]
         match_l = sub_lidar[idxs[mask]]
 
-        s_comp, R_comp, t_comp, rmse_icp = solve_umeyama_sim3(match_c, match_l)
-        current_pts = s_comp * (R_comp @ raw_sub_col.T).T + t_comp
+        try:
+            s_cand, R_cand, t_cand, r_cand = solve_umeyama_sim3(match_c, match_l)
+            if not np.isnan(r_cand) and not np.isinf(r_cand):
+                s_comp, R_comp, t_comp, rmse_icp = s_cand, R_cand, t_cand, r_cand
+                current_pts = s_comp * (R_comp @ raw_sub_col.T).T + t_comp
+        except Exception:
+            break
 
     print(f"[+] ICP Convergiu: RMSE = {rmse_icp*100:.2f} cm, Escala s = {s_comp:.6f}")
 
@@ -524,6 +544,196 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0):
         json.dump(align_data, f, indent=2)
 
     return align_data
+
+
+def transform_colmap_to_metric(src_dir: Path, dst_dir: Path, s_sim: float, R_sim: np.ndarray, t_sim: np.ndarray):
+    """Converte o modelo esparso COLMAP do Spirula para o referencial MÉTRICO do LiDAR"""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Cameras
+    cams_bin = src_dir / "cameras.bin"
+    cameras = {}
+    if cams_bin.exists():
+        with open(cams_bin, "rb") as f:
+            num_cams = struct.unpack("<Q", f.read(8))[0]
+            for _ in range(num_cams):
+                cid, mid, w, h = struct.unpack("<iiQQ", f.read(24))
+                n_params = 12 if mid == 10 else (8 if mid == 9 else 4)
+                params = struct.unpack(f"<{n_params}d", f.read(n_params * 8))
+                cameras[cid] = {"model_id": mid, "width": w, "height": h, "params": params}
+
+        # Salvar cameras.txt com modelo OPENCV_FISHEYE universal para 3DGS
+        with open(dst_dir / "cameras.txt", "w", encoding="utf-8") as f:
+            f.write("# Camera list with one line of data per camera:\n")
+            f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            for cid, c in cameras.items():
+                p = c["params"]
+                if c["model_id"] == 10 and len(p) >= 12:
+                    # fx, fy, cx, cy, k1, k2, k3, k4
+                    f.write(f"{cid} OPENCV_FISHEYE {c['width']} {c['height']} {p[0]} {p[1]} {p[2]} {p[3]} {p[4]} {p[5]} {p[8]} {p[9]}\n")
+                elif c["model_id"] == 9 and len(p) >= 8:
+                    f.write(f"{cid} OPENCV_FISHEYE {c['width']} {c['height']} {' '.join(str(x) for x in p[:8])}\n")
+                else:
+                    f.write(f"{cid} PINHOLE {c['width']} {c['height']} {' '.join(str(x) for x in p)}\n")
+
+        shutil.copy2(cams_bin, dst_dir / "cameras.bin")
+
+    # 2. Images (Transformar Câmeras para Referencial Métrico)
+    img_bin = src_dir / "images.bin"
+    metric_images = []
+    if img_bin.exists():
+        with open(img_bin, "rb") as f:
+            num_imgs = struct.unpack("<Q", f.read(8))[0]
+            for _ in range(num_imgs):
+                img_id = struct.unpack("<I", f.read(4))[0]
+                qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
+                tx, ty, tz = struct.unpack("<3d", f.read(24))
+                cam_id = struct.unpack("<I", f.read(4))[0]
+                name = ""
+                while True:
+                    c = f.read(1)
+                    if c == b"\x00":
+                        break
+                    name += c.decode("ascii")
+                n_pts = struct.unpack("<Q", f.read(8))[0]
+                pts2d = []
+                for _ in range(n_pts):
+                    x, y = struct.unpack("<2d", f.read(16))
+                    pid = struct.unpack("<Q", f.read(8))[0]
+                    pts2d.append((x, y, pid))
+
+                R_cw = Rot.from_quat([qx, qy, qz, qw]).as_matrix()
+                tvec = np.array([tx, ty, tz], dtype=np.float64)
+                C = -R_cw.T @ tvec
+
+                # Transformação de similaridade Sim(3)
+                C_metric = s_sim * (R_sim @ C) + t_sim
+                R_cw_metric = R_cw @ R_sim.T
+                t_cw_metric = -R_cw_metric @ C_metric
+                q_cw_metric = Rot.from_matrix(R_cw_metric).as_quat()  # x, y, z, w -> qw, qx, qy, qz
+
+                metric_images.append({
+                    "img_id": img_id,
+                    "qw": q_cw_metric[3], "qx": q_cw_metric[0], "qy": q_cw_metric[1], "qz": q_cw_metric[2],
+                    "tx": t_cw_metric[0], "ty": t_cw_metric[1], "tz": t_cw_metric[2],
+                    "cam_id": cam_id,
+                    "name": name,
+                    "pts2d": pts2d
+                })
+
+        # Escrever images.txt
+        with open(dst_dir / "images.txt", "w", encoding="utf-8") as f:
+            f.write("# Image list with two lines of data per image:\n")
+            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+            for im in metric_images:
+                f.write(f"{im['img_id']} {im['qw']:.8f} {im['qx']:.8f} {im['qy']:.8f} {im['qz']:.8f} "
+                        f"{im['tx']:.8f} {im['ty']:.8f} {im['tz']:.8f} {im['cam_id']} {im['name']}\n")
+                pts_str = " ".join(f"{pt[0]:.2f} {pt[1]:.2f} {pt[2]}" for pt in im["pts2d"])
+                f.write(pts_str + "\n")
+
+        # Escrever images.bin
+        with open(dst_dir / "images.bin", "wb") as f:
+            f.write(struct.pack("<Q", len(metric_images)))
+            for im in metric_images:
+                f.write(struct.pack("<I", im["img_id"]))
+                f.write(struct.pack("<4d", im["qw"], im["qx"], im["qy"], im["qz"]))
+                f.write(struct.pack("<3d", im["tx"], im["ty"], im["tz"]))
+                f.write(struct.pack("<I", im["cam_id"]))
+                f.write(im["name"].encode("ascii") + b"\x00")
+                f.write(struct.pack("<Q", len(im["pts2d"])))
+                for pt in im["pts2d"]:
+                    f.write(struct.pack("<2d", pt[0], pt[1]))
+                    f.write(struct.pack("<Q", pt[2]))
+
+    # 3. Points3D (Transformar Coordenadas 3D para Referencial Métrico)
+    pts_bin = src_dir / "points3D.bin"
+    metric_pts = []
+    if pts_bin.exists():
+        with open(pts_bin, "rb") as f:
+            num_pts = struct.unpack("<Q", f.read(8))[0]
+            for _ in range(num_pts):
+                pid = struct.unpack("<Q", f.read(8))[0]
+                xyz = struct.unpack("<3d", f.read(24))
+                rgb = struct.unpack("<3B", f.read(3))
+                err = struct.unpack("<d", f.read(8))[0]
+                track_len = struct.unpack("<Q", f.read(8))[0]
+                tracks = []
+                for _ in range(track_len):
+                    img_id, p2d_idx = struct.unpack("<2I", f.read(8))
+                    tracks.append((img_id, p2d_idx))
+
+                xyz_metric = s_sim * (R_sim @ np.array(xyz)) + t_sim
+                err_metric = s_sim * err
+                metric_pts.append({
+                    "pid": pid,
+                    "xyz": xyz_metric,
+                    "rgb": rgb,
+                    "err": err_metric,
+                    "tracks": tracks
+                })
+
+        # Escrever points3D.txt
+        with open(dst_dir / "points3D.txt", "w", encoding="utf-8") as f:
+            f.write("# 3D point list with one line of data per point:\n")
+            f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+            for p in metric_pts:
+                track_str = " ".join(f"{t[0]} {t[1]}" for t in p["tracks"])
+                f.write(f"{p['pid']} {p['xyz'][0]:.6f} {p['xyz'][1]:.6f} {p['xyz'][2]:.6f} "
+                        f"{p['rgb'][0]} {p['rgb'][1]} {p['rgb'][2]} {p['err']:.4f} {track_str}\n")
+
+        # Escrever points3D.bin
+        with open(dst_dir / "points3D.bin", "wb") as f:
+            f.write(struct.pack("<Q", len(metric_pts)))
+            for p in metric_pts:
+                f.write(struct.pack("<Q", p["pid"]))
+                f.write(struct.pack("<3d", p["xyz"][0], p["xyz"][1], p["xyz"][2]))
+                f.write(struct.pack("<3B", p["rgb"][0], p["rgb"][1], p["rgb"][2]))
+                f.write(struct.pack("<d", p["err"]))
+                f.write(struct.pack("<Q", len(p["tracks"])))
+                for t in p["tracks"]:
+                    f.write(struct.pack("<2I", t[0], t[1]))
+
+        # Escrever points3D.ply binário para 3DGS
+        n = len(metric_pts)
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {n}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        ).encode("ascii")
+        dt = [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")]
+        arr = np.empty(n, dtype=dt)
+        for i, p in enumerate(metric_pts):
+            arr["x"][i] = p["xyz"][0]
+            arr["y"][i] = p["xyz"][1]
+            arr["z"][i] = p["xyz"][2]
+            arr["r"][i] = p["rgb"][0]
+            arr["g"][i] = p["rgb"][1]
+            arr["b"][i] = p["rgb"][2]
+
+        ply_path = dst_dir / "points3D.ply"
+        with open(ply_path, "wb") as f:
+            f.write(header)
+            f.write(arr.tobytes())
+
+        if dst_dir.parent.parent.exists():
+            try:
+                shutil.copy2(ply_path, dst_dir.parent.parent / "points3D.ply")
+            except Exception:
+                pass
+
+    print(f"[+] Dataset COLMAP Métrico para 3DGS gerado com sucesso em: {dst_dir}")
+    print(f"    Câmeras:  {len(cameras)}")
+    print(f"    Imagens:  {len(metric_images)}")
+    print(f"    Pontos3D: {len(metric_pts):,} tie-points fotogramétricos métricos")
+    return dst_dir
 
 
 def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
@@ -747,11 +957,8 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
         json.dump(calib_dict, f, indent=2)
     with open(dataset_dir / "calibracao_rigida_recalibrada.json", "w", encoding="utf-8") as f:
         json.dump(calib_dict, f, indent=2)
-    with open(DEFAULT_CALIB_JSON, "w", encoding="utf-8") as f:
-        json.dump(calib_dict, f, indent=2)
 
-    print(f"  [+] Calibração salva em: {dataset_dir / 'calibracao_rigida_auto.json'}")
-    print(f"  [+] Calibração mestre atualizada: {DEFAULT_CALIB_JSON}")
+    print(f"  [+] Calibração dinâmica salva em: {dataset_dir / 'calibracao_rigida_auto.json'}")
     return calib_dict
 
 
