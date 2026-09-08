@@ -29,7 +29,8 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 SPIRULA_EXE = WORKSPACE_DIR / "spirula" / "spirula.exe"
@@ -43,15 +44,37 @@ DEFAULT_CALIB_JSON = WORKSPACE_DIR / "calibracao_rigida_raven_insta360.json"
 def load_pcd(path):
     print(f"[*] Carregando nuvem PCD: {path.name}...")
     with open(path, "rb") as f:
-        while True:
-            line = f.readline().decode("ascii", errors="ignore").strip()
-            if line.startswith("POINTS"):
-                n = int(line.split()[1])
-            elif line.startswith("DATA"):
+        header = {}
+        for _ in range(100):
+            raw_line = f.readline()
+            if not raw_line:
+                raise ValueError('Truncated PCD header')
+            line = raw_line.decode('ascii').strip().split()
+            if not line or line[0].startswith('#'):
+                continue
+            header[line[0]] = line[1:]
+            if line[0] == 'DATA':
                 break
-        raw = f.read(n * 16)
-        data = np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
-        xyz = data[:, :3].astype(np.float64)
+        else:
+            raise ValueError('PCD header exceeds 100 lines')
+        if header.get('DATA') != ['binary']:
+            raise ValueError('Expected uncompressed binary PCD')
+        names = header['FIELDS']
+        sizes = list(map(int, header['SIZE']))
+        counts = list(map(int, header.get('COUNT', ['1'] * len(names))))
+        types = {'F':'f', 'I':'i', 'U':'u'}
+        if not (len(names) == len(sizes) == len(counts) == len(header['TYPE'])):
+            raise ValueError('Inconsistent PCD field layout')
+        formats = [('<' + types[t] + str(s), (c,)) if c != 1 else '<' + types[t] + str(s)
+                   for t, s, c in zip(header['TYPE'], sizes, counts)]
+        dtype = np.dtype(list(zip(names, formats)))
+        n = int(header['POINTS'][0])
+        if n <= 0 or not all(name in names for name in ('x','y','z')):
+            raise ValueError('PCD must contain points with XYZ fields')
+        if os.fstat(f.fileno()).st_size - f.tell() != n * dtype.itemsize:
+            raise ValueError('PCD payload size does not match its header')
+        data = np.fromfile(f, dtype=dtype, count=n)
+        xyz = np.column_stack([data[name] for name in ('x','y','z')]).astype(np.float64)
     print(f"    Pontos carregados: {len(xyz):,}")
     return xyz
 

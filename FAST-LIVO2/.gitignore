@@ -1,0 +1,51 @@
+# Build & devel artifacts
+build/
+devel/
+install/
+.catkin_workspace
+
+# Logs & Output Datasets
+Log/
+Log/*
+
+# Large raw sensor datasets & videos
+DATA_TEST/
+SMALL-DATASET-TEST/
+videos/
+*.bag
+*.pcd
+*.ply
+*.insv
+*.mp4
+*.bin
+*.tar
+*.tar.gz
+*.db
+
+# Helper docs large media & reference splats
+helper-docs/*.jpg
+helper-docs/*.png
+helper-docs/*.db
+helper-docs/snapshots/
+helper-docs/**/images/
+helper-docs/gaussian_ref/
+
+# Python bytecode & temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE & OS files
+.vscode/
+.idea/
+.system_generated/
+*.swp
+*~
+Thumbs.db
+.gemini/
+graphify-out/
+test_telemetry.json
+*.laz
+*.las

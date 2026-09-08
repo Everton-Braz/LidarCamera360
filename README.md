@@ -1,5 +1,18 @@
 # LiDAR-Camera 360 Calibrator & Multi-View Colorizer
 
+## Windows standalone application
+
+The project now includes a desktop application and headless CLI plus a native
+MSVC build of FAST-LIVO2. Build with `tools/build_windows.ps1`; the portable app
+is written to `dist/RavenCalibrator/RavenCalibrator.exe` with its bundled runtime.
+See [standalone build and usage](docs/STANDALONE.md) for prerequisites, supported
+bag formats, command examples, and the separate `fastlivo2.exe` native engine.
+
+```powershell
+.\dist\RavenCalibrator\RavenCalibrator.exe --headless doctor
+.\dist\RavenCalibrator\RavenCalibrator.exe slam --bag D:\capture\merged.bag --lio --output D:\dataset\slam_out
+```
+
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![SLAM](https://img.shields.io/badge/SLAM-FAST--LIVO2-orange.svg)](https://github.com/hku-mars/FAST-LIVO2)
 [![SfM](https://img.shields.io/badge/SfM-Spirula_Studio-brightgreen.svg)](https://github.com/harry7557558/spirula-studio)

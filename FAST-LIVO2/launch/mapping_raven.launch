@@ -1,0 +1,19 @@
+<launch>
+<!-- Launch file for 3DMakerPro Raven LiDAR Scanner (Vanjee 722z + IMU + 12MP Camera) -->
+
+	<arg name="rviz" default="true" />
+
+	<rosparam command="load" file="$(find fast_livo)/config/raven.yaml" />
+
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+		<rosparam file="$(find fast_livo)/config/camera_raven.yaml" />
+	</node>
+	
+	<group if="$(arg rviz)">
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
+	</group>
+	
+	<!-- Decompress camera image topic from CompressedImage to raw sensor_msgs/Image -->
+	<node pkg="image_transport" type="republish" name="republish_raven" args="compressed in:=/camera_front/image raw out:=/camera_front/image_raw" output="screen" respawn="true"/>
+
+</launch>
