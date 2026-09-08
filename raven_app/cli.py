@@ -100,16 +100,31 @@ def run(a):
     if a.command in (None,'gui'):
         from raven_app.gui import launch
         launch();return 0
-    if a.command=='doctor':
+    if a.command == 'doctor':
         import numpy, scipy, cv2
-        report={'version':__version__,'native_engine':str(engine()),'native_engine_exists':engine().is_file(),
-                'numpy':numpy.__version__,'scipy':scipy.__version__,'opencv':cv2.__version__,
-                'spirula_exists':(resources()/'spirula/spirula.exe').is_file()}
+        from raven_app.config import get_spirula_bin, get_ffmpeg_bin, validate_tool
+        ff = get_ffmpeg_bin()
+        ok_ff, ver_ff = validate_tool("ffmpeg", ff)
+        sp = get_spirula_bin()
+        ok_sp, ver_sp = validate_tool("spirula", str(sp))
+        report = {
+            'version': __version__,
+            'native_engine': str(engine()),
+            'native_engine_exists': engine().is_file(),
+            'numpy': numpy.__version__,
+            'scipy': scipy.__version__,
+            'opencv': cv2.__version__,
+            'ffmpeg_path': ff,
+            'ffmpeg_ready': ok_ff,
+            'spirula_path': str(sp),
+            'spirula_ready': ok_sp
+        }
         if engine().is_file():
-            probe=subprocess.run([str(engine()),'--version'],capture_output=True,text=True)
-            report['native_exit_code']=probe.returncode
-            report['native_version']=probe.stdout.strip()
-        print(json.dumps(report,indent=2));return 0 if report.get('native_exit_code')==0 else 2
+            probe = subprocess.run([str(engine()), '--version'], capture_output=True, text=True)
+            report['native_exit_code'] = probe.returncode
+            report['native_version'] = probe.stdout.strip()
+        print(json.dumps(report, indent=2))
+        return 0 if report.get('native_exit_code') == 0 else 2
     if a.command=='inspect-bag':
         from raven_app.bag_io import inspect_bags
         print(json.dumps(inspect_bags(a.bag),indent=2));return 0

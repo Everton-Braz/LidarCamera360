@@ -404,19 +404,26 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
         print(f"[+] Reconstrução SfM existente encontrada em: {sparse_dir}")
         return True
 
-    if not SPIRULA_EXE.exists():
-        print(f"[!] spirula.exe não encontrado em: {SPIRULA_EXE}")
+    try:
+        from raven_app.config import get_spirula_bin
+        spirula_bin = get_spirula_bin()
+    except Exception:
+        spirula_bin = SPIRULA_EXE
+
+    if not spirula_bin.exists():
+        print(f"[!] spirula.exe não encontrado em: {spirula_bin}")
         return False
 
     vulkan_dev = get_best_vulkan_device()
     print("=" * 80)
     print(f" INICIANDO SPIRULA STUDIO SFM (VULKAN GPU HEADLESS, DEVICE: {vulkan_dev if vulkan_dev >= 0 else 'DEFAULT'})...")
-    print(f" Imagens:   {img_dir}")
-    print(f" Qualidade: {quality}")
+    print(f" Executável: {spirula_bin}")
+    print(f" Imagens:    {img_dir}")
+    print(f" Qualidade:  {quality}")
     print("=" * 80)
 
     cmd = [
-        str(SPIRULA_EXE), "sfm", "auto",
+        str(spirula_bin), "sfm", "auto",
         str(img_dir),
         "-o", str(dataset_dir),
         "--data-type", "video",

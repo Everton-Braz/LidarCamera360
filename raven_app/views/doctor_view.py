@@ -139,14 +139,15 @@ class DoctorView(QWidget):
             self.lbl_native_ver.setText("Requires: Visual Studio 2022/2026 + CMake + vcpkg")
 
         # Spirula check
-        spirula_path = resources() / 'spirula/spirula.exe'
-        has_spirula = spirula_path.is_file()
-        if has_spirula:
+        from raven_app.config import get_spirula_bin, validate_tool
+        spirula_path = get_spirula_bin()
+        ok_sp, ver_sp = validate_tool("spirula", str(spirula_path))
+        if ok_sp:
             self.lbl_spirula_status.setText("Status: [OK] Photogrammetry Ready")
             self.lbl_spirula_path.setText(f"Path: {spirula_path}")
         else:
             self.lbl_spirula_status.setText("Status: [OPTIONAL] Spirula Not Found")
-            self.lbl_spirula_path.setText("SfM Consensus requires spirula/spirula.exe")
+            self.lbl_spirula_path.setText("Configure in Settings or keep in spirula/spirula.exe")
 
         # Python math libraries
         import numpy as np
