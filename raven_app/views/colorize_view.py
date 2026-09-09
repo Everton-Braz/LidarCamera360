@@ -217,7 +217,7 @@ class ColorizeView(QWidget):
             )
             return
 
-        method_key = ['trajectory', 'reconstruction', 'all'][self.method_combo.currentIndex()]
+        method_key = ['direct', 'sfm', 'all'][self.method_combo.currentIndex()]
         args = [
             'colorize',
             '--dataset', ds,

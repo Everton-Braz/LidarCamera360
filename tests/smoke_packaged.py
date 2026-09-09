@@ -54,7 +54,9 @@ def main():
             assert cv2.imwrite(str(directory/'frame_000001.jpg'),image)
         result=call(['--headless','colorize','--dataset',str(dataset),'--method','direct','--fps','1','--dt','0'])
         assert 'Vulkan frames' in result.stdout, result.stdout
-        output=dataset/'deliverables/03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd'
+        pcd_files=list((dataset/'deliverables').glob('*.pcd'))
+        assert pcd_files, f"No PCD deliverable found in {list((dataset/'deliverables').iterdir())}"
+        output=pcd_files[0]
         data=output.read_bytes().split(b'DATA binary\n',1)[1]
         assert len(data)==3*16
         rows=np.frombuffer(data,dtype=[('xyz','<f4',3),('rgb','<u4')])

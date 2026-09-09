@@ -182,13 +182,7 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 1.0, dt
         t_sim = np.array(al["t"])
         transform_colmap_to_metric(sfm_sparse, sparse_out, s_sim, R_sim, t_sim)
 
-        # Also provide colored LiDAR point cloud as points3D_lidar.ply
-        colored_ply = dataset_dir / "deliverables" / "colored_point_cloud.ply"
-        if not colored_ply.is_file():
-            colored_ply = dataset_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
-        if colored_ply.is_file():
-            shutil.copy2(colored_ply, out_dir / "points3D_lidar.ply")
-
+        _postprocess_3dgs_dataset(out_dir, dataset_dir)
         print(f"[+] Spirula 3DGS Metric Dataset ready: {out_dir}")
         return out_dir
 
@@ -269,15 +263,11 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 1.0, dt
 
         print(f"  [+] Written images.txt with {img_id - 1} camera poses")
 
-    colored_ply = dataset_dir / "deliverables" / "colored_point_cloud.ply"
-    if not colored_ply.is_file():
-        colored_ply = dataset_dir / "deliverables" / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
-    if not colored_ply.is_file():
-        colored_ply = dataset_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
+    ply_candidates = sorted((dataset_dir / "deliverables").glob("lidar_colored_*.ply"))
+    colored_ply = ply_candidates[-1] if ply_candidates else (dataset_dir / "deliverables" / "colored_point_cloud.ply")
 
-    colored_pcd = dataset_dir / "deliverables" / "colored_point_cloud.pcd"
-    if not colored_pcd.is_file():
-        colored_pcd = dataset_dir / "deliverables" / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd"
+    pcd_candidates = sorted((dataset_dir / "deliverables").glob("lidar_colored_*.pcd"))
+    colored_pcd = pcd_candidates[-1] if pcd_candidates else (dataset_dir / "deliverables" / "colored_point_cloud.pcd")
 
     points3d_txt = sparse_out / "points3D.txt"
     points3d_ply = out_dir / "points3D.ply"
@@ -327,8 +317,73 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 1.0, dt
         shutil.copy2(points3d_ply, sparse_out / "points3D.ply")
         print(f"  [+] Written points3D.txt and points3D.ply ({len(sub_xyz):,} tie points with RGB)")
 
+    _postprocess_3dgs_dataset(out_dir, dataset_dir)
     print(f"[+] COLMAP 3DGS dataset generation complete: {out_dir}")
     return out_dir
+
+
+def setup_sparse_compatibility(out_dir: Path):
+    """Ensure both colmap_3dgs and colmap_3dgs/sparse work seamlessly in Spirula Studio."""
+    sparse_dir = out_dir / "sparse"
+    sparse_0 = sparse_dir / "0"
+    if sparse_0.is_dir():
+        for fname in ("cameras.bin", "cameras.txt", "images.bin", "images.txt", "points3D.bin", "points3D.txt", "points3D.ply"):
+            src = sparse_0 / fname
+            dst = sparse_dir / fname
+            if src.is_file() and not dst.exists():
+                try:
+                    dst.symlink_to(src)
+                except Exception:
+                    shutil.copy2(src, dst)
+
+    images_dir = out_dir / "images"
+    sparse_images = sparse_dir / "images"
+    if images_dir.is_dir() and not sparse_images.exists():
+        try:
+            if os.name == "nt":
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(sparse_images), str(images_dir)], capture_output=True)
+            if not sparse_images.exists():
+                sparse_images.symlink_to(images_dir, target_is_directory=True)
+        except Exception:
+            pass
+
+
+def _postprocess_3dgs_dataset(out_dir: Path, dataset_dir: Path):
+    """Adds point cloud seed, compatibility links, and instructions to the 3DGS dataset."""
+    ply_candidates = sorted((dataset_dir / "deliverables").glob("lidar_colored_*.ply"))
+    if not ply_candidates:
+        ply_candidates = sorted(dataset_dir.glob("*.ply"))
+    if ply_candidates:
+        try:
+            shutil.copy2(ply_candidates[-1], out_dir / "points3D_lidar.ply")
+        except Exception:
+            pass
+
+    readme_txt = out_dir / "README_3DGS_DATASET.txt"
+    try:
+        readme_txt.write_text(
+            "================================================================================\n"
+            "3D GAUSSIAN SPLATTING (3DGS) DATASET GUIDE\n"
+            "================================================================================\n\n"
+            "This dataset has been transformed into true metric LiDAR scale and is configured\n"
+            "for training 3D Gaussian Splatting models.\n\n"
+            "HOW TO LOAD IN SPIRULA STUDIO:\n"
+            "1. Open Spirula Studio.\n"
+            "2. Click 'Open Dataset' (or 'Change...') and select THIS folder:\n"
+            f"   {out_dir}\n"
+            "   (Important: Select this folder, NOT the 'sparse' subfolder).\n"
+            "3. Choose preset 'General purpose (3dgs)' or '360-camera'.\n"
+            "4. Click Train.\n\n"
+            "COMPATIBILITY:\n"
+            "- Spirula Studio: Native COLMAP dataset.\n"
+            "- Nerfstudio / PostShot / LichtFeld Studio: Supported via standard COLMAP models.\n"
+            "================================================================================\n",
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+    setup_sparse_compatibility(out_dir)
 
 
 def execute_unified_workflow(
@@ -353,6 +408,10 @@ def execute_unified_workflow(
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
+    if method == "trajectory":
+        method = "direct"
+    elif method == "reconstruction":
+        method = "sfm"
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     deliverables_dir = output_dir / "deliverables"
@@ -429,7 +488,9 @@ def execute_unified_workflow(
     # --------------------------------------------------------------------------
     print("\n[STAGE 4/5] Multi-View SfM Reconstruction & Spatial Recalibration...")
     from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
-    calib = calib_json or (output_dir / "calibracao_rigida_auto.json")
+    calib = calib_json or (output_dir / "rig_calibration.json")
+    if not calib.is_file():
+        calib = output_dir / "calibracao_rigida_auto.json"
     if not calib.is_file():
         calib = resources() / "calibracao_rigida_raven_insta360.json"
 
@@ -454,7 +515,9 @@ def execute_unified_workflow(
             print("[*] Auto-Recalibrating spatial mounting extrinsics (T_LC0, T_LC1) from SfM...")
             try:
                 pipeline.recalibrate_from_sfm(output_dir, fps=fps)
-                calib = output_dir / "calibracao_rigida_auto.json"
+                calib = output_dir / "rig_calibration.json"
+                if not calib.is_file():
+                    calib = output_dir / "calibracao_rigida_auto.json"
             except Exception as e:
                 print(f"[!] Extrinsics recalibration notice: {e}")
 
@@ -462,45 +525,37 @@ def execute_unified_workflow(
     # STAGE 5: Point Cloud Colorization
     # --------------------------------------------------------------------------
     print("\n[STAGE 5/5] Running Point Cloud Colorization...")
+    sfm_done = False
     if method in ("sfm", "all") and sparse_bin.is_file():
         try:
             pipeline.colorize_via_spirula_sfm(output_dir, fps=fps, use_vulkan=use_vulkan)
+            sfm_done = True
         except Exception as e:
             print(f"[!] SfM colorization notice: {e}")
 
-    if method in ("direct", "all") or not (deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.ply").is_file():
+    if method in ("direct", "all") or (method == "sfm" and not sfm_done):
         pipeline.colorize_via_direct_rigid(output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan)
 
     # --------------------------------------------------------------------------
     # Packaging Deliverables
     # --------------------------------------------------------------------------
     print("\n[*] Packaging Deliverables...")
-    primary_ply = deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.ply"
-    if not primary_ply.is_file():
-        primary_ply = deliverables_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
-    if not primary_ply.is_file():
-        primary_ply = output_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
-
-    primary_pcd = deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.pcd"
-    if not primary_pcd.is_file():
-        primary_pcd = deliverables_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd"
-    if not primary_pcd.is_file():
-        primary_pcd = output_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd"
-
-    if export_ply and primary_ply.is_file():
-        dest_ply = deliverables_dir / "colored_point_cloud.ply"
-        if primary_ply != dest_ply:
-            shutil.copy2(primary_ply, dest_ply)
-        print(f"  [+] Saved: {dest_ply}")
-
-    if export_pcd and primary_pcd.is_file():
-        dest_pcd = deliverables_dir / "colored_point_cloud.pcd"
-        if primary_pcd != dest_pcd:
-            shutil.copy2(primary_pcd, dest_pcd)
-        print(f"  [+] Saved: {dest_pcd}")
+    if not export_ply:
+        for f in deliverables_dir.glob("*.ply"):
+            try: f.unlink()
+            except Exception: pass
+    if not export_pcd:
+        for f in deliverables_dir.glob("*.pcd"):
+            try: f.unlink()
+            except Exception: pass
 
     if export_colmap:
         export_colmap_3dgs(output_dir, calib, fps=fps, dt_sync=dt_sync)
+
+    print("\n[+] Deliverables currently in folder:")
+    for deliv_item in sorted(deliverables_dir.iterdir()):
+        if deliv_item.is_file():
+            print(f"    - {deliv_item.name} ({deliv_item.stat().st_size / 1e6:.1f} MB)")
 
     elapsed = time.time() - t_start
     print("\n" + "=" * 80)

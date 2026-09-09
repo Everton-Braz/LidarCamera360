@@ -403,7 +403,7 @@ class UnifiedWorkflowView(QWidget):
             )
             return
 
-        method_key = ["reconstruction", "trajectory", "all"][self.method_combo.currentIndex()]
+        method_key = ["sfm", "direct", "all"][self.method_combo.currentIndex()]
 
         args = [
             "workflow",
@@ -443,6 +443,7 @@ class UnifiedWorkflowView(QWidget):
 
         self.log_console.appendPlainText(f"\n>>> Starting Unified Workflow: {' '.join(args)}\n")
         self.runner.start_job(args)
+
     def _cancel_workflow(self):
         self.status_title.setText("Status: Cancelling...")
         self.status_desc.setText("Gracefully saving accumulated SLAM and colorization data...")
@@ -463,13 +464,13 @@ class UnifiedWorkflowView(QWidget):
 
         if code == 0:
             self.status_title.setText("Status: Completed Successfully")
-            self.status_desc.setText("All deliverables generated and saved.")
+            self.status_desc.setText("Deliverables saved in 'deliverables/'. 3DGS dataset in 'colmap_3dgs/'.")
             InfoBar.success(
                 title=tr("Unified Workflow Complete"),
-                content=tr("Point clouds and 3DGS COLMAP models generated successfully!"),
+                content=tr("Deliverables saved in 'deliverables/'. For 3DGS, select the 'colmap_3dgs' folder."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
-                duration=4000,
+                duration=6000,
                 parent=self
             )
         elif code == 130:

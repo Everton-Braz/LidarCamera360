@@ -69,7 +69,7 @@ def parse(argv=None):
     slam.add_argument('--threads',type=int,choices=range(1,257),metavar='1..256',default=min(4,os.cpu_count() or 1))
     color=sub.add_parser('colorize',help='Run the existing calibration and colorization pipeline')
     color.add_argument('--dataset',type=Path,required=True)
-    color.add_argument('--method',choices=['sfm','direct','all'],default='direct')
+    color.add_argument('--method',choices=['sfm','direct','all','trajectory','reconstruction'],default='direct')
     color.add_argument('--fps',type=positive,default=1.)
     color.add_argument('--calib','--calib-json',type=Path)
     color.add_argument('--dt',type=finite)
@@ -84,7 +84,7 @@ def parse(argv=None):
     wf.add_argument('--lio',action='store_true',default=True,help='LiDAR + IMU SLAM')
     wf.add_argument('--threads',type=int,default=min(4,os.cpu_count() or 1))
     wf.add_argument('--fps',type=positive,default=1.)
-    wf.add_argument('--method',choices=['direct','sfm','all'],default='direct')
+    wf.add_argument('--method',choices=['direct','sfm','all','trajectory','reconstruction'],default='direct')
     wf.add_argument('--calib','--calib-json',type=Path)
     wf.add_argument('--dt',type=finite)
     wf.add_argument('--recalibrate',action='store_true',default=True,help='Auto-recalibrate spatial extrinsics from SfM')
@@ -96,6 +96,9 @@ def parse(argv=None):
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
     a=p.parse_args(argv)
+    if hasattr(a, 'method'):
+        if a.method == 'trajectory': a.method = 'direct'
+        elif a.method == 'reconstruction': a.method = 'sfm'
     if a.headless and a.command in (None,'gui'):p.error('--headless requires a processing or inspection command')
     return a
 

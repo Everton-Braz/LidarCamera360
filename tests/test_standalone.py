@@ -123,6 +123,23 @@ class WorkflowTests(unittest.TestCase):
         ])
         self.assertFalse(args_no.recalibrate)
 
+    def test_method_aliases(self):
+        for cmd in ('colorize', 'workflow'):
+            base_args = [cmd, '--dataset', 'test_ds'] if cmd == 'colorize' else [cmd, '--bag', 'b.bag', '--insv', 'v.insv', '--output', 'out']
+            # Test reconstruction maps to sfm
+            a1 = parse(base_args + ['--method', 'reconstruction'])
+            self.assertEqual(a1.method, 'sfm')
+            # Test trajectory maps to direct
+            a2 = parse(base_args + ['--method', 'trajectory'])
+            self.assertEqual(a2.method, 'direct')
+            # Test direct, sfm, all
+            a3 = parse(base_args + ['--method', 'sfm'])
+            self.assertEqual(a3.method, 'sfm')
+            a4 = parse(base_args + ['--method', 'direct'])
+            self.assertEqual(a4.method, 'direct')
+            a5 = parse(base_args + ['--method', 'all'])
+            self.assertEqual(a5.method, 'all')
+
     def test_transform_colmap_to_metric(self):
         from scipy.spatial.transform import Rotation as Rot
         from scripts.pipeline_auto_calibrator_and_colorizer import transform_colmap_to_metric

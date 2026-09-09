@@ -22,6 +22,7 @@ import json
 import argparse
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 import cv2
@@ -997,12 +998,17 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
         "dt_sync_seconds": float(dt_sync)
     }
 
+    deliv_dir = dataset_dir / "deliverables"
+    deliv_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    with open(dataset_dir / "rig_calibration.json", "w", encoding="utf-8") as f:
+        json.dump(calib_dict, f, indent=2)
     with open(dataset_dir / "calibracao_rigida_auto.json", "w", encoding="utf-8") as f:
         json.dump(calib_dict, f, indent=2)
-    with open(dataset_dir / "calibracao_rigida_recalibrada.json", "w", encoding="utf-8") as f:
+    with open(deliv_dir / f"rig_calibration_{ts}.json", "w", encoding="utf-8") as f:
         json.dump(calib_dict, f, indent=2)
 
-    print(f"  [+] Dynamic calibration saved to: {dataset_dir / 'auto_rigid_calibration.json'}")
+    print(f"  [+] Dynamic calibration saved to: {dataset_dir / 'rig_calibration.json'}")
     return calib_dict
 
 
@@ -1164,20 +1170,19 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
             final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
             colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
 
-    out_ply = dataset_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.ply"
-    out_pcd = dataset_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.pcd"
+    deliv_dir = dataset_dir / "deliverables"
+    deliv_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_ply = deliv_dir / f"lidar_colored_sfm_consensus_{ts}.ply"
+    out_pcd = deliv_dir / f"lidar_colored_sfm_consensus_{ts}.pcd"
     write_ply(out_ply, pts_lidar, colors)
     write_pcd(out_pcd, pts_lidar, colors)
 
-    deliv_dir = dataset_dir / "deliverables"
-    deliv_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copy2(out_ply, deliv_dir / out_ply.name)
-        shutil.copy2(out_pcd, deliv_dir / out_pcd.name)
-    except Exception:
-        pass
-
+    print(f"[+] Deliverables saved to: {deliv_dir}")
+    print(f"    - {out_ply.name}")
+    print(f"    - {out_pcd.name}")
     print(f"[+] Completed in {time.time() - t0:.1f}s!")
+    return out_ply, out_pcd
 
 
 # ==============================================================================
@@ -1187,17 +1192,20 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
 def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_override=None, use_vulkan=True):
     """Executa a coloração direta rápida usando matriz rígida e tempo calibrado"""
     if calib_json_path is None:
+        rig_json = dataset_dir / "rig_calibration.json"
         auto_json = dataset_dir / "calibracao_rigida_auto.json"
         azure_json = dataset_dir / "calibracao_rigida_azure_dataset.json"
         recalib_json = dataset_dir / "calibracao_rigida_recalibrada.json"
-        if auto_json.exists():
+        if rig_json.exists():
+            calib_json_path = rig_json
+        elif auto_json.exists():
             calib_json_path = auto_json
         elif recalib_json.exists():
             calib_json_path = recalib_json
         elif azure_json.exists():
             calib_json_path = azure_json
         else:
-            candidates = list(dataset_dir.glob("calibracao_rigida*.json"))
+            candidates = list(dataset_dir.glob("*calibrat*.json")) + list(dataset_dir.glob("calibracao_rigida*.json"))
             calib_json_path = candidates[0] if candidates else DEFAULT_CALIB_JSON
 
     print("=" * 80)
@@ -1477,20 +1485,19 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
             colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
 
-    out_ply = dataset_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
-    out_pcd = dataset_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd"
+    deliv_dir = dataset_dir / "deliverables"
+    deliv_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_ply = deliv_dir / f"lidar_colored_direct_rigid_{ts}.ply"
+    out_pcd = deliv_dir / f"lidar_colored_direct_rigid_{ts}.pcd"
     write_ply(out_ply, pts_lidar, colors)
     write_pcd(out_pcd, pts_lidar, colors)
 
-    deliv_dir = dataset_dir / "deliverables"
-    deliv_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copy2(out_ply, deliv_dir / out_ply.name)
-        shutil.copy2(out_pcd, deliv_dir / out_pcd.name)
-    except Exception:
-        pass
-
+    print(f"[+] Deliverables saved to: {deliv_dir}")
+    print(f"    - {out_ply.name}")
+    print(f"    - {out_pcd.name}")
     print(f"[+] Direct rigid method completed in {time.time() - t0:.1f}s!")
+    return out_ply, out_pcd
 
 
 # ==============================================================================
@@ -1501,7 +1508,7 @@ def main():
     parser = argparse.ArgumentParser(description="Unified LiDAR-camera calibration and colorization pipeline for 360-degree data.")
     parser.add_argument("--dataset", type=str, required=True,
                         help="Dataset directory.")
-    parser.add_argument("--method", type=str, choices=["all", "sfm", "direct"], default="all",
+    parser.add_argument("--method", type=str, choices=["all", "sfm", "direct", "trajectory", "reconstruction"], default="all",
                         help="Method to run: 'sfm', 'direct', or 'all'.")
     parser.add_argument("--fps", type=float, default=1.0, help="Frame sampling rate (FPS, default 1.0).")
     parser.add_argument("--run-spirula", action="store_true", help="Force spirula.exe execution before colorization.")
@@ -1510,6 +1517,10 @@ def main():
     parser.add_argument("--calib", type=str, default=None, help="Optional calibration JSON path.")
 
     args = parser.parse_args()
+    if args.method == "trajectory":
+        args.method = "direct"
+    elif args.method == "reconstruction":
+        args.method = "sfm"
     dataset_dir = Path(args.dataset)
 
     print("=" * 80)
