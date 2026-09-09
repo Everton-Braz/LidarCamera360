@@ -43,5 +43,5 @@ Invoke-Checked $buildPython @('-m','pip','install','-r','requirements-build.txt'
 $packageArguments = @('tools/package_app.py','--vcpkg-root',$VcpkgRoot)
 if ($OneFile) { $packageArguments += '--onefile' }
 Invoke-Checked $buildPython $packageArguments
-$binaryRelativePath = if ($OneFile) { 'dist/single-file/RavenCalibrator.exe' } else { 'dist/RavenCalibrator/RavenCalibrator.exe' }
+$binaryRelativePath = if ($OneFile) { 'dist/single-file/LidarCamera360.exe' } else { 'dist/LidarCamera360/LidarCamera360.exe' }
 Invoke-Checked (Join-Path $projectRoot $binaryRelativePath) @('--headless','doctor')

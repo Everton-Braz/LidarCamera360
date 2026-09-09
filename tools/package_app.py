@@ -9,11 +9,15 @@ import shutil
 import subprocess
 import sys
 
-ROOT=Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from raven_app.branding import APP_NAME
 
 
 def main():
-    p = argparse.ArgumentParser(description="Package RavenCalibrator into standalone Windows binary")
+    p = argparse.ArgumentParser(description=f"Package {APP_NAME} into standalone Windows binary")
     p.add_argument('--vcpkg-root', type=Path, default=None, help="Path to vcpkg root (optional)")
     p.add_argument('--onefile', action='store_true', help="Package as single-file portable executable")
     p.add_argument('--bundle-spirula', action='store_true', help='Compatibility flag; Spirula is always bundled')
@@ -58,7 +62,7 @@ def main():
 
     cmd = [
         sys.executable, '-m', 'PyInstaller', '--noconfirm',
-        '--name', 'RavenCalibrator',
+        '--name', APP_NAME,
         '--onefile' if a.onefile else '--onedir',
         '--console',
         '--distpath', str(ROOT / 'dist/single-file' if a.onefile else ROOT / 'dist'),
@@ -72,8 +76,20 @@ def main():
         '--add-data', f'{ROOT / "calibracao_rigida_raven_insta360.json"};.',
         '--add-data', f'{stage};.',
     ]
+    if (ROOT / 'assets/app.ico').is_file():
+        cmd += ['--icon', str(ROOT / 'assets/app.ico')]
+    if (ROOT / 'assets').is_dir():
+        cmd += ['--add-data', f'{ROOT / "assets"};assets']
+    if (ROOT / 'configs').is_dir():
+        cmd += ['--add-data', f'{ROOT / "configs"};configs']
+    if (ROOT / 'locales').is_dir():
+        cmd += ['--add-data', f'{ROOT / "locales"};locales']
     if not a.incremental:
         cmd.append('--clean')
+    # Conda-based Python keeps the stdlib SQLite runtime outside its DLLs folder.
+    sqlite = Path(sys.base_prefix) / 'Library/bin/sqlite3.dll'
+    if sqlite.is_file():
+        cmd += ['--add-binary', f'{sqlite};.']
     if (ROOT / 'docs/STANDALONE.md').is_file():
         cmd += ['--add-data', f'{ROOT / "docs/STANDALONE.md"};docs']
 
@@ -103,24 +119,34 @@ def main():
             raise SystemExit(f'Missing compiled shader: {source}')
         cmd += ['--add-data', f'{source};bin/shaders']
 
-    cmd.append(str(ROOT / 'raven.py'))
+    entry = ROOT / 'lidarcamera360.py' if (ROOT / 'lidarcamera360.py').is_file() else ROOT / 'raven.py'
+    cmd.append(str(entry))
     print(f"[*] Running PyInstaller packaging ({'ONEFILE' if a.onefile else 'ONEDIR'})...")
     env = os.environ.copy()
     env.pop('PYTHONPATH', None)
     env.pop('PYTHONHOME', None)
+    # Resolve OS DLLs from Windows, not unrelated tools such as Poppler's ICU.
+    if sys.platform == 'win32':
+        env['PATH'] = os.pathsep.join((
+            str(Path(os.environ['SystemRoot']) / 'System32'),
+            str(Path(sys.base_prefix) / 'Library/bin'),
+        ))
     subprocess.run(cmd, check=True, cwd=ROOT, env=env)
 
-    output = ROOT / 'dist/single-file' if a.onefile else ROOT / 'dist/RavenCalibrator'
+    output = ROOT / 'dist/single-file' if a.onefile else ROOT / f'dist/{APP_NAME}'
     output.mkdir(parents=True, exist_ok=True)
     if (ROOT / 'docs/STANDALONE.md').is_file():
         shutil.copy2(ROOT / 'docs/STANDALONE.md', output / 'README.md')
     # Also make the native engine runnable on its own, without relying on the
     # parent bootloader's DLL directory or a system Visual C++ installation.
     if not a.onefile:
-        internal=output/'_internal'
-        for pattern in ('vcruntime*.dll','msvcp*.dll','vcomp*.dll','concrt*.dll'):
-            for f in internal.glob(pattern):shutil.copy2(f,internal/'bin'/f.name)
-    print(output/'RavenCalibrator.exe')
+        internal = output / '_internal'
+        bin_dir = internal / 'bin'
+        if bin_dir.is_dir():
+            for pattern in ('vcruntime*.dll', 'msvcp*.dll', 'vcomp*.dll', 'concrt*.dll'):
+                for f in internal.glob(pattern):
+                    shutil.copy2(f, bin_dir / f.name)
+    print(output / f'{APP_NAME}.exe')
 
 
 if __name__=='__main__':main()

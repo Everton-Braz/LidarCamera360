@@ -1,4 +1,4 @@
-"""LiDAR Point Cloud Colorization View - Microsoft UI XAML / Fluent Design System."""
+"""LiDAR point cloud colorization view."""
 from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -11,6 +11,7 @@ from qfluentwidgets import (
     PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
 )
 from raven_app.process_runner import ProcessRunner
+from raven_app.i18n import tr
 
 
 class ColorizeView(QWidget):
@@ -90,9 +91,9 @@ class ColorizeView(QWidget):
         method_label.setFixedWidth(140)
         self.method_combo = ComboBox()
         self.method_combo.addItems([
-            "direct (Calibrated Direct Rigid + Gyro Offset)",
-            "sfm (Spirula Studio Top-3 Consensus SfM)",
-            "all (Dual-Method Benchmark & Comparison)"
+            tr("Trajectory-based colorization"),
+            tr("Reconstruction-based colorization"),
+            tr("Compare both methods")
         ])
         self.method_combo.setCurrentIndex(0)
         method_row.addWidget(method_label)
@@ -207,8 +208,8 @@ class ColorizeView(QWidget):
         ds = self.ds_input.text().strip()
         if not ds or not Path(ds).is_dir():
             InfoBar.error(
-                title="Invalid Dataset Directory",
-                content="Please specify a valid dataset directory containing slam_out and images.",
+                title=tr("Invalid Dataset Directory"),
+                content=tr("Please specify a valid dataset directory containing slam_out and images."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=3500,
@@ -216,7 +217,7 @@ class ColorizeView(QWidget):
             )
             return
 
-        method_key = ['direct', 'sfm', 'all'][self.method_combo.currentIndex()]
+        method_key = ['trajectory', 'reconstruction', 'all'][self.method_combo.currentIndex()]
         args = [
             'colorize',
             '--dataset', ds,
@@ -260,8 +261,8 @@ class ColorizeView(QWidget):
             self.status_title.setText("Status: Colorization Completed")
             self.status_desc.setText("Deliverable PCDs generated under dataset/deliverables/")
             InfoBar.success(
-                title="Colorization Finished",
-                content="Point cloud colorization completed successfully.",
+                title=tr("Colorization Finished"),
+                content=tr("Point cloud colorization completed successfully."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=4000,
@@ -274,8 +275,8 @@ class ColorizeView(QWidget):
             self.status_title.setText(f"Status: Failed (exit code {code})")
             self.status_desc.setText("Error during colorization. Review the log console.")
             InfoBar.error(
-                title="Colorization Error",
-                content=f"Process exited with code {code}.",
+                title=tr("Colorization Error"),
+                content=tr("Process exited with code {code}.", code=code),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=5000,

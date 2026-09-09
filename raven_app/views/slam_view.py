@@ -1,4 +1,4 @@
-"""FAST-LIVO2 Mapping View - Microsoft UI XAML / Fluent Design System."""
+"""FAST-LIVO2 mapping view."""
 from pathlib import Path
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -11,6 +11,7 @@ from qfluentwidgets import (
     PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
 )
 from raven_app.process_runner import ProcessRunner
+from raven_app.i18n import tr
 
 
 class SlamView(QWidget):
@@ -82,7 +83,7 @@ class SlamView(QWidget):
 
         # LIO mode and Topic settings
         toggle_row = QHBoxLayout()
-        self.lio_switch = SwitchButton(text="LiDAR + IMU Mode Only (disable camera fusion)")
+        self.lio_switch = SwitchButton(text=tr("LiDAR + IMU mode (camera fusion disabled)"))
         self.lio_switch.setChecked(True)
         self.lio_switch.checkedChanged.connect(self._toggle_lio)
         toggle_row.addWidget(self.lio_switch)
@@ -217,8 +218,8 @@ class SlamView(QWidget):
 
         if not bag or not Path(bag).is_file():
             InfoBar.error(
-                title="Invalid Input",
-                content="Please specify a valid ROS bag file (.bag).",
+                title=tr("Invalid Input"),
+                content=tr("Please specify a valid ROS bag file (.bag)."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=3500,
@@ -228,8 +229,8 @@ class SlamView(QWidget):
 
         if not out:
             InfoBar.error(
-                title="Missing Output Folder",
-                content="Please choose an output directory for SLAM deliverables.",
+                title=tr("Missing Output Folder"),
+                content=tr("Please choose an output directory for SLAM deliverables."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=3500,
@@ -275,8 +276,8 @@ class SlamView(QWidget):
             self.status_title.setText("Status: Completed Successfully")
             self.status_desc.setText("Point cloud and trajectory written to output directory.")
             InfoBar.success(
-                title="Mapping Completed",
-                content="FAST-LIVO2 execution finished with return code 0.",
+                title=tr("Mapping Completed"),
+                content=tr("FAST-LIVO2 execution finished with return code 0."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=4000,
@@ -286,8 +287,8 @@ class SlamView(QWidget):
             self.status_title.setText("Status: Cancelled & Flushed")
             self.status_desc.setText("Run interrupted by user. Accumulated partial map saved.")
             InfoBar.warning(
-                title="Job Cancelled",
-                content="Accumulated map data was saved.",
+                title=tr("Job Cancelled"),
+                content=tr("Accumulated map data was saved."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=4000,
@@ -297,8 +298,8 @@ class SlamView(QWidget):
             self.status_title.setText(f"Status: Failed (exit code {code})")
             self.status_desc.setText("Execution encountered an error. Check console log below.")
             InfoBar.error(
-                title="Execution Failed",
-                content=f"FAST-LIVO2 stopped with exit code {code}.",
+                title=tr("Execution Failed"),
+                content=tr("FAST-LIVO2 stopped with exit code {code}.", code=code),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=5000,

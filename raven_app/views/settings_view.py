@@ -1,4 +1,10 @@
-"""Settings & Personalization View - Microsoft UI XAML / Fluent Design System."""
+"""Settings and personalization view."""
+from pathlib import Path
+import shutil
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog
+)
 from pathlib import Path
 import shutil
 from PyQt6.QtCore import Qt
@@ -12,10 +18,12 @@ from qfluentwidgets import (
     FluentIcon, setTheme, Theme, isDarkTheme
 )
 from raven_app import __version__
+from raven_app.branding import APP_NAME, APP_DESCRIPTION
 from raven_app.config import (
     load_config, save_config, get_spirula_bin,
     validate_tool, auto_detect_tools
 )
+from raven_app.i18n import available_languages, get_language, set_language, tr
 
 
 class SettingsView(QWidget):
@@ -36,7 +44,7 @@ class SettingsView(QWidget):
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel("Settings & Personalization")
+        title = TitleLabel(tr("Settings & Personalization"))
         subtitle = CaptionLabel(
             "Customize interface appearance, external processing binaries, and view application information"
         )
@@ -100,12 +108,12 @@ class SettingsView(QWidget):
         theme_layout.setContentsMargins(20, 16, 20, 16)
         theme_layout.setSpacing(12)
 
-        theme_layout.addWidget(SubtitleLabel("Appearance"))
+        theme_layout.addWidget(SubtitleLabel(tr("Appearance")))
 
         mode_row = QHBoxLayout()
-        mode_label = BodyLabel("Application Theme:")
+        mode_label = BodyLabel(tr("Application Theme:"))
         self.theme_combo = ComboBox()
-        self.theme_combo.addItems(["Dark Theme", "Light Theme", "Follow Windows System"])
+        self.theme_combo.addItems([tr("Dark Theme"), tr("Light Theme"), tr("Follow Windows System")])
         current_theme = self.cfg.get("theme", "dark")
         if current_theme == "light":
             self.theme_combo.setCurrentIndex(1)
@@ -126,27 +134,41 @@ class SettingsView(QWidget):
         theme_layout.addWidget(desc)
         layout.addWidget(theme_card)
 
+        language_card = CardWidget(self)
+        language_layout = QHBoxLayout(language_card)
+        language_layout.setContentsMargins(20, 16, 20, 16)
+        language_layout.addWidget(BodyLabel(tr("Language:")))
+        self.language_combo = ComboBox()
+        self._language_codes = [code for code, _ in available_languages()]
+        self.language_combo.addItems([tr(name) if code == get_language() else name for code, name in available_languages()])
+        current_language = get_language()
+        if current_language in self._language_codes:
+            self.language_combo.setCurrentIndex(self._language_codes.index(current_language))
+        language_layout.addWidget(self.language_combo)
+        language_layout.addStretch()
+        layout.addWidget(language_card)
+
+
         # 3. About Card
         about_card = CardWidget(self)
         about_layout = QVBoxLayout(about_card)
         about_layout.setContentsMargins(20, 16, 20, 16)
         about_layout.setSpacing(8)
 
-        about_layout.addWidget(SubtitleLabel("About RavenCalibrator"))
-        about_layout.addWidget(StrongBodyLabel(f"RavenCalibrator v{__version__}"))
+        about_layout.addWidget(SubtitleLabel(tr("About {app_name}", app_name=APP_NAME)))
+        about_layout.addWidget(StrongBodyLabel(f"{APP_NAME} v{__version__}"))
         about_layout.addWidget(CaptionLabel(
-            "Advanced 3D LiDAR-Inertial-Visual Mapping and Colorization Suite\n"
-            "Hardware: 3DMakerPro Raven LiDAR + Insta360 X4 Dual Fisheye\n"
-            "UI Framework: Microsoft UI XAML Fluent Design System (PyQt6-Fluent-Widgets)\n"
+            f"{APP_DESCRIPTION}\n"
+            "Hardware: 3DMakerPro Raven LiDAR + Insta360 X4 Dual Fisheye (Generic Rig Compatible)\n"
+            "UI Framework: PyQt6 with qfluentwidgets\n"
             "Estimator: Native MSVC C++17 FAST-LIVO2 (GPL-2.0)"
         ))
         layout.addWidget(about_card)
-
         layout.addStretch()
 
     def _browse_spirula(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select spirula.exe", "", "Executables (spirula*.exe *.exe);;All Files (*)"
+            self, tr("Select spirula.exe"), "", tr("Executables (spirula*.exe *.exe);;All Files (*)")
         )
         if path:
             self.spirula_input.setText(path)
@@ -181,21 +203,32 @@ class SettingsView(QWidget):
 
     def _save_settings(self):
         theme_names = ["dark", "light", "auto"]
+        previous_language = self.cfg.get("language", get_language())
         self.cfg["spirula_path"] = self.spirula_input.text().strip()
         self.cfg["theme"] = theme_names[self.theme_combo.currentIndex()]
+        self.cfg["language"] = self._language_codes[self.language_combo.currentIndex()]
+        set_language(self.cfg["language"])
 
         if save_config(self.cfg):
             InfoBar.success(
-                title="Settings Saved",
-                content="Preferences and binary tool locations saved successfully.",
+                title=tr("Settings Saved"),
+                content=tr("Preferences and binary tool locations saved successfully."),
                 parent=self,
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=3000
             )
+            if previous_language != self.cfg["language"]:
+                InfoBar.info(
+                    title=tr("Language"),
+                    content=tr("Language changes take effect after restarting the application."),
+                    parent=self,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=5000
+                )
         else:
             InfoBar.error(
-                title="Save Error",
-                content="Could not write settings file to disk.",
+                title=tr("Save Error"),
+                content=tr("Could not write settings file to disk."),
                 parent=self,
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=4000

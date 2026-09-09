@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Alinhamento Métrico COLMAP (Spirula Studio) -> LiDAR SLAM Ground Truth
+"""Metric Alignment: COLMAP (Spirula Studio) -> LiDAR SLAM Ground Truth
 =====================================================================
-1. Otimiza a sincronização temporal exata Δt entre o vídeo INSV e o SLAM do LiDAR.
-2. Resolve a transformação de similaridade Sim(3) de Umeyama (escala s, rotação R, translação t).
-3. Transforma todos os 177.479 pontos 3D do COLMAP para o referencial métrico real do LiDAR.
-4. Exporta as nuvens PCD para inspeção visual e medição no CloudCompare.
-5. Deriva a calibração extrínseca rígida sensor-a-sensor via Hand-Eye (AX = XB).
+1. Optimizes exact time synchronization (Δt) between INSV video and LiDAR SLAM.
+2. Solves Umeyama Sim(3) similarity transformation (scale s, rotation R, translation t).
+3. Transforms COLMAP 3D tie-points into the true LiDAR metric coordinate frame.
+4. Exports PCD clouds for visual inspection and measurement.
+5. Derives sensor-to-sensor rigid extrinsic calibration via Hand-Eye (AX = XB).
 """
 
 import os
@@ -19,13 +18,6 @@ import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
 sys.stdout.reconfigure(encoding='utf-8')
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATASET_DIR = Path(r"C:\Users\User\Downloads\Lidou\DinamicAprilTagCalib")
-COLMAP_DIR = DATASET_DIR / "VID_20260902_143757_00_277_dataset" / "sparse" / "0"
-SLAM_FILE = DATASET_DIR / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
-OUT_DIR = Path(r"C:\Users\User\Downloads\Lidou\COMPARATIVO_NUVENS_TODOS_METODOS")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_colmap_images(img_bin_path):
@@ -72,7 +64,7 @@ def load_colmap_points3d(pts_bin_path):
     errors = []
     with open(pts_bin_path, "rb") as f:
         num_pts = struct.unpack("<Q", f.read(8))[0]
-        print(f"[*] Carregando {num_pts:,} pontos 3D do COLMAP ({pts_bin_path.name})...")
+        print(f"[*] Loading {num_pts:,} COLMAP 3D tie-points ({pts_bin_path.name})...")
         for _ in range(num_pts):
             pid = struct.unpack("<Q", f.read(8))[0]
             xyz = struct.unpack("<3d", f.read(24))
@@ -87,9 +79,7 @@ def load_colmap_points3d(pts_bin_path):
 
 
 def solve_umeyama_sim3(X, Y):
-    """
-    Resolve Y = s * R * X + t (onde Y é métrico LiDAR e X é COLMAP)
-    """
+    """Solve Y = s * R * X + t (where Y is metric LiDAR frame and X is COLMAP frame)."""
     n = len(X)
     mu_X = X.mean(axis=0)
     mu_Y = Y.mean(axis=0)
@@ -105,73 +95,129 @@ def solve_umeyama_sim3(X, Y):
     s = np.trace(np.diag(D) @ S) / var_X
     t = mu_Y - s * R @ mu_X
 
+    # Compute RMSE
     Y_pred = (s * R @ X.T).T + t
-    err = np.linalg.norm(Y - Y_pred, axis=1)
-    rmse = np.sqrt(np.mean(err ** 2))
-    return s, R, t, rmse, err
+    rmse = np.sqrt(np.mean(np.sum((Y - Y_pred) ** 2, axis=1)))
+    return s, R, t, rmse, Y_pred
 
 
-def write_pcd(path, points, colors_rgb):
+def write_pcd(path, points, colors=None):
     n = len(points)
-    rgb_packed = (
-        (colors_rgb[:, 0].astype(np.uint32) << 16)
-        | (colors_rgb[:, 1].astype(np.uint32) << 8)
-        | (colors_rgb[:, 2].astype(np.uint32))
-    ).view(np.float32)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if colors is None:
+        header = f"""# .PCD v0.7 - Point Cloud Data file format
+VERSION 0.7
+FIELDS x y z
+SIZE 4 4 4
+TYPE F F F
+COUNT 1 1 1
+WIDTH {n}
+HEIGHT 1
+VIEWPOINT 0 0 0 1 0 0 0
+POINTS {n}
+DATA binary
+""".encode("ascii")
+        with open(path, "wb") as f:
+            f.write(header)
+            f.write(points.astype(np.float32).tobytes())
+        print(f"  [+] Saved PCD: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+        return
 
-    header = (
-        "# .PCD v0.7 - Point Cloud Data file format\n"
-        "VERSION 0.7\n"
-        "FIELDS x y z rgb\n"
-        "SIZE 4 4 4 4\n"
-        "TYPE F F F U\n"
-        "COUNT 1 1 1 1\n"
-        f"WIDTH {n}\n"
-        "HEIGHT 1\n"
-        "VIEWPOINT 0 0 0 1 0 0 0\n"
-        f"POINTS {n}\n"
-        "DATA binary\n"
-    ).encode("ascii")
+    # PCD with packed RGB
+    header = f"""# .PCD v0.7 - Point Cloud Data file format
+VERSION 0.7
+FIELDS x y z rgb
+SIZE 4 4 4 4
+TYPE F F F U
+COUNT 1 1 1 1
+WIDTH {n}
+HEIGHT 1
+VIEWPOINT 0 0 0 1 0 0 0
+POINTS {n}
+DATA binary
+""".encode("ascii")
 
-    dt = [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgb", "<f4")]
+    r = colors[:, 0].astype(np.uint32)
+    g = colors[:, 1].astype(np.uint32)
+    b = colors[:, 2].astype(np.uint32)
+    rgb_packed = (r << 16) | (g << 8) | b
+
+    dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgb", "<u4")])
     arr = np.empty(n, dtype=dt)
-    arr["x"] = points[:, 0].astype(np.float32)
-    arr["y"] = points[:, 1].astype(np.float32)
-    arr["z"] = points[:, 2].astype(np.float32)
+    arr["x"] = points[:, 0]
+    arr["y"] = points[:, 1]
+    arr["z"] = points[:, 2]
     arr["rgb"] = rgb_packed
 
     with open(path, "wb") as f:
         f.write(header)
         f.write(arr.tobytes())
-    print(f"  [+] PCD exportado: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+    print(f"  [+] Saved PCD: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+
+
+def find_sparse_dir(dataset_dir):
+    candidates = [
+        dataset_dir / "sparse" / "0",
+        dataset_dir / "colmap" / "sparse" / "0",
+    ]
+    for c in candidates:
+        if (c / "images.bin").is_file() or (c / "images.txt").is_file():
+            return c
+    # Check subdirectories
+    for sub in dataset_dir.glob("*_dataset/sparse/0"):
+        if (sub / "images.bin").is_file() or (sub / "images.txt").is_file():
+            return sub
+    for sub in dataset_dir.glob("*/sparse/0"):
+        if (sub / "images.bin").is_file() or (sub / "images.txt").is_file():
+            return sub
+    return candidates[0]
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Align COLMAP reconstruction with LiDAR SLAM ground truth via Sim(3).")
+    parser.add_argument("--dataset", type=Path, required=True, help="Dataset directory.")
+    parser.add_argument("--sparse", type=Path, default=None, help="Path to COLMAP sparse/0 directory.")
+    parser.add_argument("--trajectory", type=Path, default=None, help="Path to SLAM trajectory file.")
+    parser.add_argument("--output", type=Path, default=None, help="Output directory.")
+    args = parser.parse_args()
+
+    dataset_dir = args.dataset.resolve()
+    colmap_dir = args.sparse.resolve() if args.sparse else find_sparse_dir(dataset_dir)
+    slam_file = args.trajectory.resolve() if args.trajectory else (
+        dataset_dir / "slam_out" / "result" / "trajectory.txt"
+        if (dataset_dir / "slam_out" / "result" / "trajectory.txt").is_file()
+        else dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+    )
+    out_dir = args.output.resolve() if args.output else dataset_dir / "deliverables"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     print("=" * 75)
-    print(" ALINHAMENTO MÉTRICO COLMAP (SPIRULA STUDIO) -> LIDAR GROUND TRUTH")
+    print(" METRIC ALIGNMENT: COLMAP (SPIRULA STUDIO) -> LIDAR GROUND TRUTH")
     print("=" * 75)
 
-    # 1. Carregar Trajetória LiDAR SLAM
-    print(f"[*] Carregando trajetória LiDAR: {SLAM_FILE.name}...")
-    lidar_trj = np.loadtxt(SLAM_FILE)
+    # 1. Load LiDAR SLAM Trajectory
+    print(f"[*] Loading LiDAR trajectory: {slam_file.name}...")
+    lidar_trj = np.loadtxt(slam_file)
     t_lidar = lidar_trj[:, 0]
     pos_lidar = lidar_trj[:, 1:4]
     rot_lidar = Rot.from_quat(lidar_trj[:, 4:8]).as_matrix()
     t0_lidar = t_lidar[0]
-    print(f"    Total de poses LiDAR: {len(lidar_trj):,}, Duração: {t_lidar[-1] - t0_lidar:.2f} s")
+    print(f"    Total LiDAR poses: {len(lidar_trj):,}, Duration: {t_lidar[-1] - t0_lidar:.2f} s")
 
-    # 2. Carregar Câmeras do COLMAP
-    print(f"[*] Carregando poses de câmera do COLMAP...")
-    colmap_images = load_colmap_images(COLMAP_DIR / "images.bin")
-    print(f"    Total de poses de câmera cam0: {len(colmap_images):,}")
+    # 2. Load COLMAP Camera Poses
+    print(f"[*] Loading COLMAP camera poses from: {colmap_dir}...")
+    colmap_images = load_colmap_images(colmap_dir / "images.bin")
+    print(f"    Total cam0 camera poses: {len(colmap_images):,}")
 
-    # Offset físico nominal da câmera na haste do LiDAR (18.5 cm ao longo de Z_up do rig)
+    # Nominal physical camera lever-arm on the LiDAR rig
     u_L = np.array([0.003102, -0.504937, -0.863152])
     c_L_phys = 0.185 * u_L
 
-    # 3. Otimizar Sincronização Temporal (Δt) via busca em grade fina
-    print("\n[*] Otimizando sincronização temporal exata Δt...")
-    dt_candidates = np.linspace(5.2, 6.0, 161)  # passo de 5 ms
+    # 3. Optimize Temporal Synchronization (Δt) via fine grid search
+    print("\n[*] Optimizing exact time synchronization Δt...")
+    dt_candidates = np.linspace(4.0, 8.0, 401)  # 10ms steps across 4s window
     best_dt = None
     best_rmse = 1e9
     best_s = None
@@ -191,7 +237,7 @@ def main():
                     t1, t2 = t_lidar[idx - 1], t_lidar[idx]
                     w = (t_query - t1) / (t2 - t1)
                     p_lidar = (1 - w) * pos_lidar[idx - 1] + w * pos_lidar[idx]
-                    R_lidar = rot_lidar[idx]  # aproximação
+                    R_lidar = rot_lidar[idx]
                     p_cam_metric = p_lidar + R_lidar @ c_L_phys
                     X_list.append(img["C_colmap"])
                     Y_list.append(p_cam_metric)
@@ -209,35 +255,40 @@ def main():
                 best_X = X_arr
                 best_Y = Y_arr
 
+    if best_dt is None:
+        print("[!] Could not find valid alignment between COLMAP and LiDAR.")
+        return 1
+
     print("=" * 75)
-    print(f" [RESULTADO DA OTIMIZAÇÃO SIM(3)]")
-    print(f"  Δt Ótimo (Sincronização):     {best_dt:.4f} s")
-    print(f"  Fator de Escala Métrico (s):  {best_s:.4f}  (1 un COLMAP = {best_s:.3f} m)")
-    print(f"  RMSE do Alinhamento 3D:       {best_rmse * 100:.2f} cm ({best_rmse:.4f} m)")
-    print(f"  Número de Poses Pareadas:     {len(best_X)} quadros")
+    print(f" [SIM(3) OPTIMIZATION RESULT]")
+    print(f"  Optimal Δt (Sync):         {best_dt:.4f} s")
+    print(f"  Metric scale factor (s):   {best_s:.4f} (1 COLMAP unit = {best_s:.3f} m)")
+    print(f"  Alignment RMSE:            {best_rmse * 100:.2f} cm ({best_rmse:.4f} m)")
+    print(f"  Matched poses:             {len(best_X)} frames")
     print("=" * 75)
 
-    # 4. Transformar a Nuvem 3D do COLMAP (177.479 pontos) para Metros Reais
-    pts_colmap, colors_colmap, errors_colmap = load_colmap_points3d(COLMAP_DIR / "points3D.bin")
+    # 4. Transform COLMAP 3D tie-points into true metric coordinates
+    pts_colmap, colors_colmap, errors_colmap = load_colmap_points3d(colmap_dir / "points3D.bin")
     
-    # Filtrar pontos com erro de triangulação excessivo (> 4px)
+    # Filter points with high triangulation error (> 4px)
     mask_good = errors_colmap < 4.0
     pts_filtered = pts_colmap[mask_good]
     colors_filtered = colors_colmap[mask_good]
-    print(f"[*] Filtragem de qualidade: {np.sum(mask_good):,} pontos retidos (erro < 4px)")
+    print(f"[*] Quality filtering: {np.sum(mask_good):,} tie-points retained (error < 4px)")
 
-    # Aplicação da transformação métrica Sim(3): P_metric = s * R * P_colmap + t
-    print("[*] Aplicando transformação métrica Sim(3) nos pontos 3D...")
+    # Sim(3) metric transformation: P_metric = s * R * P_colmap + t
+    print("[*] Applying metric Sim(3) transformation to 3D points...")
     pts_metric = (best_s * best_R @ pts_filtered.T).T + best_t
 
-    # 5. Exportar Nuvem Fotogramétrica Métrica
-    out_colmap_pcd = OUT_DIR / "05_COLMAP_SfM_Metrico_Spirula_Studio.pcd"
+    # 5. Export Metric Photogrammetric Point Cloud
+    out_colmap_pcd = out_dir / "colmap_sfm_metric.pcd"
     write_pcd(out_colmap_pcd, pts_metric, colors_filtered)
 
-    # 6. Carregar Nuvem SLAM LiDAR e Exportar Fusão Conjunta
-    slam_pcd_path = DATASET_DIR / "slam_out" / "pcd" / "all_raw_points.pcd"
+    # 6. Load Raw LiDAR SLAM Cloud and Export Combined Fusion
+    slam_pcd_path = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
+    out_fusion_pcd = None
     if slam_pcd_path.exists():
-        print(f"\n[*] Carregando nuvem bruta do LiDAR SLAM para fusão...")
+        print(f"\n[*] Loading raw LiDAR SLAM point cloud for fusion...")
         with open(slam_pcd_path, "rb") as f:
             while True:
                 line = f.readline().decode("ascii", errors="ignore").strip()
@@ -249,19 +300,19 @@ def main():
             lidar_data = np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
             pts_lidar_all = lidar_data[:, :3].astype(np.float64)
 
-        # Pintar a nuvem do LiDAR de cinza neutro (180, 180, 180) para destacar os pontos coloridos do COLMAP
+        # Color LiDAR cloud neutral gray (160, 160, 160) to highlight COLMAP points
         colors_lidar = np.full((len(pts_lidar_all), 3), 160, dtype=np.uint8)
 
-        # Fusão: LiDAR em cinza + COLMAP em cores reais
+        # Fusion: LiDAR in gray + COLMAP in true color
         pts_fusion = np.vstack([pts_lidar_all, pts_metric])
         colors_fusion = np.vstack([colors_lidar, colors_filtered])
 
-        out_fusion_pcd = OUT_DIR / "06_FUSAO_LiDAR_Cinza_e_COLMAP_Cores.pcd"
+        out_fusion_pcd = out_dir / "lidar_colmap_fusion.pcd"
         write_pcd(out_fusion_pcd, pts_fusion, colors_fusion)
 
-    # 7. Salvar Resumo em JSON
+    # 7. Save Summary JSON
     summary = {
-        "dataset": "VID_20260902_143757_00_277",
+        "dataset": dataset_dir.name,
         "optimal_delta_t_sec": float(best_dt),
         "metric_scale_factor_s": float(best_s),
         "alignment_rmse_meters": float(best_rmse),
@@ -270,16 +321,19 @@ def main():
         "sim3_translation_vector": best_t.tolist(),
         "total_colmap_points_transformed": int(len(pts_metric)),
         "exported_colmap_pcd": str(out_colmap_pcd),
-        "exported_fusion_pcd": str(out_fusion_pcd) if slam_pcd_path.exists() else None
+        "exported_fusion_pcd": str(out_fusion_pcd) if out_fusion_pcd else None
     }
-    with open(OUT_DIR / "colmap_lidar_sim3_alignment_summary.json", "w") as f:
+    summary_path = out_dir / "colmap_lidar_sim3_alignment_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print("\n" + "=" * 75)
-    print(" PROCESSO CONCLUÍDO COM SUCESSO!")
-    print(f" Arquivos disponíveis na pasta:\n {OUT_DIR}")
+    print(" PROCESS COMPLETED SUCCESSFULLY!")
+    print(f" Summary: {summary_path}")
+    print(f" Deliverables directory: {out_dir}")
     print("=" * 75)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

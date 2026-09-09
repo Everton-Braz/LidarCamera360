@@ -1,11 +1,11 @@
 import struct
 import os
 import sys
+import argparse
 
-if len(sys.argv) > 1:
-    insv_path = sys.argv[1]
-else:
-    insv_path = "sample.insv"
+parser = argparse.ArgumentParser(description="Inspect the telemetry trailer of an Insta360 INSV file.")
+parser.add_argument("--insv", required=True, help="Path to the INSV file.")
+insv_path = parser.parse_args().insv
 file_size = os.path.getsize(insv_path) if os.path.exists(insv_path) else 0
 HEADER_SIZE = 32 + 4 + 4 + 32 # 72
 

@@ -1,0 +1,89 @@
+common:
+  img_topic: "/camera_front/image_raw"
+  lid_topic: "/vanjee_722z"
+  imu_topic: "/vanjee_imu_packets"
+  img_en: 1
+  lidar_en: 1
+  ros_driver_bug_fix: false
+
+extrin_calib:
+  extrinsic_T: [0.0, 0.0, 0.0]
+  extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  Rcl: [-0.99961077, 0.02221961, -0.01687019,
+         0.00370246, -0.49369625, -0.86962653,
+        -0.02765151, -0.86935051,  0.49342182]
+  Pcl: [-0.00681037, -0.06977653, -0.00248979]
+
+time_offset: 
+  imu_time_offset: 0.0
+  img_time_offset: 0.0
+  exposure_time_init: 0.0
+
+preprocess:
+  point_filter_num: 1
+  filter_size_surf: 0.05
+  lidar_type: 5 # XT32 compatible point format (x, y, z, intensity, ring, timestamp in seconds)
+  scan_line: 16
+  blind: 0.4
+  feature_extract_enabled: false
+
+vio:
+  max_iterations: 5
+  outlier_threshold: 500
+  img_point_cov: 500
+  patch_size: 8
+  patch_pyrimid_level: 4
+  normal_en: true
+  raycast_en: false
+  inverse_composition_en: false
+  exposure_estimate_en: true
+  inv_expo_cov: 0.1
+
+imu:
+  imu_en: true
+  imu_int_frame: 30
+  acc_cov: 0.2
+  gyr_cov: 0.05
+  b_acc_cov: 0.00001
+  b_gyr_cov: 0.00001
+
+lio:
+  max_iterations: 5
+  dept_err: 0.02
+  beam_err: 0.05
+  min_eigen_value: 0.005
+  voxel_size: 0.3
+  max_layer: 2
+  max_points_num: 100
+  layer_init_num: [5, 5, 5, 5, 5]
+
+local_map:  
+  map_sliding_en: false
+  half_map_size: 100
+  sliding_thresh: 8
+
+uav:
+  imu_rate_odom: false
+  gravity_align_en: true
+
+publish:
+  dense_map_en: true
+  pub_effect_point_en: false 
+  pub_plane_en: false
+  pub_scan_num: 1
+  blind_rgb_points: 0.0
+
+evo:
+  seq_name: "trajectory"
+  pose_output_en: true
+
+pcd_save:
+  pcd_save_en: true
+  type: 0 # 0: World Frame, 1: Body Frame;
+  colmap_output_en: true
+  filter_size_pcd: 0.02
+  interval: -1
+
+image_save:
+  img_save_en: false
+  interval: 1

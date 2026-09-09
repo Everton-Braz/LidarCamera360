@@ -1,0 +1,3 @@
+The canonical GPL-2.0-only license text is included at ../FAST-LIVO2/LICENSE.
+
+Keep ../FAST-LIVO2/LICENSE beside the vendored source and copy both files into any source release containing the adapted FAST-LIVO2 estimator.

@@ -1,1 +1,1 @@
-"""Views and UI components for the RavenCalibrator Microsoft UI XAML application."""
+"""Views and UI components for the PyQt6 desktop application."""

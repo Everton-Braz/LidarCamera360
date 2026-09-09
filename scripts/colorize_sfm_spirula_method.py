@@ -20,18 +20,17 @@ from scipy.spatial.transform import Rotation as Rot
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-DATASET_DIR = Path(r"C:\Users\User\Documents\ARQUIVOS_TESTE\SMALL-DATASET-TEST")
-SPARSE_DIR = DATASET_DIR / "sparse" / "0"
-SLAM_PCD = DATASET_DIR / "slam_out" / "pcd" / "all_raw_points.pcd"
-ALIGN_JSON = DATASET_DIR / "colmap_to_lidar_alignment.json"
-IMG_DIR = DATASET_DIR / "images"
-
-OUT_PLY = DATASET_DIR / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.ply"
-OUT_PCD = DATASET_DIR / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.pcd"
-CLOUDCOMPARE_COPY = Path(r"C:\Users\User\Downloads\Lidou\TESTE_ICP_CLOUDCOMPARE\05_SMALL_DATASET_SFM_SPIRULA_CORRIGIDO.ply")
+DATASET_DIR = None
+SPARSE_DIR = None
+SLAM_PCD = None
+ALIGN_JSON = None
+IMG_DIR = None
+OUT_PLY = None
+OUT_PCD = None
+CLOUDCOMPARE_COPY = None
 
 def load_pcd(path):
-    print(f"[*] Carregando nuvem LiDAR: {path.name}...")
+    print(f"[*] Loading LiDAR point cloud: {path.name}...")
     with open(path, "rb") as f:
         while True:
             line = f.readline().decode("ascii", errors="ignore").strip()
@@ -42,7 +41,7 @@ def load_pcd(path):
         raw = f.read(n * 16)
         data = np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
         xyz = data[:, :3].astype(np.float64)
-    print(f"    Total de pontos carregados: {len(xyz):,}")
+    print(f"    Total points loaded: {len(xyz):,}")
     return xyz
 
 def load_cameras(path):
@@ -140,7 +139,7 @@ def write_ply(path, points, colors_rgb):
     with open(path, "wb") as f:
         f.write(header)
         f.write(arr.tobytes())
-    print(f"  [+] PLY salvo: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+    print(f"  [+] Saved PLY: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
 
 def write_pcd(path, points, colors_rgb):
     n = len(points)
@@ -174,26 +173,41 @@ def write_pcd(path, points, colors_rgb):
     with open(path, "wb") as f:
         f.write(header)
         f.write(arr.tobytes())
-    print(f"  [+] PCD salvo: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+    print(f"  [+] Saved PCD: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Colorize a LiDAR point cloud from aligned COLMAP views.")
+    parser.add_argument("--dataset", type=Path, required=True, help="Dataset directory.")
+    args = parser.parse_args()
+    global DATASET_DIR, SPARSE_DIR, SLAM_PCD, ALIGN_JSON, IMG_DIR, OUT_PLY, OUT_PCD
+    DATASET_DIR = args.dataset.resolve()
+    SPARSE_DIR = DATASET_DIR / "sparse" / "0"
+    SLAM_PCD = DATASET_DIR / "slam_out" / "pcd" / "all_raw_points.pcd"
+    ALIGN_JSON = DATASET_DIR / "colmap_to_lidar_alignment.json"
+    IMG_DIR = DATASET_DIR / "images"
+    deliv_dir = DATASET_DIR / "deliverables"
+    deliv_dir.mkdir(parents=True, exist_ok=True)
+    OUT_PLY = deliv_dir / "reconstruction_colorized.ply"
+    OUT_PCD = deliv_dir / "reconstruction_colorized.pcd"
+    CLOUDCOMPARE_COPY = deliv_dir / "reconstruction_colorized_cloudcompare.ply"
     print("=" * 80)
-    print(" COLORACAO SFM (SPIRULA STUDIO) ALINHADA POR SIM(3) + ICP")
-    print(" Dataset: SMALL-DATASET-TEST")
+    print(" SFM COLORIZATION (SPIRULA STUDIO) ALIGNED VIA SIM(3) + ICP")
+    print(f" Dataset: {DATASET_DIR}")
     print("=" * 80)
 
-    # 1. Carregar alinhamento Sim(3) + ICP
+    # 1. Load Sim(3) + ICP alignment
     with open(ALIGN_JSON, "r", encoding="utf-8") as f:
         al = json.load(f)
     s_sim = al["scale"]
     R_sim = np.array(al["R"])
     t_sim = np.array(al["t"])
-    print(f"[*] Transformação Composta Carregada: Escala={s_sim:.6f}, RMSE={al['rmse_cm']:.2f} cm")
+    print(f"[*] Loaded composite transformation: Scale={s_sim:.6f}, RMSE={al.get('rmse_cm', 0.0):.2f} cm")
 
-    # 2. Carregar Câmeras e Imagens do COLMAP
+    # 2. Load COLMAP Cameras and Images
     cameras = load_cameras(SPARSE_DIR / "cameras.bin")
     images = load_images(SPARSE_DIR / "images.bin")
-    print(f"[*] Câmeras: {len(cameras)}, Imagens Registradas: {len(images)}")
+    print(f"[*] Cameras: {len(cameras)}, Registered Images: {len(images)}")
 
     # 3. Carregar Nuvem LiDAR
     pts_lidar = load_pcd(SLAM_PCD)
@@ -295,23 +309,23 @@ def main():
         processed_count += 1
         if processed_count % 35 == 0 or processed_count == len(images):
             colored_pct = np.count_nonzero(best_scores > 0) / n_pts * 100
-            print(f"    [{processed_count:3d}/{len(images)}] Quadros projetados | Cobertura LiDAR: {colored_pct:.1f}%")
+            print(f"    [{processed_count:3d}/{len(images)}] Projected frames | LiDAR coverage: {colored_pct:.1f}%")
 
     print("\n" + "=" * 80)
-    print(f" COLORACAO CONCLUIDA EM {time.time() - t_start:.1f}s")
+    print(f" COLORIZATION COMPLETED IN {time.time() - t_start:.1f}s")
     total_colored = np.count_nonzero(best_scores > 0)
-    print(f" Pontos coloridos: {total_colored:,} / {n_pts:,} ({total_colored/n_pts*100:.2f}%)")
+    print(f" Colorized points: {total_colored:,} / {n_pts:,} ({total_colored/n_pts*100:.2f}%)")
     print("=" * 80)
 
-    # Salvar resultados
+    # Save deliverables
     write_ply(OUT_PLY, pts_lidar, colors)
     write_pcd(OUT_PCD, pts_lidar, colors)
 
-    # Copiar para a pasta de inspeção do CloudCompare
+    # Copy to deliverables inspection folder
     CLOUDCOMPARE_COPY.parent.mkdir(parents=True, exist_ok=True)
     import shutil
     shutil.copy2(OUT_PLY, CLOUDCOMPARE_COPY)
-    print(f"  [+] Cópia para CloudCompare: {CLOUDCOMPARE_COPY.name}")
+    print(f"  [+] Deliverable copy: {CLOUDCOMPARE_COPY.name}")
 
 if __name__ == "__main__":
     main()

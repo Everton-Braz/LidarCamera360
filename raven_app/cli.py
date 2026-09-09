@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from raven_app import __version__
+from raven_app.branding import APP_NAME, APP_DESCRIPTION
 
 
 def resources():
@@ -45,8 +46,8 @@ def bag_options(p):
 
 
 def parse(argv=None):
-    p=argparse.ArgumentParser(prog='RavenCalibrator',description='Standalone Raven LiDAR / camera processor')
-    p.add_argument('--version',action='version',version='RavenCalibrator '+__version__)
+    p=argparse.ArgumentParser(prog=APP_NAME, description=f'{APP_NAME} - {APP_DESCRIPTION}')
+    p.add_argument('--version', action='version', version=f'{APP_NAME} {__version__}')
     p.add_argument('--headless',action='store_true',help='Require a CLI command; never open the desktop UI')
     sub=p.add_subparsers(dest='command')
     gui=sub.add_parser('gui',help='Open desktop controls')

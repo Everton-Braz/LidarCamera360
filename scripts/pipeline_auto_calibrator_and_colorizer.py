@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pipeline Unificado: Auto-Calibração, Sincronização Temporal e Coloração LiDAR-Câmera 360
+Unified pipeline: Auto-Calibração, Sincronização Temporal e Coloração LiDAR-Câmera 360
 ========================================================================================
-Integração completa:
+Complete integration:
 1. Executa o Spirula Studio SfM (spirula.exe) de forma headless (se solicitado ou se sparse não existir).
 2. Realiza o alinhamento de alta precisão Sim(3) + ICP dos tie-points do COLMAP contra a nuvem LiDAR.
-3. Auto-sincroniza o tempo exato (Δt) entre o vídeo INSV e o SLAM (0 ms de erro) via SfM ou IMU Gyro.
-4. Auto-recalibra e compensa variações mecânicas de aperto do suporte (Yaw/Roll/Pitch).
-5. Colore a nuvem com oclusão via Z-Buffer (960x960) e ponderação de nitidez óptica.
+3. Automatically synchronize the exact time (Δt) entre o vídeo INSV e o SLAM (0 ms de erro) via SfM ou IMU Gyro.
+4. Automatically recalibrate and compensate variações mecânicas de aperto do suporte (Yaw/Roll/Pitch).
+5. Colorize the point cloud with occlusion via Z-Buffer (960x960) e ponderação de nitidez óptica.
 6. Suporta os dois métodos:
-   - Método A: SfM Spirula Alinhado (Padrão Ouro, 100% autônomo e aprumado).
-   - Método B: Direto Rígido (Rápido, universal para qualquer dataset com o mesmo rig fixo).
+   - Method A: SfM Spirula Alinhado (Padrão Ouro, 100% autônomo e aprumado).
+   - Method B: Direto Rígido (Rápido, universal para qualquer dataset com o mesmo rig fixo).
 """
 
 import os
@@ -44,7 +44,7 @@ DEFAULT_CALIB_JSON = WORKSPACE_DIR / "calibracao_rigida_raven_insta360.json"
 # ==============================================================================
 
 def load_pcd(path):
-    print(f"[*] Carregando nuvem PCD: {path.name}...")
+    print(f"[*] Loading PCD cloud: {path.name}...")
     with open(path, "rb") as f:
         header = {}
         for _ in range(100):
@@ -77,17 +77,17 @@ def load_pcd(path):
             raise ValueError('PCD payload size does not match its header')
         data = np.fromfile(f, dtype=dtype, count=n)
         xyz = np.column_stack([data[name] for name in ('x','y','z')]).astype(np.float64)
-    print(f"    Pontos carregados: {len(xyz):,}")
+    print(f"    Loaded points: {len(xyz):,}")
     return xyz
 
 
 def load_trajectory(path):
-    print(f"[*] Carregando trajetória SLAM: {path.name}...")
+    print(f"[*] Loading SLAM trajectory: {path.name}...")
     data = np.loadtxt(path)
     timestamps = data[:, 0]
     positions = data[:, 1:4]
     rotations = Rot.from_quat(data[:, 4:8])
-    print(f"    Total de poses: {len(data):,}, Duração: {timestamps[-1] - timestamps[0]:.2f}s")
+    print(f"    Total poses: {len(data):,}, Duration: {timestamps[-1] - timestamps[0]:.2f}s")
     return timestamps, positions, rotations
 
 
@@ -234,7 +234,7 @@ def write_ply(path, points, colors_rgb):
     with open(path, "wb") as f:
         f.write(header)
         f.write(arr.tobytes())
-    print(f"  [+] PLY salvo: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+    print(f"  [+] Saved PLY: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
 
 
 def write_pcd(path, points, colors_rgb):
@@ -269,7 +269,7 @@ def write_pcd(path, points, colors_rgb):
     with open(path, "wb") as f:
         f.write(header)
         f.write(arr.tobytes())
-    print(f"  [+] PCD salvo: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+    print(f"  [+] Saved PCD: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
 
 
 # ==============================================================================
@@ -361,7 +361,7 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
             return float(best_dt)
         return None
     except Exception as e:
-        print(f"[*] Sincronização via giroscópio indisponível ({e}), prosseguindo...")
+        print(f"[*] Gyro synchronization unavailable ({e}), proceeding...")
         return None
 
 
@@ -403,7 +403,7 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
 
     if all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
         load_colmap_cameras(sparse_dir / "cameras.bin")
-        print(f"[+] Reconstrução SfM existente encontrada em: {sparse_dir}")
+        print(f"[+] Existing SfM reconstruction found at: {sparse_dir}")
         return True
 
     try:
@@ -413,15 +413,15 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
         spirula_bin = SPIRULA_EXE
 
     if not spirula_bin.exists():
-        print(f"[!] spirula.exe não encontrado em: {spirula_bin}")
+        print(f"[!] spirula.exe not found at: {spirula_bin}")
         return False
 
     vulkan_dev = get_best_vulkan_device()
     print("=" * 80)
     print(f" INICIANDO SPIRULA STUDIO SFM (VULKAN GPU HEADLESS, DEVICE: {vulkan_dev if vulkan_dev >= 0 else 'DEFAULT'})...")
-    print(f" Executável: {spirula_bin}")
-    print(f" Imagens:    {img_dir}")
-    print(f" Qualidade:  {quality}")
+    print(f" Executable: {spirula_bin}")
+    print(f" Images:     {img_dir}")
+    print(f" Quality:    {quality}")
     print("=" * 80)
 
     cmd = [
@@ -440,13 +440,13 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
     t0 = time.time()
     ret = subprocess.run(cmd)
     if ret.returncode != 0 or not all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
-        print(f"[!] Spirula SFM finalizou com código {ret.returncode}")
+        print(f"[!] Spirula SFM exited with code {ret.returncode}")
         return False
 
     cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
     if not cameras:
         return False
-    print(f"[+] Spirula SFM concluído em {time.time() - t0:.1f}s!")
+    print(f"[+] Spirula SFM completed in {time.time() - t0:.1f}s!")
     return True
 
 
@@ -458,7 +458,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
     print("=" * 80)
-    print(" ALINHAMENTO MÉTRICO COLMAP (SPIRULA) -> LIDAR SLAM")
+    print(" METRIC ALIGNMENT: COLMAP (SPIRULA) -> LIDAR SLAM")
     print("=" * 80)
 
     pts_colmap, rgb_colmap = load_colmap_points(sparse_dir / "points3D.bin")
@@ -482,7 +482,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
     c_L_phys = 0.185 * u_L
 
     # Busca ótima do dt (coarse-to-fine adaptativa)
-    print(f"[*] Buscando sincronização temporal ótima Δt (FPS = {fps:.1f}, hint = {dt_hint})...")
+    print(f"[*] Searching for optimal time synchronization Δt (FPS = {fps:.1f}, hint = {dt_hint})...")
     best_rmse = 1e9
     best_dt = 0
     best_sim3 = None
@@ -516,7 +516,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
 
     if best_sim3 is None:
         # Fallback if window was too tight
-        print("[!] Aviso: Janela restrita não encontrou alinhamento suficiente. Ampliando busca...")
+        print("[!] Warning: Restricted search window found insufficient alignment. Widening search...")
         dts = np.linspace(-150.0, 50.0, 2001)
         for dt in dts:
             X_trj, Y_trj = [], []
@@ -540,10 +540,10 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
                     best_sim3 = (s, R, t_trans)
 
     if best_sim3 is None:
-        raise RuntimeError("Não foi possível alinhar a trajetória COLMAP contra o SLAM LiDAR.")
+        raise RuntimeError("Could not align COLMAP trajectory against LiDAR SLAM.")
 
     s_init, R_init, t_init = best_sim3
-    print(f"    Sincronização Ótima: Δt = {best_dt:.4f}s | RMSE Trajetória: {best_rmse*100:.2f} cm (Escala s = {s_init:.4f})")
+    print(f"    Optimal synchronization: Δt = {best_dt:.4f}s | Trajectory RMSE: {best_rmse*100:.2f} cm (Scale s = {s_init:.4f})")
 
     # Refinamento Trimmed ICP nos tie-points 3D
     step_lidar = max(1, len(pts_lidar) // 200000)
@@ -554,7 +554,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
     raw_sub_col = pts_colmap[::step_col].copy()
     current_pts = s_init * (R_init @ raw_sub_col.T).T + t_init
 
-    print(f"[*] Executando Refinamento Trimmed ICP ({len(raw_sub_col):,} tie-points)...")
+    print(f"[*] Running Trimmed ICP refinement ({len(raw_sub_col):,} tie-points)...")
     s_comp, R_comp, t_comp = s_init, R_init.copy(), t_init.copy()
     rmse_icp = best_rmse
 
@@ -575,7 +575,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
         except Exception:
             break
 
-    print(f"[+] ICP Convergiu: RMSE = {rmse_icp*100:.2f} cm, Escala s = {s_comp:.6f}")
+    print(f"[+] ICP converged: RMSE = {rmse_icp*100:.2f} cm, Scale s = {s_comp:.6f}")
 
     align_data = {
         "scale": float(s_comp),
@@ -773,10 +773,10 @@ def transform_colmap_to_metric(src_dir: Path, dst_dir: Path, s_sim: float, R_sim
             except Exception:
                 pass
 
-    print(f"[+] Dataset COLMAP Métrico para 3DGS gerado com sucesso em: {dst_dir}")
-    print(f"    Câmeras:  {len(cameras)}")
-    print(f"    Imagens:  {len(metric_images)}")
-    print(f"    Pontos3D: {len(metric_pts):,} tie-points fotogramétricos métricos")
+    print(f"[+] Metric COLMAP dataset for 3DGS generated successfully at: {dst_dir}")
+    print(f"    Cameras:  {len(cameras)}")
+    print(f"    Images:   {len(metric_images)}")
+    print(f"    Points3D: {len(metric_pts):,} metric tie-points")
     return dst_dir
 
 
@@ -785,7 +785,7 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
     try:
         from rosbags.highlevel import AnyReader
     except ImportError:
-        print("[!] rosbags não instalado para leitura direta de IMU.")
+        print("[!] rosbags not installed for direct IMU reading.")
         return None
 
     HEADER_SIZE = 72
@@ -806,7 +806,7 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
                     offsets[oid] = (ofmt, osize, ooff)
 
             if 3 not in offsets or 4 not in offsets:
-                print("[!] Registros de Gyro/Exposure não encontrados no trailer INSV.")
+                print("[!] Gyro/Exposure records not found in INSV trailer.")
                 return None
 
             _, g_size, g_off = offsets[3]
@@ -846,7 +846,7 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
                     lidar_wz.append(msg.angular_velocity.z)
 
         if len(lidar_t) == 0:
-            print("[!] Nenhuma mensagem de IMU encontrada no arquivo .bag.")
+            print("[!] No IMU messages found in the .bag file.")
             return None
 
         lidar_t = np.array(lidar_t)
@@ -887,15 +887,15 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
 
         best_exact = fine_shifts[np.argmax(fine_corrs)]
         max_corr = np.max(fine_corrs)
-        print(f"  [+] Sincronização IMU Gyro Ótima: Δt = {best_exact:.4f}s (Pearson r = {max_corr:.4f})")
+        print(f"  [+] Optimal IMU gyro synchronization: Δt = {best_exact:.4f}s (Pearson r = {max_corr:.4f})")
         return float(best_exact)
     except Exception as e:
-        print(f"[!] Erro no cálculo de sincronização IMU: {e}")
+        print(f"[!] Error computing IMU synchronization: {e}")
         return None
 
 
 def recalibrate_from_sfm(dataset_dir, fps=1.0):
-    """Recalibra com alta precisão os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
+    """Recalibrate with high precision os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_trj = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
@@ -959,10 +959,10 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
     e1 = R1.as_euler("xyz", degrees=True)
 
     print("\n" + "=" * 80)
-    print(" RE-CALIBRAÇÃO FÍSICA A PARTIR DO SFM/SPIRULA CONCLUÍDA:")
-    print(f" Cam0: Euler XYZ={e0} | Braço={t0*100} cm (norma {np.linalg.norm(t0)*100:.2f} cm)")
-    print(f" Cam1: Euler XYZ={e1} | Braço={t1*100} cm (norma {np.linalg.norm(t1)*100:.2f} cm)")
-    print(f" Ângulo relativo entre lentes: {rel_ang:.2f}° (Teórico: 180°)")
+    print(" PHYSICAL RIG RE-CALIBRATION FROM SFM/SPIRULA COMPLETE:")
+    print(f" Cam0: Euler XYZ={e0} | Lever arm={t0*100} cm (norm {np.linalg.norm(t0)*100:.2f} cm)")
+    print(f" Cam1: Euler XYZ={e1} | Lever arm={t1*100} cm (norm {np.linalg.norm(t1)*100:.2f} cm)")
+    print(f" Relative angle between lenses: {rel_ang:.2f}° (Theoretical: 180°)")
     print("=" * 80)
 
     calib_dict = {
@@ -1002,7 +1002,7 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
     with open(dataset_dir / "calibracao_rigida_recalibrada.json", "w", encoding="utf-8") as f:
         json.dump(calib_dict, f, indent=2)
 
-    print(f"  [+] Calibração dinâmica salva em: {dataset_dir / 'calibracao_rigida_auto.json'}")
+    print(f"  [+] Dynamic calibration saved to: {dataset_dir / 'auto_rigid_calibration.json'}")
     return calib_dict
 
 
@@ -1035,7 +1035,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
     scale_factor_zbuf = 3840.0 / zbuf_w
 
     print("\n" + "=" * 80)
-    print(" PROJETANDO QUADROS SFM SOBRE A NUVEM LIDAR (TOP-3 CONSENSUS)...")
+    print(" PROJECTING SFM FRAMES ONTO LIDAR POINT CLOUD (TOP-3 CONSENSUS)...")
     print("=" * 80)
 
     t0 = time.time()
@@ -1121,9 +1121,9 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
 
         if count % 50 == 0 or count == len(images):
             cov = np.count_nonzero(np.any(top_scores > 0, axis=1)) / n_pts * 100
-            print(f"    [{count:3d}/{len(images)}] Quadros projetados | Cobertura LiDAR: {cov:.1f}%")
+            print(f"    [{count:3d}/{len(images)}] Projected frames | LiDAR coverage: {cov:.1f}%")
 
-    print("[*] Resolvendo consenso estatístico SfM...")
+    print("[*] Solving statistical consensus SfM...")
     if gpu_views is not None:
         colors = colorize_views(pts_lidar, gpu_views, dataset_dir)
         if colors is None:
@@ -1177,7 +1177,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
     except Exception:
         pass
 
-    print(f"[+] Concluído em {time.time() - t0:.1f}s!")
+    print(f"[+] Completed in {time.time() - t0:.1f}s!")
 
 
 # ==============================================================================
@@ -1201,8 +1201,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             calib_json_path = candidates[0] if candidates else DEFAULT_CALIB_JSON
 
     print("=" * 80)
-    print(" COLORACAO DIRETA RIGIDA (SEM SFM)")
-    print(f" Calibração: {calib_json_path.name}")
+    print(" DIRECT RIGID COLORIZATION (WITHOUT SFM)")
+    print(f" Calibration: {calib_json_path.name}")
     print("=" * 80)
 
     with open(calib_json_path, "r", encoding="utf-8") as f:
@@ -1236,7 +1236,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
                 al = json.load(f)
                 dt_sync = al.get("dt_sync_seconds", None)
                 if dt_sync is not None:
-                    print(f"[*] Sincronização herdada do COLMAP Sim(3): Δt = {dt_sync:.4f}s")
+                    print(f"[*] Synchronization inherited from COLMAP Sim(3): Δt = {dt_sync:.4f}s")
         except Exception:
             pass
 
@@ -1244,14 +1244,14 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
         insv_files = list(dataset_dir.glob("*.insv"))
         bag_files = list(dataset_dir.glob("*.bag"))
         if insv_files and bag_files:
-            print("[*] Sincronização via Gyro Cross-Correlation...")
+            print("[*] Synchronizing via Gyro Cross-Correlation...")
             dt_sync = sync_via_gyro_cross_correlation(insv_files[0], bag_files[0], slam_trj)
 
     if dt_sync is None:
         dt_sync = -4.220
-        print(f"[!] Aviso: Δt padrão adotado = {dt_sync:.4f}s")
+        print(f"[!] Warning: Default Δt adopted = {dt_sync:.4f}s")
     else:
-        print(f"[*] Sincronização Temporal Ativa: Δt = {dt_sync:.4f}s")
+        print(f"[*] Active time synchronization: Δt = {dt_sync:.4f}s")
 
     pts_lidar = load_pcd(slam_pcd)
     n_pts = len(pts_lidar)
@@ -1276,7 +1276,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
     num_frames = min(len(cam0_files), len(cam1_files))
 
     print("\n" + "=" * 80)
-    print(" COLORACAO DIRETA RIGIDA (TOP-3 MULTI-VIEW CONSENSUS)")
+    print(" DIRECT RIGID COLORIZATION (TOP-3 MULTI-VIEW CONSENSUS)")
     print("=" * 80)
 
     # Se alinhamento SfM existir, calcular correção suave de drift da trajetória (Amostragem de Keyframes)
@@ -1328,9 +1328,9 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
                 delta_p_arr = np.array(delta_p_list)
                 slerp_delta_R = Slerp(sample_times, Rot.from_matrix(delta_R_list))
                 use_drift_correction = True
-                print(f"[*] Correção de Drift da Trajetória ativada com {len(sample_times)} quadros-chave SfM!")
+                print(f"[*] Trajectory drift correction enabled with {len(sample_times)} SfM keyframes!")
         except Exception as e:
-            print(f"[!] Aviso: não foi possível carregar drift correction do SfM: {e}")
+            print(f"[!] Warning: Could not load SfM drift correction: {e}")
 
     for k in range(num_frames):
         fn_digits = "".join(filter(str.isdigit, cam0_files[k].stem))
@@ -1434,9 +1434,9 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
 
         if gpu_views is None and ((k + 1) % 25 == 0 or (k + 1) == num_frames):
             cov = np.count_nonzero(np.any(top_scores > 0, axis=1)) / n_pts * 100
-            print(f"    [{k+1:3d}/{num_frames}] Pares de quadros acumulados | Cobertura: {cov:.1f}%")
+            print(f"    [{k+1:3d}/{num_frames}] Accumulated frame pairs | Coverage: {cov:.1f}%")
 
-    print("[*] Resolvendo consenso estatístico e eliminando outliers de projeção...")
+    print("[*] Solving statistical consensus and removing projection outliers...")
     if gpu_views is not None:
         colors = colorize_views(pts_lidar, gpu_views, dataset_dir)
         if colors is None:
@@ -1490,7 +1490,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
     except Exception:
         pass
 
-    print(f"[+] Método Direto Rígido concluído em {time.time() - t0:.1f}s!")
+    print(f"[+] Direct rigid method completed in {time.time() - t0:.1f}s!")
 
 
 # ==============================================================================
@@ -1498,24 +1498,24 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Pipeline Unificado de Calibração e Coloração LiDAR-Câmera 360")
-    parser.add_argument("--dataset", type=str, default=r"C:\Users\User\Documents\ARQUIVOS_TESTE\SMALL-DATASET-TEST",
-                        help="Caminho para a pasta do dataset")
+    parser = argparse.ArgumentParser(description="Unified LiDAR-camera calibration and colorization pipeline for 360-degree data.")
+    parser.add_argument("--dataset", type=str, required=True,
+                        help="Dataset directory.")
     parser.add_argument("--method", type=str, choices=["all", "sfm", "direct"], default="all",
-                        help="Método a executar: 'sfm', 'direct' ou 'all' para ambos")
-    parser.add_argument("--fps", type=float, default=1.0, help="Taxa de amostragem dos quadros (FPS, padrão 1.0)")
-    parser.add_argument("--run-spirula", action="store_true", help="Forçar execução do spirula.exe antes de colorir")
-    parser.add_argument("--recalibrate-from-sfm", action="store_true", help="Recalcular parâmetros de montagem usando SfM")
-    parser.add_argument("--dt", type=float, default=None, help="Sincronização temporal manual Δt em segundos")
-    parser.add_argument("--calib", type=str, default=None, help="Caminho opcional do arquivo de calibração JSON")
+                        help="Method to run: 'sfm', 'direct', or 'all'.")
+    parser.add_argument("--fps", type=float, default=1.0, help="Frame sampling rate (FPS, default 1.0).")
+    parser.add_argument("--run-spirula", action="store_true", help="Force spirula.exe execution before colorization.")
+    parser.add_argument("--recalibrate-from-sfm", action="store_true", help="Recalculate rig parameters from SfM.")
+    parser.add_argument("--dt", type=float, default=None, help="Manual time offset Δt in seconds.")
+    parser.add_argument("--calib", type=str, default=None, help="Optional calibration JSON path.")
 
     args = parser.parse_args()
     dataset_dir = Path(args.dataset)
 
     print("=" * 80)
-    print(" PIPELINE MASTER DE COLORACAO LIDAR-CAMERA 360")
+    print(" MASTER LIDAR-360 CAMERA COLORIZATION PIPELINE")
     print(f" Dataset: {dataset_dir}")
-    print(f" Método:  {args.method.upper()}")
+    print(f" Method:  {args.method.upper()}")
     print(f" FPS:     {args.fps:.1f}")
     print("=" * 80)
 
@@ -1532,9 +1532,9 @@ def main():
         colorize_via_direct_rigid(dataset_dir, calib_path, fps=args.fps, dt_override=args.dt)
 
     print("\n" + "=" * 80)
-    print(" PROCESSO FINALIZADO COM SUCESSO!")
-    print(f" Os arquivos coloridos foram salvos em: {dataset_dir}")
-    print(f" Entregáveis consolidados em: {dataset_dir / 'deliverables'}")
+    print(" PIPELINE COMPLETED SUCCESSFULLY!")
+    print(f" Colorized files saved in: {dataset_dir}")
+    print(f" Deliverables consolidated in: {dataset_dir / 'deliverables'}")
     print("=" * 80)
 
 

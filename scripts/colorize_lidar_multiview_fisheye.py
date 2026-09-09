@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Coloração Multi-Visão da Nuvem LiDAR com Imagens Dual-Fisheye 360° (Thin Prism + ICP)
+Multi-View Colorization da Nuvem LiDAR com Imagens Dual-Fisheye 360° (Thin Prism + ICP)
 ==================================================================================
 1. Carrega a nuvem LiDAR métrica completa (2.336.721 pontos).
-2. Transforma a nuvem para o referencial de câmeras do COLMAP via Sim(3) + ICP.
+2. Transform the point cloud to the camera reference frame do COLMAP via Sim(3) + ICP.
 3. Projeta os pontos em todas as fotos olho de peixe calibradas (cam0 e cam1).
-4. Realiza teste de oclusão por Z-Buffer raster (960x960) para evitar projeções através de paredes.
-5. Seleciona a cor da foto com máxima nitidez ótica (menor r ao centro e menor distância d).
-6. Exporta a nuvem colorida final em formatos PCD e PLY de alta performance.
+4. Perform an occlusion test por Z-Buffer raster (960x960) para evitar projeções através de paredes.
+5. Select the image color com máxima nitidez ótica (menor r ao centro e menor distância d).
+6. Export the final colorized point cloud em formatos PCD e PLY de alta performance.
 """
 
 import os
@@ -25,17 +25,15 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 # Caminhos principais
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATASET_DIR = Path(r"C:\Users\User\Downloads\Lidou\DinamicAprilTagCalib")
-COLMAP_DIR = DATASET_DIR / "VID_20260902_143757_00_277_dataset" / "sparse" / "0"
-IMG_ROOT = DATASET_DIR / "VID_20260902_143757_00_277_dataset" / "images"
-SLAM_PCD = DATASET_DIR / "slam_out" / "pcd" / "all_raw_points.pcd"
-
-OUT_DIR = Path(r"C:\Users\User\Downloads\Lidou\COMPARATIVO_NUVENS_TODOS_METODOS")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+DATASET_DIR = None
+COLMAP_DIR = None
+IMG_ROOT = None
+SLAM_PCD = None
+OUT_DIR = None
 
 
 def load_pcd(path):
-    print(f"[*] Carregando nuvem LiDAR: {path.name}...")
+    print(f"[*] Loading LiDAR point cloud: {path.name}...")
     with open(path, "rb") as f:
         while True:
             line = f.readline().decode("ascii", errors="ignore").strip()
@@ -46,7 +44,7 @@ def load_pcd(path):
         raw = f.read(n * 16)
         data = np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
         xyz = data[:, :3].astype(np.float64)
-    print(f"    Total de pontos carregados: {len(xyz):,}")
+    print(f"    Total points loaded: {len(xyz):,}")
     return xyz
 
 
@@ -159,7 +157,7 @@ def write_pcd(path, points, colors_rgb):
     with open(path, "wb") as f:
         f.write(header)
         f.write(arr.tobytes())
-    print(f"  [+] Arquivo PCD salvo: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+    print(f"  [+] Saved PCD: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
 
 
 def write_ply(path, points, colors_rgb):
@@ -189,12 +187,23 @@ def write_ply(path, points, colors_rgb):
     with open(path, "wb") as f:
         f.write(header)
         f.write(arr.tobytes())
-    print(f"  [+] Arquivo PLY salvo: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+    print(f"  [+] Saved PLY: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Colorize a LiDAR point cloud from calibrated fisheye views.")
+    parser.add_argument("--dataset", type=Path, required=True, help="Dataset directory.")
+    args = parser.parse_args()
+    global DATASET_DIR, COLMAP_DIR, IMG_ROOT, SLAM_PCD, OUT_DIR
+    DATASET_DIR = args.dataset.resolve()
+    COLMAP_DIR = DATASET_DIR / "VID_20260902_143757_00_277_dataset" / "sparse" / "0"
+    IMG_ROOT = DATASET_DIR / "VID_20260902_143757_00_277_dataset" / "images"
+    SLAM_PCD = DATASET_DIR / "slam_out" / "pcd" / "all_raw_points.pcd"
+    OUT_DIR = DATASET_DIR / "deliverables"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     print("=" * 80)
-    print(" COLORACAO MULTI-VISAO LIDAR 360 COM CALIBRACAO THIN PRISM + SIM(3) + ICP")
+    print(" 360 LIDAR MULTI-VIEW COLORIZATION WITH THIN PRISM + SIM(3) + ICP CALIBRATION")
     print("=" * 80)
     t_start = time.time()
 
@@ -203,7 +212,7 @@ def main():
     icp_res_file = OUT_DIR / "calibracao_automatica_icp_resultado.json"
 
     if not sim3_summary_file.exists() or not icp_res_file.exists():
-        print("[-] Arquivos de calibração não encontrados.")
+        print("[-] Calibration files not found.")
         return
 
     with open(sim3_summary_file, "r") as f:
@@ -226,10 +235,10 @@ def main():
     R_tot = R_icp @ R_s3
     t_tot = R_icp @ t_s3 + t_icp
 
-    print(f"[*] Transformação Composta Carregada:")
-    print(f"    Escala s: {s:.6f}")
-    print(f"    Translação Total: DX={t_tot[0]:+.3f}m, DY={t_tot[1]:+.3f}m, DZ={t_tot[2]:+.3f}m")
-    print(f"    Rotação Total Euler XYZ: {Rot.from_matrix(R_tot).as_euler('xyz', degrees=True)}")
+    print(f"[*] Loaded composite transformation:")
+    print(f"    Scale s: {s:.6f}")
+    print(f"    Total Translation: DX={t_tot[0]:+.3f}m, DY={t_tot[1]:+.3f}m, DZ={t_tot[2]:+.3f}m")
+    print(f"    Total Rotation Euler XYZ: {Rot.from_matrix(R_tot).as_euler('xyz', degrees=True)}")
 
     # 2. Carregar a Nuvem de Pontos Bruta do LiDAR (Ground Truth Métrico)
     pts_lidar = load_pcd(SLAM_PCD)
@@ -237,9 +246,9 @@ def main():
 
     # 3. Pré-computar todos os pontos no mundo COLMAP:
     # P_col = (1 / s) * R_tot^T * (P_lidar - t_tot)
-    print("\n[*] Mapeando nuvem LiDAR para o referencial de câmeras do COLMAP...")
+    print("\n[*] Mapping LiDAR point cloud to COLMAP camera frame...")
     pts_col = (1.0 / s) * (R_tot.T @ (pts_lidar - t_tot).T).T
-    print("    Nuvem pré-transformada com sucesso!")
+    print("    Point cloud transformed successfully!")
 
     # 4. Carregar Parâmetros Ópticos e Imagens Registradas
     cams = load_colmap_cameras(COLMAP_DIR / "cameras.bin")
@@ -253,13 +262,13 @@ def main():
             images_valid.append(img)
 
     images_valid.sort(key=lambda x: x["name"])
-    print(f"[*] Total de fotos calibradas no disco: {len(images_valid):,} (cam0 e cam1)")
+    print(f"[*] Total calibrated images on disk: {len(images_valid):,} (cam0 e cam1)")
 
     # Amostragem inteligente de quadros (step=2 pega ~190 quadros, cobrindo cada centímetro da trajetória)
     # Isso garante cobertura completa 360° com altíssima velocidade
     step = 2
     keyframes = images_valid[::step]
-    print(f"[*] Quadros selecionados para coloração (step={step}): {len(keyframes):,} fotos de alta resolução")
+    print(f"[*] Frames selected for colorization (step={step}): {len(keyframes):,} high-resolution photos")
 
     # Arrays de cor e pontuação de qualidade
     # Cor padrão: cinza neutro (180, 180, 180) para pontos que não aparecem em nenhuma foto
@@ -268,7 +277,7 @@ def main():
 
     # 5. Loop de Projeção Multi-Visão
     print("\n" + "=" * 80)
-    print(" INICIANDO PROJEÇÃO ÓPTICA E AMOSTRAGEM FOTOGRÁFICA...")
+    print(" STARTING OPTICAL PROJECTION AND IMAGE SAMPLING...")
     print("=" * 80)
 
     zbuf_w, zbuf_h = 960, 960
@@ -365,14 +374,14 @@ def main():
     n_colored_final = np.sum(best_scores > 0)
     pct_final = (n_colored_final / n_pts) * 100.0
     print("\n" + "=" * 80)
-    print(" RESULTADO DA COLORACAO:")
-    print(f"  Total de Pontos no LiDAR: {n_pts:,}")
-    print(f"  Pontos 100% Coloridos:    {n_colored_final:,} ({pct_final:.2f}%)")
-    print(f"  Tempo Total de Projeção:  {time.time() - t_loop_start:.1f} segundos")
+    print(" COLORIZATION RESULT:")
+    print(f"  Total LiDAR points: {n_pts:,}")
+    print(f"  Fully colorized points:    {n_colored_final:,} ({pct_final:.2f}%)")
+    print(f"  Total projection time:  {time.time() - t_loop_start:.1f} seconds")
     print("=" * 80)
 
     # 7. Exportar Nuvens Finais
-    print("\n[*] Exportando arquivos finais de alta resolução...")
+    print("\n[*] Exporting final high-resolution files...")
     out_pcd = OUT_DIR / "09_NUVEM_LIDAR_COLORIDA_MULTIVIEW_FISHEYE.pcd"
     out_ply = OUT_DIR / "09_NUVEM_LIDAR_COLORIDA_MULTIVIEW_FISHEYE.ply"
 
@@ -400,8 +409,8 @@ def main():
         json.dump(summary, f, indent=2)
 
     print("\n" + "=" * 80)
-    print(" PROCESSO 100% CONCLUIDO COM SUCESSO!")
-    print(f" Arquivos disponíveis na pasta:\n {OUT_DIR}")
+    print(" PROCESS 100% COMPLETED SUCCESSFULLY!")
+    print(f" Files available in:\n {OUT_DIR}")
     print("=" * 80)
 
 

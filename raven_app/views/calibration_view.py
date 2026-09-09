@@ -1,4 +1,4 @@
-"""Calibration & Rig Geometry View - Microsoft UI XAML / Fluent Design System."""
+"""Calibration and rig geometry view."""
 import json
 from pathlib import Path
 from PyQt6.QtCore import Qt
@@ -10,6 +10,7 @@ from qfluentwidgets import (
     CaptionLabel, StrongBodyLabel, PushButton,
     PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
 )
+from raven_app.i18n import tr
 
 
 class CalibrationView(QWidget):
@@ -30,7 +31,7 @@ class CalibrationView(QWidget):
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel("LiDAR-Camera Rig Calibration")
+        title = TitleLabel(tr("LiDAR-Camera Rig Calibration"))
         subtitle = CaptionLabel(
             "Spatial rigid lever-arm extrinsics & Thin Prism dual-fisheye optical models"
         )

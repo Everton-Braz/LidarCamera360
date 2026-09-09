@@ -21,19 +21,12 @@ from scipy.spatial.transform import Rotation as Rot
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-# Caminhos
-if len(sys.argv) > 1:
-    DATASET_DIR = Path(sys.argv[1])
-else:
-    DATASET_DIR = Path(r"D:\APLICATIVOS\FAST-LIVO2\AZURE-DATASET")
-COLMAP_DIR = DATASET_DIR / "VID_dataset" / "sparse" / "0"
-SLAM_PCD = DATASET_DIR / "slam_out" / "pcd" / "all_raw_points.pcd"
-SLAM_TRJ = DATASET_DIR / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
-
-ICP_FOLDER = DATASET_DIR / "deliverables" / "TESTE_ICP_CLOUDCOMPARE"
-OUT_COMPARATIVO = DATASET_DIR / "deliverables"
-ICP_FOLDER.mkdir(parents=True, exist_ok=True)
-OUT_COMPARATIVO.mkdir(parents=True, exist_ok=True)
+DATASET_DIR = None
+COLMAP_DIR = None
+SLAM_PCD = None
+SLAM_TRJ = None
+ICP_FOLDER = None
+OUT_COMPARATIVO = None
 
 
 def load_pcd(path):
@@ -87,7 +80,7 @@ def write_pcd(path, points, colors_rgb):
     with open(path, "wb") as f:
         f.write(header)
         f.write(arr.tobytes())
-    print(f"  [+] Nuvem salva: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
+    print(f"  [+] Saved cloud: {path.name} ({os.path.getsize(path)/1e6:.2f} MB)")
 
 
 def run_robust_icp(source_pts, target_pts, max_iter=30):
@@ -95,14 +88,14 @@ def run_robust_icp(source_pts, target_pts, max_iter=30):
     Executa ICP Robusto (Point-to-Point com corte de outliers adaptativo).
     Retorna R, t e os pontos transformados.
     """
-    print("\n[*] Construindo árvore KDTree do LiDAR (Ground Truth)...")
+    print("\n[*] Building LiDAR KDTree (Ground Truth)...")
     tree = cKDTree(target_pts)
 
     P = source_pts.copy()
     R_total = np.eye(3)
     t_total = np.zeros(3)
 
-    print("[*] Iniciando iterações do ICP Robusto...")
+    print("[*] Starting Robust ICP iterations...")
     thresholds = [0.35, 0.25, 0.20, 0.15, 0.12, 0.10, 0.08]
 
     for it in range(max_iter):
@@ -115,7 +108,7 @@ def run_robust_icp(source_pts, target_pts, max_iter=30):
         n_inliers = np.sum(inliers)
 
         if n_inliers < 1000:
-            print(f"  [!] Poucos inliers ({n_inliers}), encerrando ICP.")
+            print(f"  [!] Insufficient inliers ({n_inliers}), stopping ICP.")
             break
 
         src_in = P[inliers]
@@ -142,21 +135,33 @@ def run_robust_icp(source_pts, target_pts, max_iter=30):
         med_in = np.median(dists[inliers])
 
         if (it + 1) % 5 == 0 or it == max_iter - 1:
-            print(f"  Iteração {it+1:2d}: Inliers = {n_inliers:,}/{len(P):,} ({n_inliers/len(P)*100:.1f}%), "
+            print(f"  Iteration {it+1:2d}: Inliers = {n_inliers:,}/{len(P):,} ({n_inliers/len(P)*100:.1f}%), ")
                   f"Th = {th*100:.0f}cm | RMSE = {rmse_in*100:.2f}cm, Mediana = {med_in*100:.2f}cm")
 
     return R_total, t_total, P, rmse_in, med_in
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Run robust ICP calibration between COLMAP and LiDAR point clouds.")
+    parser.add_argument("--dataset", type=Path, required=True, help="Dataset directory.")
+    args = parser.parse_args()
+    global DATASET_DIR, COLMAP_DIR, SLAM_PCD, SLAM_TRJ, ICP_FOLDER, OUT_COMPARATIVO
+    DATASET_DIR = args.dataset.resolve()
+    COLMAP_DIR = DATASET_DIR / "VID_dataset" / "sparse" / "0"
+    SLAM_PCD = DATASET_DIR / "slam_out" / "pcd" / "all_raw_points.pcd"
+    SLAM_TRJ = DATASET_DIR / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+    ICP_FOLDER = DATASET_DIR / "deliverables" / "cloudcompare_icp"
+    OUT_COMPARATIVO = DATASET_DIR / "deliverables"
+    ICP_FOLDER.mkdir(parents=True, exist_ok=True)
     print("=" * 75)
-    print(" CALIBRAÇÃO AUTOMÁTICA MULTIMODAL: LIDAR SLAM + COLMAP SFM")
+    print(" AUTOMATIC MULTIMODAL CALIBRATION: LIDAR SLAM + COLMAP SFM")
     print("=" * 75)
 
     # 1. Carregar Nuvem do COLMAP Métrica
     colmap_pcd_in = OUT_COMPARATIVO / "05_COLMAP_SfM_Metrico_Spirula_Studio.pcd"
     if not colmap_pcd_in.exists():
-        print("[-] Nuvem do COLMAP não encontrada. Execute align_colmap_to_lidar.py primeiro.")
+        print("[-] COLMAP point cloud not found. Run align_colmap_to_lidar.py primeiro.")
         return
 
     pts_colmap, colors_colmap = load_pcd(colmap_pcd_in)
@@ -220,7 +225,7 @@ COMO EXECUTAR O ICP NO CLOUDCOMPARE:
 
     # 4. Executar o ICP Automático Python
     print("\n" + "=" * 75)
-    print(" EXECUTANDO O ICP AUTOMÁTICO VIA PYTHON (ALGORITMO ROBUSTO)...")
+    print(" RUNNING AUTOMATIC ICP IN PYTHON (ALGORITMO ROBUSTO)...")
     print("=" * 75)
     R_icp, t_icp, pts_colmap_opt, rmse_final, med_final = run_robust_icp(
         pts_colmap, pts_lidar_sub, max_iter=28
@@ -274,9 +279,9 @@ COMO EXECUTAR O ICP NO CLOUDCOMPARE:
         json.dump(res_final, f, indent=2)
 
     print("\n" + "=" * 75)
-    print(" PROCESSO 100% CONCLUÍDO!")
-    print(f" Pasta CloudCompare:  {ICP_FOLDER}")
-    print(f" Pasta Comparativo:   {OUT_COMPARATIVO}")
+    print(" PROCESS COMPLETED SUCCESSFULLY!")
+    print(f" CloudCompare folder:  {ICP_FOLDER}")
+    print(f" Deliverables folder: {OUT_COMPARATIVO}")
     print("=" * 75)
 
 

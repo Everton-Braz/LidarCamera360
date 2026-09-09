@@ -1,4 +1,4 @@
-"""Native Windows desktop controls using Microsoft UI XAML / Fluent Design System."""
+"""Desktop interface built with PyQt6 and qfluentwidgets."""
 import os
 import sys
 from pathlib import Path
@@ -18,14 +18,20 @@ from raven_app.views.inspect_view import InspectView
 from raven_app.views.calibration_view import CalibrationView
 from raven_app.views.doctor_view import DoctorView
 from raven_app.views.settings_view import SettingsView
+from raven_app.config import load_config, get_app_root
+from raven_app.i18n import set_language, tr
+try:
+    from raven_app.branding import APP_NAME, APP_DESCRIPTION
+except ImportError:
+    APP_NAME, APP_DESCRIPTION = "RavenCalibrator", "LiDAR and camera calibration"
 
 
 class RavenMainWindow(FluentWindow):
-    """Main application window implementing Microsoft UI XAML / Fluent Design System."""
+    """Main application window built with PyQt6 and qfluentwidgets."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("RavenCalibrator • LiDAR & Camera Studio")
+        self.setWindowTitle(f"{APP_NAME} • {APP_DESCRIPTION}")
         self.resize(1160, 820)
         self.setMinimumSize(960, 660)
 
@@ -48,18 +54,18 @@ class RavenMainWindow(FluentWindow):
         self._init_navigation()
 
     def _init_navigation(self):
-        self.addSubInterface(self.workflow_view, FluentIcon.APPLICATION, "Unified Studio")
-        self.addSubInterface(self.slam_view, FluentIcon.SPEED_HIGH, "FAST-LIVO2 SLAM")
-        self.addSubInterface(self.colorize_view, FluentIcon.PALETTE, "Colorize Cloud")
-        self.addSubInterface(self.inspect_view, FluentIcon.FOLDER, "Bag Inspector")
-        self.addSubInterface(self.calib_view, FluentIcon.TILES, "Rig Calibration")
-        self.addSubInterface(self.doctor_view, FluentIcon.HEART, "System Doctor")
+        self.addSubInterface(self.workflow_view, FluentIcon.APPLICATION, tr("Unified Studio"))
+        self.addSubInterface(self.slam_view, FluentIcon.SPEED_HIGH, tr("FAST-LIVO2 SLAM"))
+        self.addSubInterface(self.colorize_view, FluentIcon.PALETTE, tr("Colorize Cloud"))
+        self.addSubInterface(self.inspect_view, FluentIcon.FOLDER, tr("Bag Inspector"))
+        self.addSubInterface(self.calib_view, FluentIcon.TILES, tr("Rig Calibration"))
+        self.addSubInterface(self.doctor_view, FluentIcon.HEART, tr("System Doctor"))
 
         # Bottom navigation item
         self.addSubInterface(
             self.settings_view,
             FluentIcon.SETTING,
-            "Settings",
+            tr("Settings"),
             NavigationItemPosition.BOTTOM
         )
 
@@ -79,8 +85,8 @@ class RavenMainWindow(FluentWindow):
         if self.runner.is_busy:
             reply = QMessageBox.question(
                 self,
-                "Job in Progress",
-                "A FAST-LIVO2 or Colorization job is currently running.\nDo you want to cancel it and wait for data to flush before closing?",
+                tr("Job in Progress"),
+                tr("A FAST-LIVO2 or Colorization job is currently running.\nDo you want to cancel it and wait for data to flush before closing?"),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
@@ -107,6 +113,7 @@ def launch(*, on_ready=None):
             ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
     # Enable High-DPI scaling
+    set_language(load_config().get("language", "en"))
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)

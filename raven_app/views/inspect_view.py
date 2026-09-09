@@ -1,4 +1,4 @@
-"""ROS Bag Inspector View - Microsoft UI XAML / Fluent Design System."""
+"""ROS Bag Inspector view."""
 from pathlib import Path
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtWidgets import (
@@ -10,6 +10,7 @@ from qfluentwidgets import (
     LineEdit, TableWidget, FluentIcon, InfoBar, InfoBarPosition
 )
 from raven_app.bag_io import inspect_bags
+from raven_app.i18n import tr
 
 
 class InspectWorker(QThread):
@@ -99,7 +100,7 @@ class InspectView(QWidget):
         stats_layout.addLayout(stat_col2)
         stats_layout.addStretch()
 
-        self.btn_apply = PushButton("Apply Topics to SLAM", icon=FluentIcon.SEND)
+        self.btn_apply = PushButton(tr("Apply Topics to SLAM"), icon=FluentIcon.SEND)
         self.btn_apply.setEnabled(False)
         self.btn_apply.clicked.connect(self._apply_to_slam)
         stats_layout.addWidget(self.btn_apply)

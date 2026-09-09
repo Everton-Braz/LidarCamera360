@@ -1,4 +1,4 @@
-"""Unified Studio Workflow View - Microsoft UI XAML / Fluent Design System."""
+"""Unified processing workflow view."""
 from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -12,6 +12,7 @@ from qfluentwidgets import (
     SmoothScrollArea
 )
 from raven_app.process_runner import ProcessRunner
+from raven_app.i18n import tr
 
 
 class UnifiedWorkflowView(QWidget):
@@ -48,7 +49,7 @@ class UnifiedWorkflowView(QWidget):
         # ----------------------------------------------------------------------
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel("Unified LiDAR-Camera Studio")
+        title = TitleLabel(tr("Unified LiDAR-Camera Studio"))
         subtitle = CaptionLabel(
             "Automated end-to-end pipeline: Inputs Selection → FAST-LIVO2 SLAM → "
             "Gyro Auto-Sync → Point Cloud Colorization → 3DGS Deliverables"
@@ -65,7 +66,7 @@ class UnifiedWorkflowView(QWidget):
         inputs_layout.setContentsMargins(20, 18, 20, 18)
         inputs_layout.setSpacing(12)
 
-        inputs_layout.addWidget(SubtitleLabel("1. Input Datasets & Destination"))
+        inputs_layout.addWidget(SubtitleLabel(tr("1. Input Datasets & Destination")))
 
         # Row 1: Bag File
         bag_row = QHBoxLayout()
@@ -123,7 +124,7 @@ class UnifiedWorkflowView(QWidget):
         grid.setVerticalSpacing(10)
 
         # SLAM options
-        self.lio_switch = SwitchButton(text="LiDAR + IMU Odometry (Fast LIO)")
+        self.lio_switch = SwitchButton(text=tr("LiDAR + IMU Odometry (Fast LIO)"))
         self.lio_switch.setChecked(True)
         grid.addWidget(self.lio_switch, 0, 0)
 
@@ -156,7 +157,7 @@ class UnifiedWorkflowView(QWidget):
 
         # Sync & Colorization row
         sync_row = QHBoxLayout()
-        self.auto_sync_chk = CheckBox("Auto IMU Gyro Cross-Correlation (sub-ms Δt)")
+        self.auto_sync_chk = CheckBox(tr("Auto IMU Gyro Cross-Correlation"))
         self.auto_sync_chk.setChecked(True)
         self.auto_sync_chk.stateChanged.connect(self._toggle_auto_sync)
         sync_row.addWidget(self.auto_sync_chk)
@@ -183,9 +184,9 @@ class UnifiedWorkflowView(QWidget):
         method_row.addWidget(BodyLabel("Colorization & Recalibration:"))
         self.method_combo = ComboBox()
         self.method_combo.addItems([
-            "Spirula SfM Multi-View (Gold Standard, Metric 3DGS & Dynamic Recalibration)",
-            "Direct Projection (SfM-Recalibrated Extrinsics)",
-            "All / Dual-Method Comparison"
+            tr("Reconstruction-based colorization"),
+            tr("Trajectory-based colorization"),
+            tr("Compare both methods")
         ])
         self.method_combo.setCurrentIndex(0)
         method_row.addWidget(self.method_combo)
@@ -334,8 +335,8 @@ class UnifiedWorkflowView(QWidget):
 
         if not bag or not Path(bag).is_file():
             InfoBar.error(
-                title="Invalid LiDAR Bag",
-                content="Please select a valid ROS bag file (.bag).",
+                title=tr("Invalid LiDAR Bag"),
+                content=tr("Please select a valid ROS bag file (.bag)."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=3500,
@@ -345,8 +346,8 @@ class UnifiedWorkflowView(QWidget):
 
         if not insv or not Path(insv).is_file():
             InfoBar.error(
-                title="Invalid Insta360 Video",
-                content="Please select an Insta360 video file (.insv or .mp4).",
+                title=tr("Invalid Insta360 Video"),
+                content=tr("Please select an Insta360 video file (.insv or .mp4)."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=3500,
@@ -356,8 +357,8 @@ class UnifiedWorkflowView(QWidget):
 
         if not out:
             InfoBar.error(
-                title="Missing Output Folder",
-                content="Please specify an output folder for deliverables.",
+                title=tr("Missing Output Folder"),
+                content=tr("Please specify an output folder for deliverables."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=3500,
@@ -365,7 +366,7 @@ class UnifiedWorkflowView(QWidget):
             )
             return
 
-        method_key = ["sfm", "direct", "all"][self.method_combo.currentIndex()]
+        method_key = ["reconstruction", "trajectory", "all"][self.method_combo.currentIndex()]
 
         args = [
             "workflow",
@@ -428,8 +429,8 @@ class UnifiedWorkflowView(QWidget):
             self.status_title.setText("Status: Completed Successfully")
             self.status_desc.setText("All deliverables generated and saved.")
             InfoBar.success(
-                title="Unified Workflow Complete",
-                content="Point clouds and 3DGS COLMAP models generated successfully!",
+                title=tr("Unified Workflow Complete"),
+                content=tr("Point clouds and 3DGS COLMAP models generated successfully!"),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=4000,
@@ -442,8 +443,8 @@ class UnifiedWorkflowView(QWidget):
             self.status_title.setText(f"Status: Failed (exit code {code})")
             self.status_desc.setText("Process encountered an error. Check console output below.")
             InfoBar.error(
-                title="Workflow Failed",
-                content=f"Execution exited with code {code}.",
+                title=tr("Workflow Failed"),
+                content=tr("Execution exited with code {code}.", code=code),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=5000,

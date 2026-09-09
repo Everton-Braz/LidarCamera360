@@ -68,9 +68,10 @@ class GuiTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_fluent_main_window_creation(self):
+        from raven_app.branding import APP_NAME
         from raven_app.gui import create_main_window
         win = create_main_window()
-        self.assertIn('RavenCalibrator', win.windowTitle())
+        self.assertIn(APP_NAME, win.windowTitle())
         views = [
             win.workflow_view, win.slam_view, win.colorize_view,
             win.inspect_view, win.calib_view, win.doctor_view, win.settings_view

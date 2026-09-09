@@ -1,4 +1,4 @@
-"""System Diagnostics & Doctor View - Microsoft UI XAML / Fluent Design System."""
+"""System diagnostics view."""
 import os
 import platform
 import subprocess
@@ -15,6 +15,7 @@ from qfluentwidgets import (
 )
 from raven_app import __version__
 from raven_app.cli import engine, resources
+from raven_app.i18n import tr
 
 
 class DoctorView(QWidget):
@@ -34,7 +35,7 @@ class DoctorView(QWidget):
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel("System Diagnostics & Engine Doctor")
+        title = TitleLabel(tr("System Diagnostics & Engine Doctor"))
         subtitle = CaptionLabel(
             "Verify native C++ estimator, mathematical runtimes, and photogrammetry engines"
         )

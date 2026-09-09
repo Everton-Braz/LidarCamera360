@@ -1,19 +1,30 @@
 """In-process dual-track decoding and timestamp-aware sharp frame selection."""
-import json
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from functools import lru_cache
+import json
 import math
+import os
+from pathlib import Path
 import shutil
 import tempfile
-from pathlib import Path
 
 import cv2
 import numpy as np
 
 
 def compute_laplacian_sharpness(image):
-    small = cv2.resize(image, (512, 512), interpolation=cv2.INTER_AREA).astype(np.float32)
-    gray = small @ np.array([0.114, 0.587, 0.299], dtype=np.float32)
-    gray -= gray.mean()
+    """Compute variance of the Laplacian as a blur/sharpness metric."""
+    if image.ndim == 3:
+        if image.shape[0] != 512 or image.shape[1] != 512:
+            image = cv2.resize(image, (512, 512), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        if image.shape[0] != 512 or image.shape[1] != 512:
+            gray = cv2.resize(image, (512, 512), interpolation=cv2.INTER_AREA)
+        else:
+            gray = image
     return float(cv2.Laplacian(gray, cv2.CV_32F, ksize=1).var())
 
 
@@ -35,19 +46,89 @@ def frame_time(dataset_dir, name, fps=1.0):
     return (int(digits) - 1) / fps
 
 
-def extract_insv_frames_pyav(insv_path, output_dir, fps=1.0, sharp_window=5, progress_cb=None):
-    """Choose up to sharp_window candidates per output interval, preserving PTS.
-
-    Both lenses select the same source instant using their summed sharpness.
-    A completion manifest prevents partial or differently sampled runs being reused.
-    """
+def _open_decoder(path, track, backend, threads):
     import av
+    kwargs = {}
+    if backend != 'cpu':
+        from av.codec.hwaccel import HWAccel
+        kwargs['hwaccel'] = HWAccel(backend, allow_software_fallback=False)
+    container = av.open(str(path), **kwargs)
+    try:
+        if len(container.streams.video) != 2:
+            raise ValueError('Input must contain exactly two video tracks')
+        stream = container.streams.video[track]
+        stream.codec_context.thread_count = threads
+        stream.thread_type = 'AUTO'
+        return container, stream
+    except BaseException:
+        container.close()
+        raise
+
+
+def _select_decoder(path, requested, threads):
+    if requested != 'auto':
+        return requested
+    import av
+    with av.open(str(path)) as probe:
+        if len(probe.streams.video) != 2:
+            return 'cpu'
+        if probe.streams.video[0].codec_context.name not in ('hevc', 'h264', 'av1', 'vp9', 'mpeg2video'):
+            return 'cpu'
+    from av.codec.hwaccel import hwdevices_available
+    available = hwdevices_available()
+    # Probe the actual codec/driver, not just FFmpeg's compiled-in device list.
+    for backend in ('cuda', 'd3d11va', 'videotoolbox', 'vaapi'):
+        if backend not in available:
+            continue
+        try:
+            container, stream = _open_decoder(path, 0, backend, threads)
+            with container:
+                next(container.decode(stream))
+            return backend
+        except Exception:
+            # Failed hardware initialization may leave cyclic PyAV references.
+            import gc
+            gc.collect()
+            continue
+    return 'cpu'
+
+
+def _frame_sharpness(frame):
+    # Scale native YUV directly to 512x512 grayscale in C/SIMD via FFmpeg swscale.
+    # Eliminates full-resolution RGB conversion and Python float matrix operations for candidates.
+    small = frame.reformat(width=512, height=512, format='gray', interpolation='FAST_BILINEAR')
+    return float(cv2.Laplacian(small.to_ndarray(), cv2.CV_32F, ksize=1).var())
+
+
+def _write_pair(stage, number, frames, jpeg_quality):
+    for lens, frame in enumerate(frames):
+        image = frame.to_ndarray(format='bgr24')
+        ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        if not ok:
+            raise IOError('JPEG encoding failed')
+        encoded.tofile(stage / f'cam{lens}/frame_{number:06d}.jpg')
+
+
+def extract_video_frames(insv_path, output_dir, fps=1.0, sharp_window=5,
+                         progress_cb=None, *, decoder='auto', threads=None,
+                         jpeg_quality=95):
+    """Extract synchronized sharp pairs using GPU decoding with CPU fallback.
+
+    Two bounded decoder workers overlap lenses; dedicated encoder jobs overlap
+    JPEG writing with decoding. Original presentation timestamps are retained.
+    """
     insv_path, output_dir = Path(insv_path), Path(output_dir)
-    if not math.isfinite(fps) or fps <= 0 or sharp_window < 1:
-        raise ValueError('fps must be finite and positive; sharp_window must be >= 1')
+    if not math.isfinite(fps) or fps <= 0 or not isinstance(sharp_window, int) or sharp_window < 1:
+        raise ValueError('fps must be positive and finite; sharp_window must be a positive integer')
+    threads = threads if threads is not None else max(1, min(4, (os.cpu_count() or 2)//2))
+    if threads < 1 or not 1 <= jpeg_quality <= 100:
+        raise ValueError('Invalid decoder thread count or JPEG quality')
+    if decoder not in ('auto', 'cpu', 'cuda', 'd3d11va', 'videotoolbox', 'vaapi'):
+        raise ValueError('Unsupported decoder backend')
     stat = insv_path.stat()
     signature = dict(source=str(insv_path.resolve()), size=stat.st_size,
-                     mtime_ns=stat.st_mtime_ns, fps=fps, sharp_window=sharp_window, version=1)
+                     mtime_ns=stat.st_mtime_ns, fps=fps, sharp_window=sharp_window,
+                     jpeg_quality=jpeg_quality, version=2)
     images = output_dir / 'images'
     manifest = images / 'frames.json'
     if manifest.is_file():
@@ -57,45 +138,61 @@ def extract_insv_frames_pyav(insv_path, output_dir, fps=1.0, sharp_window=5, pro
             old = {}
         if old.get('signature') == signature and old.get('timestamps') and all(
                 (images / name).is_file() for name in old['timestamps']):
-            print('[*] Reusing completed PyAV extraction.')
+            print('[*] Reusing completed video extraction.')
             return True
     output_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        with tempfile.TemporaryDirectory(prefix='insv-', dir=output_dir) as tmp:
-            stage = Path(tmp)
-            for cam in ('cam0', 'cam1'):
-                (stage / cam).mkdir()
-            timestamps = {}
-            # Independent demuxers keep decoder state isolated and memory bounded.
-            with av.open(str(insv_path)) as front, av.open(str(insv_path)) as rear:
-                if len(front.streams.video) < 2:
-                    raise ValueError('INSV must contain two video tracks')
-                s0, s1 = front.streams.video[0], rear.streams.video[1]
-                rate = float(s0.average_rate or 30)
-                origin = float((s0.start_time or 0) * s0.time_base)
-                interval, best, count, candidates = None, None, 0, 0
+    backend = _select_decoder(insv_path, decoder, threads)
+    attempts = [backend] + (['cpu'] if decoder == 'auto' and backend != 'cpu' else [])
+    for backend in attempts:
+        print(f'[*] Video decoder: {backend}; threads per lens: {threads}', flush=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix='frames-', dir=output_dir) as tmp, ExitStack() as stack:
+                stage = Path(tmp)
+                for cam in ('cam0', 'cam1'):
+                    (stage / cam).mkdir()
+                sources = []
+                for lens in range(2):
+                    container, stream = _open_decoder(insv_path, lens, backend, threads)
+                    stack.enter_context(container)
+                    sources.append((container, stream))
+                decode_pool = stack.enter_context(ThreadPoolExecutor(max_workers=2, thread_name_prefix='video'))
+                encode_workers = max(2, min(os.cpu_count() or 4, 4))
+                encode_pool = stack.enter_context(ThreadPoolExecutor(max_workers=encode_workers, thread_name_prefix='jpeg'))
+                iterators = [container.decode(stream) for container, stream in sources]
+                stream = sources[0][1]
+                rate = float(stream.average_rate or 30)
+                origin = float((stream.start_time or 0) * stream.time_base)
+                timestamps, pending = {}, deque()
+                interval, best, count, candidates, index = None, None, 0, 0, 0
+
+                def finish_job():
+                    future, number = pending.popleft()
+                    future.result()
+                    if progress_cb:
+                        for lens in range(2):
+                            progress_cb(lens, number)
 
                 def save(candidate):
                     nonlocal count
                     if candidate is None:
                         return
+                    if len(pending) >= 4:
+                        finish_job()
                     count += 1
                     _, pair, times = candidate
+                    pending.append((encode_pool.submit(_write_pair, stage, count, pair, jpeg_quality), count))
                     for lens in range(2):
-                        name = f'cam{lens}/frame_{count:06d}.jpg'
-                        ok, encoded = cv2.imencode('.jpg', pair[lens], [cv2.IMWRITE_JPEG_QUALITY, 95])
-                        if not ok:
-                            raise IOError(f'JPEG encoding failed: {name}')
-                        encoded.tofile(stage / name)
-                        timestamps[name] = times[lens]
-                        if progress_cb:
-                            progress_cb(lens, count)
+                        timestamps[f'cam{lens}/frame_{count:06d}.jpg'] = times[lens]
 
-                from itertools import zip_longest
-                for index, pair in enumerate(zip_longest(front.decode(s0), rear.decode(s1))):
+                while True:
+                    futures = [decode_pool.submit(next, iterator, None) for iterator in iterators]
+                    pair = tuple(f.result() for f in futures)
+                    if all(f is None for f in pair):
+                        break
                     if any(f is None for f in pair):
                         raise ValueError('Video tracks have different frame counts')
                     times = [float(f.time) - origin if f.time is not None else index / rate for f in pair]
+                    index += 1
                     if abs(times[0] - times[1]) > 0.5 / rate:
                         raise ValueError('Video tracks have mismatched presentation timestamps')
                     bucket = int(math.floor(max(0.0, times[0]) * fps + 1e-7))
@@ -103,27 +200,36 @@ def extract_insv_frames_pyav(insv_path, output_dir, fps=1.0, sharp_window=5, pro
                         save(best)
                         interval, best, candidates = bucket, None, 0
                     if candidates < sharp_window:
-                        arrays = [f.to_ndarray(format='bgr24') for f in pair]
-                        score = sum(compute_laplacian_sharpness(a) for a in arrays)
-                        if best is None or score > best[0]:
-                            best = score, arrays, times
-                        candidates += 1
+                        if sharp_window == 1:
+                            best = 0.0, pair, times
+                            candidates = 1
+                        else:
+                            score = sum(_frame_sharpness(frame) for frame in pair)
+                            if best is None or score > best[0]:
+                                best = score, pair, times
+                            candidates += 1
                 save(best)
-            if not count:
-                raise ValueError('No video frames decoded')
-            images.mkdir(exist_ok=True)
-            # Invalidate completion before publishing; failed publication cannot be reused.
-            manifest.unlink(missing_ok=True)
-            for cam in ('cam0', 'cam1'):
-                target = images / cam
-                target.mkdir(exist_ok=True)
-                for old in target.glob('frame_*.jpg'):
-                    old.unlink()
-                for file in (stage / cam).iterdir():
-                    shutil.move(str(file), target / file.name)
-            manifest.write_text(json.dumps(dict(signature=signature, timestamps=timestamps), indent=2), encoding='utf-8')
-            print(f'[+] PyAV extracted {count} synchronized sharp frame pairs.')
-            return True
-    except Exception as exc:
-        print(f'[!] INSV extraction failed: {exc}')
-        return False
+                while pending:
+                    finish_job()
+                if not count:
+                    raise ValueError('No video frames decoded')
+                images.mkdir(exist_ok=True)
+                manifest.unlink(missing_ok=True)
+                for cam in ('cam0', 'cam1'):
+                    target = images / cam
+                    target.mkdir(exist_ok=True)
+                    for old in target.glob('frame_*.jpg'):
+                        old.unlink()
+                    for file in (stage / cam).iterdir():
+                        shutil.move(str(file), target / file.name)
+                manifest.write_text(json.dumps(dict(signature=signature, timestamps=timestamps,
+                                                    decoder=backend), indent=2), encoding='utf-8')
+                print(f'[+] Extracted {count} synchronized sharp frame pairs.')
+                return True
+        except Exception as exc:
+            print(f'[!] {backend} video extraction failed: {exc}', flush=True)
+    return False
+
+
+# Compatibility alias for existing integrations.
+extract_insv_frames_pyav = extract_video_frames

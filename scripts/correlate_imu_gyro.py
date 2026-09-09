@@ -1,14 +1,20 @@
 import os
 import struct
+import argparse
 import numpy as np
 from pathlib import Path
 from rosbags.highlevel import AnyReader
 from scipy import signal
 from scipy.spatial.transform import Rotation as Rot
 
-INSV_FILE = r"C:\Users\User\Downloads\Lidou\DinamicAprilTagCalib\VID_20260902_143757_00_277.insv"
-BAG_FILE = r"C:\Users\User\Downloads\Lidou\DinamicAprilTagCalib\LIDAR_DinamicAprilTagCalib.bag"
-TRJ_FILE = r"C:\Users\User\Downloads\Lidou\DinamicAprilTagCalib\slam_out\result\Raven_3DMakerPro_Scan.txt"
+parser = argparse.ArgumentParser(description="Estimate camera-to-LiDAR time offset from gyro cross-correlation.")
+parser.add_argument("--insv", required=True, help="Path to the Insta360 INSV file.")
+parser.add_argument("--bag", required=True, help="Path to the LiDAR ROS bag.")
+parser.add_argument("--trajectory", required=True, help="Path to the LiDAR SLAM trajectory.")
+args = parser.parse_args()
+INSV_FILE = args.insv
+BAG_FILE = args.bag
+TRJ_FILE = args.trajectory
 
 print("=" * 80)
 print(" 1. EXTRACTING INSTA360 IMU DATA")
