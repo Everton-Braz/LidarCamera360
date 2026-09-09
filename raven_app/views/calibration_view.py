@@ -31,12 +31,12 @@ class CalibrationView(QWidget):
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel(tr("LiDAR-Camera Rig Calibration"))
-        subtitle = CaptionLabel(
-            "Spatial rigid lever-arm extrinsics & Thin Prism dual-fisheye optical models"
+        self.header_title = TitleLabel(tr("LiDAR-Camera Rig Calibration"))
+        self.header_subtitle = CaptionLabel(
+            tr("Spatial rigid lever-arm extrinsics & Thin Prism dual-fisheye optical models")
         )
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        header_layout.addWidget(self.header_title)
+        header_layout.addWidget(self.header_subtitle)
         layout.addLayout(header_layout)
 
         # Summary Metrics Row
@@ -47,7 +47,8 @@ class CalibrationView(QWidget):
         rig_card = CardWidget(self)
         rig_layout = QVBoxLayout(rig_card)
         rig_layout.setContentsMargins(16, 14, 16, 14)
-        rig_layout.addWidget(SubtitleLabel("Sensor Hardware"))
+        self.title_hardware = SubtitleLabel(tr("Sensor Hardware"))
+        rig_layout.addWidget(self.title_hardware)
         self.lbl_scanner = StrongBodyLabel("LiDAR: 3DMakerPro Raven")
         self.lbl_camera = StrongBodyLabel("Camera: Insta360 X4 Dual Fisheye")
         self.lbl_optics = CaptionLabel("Model: THIN_PRISM_FISHEYE (OpenCV)")
@@ -60,7 +61,8 @@ class CalibrationView(QWidget):
         lever_card = CardWidget(self)
         lever_layout = QVBoxLayout(lever_card)
         lever_layout.setContentsMargins(16, 14, 16, 14)
-        lever_layout.addWidget(SubtitleLabel("Rigid Lever-Arm"))
+        self.title_lever = SubtitleLabel(tr("Rigid Lever-Arm"))
+        lever_layout.addWidget(self.title_lever)
         self.lbl_lever_cam0 = StrongBodyLabel("Cam0: ΔX=+0.58cm, ΔY=+13.53cm, ΔZ=+9.20cm")
         self.lbl_lever_cam1 = StrongBodyLabel("Cam1: ΔX=-1.77cm, ΔY=+13.71cm, ΔZ=+9.07cm")
         self.lbl_norm_dist = CaptionLabel("Norm baseline distance: ~16.4 cm")
@@ -73,7 +75,8 @@ class CalibrationView(QWidget):
         rot_card = CardWidget(self)
         rot_layout = QVBoxLayout(rot_card)
         rot_layout.setContentsMargins(16, 14, 16, 14)
-        rot_layout.addWidget(SubtitleLabel("Orientation & Sync"))
+        self.title_rot = SubtitleLabel(tr("Orientation & Sync"))
+        rot_layout.addWidget(self.title_rot)
         self.lbl_lens_angle = StrongBodyLabel("Dual Lens Angle: 179.87°")
         self.lbl_euler_cam0 = CaptionLabel("Cam0 Euler: R -87.86°, P -31.57°, Y -94.85°")
         self.lbl_euler_cam1 = CaptionLabel("Cam1 Euler: R -91.70°, P +30.47°, Y +85.34°")
@@ -162,3 +165,14 @@ class CalibrationView(QWidget):
                 duration=3500,
                 parent=self
             )
+
+    def retranslate_ui(self):
+        """Update all text elements dynamically when the language changes."""
+        self.header_title.setText(tr("LiDAR-Camera Rig Calibration"))
+        self.header_subtitle.setText(
+            tr("Spatial rigid lever-arm extrinsics & Thin Prism dual-fisheye optical models")
+        )
+        self.title_hardware.setText(tr("Sensor Hardware"))
+        self.title_lever.setText(tr("Rigid Lever-Arm"))
+        self.title_rot.setText(tr("Orientation & Sync"))
+

@@ -32,12 +32,12 @@ class SlamView(QWidget):
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel("FAST-LIVO2 SLAM Engine")
-        subtitle = CaptionLabel(
-            "High-performance native MSVC C++17 odometry and mapping without ROS or WSL"
+        self.header_title = TitleLabel(tr("FAST-LIVO2 SLAM Engine"))
+        self.header_subtitle = CaptionLabel(
+            tr("High-performance native MSVC C++17 odometry and mapping without ROS or WSL")
         )
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        header_layout.addWidget(self.header_title)
+        header_layout.addWidget(self.header_subtitle)
         layout.addLayout(header_layout)
 
         # Configuration Card
@@ -46,31 +46,31 @@ class SlamView(QWidget):
         card_layout.setContentsMargins(20, 18, 20, 18)
         card_layout.setSpacing(14)
 
-        card_title = SubtitleLabel("Input & Trajectory Settings")
-        card_layout.addWidget(card_title)
+        self.card_title = SubtitleLabel(tr("Input & Trajectory Settings"))
+        card_layout.addWidget(self.card_title)
 
         # Bag file row
         bag_row = QHBoxLayout()
-        bag_label = BodyLabel("ROS Bag File:")
-        bag_label.setFixedWidth(140)
+        self.bag_label = BodyLabel(tr("ROS Bag File:"))
+        self.bag_label.setFixedWidth(140)
         self.bag_input = LineEdit()
-        self.bag_input.setPlaceholderText("Select merged or split ROS1 bag file (.bag)...")
-        self.bag_browse = PushButton("Browse", icon=FluentIcon.FOLDER)
+        self.bag_input.setPlaceholderText(tr("Select merged or raw ROS1 bag file (.bag)..."))
+        self.bag_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.bag_browse.clicked.connect(self._browse_bag)
-        bag_row.addWidget(bag_label)
+        bag_row.addWidget(self.bag_label)
         bag_row.addWidget(self.bag_input)
         bag_row.addWidget(self.bag_browse)
         card_layout.addLayout(bag_row)
 
         # Output folder row
         out_row = QHBoxLayout()
-        out_label = BodyLabel("Output Folder:")
-        out_label.setFixedWidth(140)
+        self.out_label = BodyLabel(tr("Output Folder:"))
+        self.out_label.setFixedWidth(140)
         self.out_input = LineEdit()
-        self.out_input.setPlaceholderText("Select fresh directory for PCD and trajectory results...")
-        self.out_browse = PushButton("Browse", icon=FluentIcon.FOLDER)
+        self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
+        self.out_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.out_browse.clicked.connect(self._browse_output)
-        out_row.addWidget(out_label)
+        out_row.addWidget(self.out_label)
         out_row.addWidget(self.out_input)
         out_row.addWidget(self.out_browse)
         card_layout.addLayout(out_row)
@@ -89,11 +89,11 @@ class SlamView(QWidget):
         toggle_row.addWidget(self.lio_switch)
         toggle_row.addStretch()
 
-        threads_label = BodyLabel("CPU Threads:")
+        self.threads_label = BodyLabel(tr("CPU Threads:"))
         self.threads_spin = SpinBox()
         self.threads_spin.setRange(1, 64)
         self.threads_spin.setValue(4)
-        toggle_row.addWidget(threads_label)
+        toggle_row.addWidget(self.threads_label)
         toggle_row.addWidget(self.threads_spin)
         card_layout.addLayout(toggle_row)
 
@@ -101,22 +101,22 @@ class SlamView(QWidget):
         topics_row = QHBoxLayout()
         topics_row.setSpacing(12)
 
-        lidar_label = CaptionLabel("LiDAR Topic:")
+        self.lidar_label = CaptionLabel(tr("LiDAR Topic:"))
         self.lidar_input = LineEdit()
         self.lidar_input.setText("/vanjee_722z")
 
-        imu_label = CaptionLabel("IMU Topic:")
+        self.imu_label = CaptionLabel(tr("IMU Topic:"))
         self.imu_input = LineEdit()
         self.imu_input.setText("/vanjee_imu_packets")
 
-        self.cam_label = CaptionLabel("Camera Topic:")
+        self.cam_label = CaptionLabel(tr("Camera Topic:"))
         self.cam_input = LineEdit()
         self.cam_input.setText("/camera_front/image/compressed")
         self.cam_input.setEnabled(False)
 
-        topics_row.addWidget(lidar_label)
+        topics_row.addWidget(self.lidar_label)
         topics_row.addWidget(self.lidar_input)
-        topics_row.addWidget(imu_label)
+        topics_row.addWidget(self.imu_label)
         topics_row.addWidget(self.imu_input)
         topics_row.addWidget(self.cam_label)
         topics_row.addWidget(self.cam_input)
@@ -130,8 +130,8 @@ class SlamView(QWidget):
         action_layout.setContentsMargins(20, 14, 20, 14)
 
         status_box = QVBoxLayout()
-        self.status_title = StrongBodyLabel("Status: Ready")
-        self.status_desc = CaptionLabel("Ready to start FAST-LIVO2 mapping execution.")
+        self.status_title = StrongBodyLabel(tr("Status: Ready"))
+        self.status_desc = CaptionLabel(tr("Ready to start FAST-LIVO2 mapping execution."))
         status_box.addWidget(self.status_title)
         status_box.addWidget(self.status_desc)
         action_layout.addLayout(status_box)
@@ -143,9 +143,9 @@ class SlamView(QWidget):
         self.progress_bar.setVisible(False)
         action_layout.addWidget(self.progress_bar)
 
-        self.btn_run = PrimaryPushButton("Start Mapping", icon=FluentIcon.PLAY)
+        self.btn_run = PrimaryPushButton(tr("Start Mapping"), icon=FluentIcon.PLAY)
         self.btn_run.clicked.connect(self._start_mapping)
-        self.btn_cancel = PushButton("Cancel & Save", icon=FluentIcon.CLOSE)
+        self.btn_cancel = PushButton(tr("Cancel & Save"), icon=FluentIcon.CLOSE)
         self.btn_cancel.clicked.connect(self._cancel_mapping)
         self.btn_cancel.setEnabled(False)
 
@@ -160,11 +160,11 @@ class SlamView(QWidget):
         log_layout.setSpacing(8)
 
         log_header = QHBoxLayout()
-        log_title = SubtitleLabel("Live Execution Console")
+        self.log_title = SubtitleLabel(tr("Live Execution Console"))
         self.btn_clear_log = ToolButton(FluentIcon.DELETE)
-        self.btn_clear_log.setToolTip("Clear console")
+        self.btn_clear_log.setToolTip(tr("Clear console"))
         self.btn_clear_log.clicked.connect(self._clear_log)
-        log_header.addWidget(log_title)
+        log_header.addWidget(self.log_title)
         log_header.addStretch()
         log_header.addWidget(self.btn_clear_log)
         log_layout.addLayout(log_header)
@@ -312,3 +312,31 @@ class SlamView(QWidget):
 
     def _on_error_occurred(self, err: str):
         self.log_console.appendPlainText(f"\n[ERROR] {err}\n")
+
+    def retranslate_ui(self):
+        """Update all text elements dynamically when the language changes."""
+        self.header_title.setText(tr("FAST-LIVO2 SLAM Engine"))
+        self.header_subtitle.setText(
+            tr("High-performance native MSVC C++17 odometry and mapping without ROS or WSL")
+        )
+        self.card_title.setText(tr("Input & Trajectory Settings"))
+        self.bag_label.setText(tr("ROS Bag File:"))
+        self.bag_input.setPlaceholderText(tr("Select merged or raw ROS1 bag file (.bag)..."))
+        self.bag_browse.setText(tr("Browse"))
+        self.out_label.setText(tr("Output Folder:"))
+        self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
+        self.out_browse.setText(tr("Browse"))
+        self.lio_switch.setText(tr("LiDAR + IMU mode (camera fusion disabled)"))
+        self.threads_label.setText(tr("CPU Threads:"))
+        self.lidar_label.setText(tr("LiDAR Topic:"))
+        self.imu_label.setText(tr("IMU Topic:"))
+        self.cam_label.setText(tr("Camera Topic:"))
+        self.btn_run.setText(tr("Start Mapping"))
+        self.btn_cancel.setText(tr("Cancel & Save"))
+        self.log_title.setText(tr("Live Execution Console"))
+        self.btn_clear_log.setToolTip(tr("Clear console"))
+
+        if not self.runner.is_busy:
+            self.status_title.setText(tr("Status: Ready"))
+            self.status_desc.setText(tr("Ready to start FAST-LIVO2 mapping execution."))
+

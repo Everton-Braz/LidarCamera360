@@ -40,6 +40,33 @@ class UnifiedWorkflowView(QWidget):
         scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
 
         content = QWidget()
+
+
+class UnifiedWorkflowView(QWidget):
+    """WinUI Fluent view providing single-screen end-to-end processing.
+
+    Inputs: ROS Bag (.bag) + Insta360 Video (.insv) + Output Folder
+    Workflow: Video Extraction -> SLAM -> Gyro Sync -> Colorization -> Deliverables
+    Outputs: .PLY, .PCD, and COLMAP Dataset ready for 3DGS Training.
+    """
+
+    def __init__(self, runner: ProcessRunner, parent=None):
+        super().__init__(parent)
+        self.setObjectName("UnifiedWorkflowView")
+        self.runner = runner
+        self._init_ui()
+        self._connect_signals()
+
+    def _init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Scroll area to comfortably accommodate all cards
+        scroll = SmoothScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+
+        content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(36, 24, 36, 24)
         layout.setSpacing(16)
@@ -49,13 +76,13 @@ class UnifiedWorkflowView(QWidget):
         # ----------------------------------------------------------------------
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel(tr("Unified LiDAR-Camera Studio"))
-        subtitle = CaptionLabel(
-            "Automated end-to-end pipeline: Inputs Selection → FAST-LIVO2 SLAM → "
-            "Gyro Auto-Sync → Point Cloud Colorization → 3DGS Deliverables"
+        self.header_title = TitleLabel(tr("Unified LiDAR-Camera Studio"))
+        self.header_subtitle = CaptionLabel(
+            tr("Automated end-to-end pipeline: Inputs Selection → FAST-LIVO2 SLAM → "
+               "Gyro Auto-Sync → Point Cloud Colorization → 3DGS Deliverables")
         )
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        header_layout.addWidget(self.header_title)
+        header_layout.addWidget(self.header_subtitle)
         layout.addLayout(header_layout)
 
         # ----------------------------------------------------------------------
@@ -66,43 +93,44 @@ class UnifiedWorkflowView(QWidget):
         inputs_layout.setContentsMargins(20, 18, 20, 18)
         inputs_layout.setSpacing(12)
 
-        inputs_layout.addWidget(SubtitleLabel(tr("1. Input Datasets & Destination")))
+        self.inputs_title = SubtitleLabel(tr("1. Input Datasets & Destination"))
+        inputs_layout.addWidget(self.inputs_title)
 
         # Row 1: Bag File
         bag_row = QHBoxLayout()
-        bag_label = BodyLabel("LiDAR ROS Bag (.bag):")
-        bag_label.setFixedWidth(170)
+        self.bag_label = BodyLabel(tr("LiDAR ROS Bag (.bag):"))
+        self.bag_label.setFixedWidth(170)
         self.bag_input = LineEdit()
-        self.bag_input.setPlaceholderText("Select merged or raw ROS1 bag file (.bag)...")
-        self.btn_browse_bag = PushButton("Browse", icon=FluentIcon.FOLDER)
+        self.bag_input.setPlaceholderText(tr("Select merged or raw ROS1 bag file (.bag)..."))
+        self.btn_browse_bag = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.btn_browse_bag.clicked.connect(self._browse_bag)
-        bag_row.addWidget(bag_label)
+        bag_row.addWidget(self.bag_label)
         bag_row.addWidget(self.bag_input)
         bag_row.addWidget(self.btn_browse_bag)
         inputs_layout.addLayout(bag_row)
 
         # Row 2: INSV Video
         insv_row = QHBoxLayout()
-        insv_label = BodyLabel("Insta360 Video (.insv):")
-        insv_label.setFixedWidth(170)
+        self.insv_label = BodyLabel(tr("Insta360 Video (.insv):"))
+        self.insv_label.setFixedWidth(170)
         self.insv_input = LineEdit()
-        self.insv_input.setPlaceholderText("Select Insta360 X4 8K video (.insv or .mp4)...")
-        self.btn_browse_insv = PushButton("Browse", icon=FluentIcon.VIDEO)
+        self.insv_input.setPlaceholderText(tr("Select Insta360 X4 8K video (.insv or .mp4)..."))
+        self.btn_browse_insv = PushButton(tr("Browse"), icon=FluentIcon.VIDEO)
         self.btn_browse_insv.clicked.connect(self._browse_insv)
-        insv_row.addWidget(insv_label)
+        insv_row.addWidget(self.insv_label)
         insv_row.addWidget(self.insv_input)
         insv_row.addWidget(self.btn_browse_insv)
         inputs_layout.addLayout(insv_row)
 
         # Row 3: Output Folder
         out_row = QHBoxLayout()
-        out_label = BodyLabel("Output Directory:")
-        out_label.setFixedWidth(170)
+        self.out_label = BodyLabel(tr("Output Directory:"))
+        self.out_label.setFixedWidth(170)
         self.out_input = LineEdit()
-        self.out_input.setPlaceholderText("Select output folder for deliverables, SLAM, and images...")
-        self.btn_browse_out = PushButton("Browse", icon=FluentIcon.FOLDER)
+        self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
+        self.btn_browse_out = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.btn_browse_out.clicked.connect(self._browse_output)
-        out_row.addWidget(out_label)
+        out_row.addWidget(self.out_label)
         out_row.addWidget(self.out_input)
         out_row.addWidget(self.btn_browse_out)
         inputs_layout.addLayout(out_row)
@@ -117,7 +145,8 @@ class UnifiedWorkflowView(QWidget):
         config_layout.setContentsMargins(20, 18, 20, 18)
         config_layout.setSpacing(14)
 
-        config_layout.addWidget(SubtitleLabel("2. Pipeline Processing Options"))
+        self.config_title = SubtitleLabel(tr("2. Pipeline Processing Options"))
+        config_layout.addWidget(self.config_title)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(24)
@@ -129,22 +158,25 @@ class UnifiedWorkflowView(QWidget):
         grid.addWidget(self.lio_switch, 0, 0)
 
         threads_layout = QHBoxLayout()
-        threads_layout.addWidget(CaptionLabel("CPU Threads:"))
+        self.threads_caption = CaptionLabel(tr("CPU Threads:"))
         self.threads_spin = SpinBox()
         self.threads_spin.setRange(1, 64)
         self.threads_spin.setValue(4)
+        threads_layout.addWidget(self.threads_caption)
         threads_layout.addWidget(self.threads_spin)
         grid.addLayout(threads_layout, 0, 1)
 
         # Topics
         topics_layout = QHBoxLayout()
-        topics_layout.addWidget(CaptionLabel("LiDAR Topic:"))
+        self.lidar_caption = CaptionLabel(tr("LiDAR Topic:"))
         self.lidar_topic = LineEdit()
         self.lidar_topic.setText("/vanjee_722z")
+        topics_layout.addWidget(self.lidar_caption)
         topics_layout.addWidget(self.lidar_topic)
-        topics_layout.addWidget(CaptionLabel("IMU Topic:"))
+        self.imu_caption = CaptionLabel(tr("IMU Topic:"))
         self.imu_topic = LineEdit()
         self.imu_topic.setText("/vanjee_imu_packets")
+        topics_layout.addWidget(self.imu_caption)
         topics_layout.addWidget(self.imu_topic)
         grid.addLayout(topics_layout, 1, 0, 1, 2)
 
@@ -162,26 +194,29 @@ class UnifiedWorkflowView(QWidget):
         self.auto_sync_chk.stateChanged.connect(self._toggle_auto_sync)
         sync_row.addWidget(self.auto_sync_chk)
 
-        sync_row.addWidget(CaptionLabel("Manual Δt (s):"))
+        self.dt_caption = CaptionLabel(tr("Manual Δt (s):"))
         self.dt_input = LineEdit()
         self.dt_input.setPlaceholderText("Optional (e.g. 1.892)")
         self.dt_input.setFixedWidth(120)
         self.dt_input.setEnabled(False)
+        sync_row.addWidget(self.dt_caption)
         sync_row.addWidget(self.dt_input)
         sync_row.addStretch()
 
-        sync_row.addWidget(CaptionLabel("Extraction FPS:"))
+        self.fps_caption = CaptionLabel(tr("Extraction FPS:"))
         self.fps_spin = DoubleSpinBox()
         self.fps_spin.setRange(0.1, 60.0)
         self.fps_spin.setValue(1.0)
         self.fps_spin.setSingleStep(0.5)
+        sync_row.addWidget(self.fps_caption)
         sync_row.addWidget(self.fps_spin)
 
         config_layout.addLayout(sync_row)
 
         # Colorization & Recalibration Method
         method_row = QHBoxLayout()
-        method_row.addWidget(BodyLabel("Colorization & Recalibration:"))
+        self.method_label = BodyLabel(tr("Colorization & Recalibration:"))
+        method_row.addWidget(self.method_label)
         self.method_combo = ComboBox()
         self.method_combo.addItems([
             tr("Reconstruction-based colorization"),
@@ -194,13 +229,13 @@ class UnifiedWorkflowView(QWidget):
         config_layout.addLayout(method_row)
 
         recalib_row = QHBoxLayout()
-        self.recalibrate_chk = CheckBox("Auto-Recalibrate Spatial Extrinsics (T_LC0, T_LC1) from SfM Alignment")
+        self.recalibrate_chk = CheckBox(tr("Auto-Recalibrate Spatial Extrinsics (T_LC0, T_LC1) from SfM Alignment"))
         self.recalibrate_chk.setChecked(True)
         recalib_row.addWidget(self.recalibrate_chk)
         recalib_row.addStretch()
         config_layout.addLayout(recalib_row)
 
-        self.vulkan_chk = CheckBox("Enable Vulkan GPU Compute Acceleration")
+        self.vulkan_chk = CheckBox(tr("Enable Vulkan GPU Compute Acceleration"))
         self.vulkan_chk.setChecked(True)
         config_layout.addWidget(self.vulkan_chk)
 
@@ -214,18 +249,20 @@ class UnifiedWorkflowView(QWidget):
         output_layout.setContentsMargins(20, 18, 20, 18)
         output_layout.setSpacing(10)
 
-        output_layout.addWidget(SubtitleLabel("3. Select Deliverables to Generate"))
-        output_layout.addWidget(CaptionLabel("Choose which output formats will be built in this run:"))
+        self.output_title = SubtitleLabel(tr("3. Select Deliverables to Generate"))
+        self.output_subtitle = CaptionLabel(tr("Choose which output formats will be built in this run:"))
+        output_layout.addWidget(self.output_title)
+        output_layout.addWidget(self.output_subtitle)
 
-        self.chk_ply = CheckBox("Export Colored Point Cloud (.PLY)  •  Open standard (CloudCompare, MeshLab, Blender)")
+        self.chk_ply = CheckBox(tr("Export Colored Point Cloud (.PLY)  •  Open standard (CloudCompare, MeshLab, Blender)"))
         self.chk_ply.setChecked(True)
         output_layout.addWidget(self.chk_ply)
 
-        self.chk_pcd = CheckBox("Export Colored Point Cloud (.PCD)  •  PCL format with packed RGB fields")
+        self.chk_pcd = CheckBox(tr("Export Colored Point Cloud (.PCD)  •  PCL format with packed RGB fields"))
         self.chk_pcd.setChecked(True)
         output_layout.addWidget(self.chk_pcd)
 
-        self.chk_colmap = CheckBox("Metric-Scaled 3DGS COLMAP Dataset  •  Spirula SfM converted to LiDAR Metric Ground Truth (Nerfstudio/PostShot/LichtFeld)")
+        self.chk_colmap = CheckBox(tr("Metric-Scaled 3DGS COLMAP Dataset  •  Spirula SfM converted to LiDAR Metric Ground Truth (Nerfstudio/PostShot/LichtFeld)"))
         self.chk_colmap.setChecked(True)
         output_layout.addWidget(self.chk_colmap)
 
@@ -239,8 +276,8 @@ class UnifiedWorkflowView(QWidget):
         action_layout.setContentsMargins(20, 14, 20, 14)
 
         status_box = QVBoxLayout()
-        self.status_title = StrongBodyLabel("Status: Ready")
-        self.status_desc = CaptionLabel("Select Bag and INSV files, then click 'Start Unified Workflow'.")
+        self.status_title = StrongBodyLabel(tr("Status: Ready"))
+        self.status_desc = CaptionLabel(tr("Select Bag and INSV files, then click 'Start Unified Workflow'."))
         status_box.addWidget(self.status_title)
         status_box.addWidget(self.status_desc)
         action_layout.addLayout(status_box)
@@ -248,13 +285,13 @@ class UnifiedWorkflowView(QWidget):
         action_layout.addStretch()
 
         self.progress_bar = ProgressBar()
-        self.progress_bar.setFixedWidth(220)
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
         action_layout.addWidget(self.progress_bar)
 
-        self.btn_run = PrimaryPushButton("Start Unified Workflow", icon=FluentIcon.PLAY)
+        self.btn_run = PrimaryPushButton(tr("Start Unified Workflow"), icon=FluentIcon.PLAY)
         self.btn_run.clicked.connect(self._start_workflow)
-        self.btn_cancel = PushButton("Cancel & Save", icon=FluentIcon.CLOSE)
+        self.btn_cancel = PushButton(tr("Cancel & Save"), icon=FluentIcon.CLOSE)
         self.btn_cancel.clicked.connect(self._cancel_workflow)
         self.btn_cancel.setEnabled(False)
 
@@ -271,11 +308,11 @@ class UnifiedWorkflowView(QWidget):
         log_layout.setSpacing(8)
 
         log_header = QHBoxLayout()
-        log_title = SubtitleLabel("Live Workflow Execution Console")
+        self.log_title = SubtitleLabel(tr("Live Workflow Execution Console"))
         self.btn_clear_log = ToolButton(FluentIcon.DELETE)
-        self.btn_clear_log.setToolTip("Clear console")
+        self.btn_clear_log.setToolTip(tr("Clear console"))
         self.btn_clear_log.clicked.connect(self._clear_log)
-        log_header.addWidget(log_title)
+        log_header.addWidget(self.log_title)
         log_header.addStretch()
         log_header.addWidget(self.btn_clear_log)
         log_layout.addLayout(log_header)
@@ -406,7 +443,6 @@ class UnifiedWorkflowView(QWidget):
 
         self.log_console.appendPlainText(f"\n>>> Starting Unified Workflow: {' '.join(args)}\n")
         self.runner.start_job(args)
-
     def _cancel_workflow(self):
         self.status_title.setText("Status: Cancelling...")
         self.status_desc.setText("Gracefully saving accumulated SLAM and colorization data...")
@@ -457,3 +493,58 @@ class UnifiedWorkflowView(QWidget):
 
     def _on_error_occurred(self, err: str):
         self.log_console.appendPlainText(f"\n[ERROR] {err}\n")
+
+    def retranslate_ui(self):
+        """Update all text elements dynamically when the language changes."""
+        self.header_title.setText(tr("Unified LiDAR-Camera Studio"))
+        self.header_subtitle.setText(
+            tr("Automated end-to-end pipeline: Inputs Selection → FAST-LIVO2 SLAM → "
+               "Gyro Auto-Sync → Point Cloud Colorization → 3DGS Deliverables")
+        )
+        self.inputs_title.setText(tr("1. Input Datasets & Destination"))
+        self.bag_label.setText(tr("LiDAR ROS Bag (.bag):"))
+        self.bag_input.setPlaceholderText(tr("Select merged or raw ROS1 bag file (.bag)..."))
+        self.btn_browse_bag.setText(tr("Browse"))
+        self.insv_label.setText(tr("Insta360 Video (.insv):"))
+        self.insv_input.setPlaceholderText(tr("Select Insta360 X4 8K video (.insv or .mp4)..."))
+        self.btn_browse_insv.setText(tr("Browse"))
+        self.out_label.setText(tr("Output Directory:"))
+        self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
+        self.btn_browse_out.setText(tr("Browse"))
+
+        self.config_title.setText(tr("2. Pipeline Processing Options"))
+        self.lio_switch.setText(tr("LiDAR + IMU Odometry (Fast LIO)"))
+        self.threads_caption.setText(tr("CPU Threads:"))
+        self.lidar_caption.setText(tr("LiDAR Topic:"))
+        self.imu_caption.setText(tr("IMU Topic:"))
+        self.auto_sync_chk.setText(tr("Auto IMU Gyro Cross-Correlation"))
+        self.dt_caption.setText(tr("Manual Δt (s):"))
+        self.fps_caption.setText(tr("Extraction FPS:"))
+        self.method_label.setText(tr("Colorization & Recalibration:"))
+
+        cur_idx = self.method_combo.currentIndex()
+        self.method_combo.blockSignals(True)
+        self.method_combo.clear()
+        self.method_combo.addItems([
+            tr("Reconstruction-based colorization"),
+            tr("Trajectory-based colorization"),
+            tr("Compare both methods")
+        ])
+        self.method_combo.setCurrentIndex(cur_idx)
+        self.method_combo.blockSignals(False)
+
+        self.recalibrate_chk.setText(tr("Auto-Recalibrate Spatial Extrinsics (T_LC0, T_LC1) from SfM Alignment"))
+        self.vulkan_chk.setText(tr("Enable Vulkan GPU Compute Acceleration"))
+        self.output_title.setText(tr("3. Select Deliverables to Generate"))
+        self.output_subtitle.setText(tr("Choose which output formats will be built in this run:"))
+        self.chk_ply.setText(tr("Export Colored Point Cloud (.PLY)  •  Open standard (CloudCompare, MeshLab, Blender)"))
+        self.chk_pcd.setText(tr("Export Colored Point Cloud (.PCD)  •  PCL format with packed RGB fields"))
+        self.chk_colmap.setText(tr("Metric-Scaled 3DGS COLMAP Dataset  •  Spirula SfM converted to LiDAR Metric Ground Truth (Nerfstudio/PostShot/LichtFeld)"))
+        self.btn_run.setText(tr("Start Unified Workflow"))
+        self.btn_cancel.setText(tr("Cancel & Save"))
+        self.log_title.setText(tr("Live Workflow Execution Console"))
+        self.btn_clear_log.setToolTip(tr("Clear console"))
+
+        if not self.runner.is_busy:
+            self.status_title.setText(tr("Status: Ready"))
+            self.status_desc.setText(tr("Select Bag and INSV files, then click 'Start Unified Workflow'."))

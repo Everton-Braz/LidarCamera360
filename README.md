@@ -20,6 +20,10 @@
 
 </div>
 
+> [!NOTE]
+> **Hardware & Rig Compatibility:**  
+> **LidarCamera360** was developed and pre-calibrated specifically for the **3DMakerPro Raven LiDAR Scanner** coupled with an **Insta360 X4 360° Camera** (+18.5 cm vertical lever arm). However, its architecture is completely modular and sensor-agnostic: it can be easily adapted to any other mobile or handheld scanning setup (e.g. Ouster, Hesai, Velodyne, RoboSense, or VanJee LiDARs paired with dual-fisheye or perspective camera arrays) by customizing the rigid extrinsic geometry and camera model in [`configs/rig_profile.json`](configs/rig_profile.json) and adjusting the topic mappings in [`FAST-LIVO2/config/`](FAST-LIVO2/config/).
+
 ---
 
 ## 🌟 Key Capabilities

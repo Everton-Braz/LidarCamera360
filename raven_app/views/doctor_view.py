@@ -15,6 +15,7 @@ from qfluentwidgets import (
 )
 from raven_app import __version__
 from raven_app.cli import engine, resources
+from raven_app.branding import APP_NAME
 from raven_app.i18n import tr
 
 
@@ -35,12 +36,12 @@ class DoctorView(QWidget):
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel(tr("System Diagnostics & Engine Doctor"))
-        subtitle = CaptionLabel(
-            "Verify native C++ estimator, mathematical runtimes, and photogrammetry engines"
+        self.header_title = TitleLabel(tr("System Diagnostics & Engine Doctor"))
+        self.header_subtitle = CaptionLabel(
+            tr("Verify native C++ estimator, mathematical runtimes, and photogrammetry engines")
         )
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        header_layout.addWidget(self.header_title)
+        header_layout.addWidget(self.header_subtitle)
         layout.addLayout(header_layout)
 
         # Overview Status Card
@@ -48,15 +49,15 @@ class DoctorView(QWidget):
         overview_layout = QHBoxLayout(overview_card)
         overview_layout.setContentsMargins(20, 16, 20, 16)
 
-        self.overall_status = TitleLabel("Checking System...")
-        self.overall_desc = CaptionLabel("Analyzing dependencies...")
+        self.overall_status = TitleLabel(tr("Checking System..."))
+        self.overall_desc = CaptionLabel(tr("Analyzing dependencies..."))
         status_box = QVBoxLayout()
         status_box.addWidget(self.overall_status)
         status_box.addWidget(self.overall_desc)
         overview_layout.addLayout(status_box)
         overview_layout.addStretch()
 
-        self.btn_refresh = PrimaryPushButton("Re-run Diagnostics", icon=FluentIcon.SYNC)
+        self.btn_refresh = PrimaryPushButton(tr("Re-run Diagnostics"), icon=FluentIcon.SYNC)
         self.btn_refresh.clicked.connect(self.refresh_diagnostics)
         overview_layout.addWidget(self.btn_refresh)
         layout.addWidget(overview_card)
@@ -69,7 +70,8 @@ class DoctorView(QWidget):
         self.card_native = CardWidget(self)
         native_layout = QVBoxLayout(self.card_native)
         native_layout.setContentsMargins(16, 14, 16, 14)
-        native_layout.addWidget(SubtitleLabel("Native FAST-LIVO2 Engine"))
+        self.title_native = SubtitleLabel("Native FAST-LIVO2 Engine")
+        native_layout.addWidget(self.title_native)
         self.lbl_native_status = StrongBodyLabel("--")
         self.lbl_native_path = CaptionLabel("--")
         self.lbl_native_ver = CaptionLabel("--")
@@ -82,7 +84,8 @@ class DoctorView(QWidget):
         self.card_spirula = CardWidget(self)
         spirula_layout = QVBoxLayout(self.card_spirula)
         spirula_layout.setContentsMargins(16, 14, 16, 14)
-        spirula_layout.addWidget(SubtitleLabel("Spirula SfM Engine"))
+        self.title_spirula = SubtitleLabel("Spirula SfM Engine")
+        spirula_layout.addWidget(self.title_spirula)
         self.lbl_spirula_status = StrongBodyLabel("--")
         self.lbl_spirula_path = CaptionLabel("--")
         spirula_layout.addWidget(self.lbl_spirula_status)
@@ -93,7 +96,8 @@ class DoctorView(QWidget):
         self.card_math = CardWidget(self)
         math_layout = QVBoxLayout(self.card_math)
         math_layout.setContentsMargins(16, 14, 16, 14)
-        math_layout.addWidget(SubtitleLabel("Mathematical Runtime"))
+        self.title_math = SubtitleLabel("Mathematical Runtime")
+        math_layout.addWidget(self.title_math)
         self.lbl_py = StrongBodyLabel("--")
         self.lbl_np = CaptionLabel("--")
         self.lbl_scipy = CaptionLabel("--")
@@ -110,11 +114,12 @@ class DoctorView(QWidget):
         self.card_hw = CardWidget(self)
         hw_layout = QVBoxLayout(self.card_hw)
         hw_layout.setContentsMargins(16, 14, 16, 14)
-        hw_layout.addWidget(SubtitleLabel("Host Environment"))
+        self.title_hw = SubtitleLabel("Host Environment")
+        hw_layout.addWidget(self.title_hw)
         self.lbl_os = StrongBodyLabel(f"OS: {platform.system()} {platform.release()} ({platform.architecture()[0]})")
         self.lbl_cpu = CaptionLabel(f"Processor: {platform.processor() or 'x64'}")
         self.lbl_cores = CaptionLabel(f"Available CPU Cores: {os.cpu_count() or 1}")
-        self.lbl_app_ver = CaptionLabel(f"RavenCalibrator Version: {__version__}")
+        self.lbl_app_ver = CaptionLabel(f"{APP_NAME} Version: {__version__}")
         hw_layout.addWidget(self.lbl_os)
         hw_layout.addWidget(self.lbl_cpu)
         hw_layout.addWidget(self.lbl_cores)
@@ -125,7 +130,6 @@ class DoctorView(QWidget):
         layout.addStretch()
 
     def refresh_diagnostics(self):
-        # Native engine check
         eng = engine()
         has_native = eng.is_file()
         if has_native:
@@ -141,7 +145,6 @@ class DoctorView(QWidget):
             self.lbl_native_path.setText("Build using tools/build_windows.ps1")
             self.lbl_native_ver.setText("Requires: Visual Studio 2022/2026 + CMake + vcpkg")
 
-        # Spirula check
         from raven_app.config import get_spirula_bin, validate_tool
         spirula_path = get_spirula_bin()
         ok_sp, ver_sp = validate_tool("spirula", str(spirula_path))
@@ -152,7 +155,6 @@ class DoctorView(QWidget):
             self.lbl_spirula_status.setText("Status: [OPTIONAL] Spirula Not Found")
             self.lbl_spirula_path.setText("Configure in Settings or keep in spirula/spirula.exe")
 
-        # Python math libraries
         import numpy as np
         import scipy
         import cv2
@@ -171,8 +173,17 @@ class DoctorView(QWidget):
         self.lbl_video_gpu.setText(f"PyAV: {av_text} | Vulkan: {gpu.get('detail', 'N/A')}")
 
         if has_native:
-            self.overall_status.setText("System Operational")
-            self.overall_desc.setText("All core runtimes and native estimation engines are operational.")
+            self.overall_status.setText(tr("System Operational"))
+            self.overall_desc.setText(tr("All core runtimes and native estimation engines are operational."))
         else:
-            self.overall_status.setText("Native Engine Required")
-            self.overall_desc.setText("FAST-LIVO2 native executable is missing. Run tools/build_windows.ps1 to build.")
+            self.overall_status.setText(tr("Native Engine Required"))
+            self.overall_desc.setText(tr("FAST-LIVO2 native executable is missing. Run tools/build_windows.ps1 to build."))
+
+    def retranslate_ui(self):
+        """Update all text elements dynamically when the language changes."""
+        self.header_title.setText(tr("System Diagnostics & Engine Doctor"))
+        self.header_subtitle.setText(
+            tr("Verify native C++ estimator, mathematical runtimes, and photogrammetry engines")
+        )
+        self.btn_refresh.setText(tr("Re-run Diagnostics"))
+        self.refresh_diagnostics()

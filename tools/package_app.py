@@ -139,7 +139,11 @@ def main():
         shutil.copy2(ROOT / 'docs/STANDALONE.md', output / 'README.md')
     # Also make the native engine runnable on its own, without relying on the
     # parent bootloader's DLL directory or a system Visual C++ installation.
-    if not a.onefile:
+    if a.onefile:
+        portable_target = ROOT / f'dist/{APP_NAME}_portable.exe'
+        shutil.copy2(output / f'{APP_NAME}.exe', portable_target)
+        print(f"[+] Portable executable saved to: {portable_target}")
+    else:
         internal = output / '_internal'
         bin_dir = internal / 'bin'
         if bin_dir.is_dir():

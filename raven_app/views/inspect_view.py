@@ -48,12 +48,12 @@ class InspectView(QWidget):
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel("ROS Bag Inspector")
-        subtitle = CaptionLabel(
-            "Extract stream metadata, topic structures, and sensor counts from ROS1 bags offline"
+        self.header_title = TitleLabel(tr("ROS Bag Inspector"))
+        self.header_subtitle = CaptionLabel(
+            tr("Extract stream metadata, topic structures, and sensor counts from ROS1 bags offline")
         )
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        header_layout.addWidget(self.header_title)
+        header_layout.addWidget(self.header_subtitle)
         layout.addLayout(header_layout)
 
         # File Selection Card
@@ -61,15 +61,15 @@ class InspectView(QWidget):
         card_layout = QHBoxLayout(card)
         card_layout.setContentsMargins(20, 16, 20, 16)
 
-        label = BodyLabel("ROS Bag:")
+        self.label_bag = BodyLabel(tr("ROS Bag:"))
         self.bag_input = LineEdit()
-        self.bag_input.setPlaceholderText("Select a .bag file to analyze...")
-        self.btn_browse = PushButton("Browse", icon=FluentIcon.FOLDER)
+        self.bag_input.setPlaceholderText(tr("Select a .bag file to analyze..."))
+        self.btn_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.btn_browse.clicked.connect(self._browse)
-        self.btn_inspect = PrimaryPushButton("Inspect Bag", icon=FluentIcon.SEARCH)
+        self.btn_inspect = PrimaryPushButton(tr("Inspect Bag"), icon=FluentIcon.SEARCH)
         self.btn_inspect.clicked.connect(self._inspect)
 
-        card_layout.addWidget(label)
+        card_layout.addWidget(self.label_bag)
         card_layout.addWidget(self.bag_input)
         card_layout.addWidget(self.btn_browse)
         card_layout.addWidget(self.btn_inspect)
@@ -225,3 +225,16 @@ class InspectView(QWidget):
             getattr(self, '_detected_imu', ''),
             getattr(self, '_detected_cam', '')
         )
+
+    def retranslate_ui(self):
+        """Update all text elements dynamically when the language changes."""
+        self.header_title.setText(tr("ROS Bag Inspector"))
+        self.header_subtitle.setText(
+            tr("Extract stream metadata, topic structures, and sensor counts from ROS1 bags offline")
+        )
+        self.label_bag.setText(tr("ROS Bag:"))
+        self.bag_input.setPlaceholderText(tr("Select a .bag file to analyze..."))
+        self.btn_browse.setText(tr("Browse"))
+        self.btn_inspect.setText(tr("Inspect Bag"))
+        self.btn_apply.setText(tr("Apply Topics to SLAM"))
+

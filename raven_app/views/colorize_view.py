@@ -32,12 +32,12 @@ class ColorizeView(QWidget):
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
-        title = TitleLabel("Point Cloud Colorization Studio")
-        subtitle = CaptionLabel(
-            "Colorize 3D LiDAR point clouds using Calibrated Direct Rigid projection or SfM Consensus"
+        self.header_title = TitleLabel(tr("Point Cloud Colorization Studio"))
+        self.header_subtitle = CaptionLabel(
+            tr("Colorize 3D LiDAR point clouds using Calibrated Direct Rigid projection or SfM Consensus")
         )
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        header_layout.addWidget(self.header_title)
+        header_layout.addWidget(self.header_subtitle)
         layout.addLayout(header_layout)
 
         # Dataset & Paths Card
@@ -46,31 +46,31 @@ class ColorizeView(QWidget):
         paths_layout.setContentsMargins(20, 18, 20, 18)
         paths_layout.setSpacing(14)
 
-        paths_title = SubtitleLabel("Dataset & Calibration Inputs")
-        paths_layout.addWidget(paths_title)
+        self.paths_title = SubtitleLabel(tr("Dataset & Calibration Inputs"))
+        paths_layout.addWidget(self.paths_title)
 
         # Dataset folder row
         ds_row = QHBoxLayout()
-        ds_label = BodyLabel("Dataset Directory:")
-        ds_label.setFixedWidth(140)
+        self.ds_label = BodyLabel(tr("Dataset Directory:"))
+        self.ds_label.setFixedWidth(140)
         self.ds_input = LineEdit()
-        self.ds_input.setPlaceholderText("Select folder containing slam_out/ and images/...")
-        self.ds_browse = PushButton("Browse", icon=FluentIcon.FOLDER)
+        self.ds_input.setPlaceholderText(tr("Select folder containing slam_out/ and images/..."))
+        self.ds_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.ds_browse.clicked.connect(self._browse_dataset)
-        ds_row.addWidget(ds_label)
+        ds_row.addWidget(self.ds_label)
         ds_row.addWidget(self.ds_input)
         ds_row.addWidget(self.ds_browse)
         paths_layout.addLayout(ds_row)
 
         # Calib JSON row
         calib_row = QHBoxLayout()
-        calib_label = BodyLabel("Calibration JSON:")
-        calib_label.setFixedWidth(140)
+        self.calib_label = BodyLabel(tr("Calibration JSON:"))
+        self.calib_label.setFixedWidth(140)
         self.calib_input = LineEdit()
-        self.calib_input.setPlaceholderText("Leave empty to use default Raven rigid calibration...")
-        self.calib_browse = PushButton("Browse", icon=FluentIcon.FOLDER)
+        self.calib_input.setPlaceholderText(tr("Leave empty to use default Raven rigid calibration..."))
+        self.calib_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.calib_browse.clicked.connect(self._browse_calib)
-        calib_row.addWidget(calib_label)
+        calib_row.addWidget(self.calib_label)
         calib_row.addWidget(self.calib_input)
         calib_row.addWidget(self.calib_browse)
         paths_layout.addLayout(calib_row)
@@ -83,12 +83,12 @@ class ColorizeView(QWidget):
         params_layout.setContentsMargins(20, 18, 20, 18)
         params_layout.setSpacing(14)
 
-        params_title = SubtitleLabel("Method & Synchronization")
-        params_layout.addWidget(params_title)
+        self.params_title = SubtitleLabel(tr("Method & Synchronization"))
+        params_layout.addWidget(self.params_title)
 
         method_row = QHBoxLayout()
-        method_label = BodyLabel("Colorization Method:")
-        method_label.setFixedWidth(140)
+        self.method_label = BodyLabel(tr("Colorization Method:"))
+        self.method_label.setFixedWidth(140)
         self.method_combo = ComboBox()
         self.method_combo.addItems([
             tr("Trajectory-based colorization"),
@@ -96,34 +96,34 @@ class ColorizeView(QWidget):
             tr("Compare both methods")
         ])
         self.method_combo.setCurrentIndex(0)
-        method_row.addWidget(method_label)
+        method_row.addWidget(self.method_label)
         method_row.addWidget(self.method_combo)
         params_layout.addLayout(method_row)
 
         # Timing row
         timing_row = QHBoxLayout()
-        fps_label = BodyLabel("Extraction FPS:")
+        self.fps_label = BodyLabel(tr("Extraction FPS:"))
         self.fps_spin = DoubleSpinBox()
         self.fps_spin.setRange(0.1, 120.0)
         self.fps_spin.setValue(1.0)
         self.fps_spin.setSingleStep(0.5)
 
-        dt_label = BodyLabel("Time Offset Δt (s):")
+        self.dt_label = BodyLabel(tr("Manual Δt (s):"))
         self.dt_input = LineEdit()
         self.dt_input.setPlaceholderText("Optional (e.g. -4.2 or 5.7075)")
 
-        timing_row.addWidget(fps_label)
+        timing_row.addWidget(self.fps_label)
         timing_row.addWidget(self.fps_spin)
         timing_row.addSpacing(20)
-        timing_row.addWidget(dt_label)
+        timing_row.addWidget(self.dt_label)
         timing_row.addWidget(self.dt_input)
         timing_row.addStretch()
         params_layout.addLayout(timing_row)
 
         # Checkboxes
         check_row = QHBoxLayout()
-        self.chk_spirula = CheckBox("Run Spirula SfM automatically if sparse reconstruction is missing")
-        self.chk_recalib = CheckBox("Recalibrate spatial extrinsics from SfM alignment")
+        self.chk_spirula = CheckBox(tr("Run Spirula SfM automatically if sparse reconstruction is missing"))
+        self.chk_recalib = CheckBox(tr("Recalibrate spatial extrinsics from SfM alignment"))
         check_row.addWidget(self.chk_spirula)
         check_row.addWidget(self.chk_recalib)
         check_row.addStretch()
@@ -137,8 +137,8 @@ class ColorizeView(QWidget):
         action_layout.setContentsMargins(20, 14, 20, 14)
 
         status_box = QVBoxLayout()
-        self.status_title = StrongBodyLabel("Status: Ready")
-        self.status_desc = CaptionLabel("Select a dataset folder with PCD trajectory and camera frames.")
+        self.status_title = StrongBodyLabel(tr("Status: Ready"))
+        self.status_desc = CaptionLabel(tr("Select a dataset folder with PCD trajectory and camera frames."))
         status_box.addWidget(self.status_title)
         status_box.addWidget(self.status_desc)
         action_layout.addLayout(status_box)
@@ -150,9 +150,9 @@ class ColorizeView(QWidget):
         self.progress_bar.setVisible(False)
         action_layout.addWidget(self.progress_bar)
 
-        self.btn_run = PrimaryPushButton("Run Colorization", icon=FluentIcon.PALETTE)
+        self.btn_run = PrimaryPushButton(tr("Run Colorization"), icon=FluentIcon.PALETTE)
         self.btn_run.clicked.connect(self._start_colorization)
-        self.btn_cancel = PushButton("Cancel", icon=FluentIcon.CLOSE)
+        self.btn_cancel = PushButton(tr("Cancel"), icon=FluentIcon.CLOSE)
         self.btn_cancel.clicked.connect(self._cancel)
         self.btn_cancel.setEnabled(False)
 
@@ -167,11 +167,11 @@ class ColorizeView(QWidget):
         log_layout.setSpacing(8)
 
         log_header = QHBoxLayout()
-        log_title = SubtitleLabel("Colorization Log")
+        self.log_title = SubtitleLabel(tr("Colorization Log"))
         self.btn_clear_log = ToolButton(FluentIcon.DELETE)
-        self.btn_clear_log.setToolTip("Clear log")
+        self.btn_clear_log.setToolTip(tr("Clear log"))
         self.btn_clear_log.clicked.connect(self._clear_log)
-        log_header.addWidget(log_title)
+        log_header.addWidget(self.log_title)
         log_header.addStretch()
         log_header.addWidget(self.btn_clear_log)
         log_layout.addLayout(log_header)
@@ -286,3 +286,45 @@ class ColorizeView(QWidget):
     def _on_log_received(self, line: str):
         self.log_console.insertPlainText(line)
         self.log_console.ensureCursorVisible()
+
+    def retranslate_ui(self):
+        """Update all text elements dynamically when the language changes."""
+        self.header_title.setText(tr("Point Cloud Colorization Studio"))
+        self.header_subtitle.setText(
+            tr("Colorize 3D LiDAR point clouds using Calibrated Direct Rigid projection or SfM Consensus")
+        )
+        self.paths_title.setText(tr("Dataset & Calibration Inputs"))
+        self.ds_label.setText(tr("Dataset Directory:"))
+        self.ds_input.setPlaceholderText(tr("Select folder containing slam_out/ and images/..."))
+        self.ds_browse.setText(tr("Browse"))
+        self.calib_label.setText(tr("Calibration JSON:"))
+        self.calib_input.setPlaceholderText(tr("Leave empty to use default Raven rigid calibration..."))
+        self.calib_browse.setText(tr("Browse"))
+
+        self.params_title.setText(tr("Method & Synchronization"))
+        self.method_label.setText(tr("Colorization Method:"))
+
+        cur_idx = self.method_combo.currentIndex()
+        self.method_combo.blockSignals(True)
+        self.method_combo.clear()
+        self.method_combo.addItems([
+            tr("Trajectory-based colorization"),
+            tr("Reconstruction-based colorization"),
+            tr("Compare both methods")
+        ])
+        self.method_combo.setCurrentIndex(cur_idx)
+        self.method_combo.blockSignals(False)
+
+        self.fps_label.setText(tr("Extraction FPS:"))
+        self.dt_label.setText(tr("Manual Δt (s):"))
+        self.chk_spirula.setText(tr("Run Spirula SfM automatically if sparse reconstruction is missing"))
+        self.chk_recalib.setText(tr("Recalibrate spatial extrinsics from SfM alignment"))
+        self.btn_run.setText(tr("Run Colorization"))
+        self.btn_cancel.setText(tr("Cancel"))
+        self.log_title.setText(tr("Colorization Log"))
+        self.btn_clear_log.setToolTip(tr("Clear log"))
+
+        if not self.runner.is_busy:
+            self.status_title.setText(tr("Status: Ready"))
+            self.status_desc.setText(tr("Select a dataset folder with PCD trajectory and camera frames."))
+
