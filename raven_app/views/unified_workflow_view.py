@@ -199,6 +199,10 @@ class UnifiedWorkflowView(QWidget):
         recalib_row.addStretch()
         config_layout.addLayout(recalib_row)
 
+        self.vulkan_chk = CheckBox("Enable Vulkan GPU Compute Acceleration")
+        self.vulkan_chk.setChecked(True)
+        config_layout.addWidget(self.vulkan_chk)
+
         layout.addWidget(config_card)
 
         # ----------------------------------------------------------------------
@@ -388,6 +392,9 @@ class UnifiedWorkflowView(QWidget):
 
         if not self.auto_sync_chk.isChecked() and self.dt_input.text().strip():
             args.extend(["--dt", self.dt_input.text().strip()])
+
+        if not self.vulkan_chk.isChecked():
+            args.append("--no-vulkan")
 
         if self.chk_ply.isChecked():
             args.append("--export-ply")

@@ -4,3 +4,5 @@ opencv-python>=4.7
 rosbags>=0.9
 pillow>=9.0
 open3d>=0.17
+
+av>=11.0.0

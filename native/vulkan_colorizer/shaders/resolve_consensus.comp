@@ -1,0 +1,108 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConsts {
+    uint num_points;
+    float outlier_threshold; // e.g. 45.0
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer TopScoresIn {
+    vec4 scores[]; // .xyz = top scores, .w = valid view count
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer TopColorsIn {
+    uvec4 colors[]; // .x = color1, .y = color2, .z = color3 (packed uint)
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer FinalColorsOut {
+    uint final_colors[]; // Output packed RGB8 (0x00BBGGRR or RGBA)
+};
+
+vec3 unpack_rgb(uint p) {
+    float r = float(p & 0xFFu);
+    float g = float((p >> 8) & 0xFFu);
+    float b = float((p >> 16) & 0xFFu);
+    return vec3(r, g, b);
+}
+
+uint pack_rgb(vec3 c) {
+    uint r = uint(roundEven(clamp(c.r, 0.0, 255.0)));
+    uint g = uint(roundEven(clamp(c.g, 0.0, 255.0)));
+    uint b = uint(roundEven(clamp(c.b, 0.0, 255.0)));
+    return r | (g << 8) | (b << 16) | (0xFFu << 24);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_points) return;
+
+    vec3 s = scores[idx].xyz;
+    uvec3 c_raw = colors[idx].xyz;
+
+    int valid_views = 0;
+    if (s.x > 0.0) valid_views++;
+    if (s.y > 0.0) valid_views++;
+    if (s.z > 0.0) valid_views++;
+
+    if (valid_views == 0) {
+        // Default gray for unobserved points
+        final_colors[idx] = pack_rgb(vec3(180.0, 180.0, 180.0));
+        return;
+    }
+
+    if (valid_views == 1) {
+        if (s.x > 0.0) final_colors[idx] = c_raw.x | (0xFFu << 24);
+        else if (s.y > 0.0) final_colors[idx] = c_raw.y | (0xFFu << 24);
+        else final_colors[idx] = c_raw.z | (0xFFu << 24);
+        return;
+    }
+
+    if (valid_views == 2) {
+        vec3 c1, c2;
+        float w1, w2;
+        if (s.x > 0.0 && s.y > 0.0) {
+            c1 = unpack_rgb(c_raw.x); w1 = s.x;
+            c2 = unpack_rgb(c_raw.y); w2 = s.y;
+        } else if (s.x > 0.0 && s.z > 0.0) {
+            c1 = unpack_rgb(c_raw.x); w1 = s.x;
+            c2 = unpack_rgb(c_raw.z); w2 = s.z;
+        } else {
+            c1 = unpack_rgb(c_raw.y); w1 = s.y;
+            c2 = unpack_rgb(c_raw.z); w2 = s.z;
+        }
+        vec3 blended = (w1 * c1 + w2 * c2) / max(w1 + w2, 1e-6);
+        final_colors[idx] = pack_rgb(blended);
+        return;
+    }
+
+    // Exactly 3 views -> Consensus outlier rejection
+    vec3 c1 = unpack_rgb(c_raw.x);
+    vec3 c2 = unpack_rgb(c_raw.y);
+    vec3 c3 = unpack_rgb(c_raw.z);
+
+    // Approximate component-wise median
+    vec3 med = vec3(
+        max(min(c1.r, c2.r), min(max(c1.r, c2.r), c3.r)),
+        max(min(c1.g, c2.g), min(max(c1.g, c2.g), c3.g)),
+        max(min(c1.b, c2.b), min(max(c1.b, c2.b), c3.b))
+    );
+
+    float d1 = distance(c1, med);
+    float d2 = distance(c2, med);
+    float d3 = distance(c3, med);
+
+    vec3 blended = vec3(0.0);
+    float total_w = 0.0;
+
+    if (d1 < outlier_threshold) { blended += s.x * c1; total_w += s.x; }
+    if (d2 < outlier_threshold) { blended += s.y * c2; total_w += s.y; }
+    if (d3 < outlier_threshold) { blended += s.z * c3; total_w += s.z; }
+
+    if (total_w > 0.0) {
+        blended /= total_w;
+    } else {
+        blended = (c1 + c2 + c3) / 3.0;
+    }
+
+    final_colors[idx] = pack_rgb(blended);
+}

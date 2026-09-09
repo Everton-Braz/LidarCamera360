@@ -1,0 +1,76 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform CameraUBO {
+    mat4 R_cw;          // 64 bytes: Rotation world -> camera (col-major)
+    vec4 C_world;       // 16 bytes: Optical center (xyz)
+    vec4 intrinsics1;   // 16 bytes: fx, fy, cx, cy
+    vec4 dist_radial;   // 16 bytes: k1, k2, k3, k4
+    vec4 dist_prism;    // 16 bytes: p1, p2, sx1, sy1
+    ivec2 zbuf_size;    // 8 bytes:  width, height (e.g. 960, 960)
+    vec2 zbuf_scale;    // 8 bytes:  3840.0 / width, 3840.0 / height
+    float min_z;        // 4 bytes:  0.15
+    float max_radius;   // 4 bytes:  1620.0
+    uint num_points;    // 4 bytes:  total points
+    uint pad0;          // 4 bytes
+};
+
+struct Point3D {
+    float x, y, z;
+    float intensity;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer PointsIn {
+    Point3D points[];
+};
+
+layout(std430, set = 0, binding = 2) buffer DepthMap {
+    uint depth_grid[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_points) return;
+
+    vec3 P_world = vec3(points[idx].x, points[idx].y, points[idx].z);
+    vec3 diff = P_world - C_world.xyz;
+    vec3 P_cam = (R_cw * vec4(diff, 0.0)).xyz;
+
+    if (P_cam.z <= min_z) return;
+
+    float d = length(P_cam);
+    float x = P_cam.x / P_cam.z;
+    float y = P_cam.y / P_cam.z;
+    float r = sqrt(x * x + y * y);
+    if (r < 1e-8) r = 1e-8;
+
+    float th = atan(r);
+    float th2 = th * th;
+    float th4 = th2 * th2;
+    float th6 = th4 * th2;
+    float th8 = th4 * th4;
+    float thd = th * (1.0 + dist_radial.x * th2 + dist_radial.y * th4 + dist_radial.z * th6 + dist_radial.w * th8);
+
+    float scale = th / r;
+    float xd = x * scale;
+    float yd = y * scale;
+    float rd2 = xd * xd + yd * yd;
+
+    float x_pp = xd * (th > 1e-8 ? thd / th : 1.0) + 2.0 * dist_prism.x * xd * yd + dist_prism.y * (rd2 + 2.0 * xd * xd) + dist_prism.z * rd2;
+    float y_pp = yd * (th > 1e-8 ? thd / th : 1.0) + dist_prism.x * (rd2 + 2.0 * yd * yd) + 2.0 * dist_prism.y * xd * yd + dist_prism.w * rd2;
+
+    float u = intrinsics1.x * x_pp + intrinsics1.z;
+    float v = intrinsics1.y * y_pp + intrinsics1.w;
+
+    vec2 uv = vec2(u, v);
+    float r_px = distance(uv, intrinsics1.zw);
+
+    if (r_px >= max_radius || u < 0.0 || u >= zbuf_scale.x * float(zbuf_size.x) - 1.0 || v < 0.0 || v >= zbuf_scale.y * float(zbuf_size.y) - 1.0) return;
+
+    int ug = clamp(int(floor(u / zbuf_scale.x)), 0, zbuf_size.x - 1);
+    int vg = clamp(int(floor(v / zbuf_scale.y)), 0, zbuf_size.y - 1);
+    int flat_idx = vg * zbuf_size.x + ug;
+
+    uint depth_fixed = uint(clamp(d * 1000.0, 0.0, 4294967000.0));
+    atomicMin(depth_grid[flat_idx], depth_fixed);
+}

@@ -97,10 +97,12 @@ class DoctorView(QWidget):
         self.lbl_np = CaptionLabel("--")
         self.lbl_scipy = CaptionLabel("--")
         self.lbl_cv = CaptionLabel("--")
+        self.lbl_video_gpu = CaptionLabel("--")
         math_layout.addWidget(self.lbl_py)
         math_layout.addWidget(self.lbl_np)
         math_layout.addWidget(self.lbl_scipy)
         math_layout.addWidget(self.lbl_cv)
+        math_layout.addWidget(self.lbl_video_gpu)
         grid.addWidget(self.card_math, 1, 0)
 
         # Hardware & OS Card
@@ -157,6 +159,15 @@ class DoctorView(QWidget):
         self.lbl_np.setText(f"NumPy: {np.__version__}")
         self.lbl_scipy.setText(f"SciPy: {scipy.__version__}")
         self.lbl_cv.setText(f"OpenCV: {cv2.__version__}")
+
+        try:
+            import av
+            av_text = av.__version__
+        except ImportError:
+            av_text = "Not installed (FFmpeg fallback)"
+        from raven_app.vulkan_engine import vulkan_status
+        gpu = vulkan_status()
+        self.lbl_video_gpu.setText(f"PyAV: {av_text} | Vulkan: {gpu.get('detail', 'N/A')}")
 
         if has_native:
             self.overall_status.setText("System Operational")

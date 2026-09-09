@@ -96,3 +96,41 @@ when present. Its distribution permissions and matching source/notices must be
 checked before publishing a release. This local build does not publish anything.
 When distributing the native binary, include the corresponding FAST-LIVO2 source,
 native adaptation, build scripts and dependency license/source materials.
+
+## INSV extraction and GPU colorization
+
+Approach A is the default package: PyAV and its codec libraries decode video
+in-process, and `bin/spirula.exe` performs headless Vulkan SfM. No external
+FFmpeg or separate Spirula installation is required. Packaging fails if the
+Spirula executable or the colorizer/shaders are missing.
+
+```powershell
+.\RavenCalibrator.exe extract-insv --insv D:\capture\video.insv --output D:\dataset --fps 1
+.\RavenCalibrator.exe workflow --bag D:\capture\lidar.bag --insv D:\capture\video.insv --output D:\dataset --method sfm --export-ply --export-pcd --export-colmap
+.\RavenCalibrator.exe colorize --dataset D:\dataset --method direct --no-vulkan
+```
+
+Extraction keeps synchronized front/rear pairs, selects the sharpest of up to
+five candidates per output interval, and writes measured presentation times to
+`images/frames.json`. Alignment, calibration, direct projection and 3DGS export
+read these times. Older datasets without that manifest retain one-based frame
+number/FPS timing. Both tracks must decode successfully before publication.
+
+Vulkan acceleration is enabled by default in the unified GUI and CLI. It uses
+the selected calibration/Sim(3)/drift-corrected poses for both colorization
+methods. Missing hardware, an unsupported job or a failed subprocess invokes
+the CPU path. `doctor` reports the device and shader probe. A Vulkan-capable
+GPU driver is required for GPU processing; the runtime does not require the SDK.
+The shaders use the Vulkan 1.1 compute subset and run on Vulkan 1.4 drivers.
+
+To build the colorizer independently (Visual Studio generator as installed):
+
+```powershell
+cmake -S native/vulkan_colorizer -B build/vulkan -A x64 -DCMAKE_TOOLCHAIN_FILE=D:/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build/vulkan --config Release
+```
+
+The full native build includes this target. Building requires Vulkan SDK with
+`glslc` and vcpkg OpenCV. CMake compiles shaders into the binary output directory;
+packaging takes these compiled outputs rather than source-tree SPIR-V files.
+See `docs/IMPLEMENTATION_VALIDATION.md` for measured validation and limitations.

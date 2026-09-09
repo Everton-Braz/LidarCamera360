@@ -7,6 +7,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import sys
 
 import cv2
 import numpy as np
@@ -24,8 +25,19 @@ def main():
             if r.returncode!=expected:raise AssertionError((args,r.returncode,r.stdout,r.stderr))
             return r
         t=time.perf_counter();call(['--help']);startup=time.perf_counter()-t
+        gui = call(['gui', '--smoke-test'])
+        assert '"gui_ready": true' in gui.stdout, gui.stdout
         report=json.loads(call(['--headless','doctor']).stdout)
         assert report['native_exit_code']==0
+        assert report['pyav']
+        assert report['spirula_ready']
+        assert report['vulkan_colorizer']['ready'], report['vulkan_colorizer']
+        sys.path.insert(0, str(root))
+        from test_video_vulkan import VideoTests
+        source=tmp/'synthetic.insv'
+        VideoTests().make_video(source)
+        call(['--headless','extract-insv','--insv',str(source),'--output',str(tmp/'extracted')])
+        assert len(list((tmp/'extracted/images/cam1').glob('*.jpg')))==3
         call(['--headless'],2)
         call(['colorize','--dataset',str(tmp),'--fps','nan'],2)
         dataset=tmp/'dataset';pcd=dataset/'slam_out/pcd';trj=dataset/'slam_out/result'
@@ -41,12 +53,13 @@ def main():
             image=np.full((3840,3840,3),(20,80,200),dtype=np.uint8)
             assert cv2.imwrite(str(directory/'frame_000001.jpg'),image)
         result=call(['--headless','colorize','--dataset',str(dataset),'--method','direct','--fps','1','--dt','0'])
+        assert 'Vulkan frames' in result.stdout, result.stdout
         output=dataset/'deliverables/03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd'
         data=output.read_bytes().split(b'DATA binary\n',1)[1]
         assert len(data)==3*16
         rows=np.frombuffer(data,dtype=[('xyz','<f4',3),('rgb','<u4')])
         assert np.all(rows['rgb']!=0xB4B4B4),'No points received color'
-        print(json.dumps({'help_startup_seconds':startup,'doctor':'passed','invalid_input':'passed',
+        print(json.dumps({'help_startup_seconds':startup,'doctor':'passed','gui':'passed','invalid_input':'passed',
                           'direct_colorization':'passed','colored_points':3,'isolated_cwd_and_path':True},indent=2))
 
 

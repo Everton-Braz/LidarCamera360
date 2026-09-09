@@ -28,6 +28,8 @@ import cv2
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
+from raven_app.video import frame_time
+from raven_app.vulkan_engine import get_vulkan_bin, colorize_views
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -95,6 +97,8 @@ def load_colmap_cameras(cameras_bin):
         num = struct.unpack("<Q", f.read(8))[0]
         for _ in range(num):
             cid, model_id, width, height = struct.unpack("<iiQQ", f.read(24))
+            if model_id != 10:
+                raise ValueError(f"Expected THIN_PRISM_FISHEYE camera (10), got {model_id}")
             params = struct.unpack("<12d", f.read(12 * 8))
             cameras[cid] = {
                 "model_id": model_id,
@@ -183,27 +187,24 @@ def solve_umeyama_sim3(X, Y):
 def project_thin_prism(P_v, params):
     """Projeção de pontos 3D da câmera no modelo fisheye Thin Prism de 12 parâmetros"""
     fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, sx1, sy1 = params
-    x = P_v[:, 0] / P_v[:, 2]
-    y = P_v[:, 1] / P_v[:, 2]
-    r = np.sqrt(x**2 + y**2)
-    th = np.arctan(r)
-    th2 = th**2
-    th4 = th2**2
-    th6 = th4 * th2
-    th8 = th4**2
-    thd = th * (1.0 + k1*th2 + k2*th4 + k3*th6 + k4*th8)
-
-    scale = np.where(r > 1e-8, thd / r, 1.0)
-    xd = x * scale
-    yd = y * scale
-    rd2 = xd**2 + yd**2
-
-    du = 2.0 * p1 * xd * yd + p2 * (rd2 + 2.0 * xd**2) + sx1 * rd2
-    dv = p1 * (rd2 + 2.0 * yd**2) + 2.0 * p2 * xd * yd + sy1 * rd2
-
-    u = fx * (xd + du) + cx
-    v = fy * (yd + dv) + cy
+    r = np.hypot(P_v[:, 0], P_v[:, 1])
+    theta = np.arctan2(r, P_v[:, 2])
+    scale = np.divide(theta, r, out=np.zeros_like(theta), where=r > 1e-12)
+    xd, yd = P_v[:, 0] * scale, P_v[:, 1] * scale
+    rd2 = theta**2
+    radial = 1 + rd2 * (k1 + rd2 * (k2 + rd2 * (k3 + rd2 * k4)))
+    du = 2*p1*xd*yd + p2*(rd2 + 2*xd**2) + sx1*rd2
+    dv = p1*(rd2 + 2*yd**2) + 2*p2*xd*yd + sy1*rd2
+    u, v = fx*(xd*radial + du) + cx, fy*(yd*radial + dv) + cy
     return u, v, r
+
+
+def sample_bilinear(image, u, v):
+    x, y = np.floor(u).astype(int), np.floor(v).astype(int)
+    dx, dy = (u-x)[:, None], (v-y)[:, None]
+    value = ((1-dx)*(1-dy)*image[y,x] + dx*(1-dy)*image[y,x+1]
+             + (1-dx)*dy*image[y+1,x] + dx*dy*image[y+1,x+1])
+    return np.clip(value, 0, 255).astype(np.uint8)
 
 
 def write_ply(path, points, colors_rgb):
@@ -400,7 +401,8 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
     img_dir = dataset_dir / "images"
     sparse_dir = dataset_dir / "sparse" / "0"
 
-    if sparse_dir.exists() and (sparse_dir / "cameras.bin").exists() and (sparse_dir / "images.bin").exists():
+    if all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
+        load_colmap_cameras(sparse_dir / "cameras.bin")
         print(f"[+] Reconstrução SfM existente encontrada em: {sparse_dir}")
         return True
 
@@ -428,6 +430,8 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
         "-o", str(dataset_dir),
         "--data-type", "video",
         "--quality", quality,
+        "--camera-mode", "folder",
+        "--focal", "1080.19",
         "--camera-model", "thin-prism-fisheye"
     ]
     if vulkan_dev >= 0:
@@ -435,10 +439,13 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
 
     t0 = time.time()
     ret = subprocess.run(cmd)
-    if ret.returncode != 0 and not (sparse_dir / "images.bin").exists():
+    if ret.returncode != 0 or not all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
         print(f"[!] Spirula SFM finalizou com código {ret.returncode}")
         return False
 
+    cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
+    if not cameras:
+        return False
     print(f"[+] Spirula SFM concluído em {time.time() - t0:.1f}s!")
     return True
 
@@ -490,7 +497,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
         Y_trj = []
         for im in cam0:
             frame_num = get_frame_num(im["name"])
-            t_vid = (frame_num - 1) / fps
+            t_vid = frame_time(dataset_dir, im["name"], fps)
             t_q = t0_slam + (t_vid - dt)
             if t0_slam <= t_q <= t1_slam:
                 idx = np.searchsorted(t_slam, t_q)
@@ -515,7 +522,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
             X_trj, Y_trj = [], []
             for im in cam0:
                 frame_num = get_frame_num(im["name"])
-                t_vid = (frame_num - 1) / fps
+                t_vid = frame_time(dataset_dir, im["name"], fps)
                 t_q = t0_slam + (t_vid - dt)
                 if t0_slam <= t_q <= t1_slam:
                     idx = np.searchsorted(t_slam, t_q)
@@ -916,7 +923,7 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
         R_list, t_list = [], []
         for im in cam_imgs:
             fn = get_fn(im["name"])
-            t_vid = (fn - 1) / fps
+            t_vid = frame_time(dataset_dir, im["name"], fps)
             t_q = t_slam[0] + (t_vid - dt_sync)
             if t_slam[0] <= t_q <= t_slam[-1]:
                 R_L = slerp(t_q).as_matrix()
@@ -999,7 +1006,7 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
     return calib_dict
 
 
-def colorize_via_spirula_sfm(dataset_dir, fps=1.0):
+def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
     """Executa a coloração de alta precisão projetando as poses alinhadas do SfM"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
@@ -1019,9 +1026,10 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0):
     pts_lidar = load_pcd(slam_pcd)
     n_pts = len(pts_lidar)
 
+    gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() else None
     K_VIEWS = 3
-    top_scores = np.zeros((n_pts, K_VIEWS), dtype=np.float32)
-    top_colors = np.zeros((n_pts, K_VIEWS, 3), dtype=np.uint8)
+    top_scores = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS), dtype=np.float32)
+    top_colors = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS, 3), dtype=np.uint8)
 
     zbuf_w, zbuf_h = 960, 960
     scale_factor_zbuf = 3840.0 / zbuf_w
@@ -1043,6 +1051,10 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0):
         # Posição e orientação da câmera no referencial LiDAR
         C_lidar = s_sim * (R_sim @ im["C"]) + t_sim
         R_cw_lidar = im["R_cw"] @ R_sim.T
+
+        if gpu_views is not None:
+            gpu_views.append((img_path, R_cw_lidar, C_lidar, params))
+            continue
 
         P_cam = (R_cw_lidar @ (pts_lidar - C_lidar).T).T
         z_mask = P_cam[:, 2] > 0.15
@@ -1073,14 +1085,14 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0):
         flat_idx = vg * zbuf_w + ug
 
         dmap = np.full(zbuf_w * zbuf_h, 1e9, dtype=np.float32)
-        np.minimum.at(dmap, flat_idx, d_c.astype(np.float32))
+        np.minimum.at(dmap, flat_idx, np.floor(d_c * 1000).astype(np.float32) / 1000)
 
         vis_mask = d_c <= (dmap[flat_idx] * 1.08 + 0.15)
         if not np.any(vis_mask):
             continue
 
-        u_vis = np.round(u_c[vis_mask]).astype(int)
-        v_vis = np.round(v_c[vis_mask]).astype(int)
+        u_vis = u_c[vis_mask]
+        v_vis = v_c[vis_mask]
         d_vis = d_c[vis_mask]
         r_vis = r_c[vis_mask]
         idx_vis = idx_c[vis_mask]
@@ -1101,7 +1113,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0):
         if img_bgr is None:
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        rgb_ins = img_rgb[v_ins, u_ins]
+        rgb_ins = sample_bilinear(img_rgb, u_ins, v_ins)
 
         worst_slot = np.argmin(top_scores[idx_ins], axis=1)
         top_scores[idx_ins, worst_slot] = scores_ins
@@ -1112,40 +1124,45 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0):
             print(f"    [{count:3d}/{len(images)}] Quadros projetados | Cobertura LiDAR: {cov:.1f}%")
 
     print("[*] Resolvendo consenso estatístico SfM...")
-    colors = np.full((n_pts, 3), 180, dtype=np.uint8)
-    n_obs = np.count_nonzero(top_scores > 0, axis=1)
+    if gpu_views is not None:
+        colors = colorize_views(pts_lidar, gpu_views, dataset_dir)
+        if colors is None:
+            return colorize_via_spirula_sfm(dataset_dir, fps=fps, use_vulkan=False)
+    else:
+        colors = np.full((n_pts, 3), 180, dtype=np.uint8)
+        n_obs = np.count_nonzero(top_scores > 0, axis=1)
 
-    mask_1 = (n_obs == 1)
-    if np.any(mask_1):
-        idx_1 = np.where(mask_1)[0]
-        best_slot = np.argmax(top_scores[idx_1], axis=1)
-        colors[idx_1] = top_colors[idx_1, best_slot]
+        mask_1 = (n_obs == 1)
+        if np.any(mask_1):
+            idx_1 = np.where(mask_1)[0]
+            best_slot = np.argmax(top_scores[idx_1], axis=1)
+            colors[idx_1] = top_colors[idx_1, best_slot]
 
-    mask_2 = (n_obs == 2)
-    if np.any(mask_2):
-        idx_2 = np.where(mask_2)[0]
-        s2 = top_scores[idx_2]
-        c2 = top_colors[idx_2].astype(np.float32)
-        weights = s2 / np.sum(s2, axis=1, keepdims=True)
-        avg2 = np.sum(c2 * weights[:, :, None], axis=1)
-        colors[idx_2] = np.clip(np.round(avg2), 0, 255).astype(np.uint8)
+        mask_2 = (n_obs == 2)
+        if np.any(mask_2):
+            idx_2 = np.where(mask_2)[0]
+            s2 = top_scores[idx_2]
+            c2 = top_colors[idx_2].astype(np.float32)
+            weights = s2 / np.sum(s2, axis=1, keepdims=True)
+            avg2 = np.sum(c2 * weights[:, :, None], axis=1)
+            colors[idx_2] = np.clip(np.round(avg2), 0, 255).astype(np.uint8)
 
-    mask_3 = (n_obs == 3)
-    if np.any(mask_3):
-        idx_3 = np.where(mask_3)[0]
-        c3 = top_colors[idx_3].astype(np.float32)
-        s3 = top_scores[idx_3]
-        med3 = np.median(c3, axis=1, keepdims=True)
-        diff_from_med = np.linalg.norm(c3 - med3, axis=2)
-        inliers = diff_from_med < 45.0
-        weights = s3 * inliers.astype(np.float32)
-        sum_w = np.sum(weights, axis=1, keepdims=True)
-        fallback = (sum_w[:, 0] == 0)
-        weights[fallback] = 1.0
-        sum_w[fallback] = 3.0
-        norm_w = weights / sum_w
-        final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
-        colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
+        mask_3 = (n_obs == 3)
+        if np.any(mask_3):
+            idx_3 = np.where(mask_3)[0]
+            c3 = top_colors[idx_3].astype(np.float32)
+            s3 = top_scores[idx_3]
+            med3 = np.median(c3, axis=1, keepdims=True)
+            diff_from_med = np.linalg.norm(c3 - med3, axis=2)
+            inliers = diff_from_med < 45.0
+            weights = s3 * inliers.astype(np.float32)
+            sum_w = np.sum(weights, axis=1, keepdims=True)
+            fallback = (sum_w[:, 0] == 0)
+            weights[fallback] = 1.0
+            sum_w[fallback] = 3.0
+            norm_w = weights / sum_w
+            final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
+            colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
 
     out_ply = dataset_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.ply"
     out_pcd = dataset_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.pcd"
@@ -1167,7 +1184,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0):
 # PIPELINE MÉTODO 2: DIRETO RÍGIDO (SEM SFM)
 # ==============================================================================
 
-def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_override=None):
+def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_override=None, use_vulkan=True):
     """Executa a coloração direta rápida usando matriz rígida e tempo calibrado"""
     if calib_json_path is None:
         auto_json = dataset_dir / "calibracao_rigida_auto.json"
@@ -1247,9 +1264,10 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
     cam0_files = sorted(list((dataset_dir / "images" / "cam0").glob("*.jpg")))
     cam1_files = sorted(list((dataset_dir / "images" / "cam1").glob("*.jpg")))
 
+    gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() else None
     K_VIEWS = 3
-    top_scores = np.zeros((n_pts, K_VIEWS), dtype=np.float32)
-    top_colors = np.zeros((n_pts, K_VIEWS, 3), dtype=np.uint8)
+    top_scores = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS), dtype=np.float32)
+    top_colors = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS, 3), dtype=np.uint8)
 
     zbuf_w, zbuf_h = 960, 960
     scale_factor_zbuf = 3840.0 / zbuf_w
@@ -1285,7 +1303,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
 
             for im in sample_imgs:
                 fn = int("".join(filter(str.isdigit, im["name"])))
-                t_vid = (fn - 1) / fps
+                t_vid = frame_time(dataset_dir, im["name"], fps)
                 t_q = t_slam_start + (t_vid - dt_sync)
                 if not (t_slam_start <= t_q <= t_slam_end):
                     continue
@@ -1317,7 +1335,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
     for k in range(num_frames):
         fn_digits = "".join(filter(str.isdigit, cam0_files[k].stem))
         fn = int(fn_digits) if fn_digits else (k + 1)
-        t_vid = (fn - 1) / fps
+        t_vid = frame_time(dataset_dir, "cam0/" + cam0_files[k].name, fps)
         t_query = t_slam_start + (t_vid - dt_sync)
 
         if not (t_slam_start <= t_query <= t_slam_end):
@@ -1348,6 +1366,10 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             R_world_cam = R_L @ R_LC
             R_cw = R_world_cam.T
 
+            if gpu_views is not None:
+                gpu_views.append((img_path, R_cw, p_cam, params))
+                continue
+
             P_cam = (R_cw @ (pts_lidar - p_cam).T).T
             z_mask = P_cam[:, 2] > 0.15
             idx_valid = np.where(z_mask)[0]
@@ -1376,14 +1398,14 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             flat_idx = vg * zbuf_w + ug
 
             dmap = np.full(zbuf_w * zbuf_h, 1e9, dtype=np.float32)
-            np.minimum.at(dmap, flat_idx, d_c.astype(np.float32))
+            np.minimum.at(dmap, flat_idx, np.floor(d_c * 1000).astype(np.float32) / 1000)
 
             vis_mask = d_c <= (dmap[flat_idx] * 1.08 + 0.15)
             if not np.any(vis_mask):
                 continue
 
-            u_vis = np.round(u_c[vis_mask]).astype(int)
-            v_vis = np.round(v_c[vis_mask]).astype(int)
+            u_vis = u_c[vis_mask]
+            v_vis = v_c[vis_mask]
             d_vis = d_c[vis_mask]
             r_vis = r_c[vis_mask]
             idx_vis = idx_c[vis_mask]
@@ -1404,51 +1426,56 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             if img_bgr is None:
                 continue
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            rgb_ins = img_rgb[v_ins, u_ins]
+            rgb_ins = sample_bilinear(img_rgb, u_ins, v_ins)
 
             worst_slot = np.argmin(top_scores[idx_ins], axis=1)
             top_scores[idx_ins, worst_slot] = scores_ins
             top_colors[idx_ins, worst_slot] = rgb_ins
 
-        if (k + 1) % 25 == 0 or (k + 1) == num_frames:
+        if gpu_views is None and ((k + 1) % 25 == 0 or (k + 1) == num_frames):
             cov = np.count_nonzero(np.any(top_scores > 0, axis=1)) / n_pts * 100
             print(f"    [{k+1:3d}/{num_frames}] Pares de quadros acumulados | Cobertura: {cov:.1f}%")
 
     print("[*] Resolvendo consenso estatístico e eliminando outliers de projeção...")
-    colors = np.full((n_pts, 3), 180, dtype=np.uint8)
-    n_obs = np.count_nonzero(top_scores > 0, axis=1)
+    if gpu_views is not None:
+        colors = colorize_views(pts_lidar, gpu_views, dataset_dir)
+        if colors is None:
+            return colorize_via_direct_rigid(dataset_dir, calib_json_path, fps=fps, dt_override=dt_sync, use_vulkan=False)
+    else:
+        colors = np.full((n_pts, 3), 180, dtype=np.uint8)
+        n_obs = np.count_nonzero(top_scores > 0, axis=1)
 
-    mask_1 = (n_obs == 1)
-    if np.any(mask_1):
-        idx_1 = np.where(mask_1)[0]
-        best_slot = np.argmax(top_scores[idx_1], axis=1)
-        colors[idx_1] = top_colors[idx_1, best_slot]
+        mask_1 = (n_obs == 1)
+        if np.any(mask_1):
+            idx_1 = np.where(mask_1)[0]
+            best_slot = np.argmax(top_scores[idx_1], axis=1)
+            colors[idx_1] = top_colors[idx_1, best_slot]
 
-    mask_2 = (n_obs == 2)
-    if np.any(mask_2):
-        idx_2 = np.where(mask_2)[0]
-        s2 = top_scores[idx_2]
-        c2 = top_colors[idx_2].astype(np.float32)
-        weights = s2 / np.sum(s2, axis=1, keepdims=True)
-        avg2 = np.sum(c2 * weights[:, :, None], axis=1)
-        colors[idx_2] = np.clip(np.round(avg2), 0, 255).astype(np.uint8)
+        mask_2 = (n_obs == 2)
+        if np.any(mask_2):
+            idx_2 = np.where(mask_2)[0]
+            s2 = top_scores[idx_2]
+            c2 = top_colors[idx_2].astype(np.float32)
+            weights = s2 / np.sum(s2, axis=1, keepdims=True)
+            avg2 = np.sum(c2 * weights[:, :, None], axis=1)
+            colors[idx_2] = np.clip(np.round(avg2), 0, 255).astype(np.uint8)
 
-    mask_3 = (n_obs == 3)
-    if np.any(mask_3):
-        idx_3 = np.where(mask_3)[0]
-        c3 = top_colors[idx_3].astype(np.float32)
-        s3 = top_scores[idx_3]
-        med3 = np.median(c3, axis=1, keepdims=True)
-        diff_from_med = np.linalg.norm(c3 - med3, axis=2)
-        inliers = diff_from_med < 45.0
-        weights = s3 * inliers.astype(np.float32)
-        sum_w = np.sum(weights, axis=1, keepdims=True)
-        fallback = (sum_w[:, 0] == 0)
-        weights[fallback] = 1.0
-        sum_w[fallback] = 3.0
-        norm_w = weights / sum_w
-        final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
-        colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
+        mask_3 = (n_obs == 3)
+        if np.any(mask_3):
+            idx_3 = np.where(mask_3)[0]
+            c3 = top_colors[idx_3].astype(np.float32)
+            s3 = top_scores[idx_3]
+            med3 = np.median(c3, axis=1, keepdims=True)
+            diff_from_med = np.linalg.norm(c3 - med3, axis=2)
+            inliers = diff_from_med < 45.0
+            weights = s3 * inliers.astype(np.float32)
+            sum_w = np.sum(weights, axis=1, keepdims=True)
+            fallback = (sum_w[:, 0] == 0)
+            weights[fallback] = 1.0
+            sum_w[fallback] = 3.0
+            norm_w = weights / sum_w
+            final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
+            colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
 
     out_ply = dataset_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
     out_pcd = dataset_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd"

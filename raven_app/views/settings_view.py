@@ -13,7 +13,7 @@ from qfluentwidgets import (
 )
 from raven_app import __version__
 from raven_app.config import (
-    load_config, save_config, get_ffmpeg_bin, get_spirula_bin,
+    load_config, save_config, get_spirula_bin,
     validate_tool, auto_detect_tools
 )
 
@@ -52,28 +52,10 @@ class SettingsView(QWidget):
 
         tools_layout.addWidget(SubtitleLabel("External Dependencies & Tools"))
         tools_layout.addWidget(CaptionLabel(
-            "Specify executable locations for video frame extraction (FFmpeg) and Vulkan SfM reconstruction (Spirula Studio)."
+            "Spirula is bundled by default. An executable override is available for development."
         ))
 
-        # FFmpeg Row
-        ff_header = QHBoxLayout()
-        ff_header.addWidget(StrongBodyLabel("FFmpeg Executable:"))
-        self.ff_status_label = CaptionLabel("Checking...")
-        ff_header.addWidget(self.ff_status_label)
-        ff_header.addStretch()
-        tools_layout.addLayout(ff_header)
-
-        ff_row = QHBoxLayout()
-        self.ffmpeg_input = LineEdit()
-        self.ffmpeg_input.setPlaceholderText("Auto-detected via PATH (e.g., C:\\ffmpeg\\bin\\ffmpeg.exe)")
-        self.ffmpeg_input.setText(self.cfg.get("ffmpeg_path", ""))
-        self.ffmpeg_input.textChanged.connect(self._on_paths_edited)
-        self.ffmpeg_browse_btn = PushButton("Browse...")
-        self.ffmpeg_browse_btn.setIcon(FluentIcon.FOLDER)
-        self.ffmpeg_browse_btn.clicked.connect(self._browse_ffmpeg)
-        ff_row.addWidget(self.ffmpeg_input, 1)
-        ff_row.addWidget(self.ffmpeg_browse_btn)
-        tools_layout.addLayout(ff_row)
+        tools_layout.addWidget(CaptionLabel("Video decoding: bundled PyAV (no external executable required)."))
 
         # Spirula Row
         sp_header = QHBoxLayout()
@@ -162,14 +144,6 @@ class SettingsView(QWidget):
 
         layout.addStretch()
 
-    def _browse_ffmpeg(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select ffmpeg.exe", "", "Executables (ffmpeg*.exe *.exe);;All Files (*)"
-        )
-        if path:
-            self.ffmpeg_input.setText(path)
-            self._refresh_tool_status()
-
     def _browse_spirula(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select spirula.exe", "", "Executables (spirula*.exe *.exe);;All Files (*)"
@@ -182,16 +156,6 @@ class SettingsView(QWidget):
         self._refresh_tool_status()
 
     def _refresh_tool_status(self):
-        # Validate FFmpeg
-        ff_target = self.ffmpeg_input.text().strip() or get_ffmpeg_bin()
-        ok_ff, ver_ff = validate_tool("ffmpeg", ff_target)
-        if ok_ff:
-            self.ff_status_label.setText(f"✓ Ready: {ver_ff[:40]}")
-            self.ff_status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
-        else:
-            self.ff_status_label.setText(f"⚠ Not Available ({ver_ff[:35]})")
-            self.ff_status_label.setStyleSheet("color: #FFA000;")
-
         # Validate Spirula
         sp_target = self.spirula_input.text().strip() or str(get_spirula_bin())
         ok_sp, ver_sp = validate_tool("spirula", sp_target)
@@ -204,14 +168,12 @@ class SettingsView(QWidget):
 
     def _auto_detect(self):
         detected = auto_detect_tools()
-        if "ffmpeg_path" in detected:
-            self.ffmpeg_input.setText(detected["ffmpeg_path"])
         if "spirula_path" in detected:
             self.spirula_input.setText(detected["spirula_path"])
         self._refresh_tool_status()
         InfoBar.info(
             title="Auto-Detect",
-            content=f"Detected: FFmpeg={'Found' if 'ffmpeg_path' in detected else 'Missing'}, Spirula={'Found' if 'spirula_path' in detected else 'Missing'}",
+            content=f"Detected: Spirula={'Found' if 'spirula_path' in detected else 'Missing'}",
             parent=self,
             position=InfoBarPosition.TOP_RIGHT,
             duration=3000
@@ -219,7 +181,6 @@ class SettingsView(QWidget):
 
     def _save_settings(self):
         theme_names = ["dark", "light", "auto"]
-        self.cfg["ffmpeg_path"] = self.ffmpeg_input.text().strip()
         self.cfg["spirula_path"] = self.spirula_input.text().strip()
         self.cfg["theme"] = theme_names[self.theme_combo.currentIndex()]
 

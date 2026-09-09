@@ -264,24 +264,19 @@ class ConfigTests(unittest.TestCase):
             cfg_mod.get_config_path = lambda: custom_cfg
             try:
                 c = load_config()
-                self.assertIn("ffmpeg_path", c)
                 self.assertIn("spirula_path", c)
-                c["ffmpeg_path"] = "C:\\test\\ffmpeg.exe"
                 c["spirula_path"] = "C:\\test\\spirula.exe"
                 self.assertTrue(save_config(c))
                 loaded = load_config()
-                self.assertEqual(loaded["ffmpeg_path"], "C:\\test\\ffmpeg.exe")
                 self.assertEqual(loaded["spirula_path"], "C:\\test\\spirula.exe")
             finally:
                 cfg_mod.get_config_path = orig_get
 
     def test_tool_resolution_and_validation(self):
-        from raven_app.config import get_ffmpeg_bin, get_spirula_bin, validate_tool
-        ff = get_ffmpeg_bin()
-        self.assertTrue(len(ff) > 0)
+        from raven_app.config import get_spirula_bin, validate_tool
         sp = get_spirula_bin()
         self.assertTrue(isinstance(sp, Path))
-        ok, msg = validate_tool("ffmpeg", "non_existent_binary_xyz123.exe")
+        ok, msg = validate_tool("spirula", "non_existent_binary_xyz123.exe")
         self.assertFalse(ok)
 
 

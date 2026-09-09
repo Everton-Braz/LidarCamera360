@@ -35,10 +35,10 @@ foreach ($dependency in $sources) {
 }
 Invoke-Checked cmake @('-S','native','-B','build/native','-G',$Generator,'-A','x64',('-DCMAKE_TOOLCHAIN_FILE=' + (Join-Path $VcpkgRoot 'scripts/buildsystems/vcpkg.cmake')))
 Invoke-Checked cmake @('--build','build/native','--config','Release','--parallel','4')
-if (-not (Test-Path -LiteralPath 'build/package-env/Scripts/python.exe')) {
-    Invoke-Checked $Python @('-m','venv','build/package-env')
+if (-not (Test-Path -LiteralPath 'build/portable-env/Scripts/python.exe')) {
+    Invoke-Checked $Python @('-m','venv','build/portable-env')
 }
-$buildPython = Join-Path $projectRoot 'build/package-env/Scripts/python.exe'
+$buildPython = Join-Path $projectRoot 'build/portable-env/Scripts/python.exe'
 Invoke-Checked $buildPython @('-m','pip','install','-r','requirements-build.txt')
 $packageArguments = @('tools/package_app.py','--vcpkg-root',$VcpkgRoot)
 if ($OneFile) { $packageArguments += '--onefile' }

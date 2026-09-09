@@ -2,6 +2,8 @@
 import argparse
 import hashlib
 import json
+import importlib.util
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,8 +16,18 @@ def main():
     p = argparse.ArgumentParser(description="Package RavenCalibrator into standalone Windows binary")
     p.add_argument('--vcpkg-root', type=Path, default=None, help="Path to vcpkg root (optional)")
     p.add_argument('--onefile', action='store_true', help="Package as single-file portable executable")
-    p.add_argument('--bundle-spirula', action='store_true', help="Bundle spirula.exe directly into package payload")
+    p.add_argument('--bundle-spirula', action='store_true', help='Compatibility flag; Spirula is always bundled')
+    p.add_argument('--incremental', action='store_true', help='Reuse PyInstaller analysis cache')
     a = p.parse_args()
+
+    # A system-site-packages environment can mix Qt bindings and DLL builds.
+    # Reject it before collecting dependencies, even if imports work on this PC.
+    prefix = Path(sys.prefix).resolve()
+    for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets'):
+        spec = importlib.util.find_spec(module)
+        if spec is None or not spec.origin or not Path(spec.origin).resolve().is_relative_to(prefix):
+            raise SystemExit(f'{module} must be installed in an isolated build venv. '
+                             'Use build/portable-env and requirements-build.txt.')
 
     native = ROOT / 'build/native/Release'
     if not (native / 'fastlivo2.exe').is_file():
@@ -45,7 +57,7 @@ def main():
     (stage / 'source-manifest.json').write_text(json.dumps(snapshots, indent=2))
 
     cmd = [
-        sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
+        sys.executable, '-m', 'PyInstaller', '--noconfirm',
         '--name', 'RavenCalibrator',
         '--onefile' if a.onefile else '--onedir',
         '--console',
@@ -55,11 +67,13 @@ def main():
         '--paths', str(ROOT),
         '--collect-submodules', 'rosbags',
         '--collect-all', 'qfluentwidgets',
-        '--collect-all', 'PyQt6',
+        '--collect-all', 'av',
         '--add-data', f'{ROOT / "FAST-LIVO2/config"};FAST-LIVO2/config',
         '--add-data', f'{ROOT / "calibracao_rigida_raven_insta360.json"};.',
         '--add-data', f'{stage};.',
     ]
+    if not a.incremental:
+        cmd.append('--clean')
     if (ROOT / 'docs/STANDALONE.md').is_file():
         cmd += ['--add-data', f'{ROOT / "docs/STANDALONE.md"};docs']
 
@@ -71,12 +85,30 @@ def main():
             cmd += ['--add-binary', f'{f};bin']
 
     spirula = ROOT / 'spirula/spirula.exe'
-    if a.bundle_spirula and spirula.is_file():
-        cmd += ['--add-binary', f'{spirula};spirula']
+    if not spirula.is_file():
+        raise SystemExit('Standalone build requires spirula/spirula.exe')
+    cmd += ['--add-binary', f'{spirula};bin']
+    for dependency in spirula.parent.glob('*.dll'):
+        cmd += ['--add-binary', f'{dependency};bin']
+    gpu_dirs = [ROOT / 'build/native/vulkan_colorizer/Release', ROOT / 'build/vulkan/Release']
+    gpu = next((d for d in gpu_dirs if (d / 'vulkan_colorizer.exe').is_file()), None)
+    if gpu is None:
+        raise SystemExit('Build vulkan_colorizer before packaging')
+    for binary in gpu.iterdir():
+        if binary.suffix.lower() in ('.exe', '.dll'):
+            cmd += ['--add-binary', f'{binary};bin']
+    for shader in ('occlusion_zbuf', 'colorize_consensus', 'resolve_consensus'):
+        source = gpu / 'shaders' / (shader + '.spv')
+        if not source.is_file():
+            raise SystemExit(f'Missing compiled shader: {source}')
+        cmd += ['--add-data', f'{source};bin/shaders']
 
     cmd.append(str(ROOT / 'raven.py'))
     print(f"[*] Running PyInstaller packaging ({'ONEFILE' if a.onefile else 'ONEDIR'})...")
-    subprocess.run(cmd, check=True, cwd=ROOT)
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    env.pop('PYTHONHOME', None)
+    subprocess.run(cmd, check=True, cwd=ROOT, env=env)
 
     output = ROOT / 'dist/single-file' if a.onefile else ROOT / 'dist/RavenCalibrator'
     output.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,4 @@
-"""Centralized configuration and external tools resolution (FFmpeg, Spirula)."""
+"""Application settings and bundled Spirula resolution."""
 import json
 import os
 from pathlib import Path
@@ -25,19 +25,15 @@ def get_config_path() -> Path:
 
 def load_config() -> dict:
     """Loads persistent settings or returns default configuration."""
-    cfg_path = get_config_path()
-    defaults = {
-        "ffmpeg_path": "",
-        "spirula_path": "",
-        "theme": "dark"
-    }
-    if cfg_path.is_file():
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            defaults.update(data)
-        except Exception:
-            pass
+    defaults = {"spirula_path": "", "theme": "dark"}
+    try:
+        cfg_path = get_config_path()
+        if cfg_path.is_file():
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                defaults.update(data)
+    except (OSError, ValueError):
+        pass
     return defaults
 
 
@@ -60,44 +56,6 @@ def get_app_root() -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 
 
-def get_ffmpeg_bin() -> str:
-    """Resolves path to ffmpeg executable.
-    
-    Priority:
-    1. User configured path in settings.json
-    2. System PATH (which ffmpeg)
-    3. Bundled/local executable (bin/ffmpeg.exe)
-    4. Fallback string "ffmpeg"
-    """
-    cfg = load_config()
-    custom = cfg.get("ffmpeg_path", "").strip()
-    if custom and Path(custom).is_file():
-        return str(Path(custom).resolve())
-
-    which_path = shutil.which("ffmpeg")
-    if which_path:
-        return which_path
-
-    # Check local/bundled locations
-    root = get_app_root()
-    exe_dir = Path(sys.executable).resolve().parent
-    cwd = Path.cwd()
-    candidates = [
-        root / "bin" / "ffmpeg.exe",
-        exe_dir / "bin" / "ffmpeg.exe",
-        exe_dir / "ffmpeg.exe",
-        cwd / "bin" / "ffmpeg.exe",
-        cwd / "ffmpeg.exe",
-        root / "tools" / "ffmpeg.exe",
-        root / "ffmpeg.exe"
-    ]
-    for c in candidates:
-        if c.is_file():
-            return str(c.resolve())
-
-    return "ffmpeg"
-
-
 def get_spirula_bin() -> Path:
     """Resolves path to spirula executable.
     
@@ -116,6 +74,7 @@ def get_spirula_bin() -> Path:
     exe_dir = Path(sys.executable).resolve().parent
     cwd = Path.cwd()
     candidates = [
+        root / "bin" / "spirula.exe",
         root / "spirula" / "spirula.exe",
         exe_dir / "spirula" / "spirula.exe",
         exe_dir / "spirula.exe",
@@ -136,7 +95,7 @@ def get_spirula_bin() -> Path:
 
 
 def validate_tool(tool_type: str, path_str: str) -> tuple[bool, str]:
-    """Validates if tool_type ('ffmpeg' or 'spirula') runs properly.
+    """Validates if the Spirula executable runs properly.
     
     Returns:
         (is_valid: bool, info_banner: str)
@@ -144,7 +103,7 @@ def validate_tool(tool_type: str, path_str: str) -> tuple[bool, str]:
     p = path_str.strip()
     if not p:
         # Test default resolved tool
-        resolved = get_ffmpeg_bin() if tool_type == "ffmpeg" else str(get_spirula_bin())
+        resolved = str(get_spirula_bin())
     else:
         resolved = p
 
@@ -152,7 +111,7 @@ def validate_tool(tool_type: str, path_str: str) -> tuple[bool, str]:
         return False, f"File not found: {resolved}"
 
     try:
-        cmd = [resolved, "-version"] if tool_type == "ffmpeg" else [resolved, "--help"]
+        cmd = [resolved, "--help"]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if res.returncode == 0:
             lines = res.stdout.splitlines()
@@ -165,13 +124,8 @@ def validate_tool(tool_type: str, path_str: str) -> tuple[bool, str]:
 
 
 def auto_detect_tools() -> dict:
-    """Scans system for available FFmpeg and Spirula installations."""
+    """Scans system for available Spirula installations."""
     detected = {}
-    ff = get_ffmpeg_bin()
-    ok_ff, ver_ff = validate_tool("ffmpeg", ff)
-    if ok_ff:
-        detected["ffmpeg_path"] = ff
-
     sp = str(get_spirula_bin())
     ok_sp, ver_sp = validate_tool("spirula", sp)
     if ok_sp:

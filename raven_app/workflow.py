@@ -26,84 +26,11 @@ from scipy.spatial.transform import Rotation as Rot
 from raven_app import __version__
 from raven_app.cli import engine, resources
 from raven_app.bag_io import export_bags
-from raven_app.config import get_ffmpeg_bin
-
-
-def _detect_ffmpeg_hwaccel() -> list[str]:
-    """Detect available GPU hardware acceleration for FFmpeg video decoding."""
-    ff_bin = get_ffmpeg_bin()
-    try:
-        res = subprocess.run([ff_bin, "-hwaccels"], capture_output=True, text=True, timeout=5)
-        hw = res.stdout.lower()
-        if "cuda" in hw:
-            return ["-hwaccel", "cuda"]
-        elif "d3d11va" in hw:
-            return ["-hwaccel", "d3d11va"]
-    except Exception:
-        pass
-    return []
+from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, frame_time
 
 
 def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 1.0) -> bool:
-    """Extract dual-fisheye frames from .insv into output_dir/images/cam0 and cam1."""
-    images_dir = output_dir / "images"
-    cam0_dir = images_dir / "cam0"
-    cam1_dir = images_dir / "cam1"
-    cam0_dir.mkdir(parents=True, exist_ok=True)
-    cam1_dir.mkdir(parents=True, exist_ok=True)
-
-    # If frames already exist, skip extraction
-    existing_c0 = list(cam0_dir.glob("*.jpg"))
-    existing_c1 = list(cam1_dir.glob("*.jpg"))
-    if len(existing_c0) > 0 and len(existing_c1) > 0:
-        print(f"[*] Frames already extracted: {len(existing_c0)} in cam0, {len(existing_c1)} in cam1.")
-        return True
-
-    ff_bin = get_ffmpeg_bin()
-    hw_args = _detect_ffmpeg_hwaccel()
-    if hw_args:
-        print(f"[*] GPU Hardware Video Acceleration active ({hw_args[1].upper()})")
-
-    print(f"[*] Extracting dual-fisheye frames from {insv_path.name} at {fps:.1f} FPS via {Path(ff_bin).name}...")
-    cmd_c0 = [ff_bin, "-y"] + hw_args + [
-        "-i", str(insv_path),
-        "-map", "0:v:0",
-        "-vf", f"fps={fps}",
-        "-q:v", "2",
-        str(cam0_dir / "frame_%06d.jpg")
-    ]
-    cmd_c1 = [ff_bin, "-y"] + hw_args + [
-        "-i", str(insv_path),
-        "-map", "0:v:1",
-        "-vf", f"fps={fps}",
-        "-q:v", "2",
-        str(cam1_dir / "frame_%06d.jpg")
-    ]
-
-    try:
-        p0 = subprocess.run(cmd_c0, capture_output=True, text=True)
-        if p0.returncode != 0 and hw_args:
-            print("[!] GPU decode notice on cam0; retrying with CPU decode fallback...")
-            cmd_c0 = [ff_bin, "-y", "-i", str(insv_path), "-map", "0:v:0", "-vf", f"fps={fps}", "-q:v", "2", str(cam0_dir / "frame_%06d.jpg")]
-            p0 = subprocess.run(cmd_c0, capture_output=True, text=True)
-        if p0.returncode != 0:
-            print(f"[!] Warning: Front lens extraction: {p0.stderr[-300:]}")
-
-        p1 = subprocess.run(cmd_c1, capture_output=True, text=True)
-        if p1.returncode != 0 and hw_args:
-            print("[!] GPU decode notice on cam1; retrying with CPU decode fallback...")
-            cmd_c1 = [ff_bin, "-y", "-i", str(insv_path), "-map", "0:v:1", "-vf", f"fps={fps}", "-q:v", "2", str(cam1_dir / "frame_%06d.jpg")]
-            p1 = subprocess.run(cmd_c1, capture_output=True, text=True)
-        if p1.returncode != 0:
-            print(f"[!] Warning: Rear lens extraction: {p1.stderr[-300:]}")
-
-        count0 = len(list(cam0_dir.glob("*.jpg")))
-        count1 = len(list(cam1_dir.glob("*.jpg")))
-        print(f"[+] Extracted {count0} frames for cam0 and {count1} frames for cam1.")
-        return count0 > 0
-    except Exception as e:
-        print(f"[!] Frame extraction failed: {e}")
-        return False
+    return extract_insv_frames_pyav(insv_path, output_dir, fps=fps)
 
 
 def extract_insv_gyro(insv_path: Path):
@@ -314,7 +241,7 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 1.0, dt
             for k in range(min(len(cam0_files), len(cam1_files))):
                 fn_digits = "".join(filter(str.isdigit, cam0_files[k].stem))
                 fn = int(fn_digits) if fn_digits else (k + 1)
-                t_vid = (fn - 1) / fps
+                t_vid = frame_time(dataset_dir, "cam0/" + cam0_files[k].name, fps)
                 t_query = t_slam_start + (t_vid - dt_sync)
 
                 if not (t_slam_start <= t_query <= t_slam_end):
@@ -421,6 +348,7 @@ def execute_unified_workflow(
     run_spirula: bool = False,
     export_ply: bool = True,
     export_pcd: bool = True,
+    use_vulkan: bool = True,
     export_colmap: bool = True
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
@@ -536,24 +464,24 @@ def execute_unified_workflow(
     print("\n[STAGE 5/5] Running Point Cloud Colorization...")
     if method in ("sfm", "all") and sparse_bin.is_file():
         try:
-            pipeline.colorize_via_spirula_sfm(output_dir, fps=fps)
+            pipeline.colorize_via_spirula_sfm(output_dir, fps=fps, use_vulkan=use_vulkan)
         except Exception as e:
             print(f"[!] SfM colorization notice: {e}")
 
-    if method in ("direct", "all") or not (deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_ALINHADO.ply").is_file():
-        pipeline.colorize_via_direct_rigid(output_dir, calib, fps=fps, dt_override=dt_sync)
+    if method in ("direct", "all") or not (deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.ply").is_file():
+        pipeline.colorize_via_direct_rigid(output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan)
 
     # --------------------------------------------------------------------------
     # Packaging Deliverables
     # --------------------------------------------------------------------------
     print("\n[*] Packaging Deliverables...")
-    primary_ply = deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_ALINHADO.ply"
+    primary_ply = deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.ply"
     if not primary_ply.is_file():
         primary_ply = deliverables_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
     if not primary_ply.is_file():
         primary_ply = output_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.ply"
 
-    primary_pcd = deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_ALINHADO.pcd"
+    primary_pcd = deliverables_dir / "02_NUVEM_LIDAR_COLORIDA_METODO_SFM_SPIRULA_CORRIGIDO.pcd"
     if not primary_pcd.is_file():
         primary_pcd = deliverables_dir / "03_NUVEM_LIDAR_COLORIDA_METODO_DIRETO_CALIBRADO.pcd"
     if not primary_pcd.is_file():

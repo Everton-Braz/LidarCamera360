@@ -4,8 +4,12 @@ opencv-python-headless==4.13.0.90
 rosbags==0.11.3
 pyinstaller==6.19.0
 PyQt6==6.10.2
+PyQt6-Qt6==6.10.2
+PyQt6-sip==13.11.0
 PyQt6-Fluent-Widgets>=1.7.0
 PyQt6-Frameless-Window>=0.8.0
 darkdetect>=0.8.0
 pywin32>=312
 
+
+av>=11.0.0

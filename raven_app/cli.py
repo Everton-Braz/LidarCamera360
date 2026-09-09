@@ -49,8 +49,13 @@ def parse(argv=None):
     p.add_argument('--version',action='version',version='RavenCalibrator '+__version__)
     p.add_argument('--headless',action='store_true',help='Require a CLI command; never open the desktop UI')
     sub=p.add_subparsers(dest='command')
-    sub.add_parser('gui',help='Open desktop controls')
+    gui=sub.add_parser('gui',help='Open desktop controls')
+    gui.add_argument('--smoke-test', action='store_true', help=argparse.SUPPRESS)
     sub.add_parser('doctor',help='Report bundled engines and numerical runtime')
+    video=sub.add_parser('extract-insv', help='Extract synchronized sharp lens frames using bundled PyAV')
+    video.add_argument('--insv', type=Path, required=True)
+    video.add_argument('--output', type=Path, required=True)
+    video.add_argument('--fps', type=positive, default=1.)
     info=sub.add_parser('inspect-bag',help='List bag topics without ROS')
     info.add_argument('--bag',type=Path,nargs='+',required=True)
     export=sub.add_parser('export-bag',help='Convert bags to native FLV2 input')
@@ -87,6 +92,8 @@ def parse(argv=None):
     wf.add_argument('--export-ply',action='store_true',default=False)
     wf.add_argument('--export-pcd',action='store_true',default=False)
     wf.add_argument('--export-colmap',action='store_true',default=False)
+    for command_parser in (color, wf):
+        command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
     a=p.parse_args(argv)
     if a.headless and a.command in (None,'gui'):p.error('--headless requires a processing or inspection command')
     return a
@@ -99,12 +106,20 @@ def export_options(a):
 def run(a):
     if a.command in (None,'gui'):
         from raven_app.gui import launch
-        launch();return 0
+        if getattr(a, 'smoke_test', False):
+            from PyQt6.QtWidgets import QApplication
+            def verify(window):
+                ok = window.isVisible() and not window.grab().isNull()
+                print(json.dumps({'gui_ready': ok}), flush=True)
+                window.close()
+                QApplication.instance().exit(0 if ok else 2)
+            return launch(on_ready=verify)
+        return launch()
     if a.command == 'doctor':
         import numpy, scipy, cv2
-        from raven_app.config import get_spirula_bin, get_ffmpeg_bin, validate_tool
-        ff = get_ffmpeg_bin()
-        ok_ff, ver_ff = validate_tool("ffmpeg", ff)
+        from raven_app.config import get_spirula_bin, validate_tool
+        from raven_app.vulkan_engine import vulkan_status
+        import av
         sp = get_spirula_bin()
         ok_sp, ver_sp = validate_tool("spirula", str(sp))
         report = {
@@ -114,8 +129,8 @@ def run(a):
             'numpy': numpy.__version__,
             'scipy': scipy.__version__,
             'opencv': cv2.__version__,
-            'ffmpeg_path': ff,
-            'ffmpeg_ready': ok_ff,
+            'pyav': av.__version__,
+            'vulkan_colorizer': vulkan_status(),
             'spirula_path': str(sp),
             'spirula_ready': ok_sp
         }
@@ -125,6 +140,9 @@ def run(a):
             report['native_version'] = probe.stdout.strip()
         print(json.dumps(report, indent=2))
         return 0 if report.get('native_exit_code') == 0 else 2
+    if a.command=='extract-insv':
+        from raven_app.video import extract_insv_frames_pyav
+        return 0 if extract_insv_frames_pyav(a.insv, a.output, fps=a.fps) else 2
     if a.command=='inspect-bag':
         from raven_app.bag_io import inspect_bags
         print(json.dumps(inspect_bags(a.bag),indent=2));return 0
@@ -160,8 +178,8 @@ def run(a):
             if not any((dataset/'images'/cam).glob('*.jpg')):raise ValueError(f'Missing extracted frames in images/{cam}')
         if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset):raise RuntimeError('Spirula reconstruction failed')
         if a.recalibrate_from_sfm:pipeline.recalibrate_from_sfm(dataset,fps=a.fps)
-        if a.method in ('sfm','all'):pipeline.colorize_via_spirula_sfm(dataset,fps=a.fps)
-        if a.method in ('direct','all'):pipeline.colorize_via_direct_rigid(dataset,a.calib,fps=a.fps,dt_override=a.dt)
+        if a.method in ('sfm','all'):pipeline.colorize_via_spirula_sfm(dataset,fps=a.fps,use_vulkan=not a.no_vulkan)
+        if a.method in ('direct','all'):pipeline.colorize_via_direct_rigid(dataset,a.calib,fps=a.fps,dt_override=a.dt,use_vulkan=not a.no_vulkan)
         return 0
     if a.command=='workflow':
         from raven_app.workflow import execute_unified_workflow
@@ -177,6 +195,7 @@ def run(a):
             dt_override=a.dt,
             recalibrate=a.recalibrate,
             run_spirula=a.run_spirula,
+            use_vulkan=not a.no_vulkan,
             export_ply=a.export_ply,
             export_pcd=a.export_pcd,
             export_colmap=a.export_colmap
