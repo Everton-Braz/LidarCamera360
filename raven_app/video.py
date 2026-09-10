@@ -33,7 +33,7 @@ def _timestamps(path, mtime_ns, size):
     return json.loads(Path(path).read_text(encoding='utf-8'))['timestamps']
 
 
-def frame_time(dataset_dir, name, fps=1.0):
+def frame_time(dataset_dir, name, fps=2.0):
     """Read measured presentation time; support older, one-based frame datasets."""
     manifest = Path(dataset_dir) / 'images' / 'frames.json'
     if manifest.is_file():
@@ -109,7 +109,7 @@ def _write_pair(stage, number, frames, jpeg_quality):
         encoded.tofile(stage / f'cam{lens}/frame_{number:06d}.jpg')
 
 
-def extract_video_frames(insv_path, output_dir, fps=1.0, sharp_window=5,
+def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                          progress_cb=None, *, decoder='auto', threads=None,
                          jpeg_quality=95):
     """Extract synchronized sharp pairs using GPU decoding with CPU fallback.

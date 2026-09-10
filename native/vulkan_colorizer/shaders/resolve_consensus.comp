@@ -70,6 +70,12 @@ void main() {
             c1 = unpack_rgb(c_raw.y); w1 = s.y;
             c2 = unpack_rgb(c_raw.z); w2 = s.z;
         }
+        // Do not create a synthetic color when two observations disagree
+        // strongly: retain the higher-scoring actual observation.
+        if (distance(c1, c2) >= outlier_threshold) {
+            final_colors[idx] = pack_rgb(w1 >= w2 ? c1 : c2);
+            return;
+        }
         vec3 blended = (w1 * c1 + w2 * c2) / max(w1 + w2, 1e-6);
         final_colors[idx] = pack_rgb(blended);
         return;
@@ -101,7 +107,11 @@ void main() {
     if (total_w > 0.0) {
         blended /= total_w;
     } else {
-        blended = (c1 + c2 + c3) / 3.0;
+        // There is no consensus cluster; preserve the strongest real sample
+        // rather than averaging unrelated colors into a ghost.
+        blended = c1;
+        if (s.y > s.x && s.y >= s.z) blended = c2;
+        else if (s.z > s.x && s.z > s.y) blended = c3;
     }
 
     final_colors[idx] = pack_rgb(blended);

@@ -37,7 +37,7 @@ def main():
         source=tmp/'synthetic.insv'
         VideoTests().make_video(source)
         call(['--headless','extract-insv','--insv',str(source),'--output',str(tmp/'extracted')])
-        assert len(list((tmp/'extracted/images/cam1').glob('*.jpg')))==3
+        assert len(list((tmp/'extracted/images/cam1').glob('*.jpg')))==5
         call(['--headless'],2)
         call(['colorize','--dataset',str(tmp),'--fps','nan'],2)
         dataset=tmp/'dataset';pcd=dataset/'slam_out/pcd';trj=dataset/'slam_out/result'

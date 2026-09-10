@@ -80,13 +80,24 @@ void main() {
     // 1. Occlusion Check against Z-Buffer
     int ug = clamp(int(floor(u / zbuf_scale.x)), 0, zbuf_size.x - 1);
     int vg = clamp(int(floor(v / zbuf_scale.y)), 0, zbuf_size.y - 1);
-    int flat_idx = vg * zbuf_size.x + ug;
 
-    uint min_depth_fixed = depth_grid[flat_idx];
-    float min_d = float(min_depth_fixed) / 1000.0;
-
-    // Threshold check matching pipeline: d <= min_d * 1.08 + 0.15
-    if (d > min_d * 1.08 + 0.15) return;
+    // Use the nearest valid sample in a 3x3 neighborhood.  The depth pass
+    // can leave sparse holes when a foreground surface lands between cells.
+    uint nearest_depth_fixed = 0xffffffffu;
+    for (int dy = -1; dy <= 1; ++dy) {
+        int ny = vg + dy;
+        if (ny < 0 || ny >= zbuf_size.y) continue;
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = ug + dx;
+            if (nx < 0 || nx >= zbuf_size.x) continue;
+            uint candidate = depth_grid[ny * zbuf_size.x + nx];
+            if (candidate < nearest_depth_fixed) nearest_depth_fixed = candidate;
+        }
+    }
+    if (nearest_depth_fixed == 0xffffffffu) return;
+    float nearest_d = float(nearest_depth_fixed) / 1000.0;
+    float visibility_tolerance = max(0.03, 0.01 * nearest_d);
+    if (d > nearest_d + visibility_tolerance) return;
 
     // 2. Score calculation: favors closer and center-of-lens rays
     float norm_r = r_px / max_radius;

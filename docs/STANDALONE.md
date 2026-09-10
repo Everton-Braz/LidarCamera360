@@ -10,8 +10,8 @@ LidarCamera360 is a portable Windows x64 application. Keep `LidarCamera360.exe` 
 .\LidarCamera360.exe inspect-bag --bag D:\capture\merged.bag
 .\LidarCamera360.exe export-bag --bag D:\capture\merged.bag --output D:\capture\input.flv2
 .\LidarCamera360.exe slam --bag D:\capture\merged.bag --lio --output D:\dataset\slam_out --threads 4
-.\LidarCamera360.exe extract-insv --insv D:\capture\video.insv --output D:\dataset --fps 1
-.\LidarCamera360.exe colorize --dataset D:\dataset --method trajectory --fps 1 --dt -4.2
+.\LidarCamera360.exe extract-insv --insv D:\capture\video.insv --output D:\dataset --fps 2
+.\LidarCamera360.exe colorize --dataset D:\dataset --method trajectory --fps 2 --dt -4.2
 ```
 
 The GUI exposes the same operations. Headless commands do not create a Qt application and suit automation. Return code `0` means success, `2` means invalid input or processing failure, and `130` means cancellation. A cancelled SLAM run flushes the accumulated partial map.
@@ -29,6 +29,8 @@ Pass split, non-overlapping bags after `--bag` when a capture is split. Do not p
 `extract-insv` writes paired front/rear JPEGs and `images/frames.json`, whose measured presentation times are used by alignment and colorization. Both lens tracks must decode successfully.
 
 Colorization needs `pcd/all_raw_points.pcd`, `result/Raven_3DMakerPro_Scan.txt`, paired frames, and a calibration profile. Reconstruction mode uses Spirula Studio when `--run-spirula` is requested or its sparse reconstruction is missing. Trajectory mode uses the calibrated trajectory and optional reconstruction drift correction. Canonical files are `reconstruction_colorized.ply/.pcd`, `trajectory_colorized.ply/.pcd`, `trajectory.txt`, and `configs/rig_profile.json`; `sfm` and `direct` are legacy aliases.
+
+Automatic alignment and calibration outputs use version 2 metadata. When an older alignment cache is found beside a sparse reconstruction, it is recomputed with the capture's stored synchronization hint before colorization. Each recalibration/colorization run should use a fresh output directory; synchronization is never replaced by an arbitrary fallback offset.
 
 ## Native engine
 

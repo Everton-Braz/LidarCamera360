@@ -85,6 +85,18 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(win.workflow_view.imu_topic.text(), '/custom_imu')
         win.close()
 
+    def test_workflow_ui_labels_and_defaults(self):
+        from raven_app.gui import create_main_window
+        win = create_main_window()
+        wf = win.workflow_view
+        self.assertEqual(wf.fps_spin.value(), 2.0)
+        self.assertEqual(wf.recalibrate_chk.text(), "Auto-Recalibrate Spatial Extrinsics from SfM Alignment")
+        self.assertEqual(wf.chk_ply.text(), "Export Colored Point Cloud (.PLY)")
+        self.assertEqual(wf.chk_pcd.text(), "Export Colored Point Cloud (.PCD)")
+        self.assertEqual(wf.chk_colmap.text(), "Metric-Scaled 3DGS COLMAP Dataset")
+        self.assertEqual(win.colorize_view.fps_spin.value(), 2.0)
+        win.close()
+
 
 class WorkflowTests(unittest.TestCase):
     def test_workflow_cli_parsing(self):

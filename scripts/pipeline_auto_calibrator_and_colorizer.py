@@ -29,6 +29,7 @@ import cv2
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
+from scipy.ndimage import minimum_filter
 from raven_app.video import frame_time
 from raven_app.vulkan_engine import get_vulkan_bin, colorize_views
 
@@ -38,6 +39,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 SPIRULA_EXE = WORKSPACE_DIR / "spirula" / "spirula.exe"
 DEFAULT_CALIB_JSON = WORKSPACE_DIR / "calibracao_rigida_raven_insta360.json"
+CALIBRATION_VERSION = 2
 
 
 # ==============================================================================
@@ -198,6 +200,15 @@ def project_thin_prism(P_v, params):
     dv = p1*(rd2 + 2*yd**2) + 2*p2*xd*yd + sy1*rd2
     u, v = fx*(xd*radial + du) + cx, fy*(yd*radial + dv) + cy
     return u, v, r
+
+
+def visible_depths(distances, flat_indices, width, height):
+    """Conservative radial-depth test, including adjacent sparse raster cells."""
+    depth = np.full(width * height, np.inf, dtype=np.float32)
+    np.minimum.at(depth, flat_indices, np.floor(distances * 1000).astype(np.float32) / 1000)
+    nearest = minimum_filter(depth.reshape(height, width), size=3,
+                             mode='constant', cval=np.inf).ravel()[flat_indices]
+    return distances <= nearest + np.maximum(0.03, 0.01 * nearest)
 
 
 def sample_bilinear(image, u, v):
@@ -451,7 +462,7 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
     return True
 
 
-def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
+def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None):
     """Executa o alinhamento de alta precisão Sim(3) + ICP entre COLMAP e LiDAR"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
@@ -479,8 +490,11 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
     min_overlap = max(10, int(len(cam0) * 0.40))
 
     # Nominal physical camera arm offset for initial camera center approximation
-    u_L = np.array([0.003102, -0.504937, -0.863152])
-    c_L_phys = 0.185 * u_L
+    # The trajectory is gravity-aligned (world +Z up). Express the upright
+    # camera lever in the initial body frame, rather than reusing another
+    # capture's gravity vector (which previously placed the camera BELOW it).
+    c_L_phys = rot_slam[0].inv().apply([0.0, 0.0, 0.185])
+    trajectory_slerp = Slerp(t_slam, rot_slam)
 
     # Busca ótima do dt (coarse-to-fine adaptativa)
     print(f"[*] Searching for optimal time synchronization Δt (FPS = {fps:.1f}, hint = {dt_hint})...")
@@ -506,7 +520,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
                 w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
                 p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
                 X_trj.append(im["C"])
-                Y_trj.append(p_L + rot_slam[idx].as_matrix() @ c_L_phys)
+                Y_trj.append(p_L + trajectory_slerp(t_q).apply(c_L_phys))
 
         if len(X_trj) >= min_overlap:
             s, R, t_trans, rmse = solve_umeyama_sim3(np.array(X_trj), np.array(Y_trj))
@@ -531,7 +545,7 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
                     w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
                     p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
                     X_trj.append(im["C"])
-                    Y_trj.append(p_L + rot_slam[idx].as_matrix() @ c_L_phys)
+                    Y_trj.append(p_L + trajectory_slerp(t_q).apply(c_L_phys))
 
             if len(X_trj) >= min_overlap:
                 s, R, t_trans, rmse = solve_umeyama_sim3(np.array(X_trj), np.array(Y_trj))
@@ -579,6 +593,9 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
     print(f"[+] ICP converged: RMSE = {rmse_icp*100:.2f} cm, Scale s = {s_comp:.6f}")
 
     align_data = {
+        "calibration_version": CALIBRATION_VERSION,
+        "initial_camera_lever_body_m": c_L_phys.tolist(),
+        "trajectory_rmse_cm": float(best_rmse * 100),
         "scale": float(s_comp),
         "R": R_comp.tolist(),
         "t": t_comp.tolist(),
@@ -589,6 +606,15 @@ def align_colmap_to_lidar(dataset_dir, fps=1.0, dt_hint=None):
         json.dump(align_data, f, indent=2)
 
     return align_data
+
+
+def current_alignment(dataset_dir, fps=2.0):
+    """Upgrade alignments made with the old inverted lever initialization."""
+    path = dataset_dir / "colmap_to_lidar_alignment.json"
+    saved = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+    if saved.get('calibration_version') != CALIBRATION_VERSION:
+        return align_colmap_to_lidar(dataset_dir, fps, saved.get('dt_sync_seconds'))
+    return saved
 
 
 def transform_colmap_to_metric(src_dir: Path, dst_dir: Path, s_sim: float, R_sim: np.ndarray, t_sim: np.ndarray):
@@ -895,17 +921,13 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
         return None
 
 
-def recalibrate_from_sfm(dataset_dir, fps=1.0):
+def recalibrate_from_sfm(dataset_dir, fps=2.0):
     """Recalibrate with high precision os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_trj = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
-    if not align_json.exists():
-        align_colmap_to_lidar(dataset_dir, fps=fps)
-
-    with open(align_json, "r", encoding="utf-8") as f:
-        al = json.load(f)
+    al = current_alignment(dataset_dir, fps)
     s_sim = al["scale"]
     R_sim = np.array(al["R"])
     t_sim = np.array(al["t"])
@@ -928,7 +950,7 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
             t_q = t_slam[0] + (t_vid - dt_sync)
             if t_slam[0] <= t_q <= t_slam[-1]:
                 R_L = slerp(t_q).as_matrix()
-                idx = np.searchsorted(t_slam, t_q)
+                idx = np.clip(np.searchsorted(t_slam, t_q), 1, len(t_slam) - 1)
                 w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
                 p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
 
@@ -967,19 +989,10 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
     print("=" * 80)
 
     calib_dict = {
+        "calibration_version": CALIBRATION_VERSION,
         "scanner": "3DMakerPro_Raven_LiDAR",
         "camera": "Insta360_X4_DualFisheye",
         "lens_model": "THIN_PRISM_FISHEYE",
-        "cam0_front_intrinsics": {
-            "fx": 1081.46958, "fy": 1081.54143, "cx": 1920.0, "cy": 1920.0,
-            "k1": 0.083654, "k2": -0.031306, "p1": -0.000387, "p2": 0.001724,
-            "k3": 0.012000, "k4": -0.002967, "sx1": -0.003401, "sy1": 0.000687
-        },
-        "cam1_rear_intrinsics": {
-            "fx": 1079.49331, "fy": 1079.54918, "cx": 1920.0, "cy": 1920.0,
-            "k1": 0.080167, "k2": -0.027667, "p1": -0.000449, "p2": 0.000715,
-            "k3": 0.010155, "k4": -0.002635, "sx1": 0.000645, "sy1": 0.002474
-        },
         "T_lidar_to_cam0_rigid_4x4": T_LC0.tolist(),
         "T_lidar_to_cam1_rigid_4x4": T_LC1.tolist(),
         "lever_arm_cam0_meters": {
@@ -998,6 +1011,19 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
         "dt_sync_seconds": float(dt_sync)
     }
 
+    # Extrinsics and intrinsics must describe the SAME reconstruction.
+    cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
+    keys = ('fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'sx1', 'sy1')
+    for prefix, field in (("cam0/", "cam0_front_intrinsics"),
+                          ("cam1/", "cam1_rear_intrinsics")):
+        ids = {im['cam_id'] for im in images if im['name'].startswith(prefix)}
+        if len(ids) != 1:
+            raise ValueError(f"Expected one calibrated camera for {prefix}, got {ids}")
+        camera = cameras[ids.pop()]
+        calib_dict[field] = dict(zip(keys, camera['params']))
+        calib_dict[field].update(width=camera['width'], height=camera['height'])
+    calib_dict['transform_convention'] = 'camera_to_trajectory_body'
+
     deliv_dir = dataset_dir / "deliverables"
     deliv_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1012,17 +1038,13 @@ def recalibrate_from_sfm(dataset_dir, fps=1.0):
     return calib_dict
 
 
-def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
+def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
     """Executa a coloração de alta precisão projetando as poses alinhadas do SfM"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
-    if not align_json.exists():
-        align_colmap_to_lidar(dataset_dir, fps=fps)
-
-    with open(align_json, "r", encoding="utf-8") as f:
-        al = json.load(f)
+    al = current_alignment(dataset_dir, fps)
     s_sim = al["scale"]
     R_sim = np.array(al["R"])
     t_sim = np.array(al["t"])
@@ -1090,10 +1112,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
         vg = np.clip(np.floor(v_c / scale_factor_zbuf).astype(np.int32), 0, zbuf_h - 1)
         flat_idx = vg * zbuf_w + ug
 
-        dmap = np.full(zbuf_w * zbuf_h, 1e9, dtype=np.float32)
-        np.minimum.at(dmap, flat_idx, np.floor(d_c * 1000).astype(np.float32) / 1000)
-
-        vis_mask = d_c <= (dmap[flat_idx] * 1.08 + 0.15)
+        vis_mask = visible_depths(d_c, flat_idx, zbuf_w, zbuf_h)
         if not np.any(vis_mask):
             continue
 
@@ -1151,6 +1170,12 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
             c2 = top_colors[idx_2].astype(np.float32)
             weights = s2 / np.sum(s2, axis=1, keepdims=True)
             avg2 = np.sum(c2 * weights[:, :, None], axis=1)
+            # Two contradictory views cannot establish a consensus. Keep an
+            # observed color rather than manufacturing a translucent blend.
+            slots = np.argsort(-s2, axis=1)[:, :2]
+            observed = np.take_along_axis(c2, slots[:, :, None], axis=1)
+            disagree = np.linalg.norm(observed[:, 0] - observed[:, 1], axis=1) >= 45.0
+            avg2[disagree] = observed[disagree, 0]
             colors[idx_2] = np.clip(np.round(avg2), 0, 255).astype(np.uint8)
 
         mask_3 = (n_obs == 3)
@@ -1164,8 +1189,10 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
             weights = s3 * inliers.astype(np.float32)
             sum_w = np.sum(weights, axis=1, keepdims=True)
             fallback = (sum_w[:, 0] == 0)
-            weights[fallback] = 1.0
-            sum_w[fallback] = 3.0
+            weights[fallback] = 0.0
+            best = np.argmax(s3[fallback], axis=1)
+            weights[np.where(fallback)[0], best] = 1.0
+            sum_w[fallback] = 1.0
             norm_w = weights / sum_w
             final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
             colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
@@ -1189,7 +1216,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=1.0, use_vulkan=True):
 # PIPELINE MÉTODO 2: DIRETO RÍGIDO (SEM SFM)
 # ==============================================================================
 
-def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_override=None, use_vulkan=True):
+def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_override=None, use_vulkan=True):
     """Executa a coloração direta rápida usando matriz rígida e tempo calibrado"""
     if calib_json_path is None:
         rig_json = dataset_dir / "rig_calibration.json"
@@ -1215,6 +1242,12 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
 
     with open(calib_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
+
+    if (dataset_dir / 'sparse/0/images.bin').is_file():
+        current_alignment(dataset_dir, fps)
+        if (calib_json_path.name in ('rig_calibration.json', 'calibracao_rigida_auto.json')
+                and cfg.get('calibration_version') != CALIBRATION_VERSION):
+            cfg = recalibrate_from_sfm(dataset_dir, fps)
 
     p0 = cfg["cam0_front_intrinsics"]
     params0 = (p0["fx"], p0["fy"], p0["cx"], p0["cy"], p0["k1"], p0["k2"], p0["p1"], p0["p2"], p0["k3"], p0["k4"], p0["sx1"], p0["sy1"])
@@ -1256,8 +1289,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             dt_sync = sync_via_gyro_cross_correlation(insv_files[0], bag_files[0], slam_trj)
 
     if dt_sync is None:
-        dt_sync = -4.220
-        print(f"[!] Warning: Default Δt adopted = {dt_sync:.4f}s")
+        raise ValueError("No capture-specific time synchronization. Supply --dt or calibrate this dataset first.")
     else:
         print(f"[*] Active time synchronization: Δt = {dt_sync:.4f}s")
 
@@ -1269,8 +1301,16 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
     t_slam_end = t_slam[-1]
     slerp = Slerp(t_slam, rot_slam)
 
-    cam0_files = sorted(list((dataset_dir / "images" / "cam0").glob("*.jpg")))
-    cam1_files = sorted(list((dataset_dir / "images" / "cam1").glob("*.jpg")))
+    front = {p.name: p for p in (dataset_dir / "images" / "cam0").glob("*.jpg")}
+    rear = {p.name: p for p in (dataset_dir / "images" / "cam1").glob("*.jpg")}
+    pairs = sorted(front.keys() & rear.keys(),
+                   key=lambda name: frame_time(dataset_dir, "cam0/" + name, fps))
+    if not pairs:
+        raise ValueError("No synchronized front/rear image pairs found")
+    if front.keys() != rear.keys():
+        print(f"[!] Skipping {len(front.keys() ^ rear.keys())} unpaired lens images")
+    cam0_files = [front[name] for name in pairs]
+    cam1_files = [rear[name] for name in pairs]
 
     gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() else None
     K_VIEWS = 3
@@ -1301,7 +1341,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             cam0_sfm = [im for im in sfm_imgs if im["name"].startswith("cam0")]
             cam0_sfm.sort(key=lambda x: int("".join(filter(str.isdigit, x["name"]))))
 
-            n_samples = min(30, len(cam0_sfm))
+            n_samples = len(cam0_sfm)
             sample_indices = np.linspace(0, len(cam0_sfm) - 1, n_samples).astype(int)
             sample_imgs = [cam0_sfm[i] for i in sample_indices]
 
@@ -1405,10 +1445,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             vg = np.clip(np.floor(v_c / scale_factor_zbuf).astype(np.int32), 0, zbuf_h - 1)
             flat_idx = vg * zbuf_w + ug
 
-            dmap = np.full(zbuf_w * zbuf_h, 1e9, dtype=np.float32)
-            np.minimum.at(dmap, flat_idx, np.floor(d_c * 1000).astype(np.float32) / 1000)
-
-            vis_mask = d_c <= (dmap[flat_idx] * 1.08 + 0.15)
+            vis_mask = visible_depths(d_c, flat_idx, zbuf_w, zbuf_h)
             if not np.any(vis_mask):
                 continue
 
@@ -1466,6 +1503,12 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             c2 = top_colors[idx_2].astype(np.float32)
             weights = s2 / np.sum(s2, axis=1, keepdims=True)
             avg2 = np.sum(c2 * weights[:, :, None], axis=1)
+            # Two contradictory views cannot establish a consensus. Keep an
+            # observed color rather than manufacturing a translucent blend.
+            slots = np.argsort(-s2, axis=1)[:, :2]
+            observed = np.take_along_axis(c2, slots[:, :, None], axis=1)
+            disagree = np.linalg.norm(observed[:, 0] - observed[:, 1], axis=1) >= 45.0
+            avg2[disagree] = observed[disagree, 0]
             colors[idx_2] = np.clip(np.round(avg2), 0, 255).astype(np.uint8)
 
         mask_3 = (n_obs == 3)
@@ -1479,8 +1522,10 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=1.0, dt_ove
             weights = s3 * inliers.astype(np.float32)
             sum_w = np.sum(weights, axis=1, keepdims=True)
             fallback = (sum_w[:, 0] == 0)
-            weights[fallback] = 1.0
-            sum_w[fallback] = 3.0
+            weights[fallback] = 0.0
+            best = np.argmax(s3[fallback], axis=1)
+            weights[np.where(fallback)[0], best] = 1.0
+            sum_w[fallback] = 1.0
             norm_w = weights / sum_w
             final_c3 = np.sum(c3 * norm_w[:, :, None], axis=1)
             colors[idx_3] = np.clip(np.round(final_c3), 0, 255).astype(np.uint8)
@@ -1510,7 +1555,7 @@ def main():
                         help="Dataset directory.")
     parser.add_argument("--method", type=str, choices=["all", "sfm", "direct", "trajectory", "reconstruction"], default="all",
                         help="Method to run: 'sfm', 'direct', or 'all'.")
-    parser.add_argument("--fps", type=float, default=1.0, help="Frame sampling rate (FPS, default 1.0).")
+    parser.add_argument("--fps", type=float, default=2.0, help="Frame sampling rate (FPS, default 2.0).")
     parser.add_argument("--run-spirula", action="store_true", help="Force spirula.exe execution before colorization.")
     parser.add_argument("--recalibrate-from-sfm", action="store_true", help="Recalculate rig parameters from SfM.")
     parser.add_argument("--dt", type=float, default=None, help="Manual time offset Δt in seconds.")

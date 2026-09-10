@@ -61,6 +61,53 @@ class VulkanTests(unittest.TestCase):
             self.assertIsNotNone(rgb)
             np.testing.assert_allclose(rgb[[0,3]],[[30,80,120],[30,80,120]],atol=1)
             np.testing.assert_array_equal(rgb[[1,2]],[[180]*3,[180]*3])
+    def test_visibility_rejects_shallow_occluder_and_neighbor_hole(self):
+        """A 5.2 m sample must not leak through a nearby 5 m foreground cell."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Keep the foreground and background projections in adjacent z-buffer
+            # cells (the latter exercises the 3x3 sparse-hole lookup).
+            points = np.array([[0.0, 0.0, 5.0], [0.0041, 0.0, 5.2]])
+            image = np.zeros((64, 64, 3), np.uint8)
+            image[:] = [30, 80, 120][::-1]  # RGB [30, 80, 120] after decode
+            path = root / 'view.png'
+            cv2.imwrite(str(path), image)
+            params = [18, 18, 32, 32] + [0] * 8
+            rgb = colorize_views(points, [(path, np.eye(3), np.zeros(3), params)], root)
+            self.assertIsNotNone(rgb)
+            np.testing.assert_allclose(rgb[0], [30, 80, 120], atol=1)
+            np.testing.assert_allclose(rgb[1], [180, 180, 180], atol=1)
+    def test_resolve_two_disagreeing_frames_keeps_best_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            points = np.array([[0.0, 0.0, 1.0]])
+            colors = ([255, 0, 0], [0, 0, 255])
+            views = []
+            for i, color in enumerate(colors):
+                path = root / f'frame_{i}.png'
+                cv2.imwrite(str(path), np.full((64, 64, 3), color[::-1], np.uint8))
+                # The second camera is closer, so its score is higher.
+                center = np.array([0.0, 0.0, 0.2 if i else 0.0])
+                views.append((path, np.eye(3), center, [18, 18, 32, 32] + [0] * 8))
+            rgb = colorize_views(points, views, root)
+            self.assertIsNotNone(rgb)
+            np.testing.assert_allclose(rgb[0], [0, 0, 255], atol=1)
+
+    def test_resolve_three_without_median_inlier_keeps_best_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            points = np.array([[0.0, 0.0, 1.0]])
+            colors = ([255, 0, 0], [0, 255, 0], [0, 0, 255])
+            views = []
+            centers = (0.0, 0.2, -0.2)
+            for i, (color, z_center) in enumerate(zip(colors, centers)):
+                path = root / f'orthogonal_{i}.png'
+                cv2.imwrite(str(path), np.full((64, 64, 3), color[::-1], np.uint8))
+                views.append((path, np.eye(3), np.array([0.0, 0.0, z_center]),
+                              [18, 18, 32, 32] + [0] * 8))
+            rgb = colorize_views(points, views, root)
+            self.assertIsNotNone(rgb)
+            np.testing.assert_allclose(rgb[0], [0, 255, 0], atol=1)
     def test_missing_frame_returns_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             result=colorize_views(np.array([[0.,0.,1.]]),[(Path(tmp)/'missing.jpg',np.eye(3),np.zeros(3),[18,18,32,32]+[0]*8)],tmp)

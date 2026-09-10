@@ -29,7 +29,7 @@ from raven_app.bag_io import export_bags
 from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, frame_time
 
 
-def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 1.0) -> bool:
+def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 2.0) -> bool:
     return extract_insv_frames_pyav(insv_path, output_dir, fps=fps)
 
 
@@ -137,7 +137,7 @@ def auto_sync_imu_gyro(bag_path: Path, insv_path: Path, imu_topic: str = "/vanje
         return 1.892
 
 
-def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 1.0, dt_sync: float = 0.0) -> Path:
+def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0) -> Path:
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
     
     If Spirula SfM reconstruction exists, transforms it directly into the LiDAR metric coordinate frame.
@@ -395,7 +395,7 @@ def execute_unified_workflow(
     threads: int = 4,
     lidar_topic: str = "/vanjee_722z",
     imu_topic: str = "/vanjee_imu_packets",
-    fps: float = 1.0,
+    fps: float = 2.0,
     method: str = "sfm",
     calib_json: Path = None,
     dt_override: float = None,

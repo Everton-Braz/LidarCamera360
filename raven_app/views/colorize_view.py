@@ -105,7 +105,7 @@ class ColorizeView(QWidget):
         self.fps_label = BodyLabel(tr("Extraction FPS:"))
         self.fps_spin = DoubleSpinBox()
         self.fps_spin.setRange(0.1, 120.0)
-        self.fps_spin.setValue(1.0)
+        self.fps_spin.setValue(2.0)
         self.fps_spin.setSingleStep(0.5)
 
         self.dt_label = BodyLabel(tr("Manual Δt (s):"))
