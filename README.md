@@ -64,6 +64,23 @@
 
 ---
 
+## 🖥️ Application Screenshots
+
+| **Unified Processing Studio** | **FAST-LIVO2 LiDAR SLAM** |
+|:---:|:---:|
+| <img src="docs/images/screenshot_unified_studio.png" alt="Unified LiDAR-Camera Studio" width="500"/> | <img src="docs/images/screenshot_slam.png" alt="FAST-LIVO2 SLAM Engine" width="500"/> |
+
+| **Vulkan 3D Point Cloud Colorization** | **LiDAR-Camera Rig Calibration** |
+|:---:|:---:|
+| <img src="docs/images/screenshot_colorize.png" alt="Point Cloud Colorization Studio" width="500"/> | <img src="docs/images/screenshot_calibration.png" alt="Rig Calibration & Optical Modeling" width="500"/> |
+
+<p align="center">
+  <b>System Diagnostics & Hardware Acceleration Engine Doctor</b><br/>
+  <img src="docs/images/screenshot_doctor.png" alt="System Diagnostics & Engine Doctor" width="800"/>
+</p>
+
+---
+
 ## 🚀 Quick Start
 
 ### Running via Python
