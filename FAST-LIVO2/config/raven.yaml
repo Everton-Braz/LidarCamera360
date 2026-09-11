@@ -21,10 +21,10 @@ time_offset:
 
 preprocess:
   point_filter_num: 1
-  filter_size_surf: 0.05
+  filter_size_surf: 0.1
   lidar_type: 5 # XT32 compatible point format (x, y, z, intensity, ring, timestamp in seconds)
   scan_line: 16
-  blind: 0.4
+  blind: 0.7
   feature_extract_enabled: false
 
 vio:
@@ -42,17 +42,17 @@ vio:
 imu:
   imu_en: true
   imu_int_frame: 30
-  acc_cov: 0.2
-  gyr_cov: 0.05
-  b_acc_cov: 0.00001
-  b_gyr_cov: 0.00001
+  acc_cov: 0.5
+  gyr_cov: 0.1
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
 
 lio:
-  max_iterations: 5
+  max_iterations: 8
   dept_err: 0.02
   beam_err: 0.05
-  min_eigen_value: 0.005
-  voxel_size: 0.3
+  min_eigen_value: 0.002
+  voxel_size: 0.6
   max_layer: 2
   max_points_num: 100
   layer_init_num: [5, 5, 5, 5, 5]

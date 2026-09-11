@@ -15,13 +15,16 @@ class CloudData:
     points: np.ndarray
     colors: np.ndarray
     original_count: int
+    intensities: np.ndarray | None = None
+    has_rgb: bool = False
 
     @property
     def name(self) -> str:
         return self.path.name
 
 
-def _finish(path: Path, xyz: np.ndarray, colors: np.ndarray, count: int) -> CloudData:
+def _finish(path: Path, xyz: np.ndarray, colors: np.ndarray, count: int,
+            intensities: np.ndarray | None = None, has_rgb: bool = False) -> CloudData:
     xyz = np.asarray(xyz, dtype=np.float64).reshape((-1, 3))
     colors = np.asarray(colors, dtype=np.float32).reshape((-1, 3))
     if len(xyz) != len(colors):
@@ -31,7 +34,13 @@ def _finish(path: Path, xyz: np.ndarray, colors: np.ndarray, count: int) -> Clou
     if not len(xyz):
         raise ValueError(f"{path}: no finite points")
     colors = np.nan_to_num(colors, nan=0.0, posinf=1.0, neginf=0.0)
-    return CloudData(path, np.ascontiguousarray(xyz), np.ascontiguousarray(colors), int(count))
+    valid_int = None
+    if intensities is not None:
+        valid_int = np.asarray(intensities, dtype=np.float32)[valid]
+        valid_int = np.nan_to_num(valid_int, nan=0.0, posinf=0.0, neginf=0.0)
+        valid_int = np.ascontiguousarray(valid_int)
+    return CloudData(path, np.ascontiguousarray(xyz), np.ascontiguousarray(colors), int(count),
+                     intensities=valid_int, has_rgb=has_rgb)
 
 
 def _color_values(values: np.ndarray, integer: bool = False) -> np.ndarray:
@@ -124,16 +133,25 @@ def _read_pcd(path: Path) -> CloudData:
         except (KeyError, ValueError):
             raise ValueError(f"{path}: PCD must contain x, y and z fields")
         field_types = {name: typ.upper() for name, typ in zip(fields, types)}
+        has_rgb = False
+        intensities = None
+        if "intensity" in fields:
+            try:
+                intensities = get("intensity").astype(np.float32)
+            except Exception:
+                pass
         if all(x in fields for x in ("r", "g", "b")):
             colors = np.column_stack([_color_values(get(x), field_types[x] in ("I", "U")) for x in ("r", "g", "b")])
+            has_rgb = True
         elif "rgb" in fields or "rgba" in fields:
             key = "rgb" if "rgb" in fields else "rgba"
             colors = _packed_color(get(key), field_types[key] in ("I", "U"))
+            has_rgb = True
         elif "intensity" in fields:
             v = _color_values(get("intensity"), field_types["intensity"] in ("I", "U")); colors = np.repeat(v[:, None], 3, axis=1)
         else:
             colors = np.full((n, 3), 0.7, dtype=np.float32)
-    return _finish(path, xyz, colors, n)
+    return _finish(path, xyz, colors, n, intensities=intensities, has_rgb=has_rgb)
 
 
 def _read_ply(path: Path) -> CloudData:
@@ -186,12 +204,20 @@ def _read_ply(path: Path) -> CloudData:
             rec = np.frombuffer(raw, dtype=dt, count=n); get = lambda name: rec[name]
         xyz = np.column_stack([get(x) for x in ("x", "y", "z")])
         ptypes = {p[0]: p[1] for p in props}
+        has_rgb = False
+        intensities = None
+        if "intensity" in names:
+            try:
+                intensities = get("intensity").astype(np.float32)
+            except Exception:
+                pass
         if all(x in names for x in ("red", "green", "blue")):
             colors = np.column_stack([_color_values(get(x), ptypes[x] in ("char", "int8", "uchar", "uint8", "short", "int16", "ushort", "uint16", "int", "int32", "uint", "uint32")) for x in ("red", "green", "blue")])
+            has_rgb = True
         elif "intensity" in names:
             v = _color_values(get("intensity"), ptypes["intensity"] not in ("float", "float32", "double", "float64")); colors = np.repeat(v[:, None], 3, axis=1)
         else: colors = np.full((n, 3), 0.7, dtype=np.float32)
-    return _finish(path, xyz, colors, n)
+    return _finish(path, xyz, colors, n, intensities=intensities, has_rgb=has_rgb)
 
 
 def load_cloud(path: str | Path) -> CloudData:

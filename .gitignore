@@ -6,6 +6,8 @@
 __pycache__/
 build/
 dist/
+bin/
+*.dll
 
 # Large binary scan & media files
 dataset-test/
