@@ -63,6 +63,7 @@ class RavenMainWindow(FluentWindow):
         self.calib_view = CalibrationView(self)
         self.doctor_view = DoctorView(self)
         self.settings_view = SettingsView(self)
+        self.viewer_window = None
 
         # Wire up inter-view communication
         self.inspect_view.apply_to_slam_requested.connect(self._on_apply_topics_to_slam)
@@ -80,6 +81,10 @@ class RavenMainWindow(FluentWindow):
         self.addSubInterface(self.inspect_view, FluentIcon.FOLDER, tr("Bag Inspector"))
         self.addSubInterface(self.calib_view, FluentIcon.TILES, tr("Rig Calibration"))
         self.addSubInterface(self.doctor_view, FluentIcon.HEART, tr("System Doctor"))
+        self.navigationInterface.addItem(
+            "PointCloudViewer", FluentIcon.VIEW, tr("3D Viewer"),
+            onClick=self._open_viewer, selectable=False,
+        )
 
         # Bottom navigation item
         self.addSubInterface(
@@ -106,6 +111,7 @@ class RavenMainWindow(FluentWindow):
             self.inspect_view.objectName(): tr("Bag Inspector"),
             self.calib_view.objectName(): tr("Rig Calibration"),
             self.doctor_view.objectName(): tr("System Doctor"),
+            "PointCloudViewer": tr("3D Viewer"),
             self.settings_view.objectName(): tr("Settings"),
         }
         for obj_name, text in nav_map.items():
@@ -130,7 +136,21 @@ class RavenMainWindow(FluentWindow):
             self.workflow_view.imu_topic.setText(imu)
         self.switchTo(self.workflow_view)
 
+    def _open_viewer(self):
+        from raven_app.viewer_window import PointCloudViewerWindow
+        if self.viewer_window is None:
+            self.viewer_window = PointCloudViewerWindow(self)
+            self.viewer_window.destroyed.connect(lambda: setattr(self, "viewer_window", None))
+        self.viewer_window.show()
+        self.viewer_window.raise_()
+        self.viewer_window.activateWindow()
+
     def closeEvent(self, event):
+        if self.viewer_window is not None and self.viewer_window.isVisible():
+            self.viewer_window.close()
+            if self.viewer_window.isVisible():
+                event.ignore()
+                return
         unregister_language_listener(self._on_language_changed_globally)
         if self.runner.is_busy:
             reply = QMessageBox.question(

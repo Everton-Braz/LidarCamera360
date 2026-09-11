@@ -16,6 +16,14 @@ LidarCamera360 is a portable Windows x64 application. Keep `LidarCamera360.exe` 
 
 The GUI exposes the same operations. Headless commands do not create a Qt application and suit automation. Return code `0` means success, `2` means invalid input or processing failure, and `130` means cancellation. A cancelled SLAM run flushes the accumulated partial map.
 
+## 3D viewer
+
+Open `3D Viewer` from the navigation rail to compare two point clouds in a separate window. Load `.pcd` or `.ply` files with `Load A` and `Load B`; loading runs in a worker thread so the interface remains responsive. The split slider controls the A/B reveal, and measurements can be exported as CSV. Distances use project meters.
+
+Both clouds use one camera and their original coordinates; the viewer does not independently center or register them. Drag the divider or the A/B slider to inspect exactly the same location. Left-drag orbits, right/middle-drag pans, the wheel zooms at the cursor, and `F` fits the clouds. Top, Front, Right and Iso presets are available.
+
+The separate measurement icon tools provide Point coordinates, Distance (two clicks), Polyline length (click vertices, then Enter), and Angle (three clicks, with the second as the vertex). Hover over an icon for its name. Click to pick; dragging still orbits while a measurement is active, and right/middle-drag and wheel navigation remain available. Picks snap to displayed cloud vertices and retain their stored XYZ coordinates. Escape cancels pending picks; Undo removes the last vertex or measurement. CSV records include source files, valid-point indices, coordinates and results. Files must use the same coordinate system and meter units. For clouds above five million points, the preview uses a labeled subset; picked coordinates still come from the original vertices. PCD ASCII/binary and PLY ASCII/little-/big-endian are supported; compressed PCD must first be exported as ordinary binary PCD.
+
 ## Bag requirements
 
 Default Raven topics are `/vanjee_722z`, `/vanjee_imu_packets`, and optionally `/camera_front/image/compressed`. Use `inspect-bag` to discover topic names and fields. The reader accepts standard `PointCloud2` XYZ data with per-point timing; it does not accept Livox `CustomMsg` packets. Missing timing, non-monotonic timestamps, malformed records, and unsupported image encodings are rejected.

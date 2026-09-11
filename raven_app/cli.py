@@ -112,11 +112,28 @@ def run(a):
         from raven_app.gui import launch
         if getattr(a, 'smoke_test', False):
             from PyQt6.QtWidgets import QApplication
+            from PyQt6.QtCore import QTimer
+            from raven_app.viewer_smoke import prepare_viewer_smoke, verify_viewer_smoke
             def verify(window):
-                ok = window.isVisible() and not window.grab().isNull()
-                print(json.dumps({'gui_ready': ok}), flush=True)
-                window.close()
-                QApplication.instance().exit(0 if ok else 2)
+                try:
+                    viewer = prepare_viewer_smoke(window)
+                except Exception as exc:
+                    print(json.dumps({'gui_ready': False, 'error': str(exc)}), flush=True)
+                    QApplication.instance().exit(2)
+                    return
+                def finish():
+                    try:
+                        report = verify_viewer_smoke(viewer)
+                        report['gui_ready'] = window.isVisible() and not window.grab().isNull()
+                        print(json.dumps(report), flush=True)
+                        code = 0 if report['gui_ready'] else 2
+                    except Exception as exc:
+                        print(json.dumps({'gui_ready': False, 'error': str(exc)}), flush=True)
+                        code = 2
+                    viewer.close()
+                    window.close()
+                    QApplication.instance().exit(code)
+                QTimer.singleShot(300, finish)
             return launch(on_ready=verify)
         return launch()
     if a.command == 'doctor':
