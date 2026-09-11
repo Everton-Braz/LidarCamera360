@@ -24,18 +24,16 @@ def main():
     p.add_argument('--incremental', action='store_true', help='Reuse PyInstaller analysis cache')
     a = p.parse_args()
 
-    # A system-site-packages environment can mix Qt bindings and DLL builds.
-    # Reject it before collecting dependencies, even if imports work on this PC.
-    prefix = Path(sys.prefix).resolve()
+    # Validate required runtime modules are installed
     for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets'):
         spec = importlib.util.find_spec(module)
-        if spec is None or not spec.origin or not Path(spec.origin).resolve().is_relative_to(prefix):
-            raise SystemExit(f'{module} must be installed in an isolated build venv. '
-                             'Use build/portable-env and requirements-build.txt.')
+        if spec is None or not spec.origin:
+            raise SystemExit(f'{module} must be installed. Check requirements.txt.')
 
-    native = ROOT / 'build/native/Release'
-    if not (native / 'fastlivo2.exe').is_file():
-        raise SystemExit('Build the native engine first (build/native/Release/fastlivo2.exe missing)')
+    native_dirs = [ROOT / 'build/native/Release', ROOT / 'bin']
+    native = next((d for d in native_dirs if (d / 'fastlivo2.exe').is_file()), None)
+    if native is None:
+        raise SystemExit('Build the native engine first (fastlivo2.exe missing in build/ or bin/)')
 
     stage = ROOT / 'build/package-data'
     licenses = stage / 'licenses'
@@ -96,25 +94,38 @@ def main():
     for name in ('torch', 'tensorflow', 'matplotlib', 'pandas', 'IPython', 'pytest', 'open3d', 'PyQt5', 'PySide6'):
         cmd += ['--exclude-module', name]
 
+    added_binaries = set()
+    def add_binary(src, dst='bin'):
+        p = Path(src).resolve()
+        if p not in added_binaries and p.is_file():
+            added_binaries.add(p)
+            cmd.extend(['--add-binary', f'{p};{dst}'])
+
     for f in sorted(native.glob('*')):
         if f.suffix.lower() in ('.exe', '.dll'):
-            cmd += ['--add-binary', f'{f};bin']
+            add_binary(f, 'bin')
 
     spirula = ROOT / 'spirula/spirula.exe'
     if not spirula.is_file():
+        spirula = ROOT / 'bin/spirula.exe'
+    if not spirula.is_file():
         raise SystemExit('Standalone build requires spirula/spirula.exe')
-    cmd += ['--add-binary', f'{spirula};bin']
+    add_binary(spirula, 'bin')
     for dependency in spirula.parent.glob('*.dll'):
-        cmd += ['--add-binary', f'{dependency};bin']
-    gpu_dirs = [ROOT / 'build/native/vulkan_colorizer/Release', ROOT / 'build/vulkan/Release']
+        add_binary(dependency, 'bin')
+
+    gpu_dirs = [ROOT / 'build/native/vulkan_colorizer/Release', ROOT / 'build/vulkan/Release', ROOT / 'bin']
     gpu = next((d for d in gpu_dirs if (d / 'vulkan_colorizer.exe').is_file()), None)
     if gpu is None:
         raise SystemExit('Build vulkan_colorizer before packaging')
     for binary in gpu.iterdir():
         if binary.suffix.lower() in ('.exe', '.dll'):
-            cmd += ['--add-binary', f'{binary};bin']
+            add_binary(binary, 'bin')
+
     for shader in ('occlusion_zbuf', 'colorize_consensus', 'resolve_consensus'):
         source = gpu / 'shaders' / (shader + '.spv')
+        if not source.is_file():
+            source = ROOT / 'native/vulkan_colorizer/shaders' / (shader + '.spv')
         if not source.is_file():
             raise SystemExit(f'Missing compiled shader: {source}')
         cmd += ['--add-data', f'{source};bin/shaders']
@@ -125,12 +136,16 @@ def main():
     env = os.environ.copy()
     env.pop('PYTHONPATH', None)
     env.pop('PYTHONHOME', None)
-    # Resolve OS DLLs from Windows, not unrelated tools such as Poppler's ICU.
     if sys.platform == 'win32':
-        env['PATH'] = os.pathsep.join((
+        paths = [
             str(Path(os.environ['SystemRoot']) / 'System32'),
+            str(Path(sys.base_prefix)),
+            str(Path(sys.base_prefix) / 'Scripts'),
             str(Path(sys.base_prefix) / 'Library/bin'),
-        ))
+            str(Path(sys.base_prefix) / 'Library/usr/bin'),
+        ]
+        existing = env.get('PATH', '')
+        env['PATH'] = os.pathsep.join([p for p in paths if Path(p).is_dir()] + ([existing] if existing else []))
     subprocess.run(cmd, check=True, cwd=ROOT, env=env)
 
     output = ROOT / 'dist/single-file' if a.onefile else ROOT / f'dist/{APP_NAME}'
