@@ -57,6 +57,9 @@ def parse(argv=None):
     video.add_argument('--insv', type=Path, required=True)
     video.add_argument('--output', type=Path, required=True)
     video.add_argument('--fps', type=positive, default=2.)
+    gps=sub.add_parser('extract-gps', help='Extract native INSV GPS and assess whether it supplies a trajectory')
+    gps.add_argument('--insv', type=Path, nargs='+', required=True)
+    gps.add_argument('--output', type=Path, required=True)
     info=sub.add_parser('inspect-bag',help='List bag topics without ROS')
     info.add_argument('--bag',type=Path,nargs='+',required=True)
     export=sub.add_parser('export-bag',help='Convert bags to native FLV2 input')
@@ -164,6 +167,13 @@ def run(a):
     if a.command=='extract-insv':
         from raven_app.video import extract_insv_frames_pyav
         return 0 if extract_insv_frames_pyav(a.insv, a.output, fps=a.fps) else 2
+    if a.command=='extract-gps':
+        from raven_app.insv_gps import export_gps
+        if len({p.stem.casefold() for p in a.insv}) != len(a.insv):
+            raise ValueError('INSV filenames must be unique within a batch')
+        reports = [export_gps(path, a.output / path.stem) for path in a.insv]
+        print(json.dumps(reports, indent=2, ensure_ascii=False))
+        return 0 if all(r['valid_records'] for r in reports) else 2
     if a.command=='inspect-bag':
         from raven_app.bag_io import inspect_bags
         print(json.dumps(inspect_bags(a.bag),indent=2));return 0

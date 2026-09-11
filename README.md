@@ -2,6 +2,8 @@
 
 # LidarCamera360
 
+Native INSV GPS extraction: see [GPS export and georeferencing requirements](docs/INSV_GPS.md).
+
 **Unified LiDAR-Inertial SLAM, 360° Camera Telemetry, Rig Calibration, and 3D Colorization Suite**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
