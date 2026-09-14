@@ -10,6 +10,12 @@ PyQt6-Fluent-Widgets>=1.7.0
 PyQt6-Frameless-Window>=0.8.0
 darkdetect>=0.8.0
 pywin32>=312
+pyproj==3.8.0
+laspy==2.7.0
+lazrs==0.8.2
+pillow==12.3.0
+tifffile==2026.9.9
 
 
 av>=11.0.0
+piexif>=1.1.3

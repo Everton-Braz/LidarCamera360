@@ -141,6 +141,27 @@ class RavenMainWindow(FluentWindow):
         if self.viewer_window is None:
             self.viewer_window = PointCloudViewerWindow(self)
             self.viewer_window.destroyed.connect(lambda: setattr(self, "viewer_window", None))
+        def text(name):
+            widget = getattr(self.workflow_view, name, None)
+            return widget.text().strip() if widget is not None else None
+        output = text("out_input")
+        trajectory = None
+        if output:
+            out_path = Path(output)
+            for candidate in (out_path / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt",
+                              out_path / "slam" / "trajectory.txt", out_path / "trajectory.txt",
+                              out_path / "Raven_3DMakerPro_Scan.txt"):
+                if candidate.is_file():
+                    trajectory = str(candidate); break
+        colmap = None
+        if output:
+            for candidate in (Path(output) / "colmap_3dgs", Path(output) / "colmap"):
+                if candidate.is_dir():
+                    colmap = str(candidate); break
+        georef_output = str(Path(output) / "deliverables" / "georeferenced") if output else None
+        self.viewer_window.set_dataset_context(
+            insv=text("insv_input"), trajectory=trajectory, output=georef_output, colmap_dir=colmap,
+        )
         self.viewer_window.show()
         self.viewer_window.raise_()
         self.viewer_window.activateWindow()

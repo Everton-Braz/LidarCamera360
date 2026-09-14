@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import struct
 from typing import BinaryIO
 
@@ -17,6 +18,7 @@ class CloudData:
     original_count: int
     intensities: np.ndarray | None = None
     has_rgb: bool = False
+    crs_wkt: str | None = None
 
     @property
     def name(self) -> str:
@@ -220,9 +222,36 @@ def _read_ply(path: Path) -> CloudData:
     return _finish(path, xyz, colors, n, intensities=intensities, has_rgb=has_rgb)
 
 
+def _read_las(path: Path) -> CloudData:
+    import laspy
+
+    las = laspy.read(path)
+    names = set(las.point_format.dimension_names)
+    xyz = np.column_stack((las.x, las.y, las.z)).astype(np.float64, copy=False)
+    has_rgb = {'red', 'green', 'blue'} <= names
+    colors = (np.column_stack((las.red, las.green, las.blue)).astype(np.float32) / 65535.
+              if has_rgb else np.full((len(xyz), 3), 0.7, dtype=np.float32))
+    intensities = np.asarray(las.intensity, dtype=np.float32) if 'intensity' in names else None
+    cloud = _finish(path, xyz, colors, len(las.points), intensities=intensities, has_rgb=has_rgb)
+    crs = las.header.parse_crs()
+    cloud.crs_wkt = crs.to_wkt() if crs is not None else None
+    return cloud
+
+
 def load_cloud(path: str | Path) -> CloudData:
     p = Path(path)
     if not p.is_file(): raise ValueError(f"cloud file does not exist: {p}")
-    if p.suffix.lower() == ".pcd": return _read_pcd(p)
-    if p.suffix.lower() == ".ply": return _read_ply(p)
-    raise ValueError(f"unsupported point-cloud format: {p.suffix or p.name}")
+    if p.suffix.lower() == ".pcd": cloud = _read_pcd(p)
+    elif p.suffix.lower() == ".ply": cloud = _read_ply(p)
+    elif p.suffix.lower() in ('.las', '.laz'): cloud = _read_las(p)
+    else: raise ValueError(f"unsupported point-cloud format: {p.suffix or p.name}")
+    sidecar = p.with_suffix(p.suffix + ".geo.json")
+    if cloud.crs_wkt is None and sidecar.is_file():
+        try:
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+            value = metadata.get("crs_wkt")
+            if value:
+                cloud.crs_wkt = str(value)
+        except (OSError, ValueError, TypeError):
+            pass
+    return cloud

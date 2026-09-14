@@ -18,9 +18,13 @@ The GUI exposes the same operations. Headless commands do not create a Qt applic
 
 ## 3D viewer
 
-Open `3D Viewer` from the navigation rail to compare two point clouds in a separate window. Load `.pcd` or `.ply` files with `Load A` and `Load B`; loading runs in a worker thread so the interface remains responsive. The split slider controls the A/B reveal, and measurements can be exported as CSV. Distances use project meters.
+Open `3D Viewer` from the navigation rail to compare two point clouds in one shared 3D scene. Load `.pcd`, `.ply`, `.las`, or `.laz` files with `Load A` and `Load B`; loading runs in a worker thread so the interface remains responsive. The split slider controls the A/B reveal, and measurements can be exported as CSV. Distances use project meters.
+
+The viewer keeps each cloud's original coordinates. Its side panel edits the selected loaded cloud and saves a new LAS/LAZ/PLY/PCD file; the same panel can generate a GeoTIFF/PNG orthophoto from that loaded cloud. There is no separate georeferencing tab. GPS georeferencing is enabled from the main workflow when the input contains usable GPS.
 
 Both clouds use one camera and their original coordinates; the viewer does not independently center or register them. Drag the divider or the A/B slider to inspect exactly the same location. Left-drag orbits, right/middle-drag pans, the wheel zooms at the cursor, and `F` fits the clouds. Top, Front, Right and Iso presets are available.
+
+Use the **Base map** toggle in the cloud viewer side panel to show satellite or street tiles beneath a georeferenced cloud. The map is an optional scene layer and requires coordinates that can be related to the map.
 
 The separate measurement icon tools provide Point coordinates, Distance (two clicks), Polyline length (click vertices, then Enter), and Angle (three clicks, with the second as the vertex). Hover over an icon for its name. Click to pick; dragging still orbits while a measurement is active, and right/middle-drag and wheel navigation remain available. Picks snap to displayed cloud vertices and retain their stored XYZ coordinates. Escape cancels pending picks; Undo removes the last vertex or measurement. CSV records include source files, valid-point indices, coordinates and results. Files must use the same coordinate system and meter units. For clouds above five million points, the preview uses a labeled subset; picked coordinates still come from the original vertices. PCD ASCII/binary and PLY ASCII/little-/big-endian are supported; compressed PCD must first be exported as ordinary binary PCD.
 
@@ -37,6 +41,10 @@ Pass split, non-overlapping bags after `--bag` when a capture is split. Do not p
 `extract-insv` writes paired front/rear JPEGs and `images/frames.json`, whose measured presentation times are used by alignment and colorization. Both lens tracks must decode successfully.
 
 Colorization needs `pcd/all_raw_points.pcd`, `result/Raven_3DMakerPro_Scan.txt`, paired frames, and a calibration profile. Reconstruction mode uses Spirula Studio when `--run-spirula` is requested or its sparse reconstruction is missing. Trajectory mode uses the calibrated trajectory and optional reconstruction drift correction. Canonical files are `reconstruction_colorized.ply/.pcd`, `trajectory_colorized.ply/.pcd`, `trajectory.txt`, and `configs/rig_profile.json`; `sfm` and `direct` are legacy aliases.
+
+The unified workflow can automatically georeference the cloud when the main **Automatic GPS georeferencing** checkbox is enabled and timing/alignment checks pass. Choose one or more automatic georeferenced cloud formats (LAS, LAZ, PLY, or PCD) in the output section. If an INSV has no usable GPS, it records `gps_metadata_unavailable` and continues the LiDAR/camera pipeline; no geographic transform is invented.
+
+The main workflow keeps motion in the local SLAM frame; GPS placement is an optional checked output step. Choose LIO (`LiDAR + IMU`) or VIO (`LiDAR + camera + IMU`) according to the available sensor streams.
 
 Automatic alignment and calibration outputs use version 2 metadata. When an older alignment cache is found beside a sparse reconstruction, it is recomputed with the capture's stored synchronization hint before colorization. Each recalibration/colorization run should use a fresh output directory; synchronization is never replaced by an arbitrary fallback offset.
 

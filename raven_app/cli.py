@@ -60,6 +60,24 @@ def parse(argv=None):
     gps=sub.add_parser('extract-gps', help='Extract native INSV GPS and assess whether it supplies a trajectory')
     gps.add_argument('--insv', type=Path, nargs='+', required=True)
     gps.add_argument('--output', type=Path, required=True)
+    gps.add_argument('--formats', nargs='+', choices=('geojson', 'gpx', 'csv'), default=None,
+                     help='GPS output formats; report JSON is always written (default: CSV and GPX)')
+    geo=sub.add_parser('georeference', help='Calculate INSV GPS, georeference point clouds and COLMAP datasets, and export GeoJSON')
+    geo.add_argument('--insv', type=Path, required=True, help='Path to Insta360 .INSV video')
+    geo.add_argument('--output', type=Path, required=True, help='Output directory for georeferenced deliverables and GeoJSON')
+    geo.add_argument('--cloud', type=Path, help='Optional point cloud (PCD/PLY/LAZ/LAS) to georeference')
+    geo.add_argument('--colmap-dir', type=Path, help='Optional COLMAP dataset directory containing sparse/ and images/')
+    geo.add_argument('--trajectory', type=Path, help='Optional SLAM or TUM trajectory file (.txt)')
+    geo.add_argument('--crs', help='Projected target CRS (e.g. EPSG:31984, EPSG:32724; default auto-detected UTM/SIRGAS 2000)')
+    geo.add_argument('--yaw-deg', type=float, help='Optional manual True North Yaw angle in degrees (default: auto-fit from trajectory/motion vector)')
+    geo.add_argument('--shift-e', type=float, default=0.0, help='Delta Easting shift in meters')
+    geo.add_argument('--shift-n', type=float, default=0.0, help='Delta Northing shift in meters')
+    geo.add_argument('--shift-z', type=float, default=0.0, help='Delta Elevation shift in meters')
+    geo.add_argument('--orthophoto', action='store_true', help='Generate high-resolution georeferenced orthophoto')
+    geo.add_argument('--ortho-gsd', type=float, default=0.05, help='Orthophoto GSD resolution in meters/pixel (default: 0.05)')
+    geo.add_argument('--no-geojson', action='store_true', help='Skip exporting GeoJSON deliverables')
+    geo.add_argument('--no-cloud', action='store_true', help='Skip point cloud georeferencing')
+    geo.add_argument('--no-colmap', action='store_true', help='Skip COLMAP dataset georeferencing and geotagging')
     info=sub.add_parser('inspect-bag',help='List bag topics without ROS')
     info.add_argument('--bag',type=Path,nargs='+',required=True)
     export=sub.add_parser('export-bag',help='Convert bags to native FLV2 input')
@@ -85,6 +103,7 @@ def parse(argv=None):
     wf.add_argument('--lidar-topic',default='/vanjee_722z')
     wf.add_argument('--imu-topic',default='/vanjee_imu_packets')
     wf.add_argument('--lio',action='store_true',default=True,help='LiDAR + IMU SLAM')
+    wf.add_argument('--vio', action='store_false', dest='lio', help='LiDAR + camera + IMU SLAM')
     wf.add_argument('--threads',type=int,default=min(4,os.cpu_count() or 1))
     wf.add_argument('--fps',type=positive,default=2.)
     wf.add_argument('--method',choices=['direct','sfm','all','trajectory','reconstruction'],default='direct')
@@ -96,6 +115,11 @@ def parse(argv=None):
     wf.add_argument('--export-ply',action='store_true',default=False)
     wf.add_argument('--export-pcd',action='store_true',default=False)
     wf.add_argument('--export-colmap',action='store_true',default=False)
+    wf.add_argument('--process-gps', action='store_true', help='Extract GPS metadata automatically; does not infer cloud placement')
+    wf.add_argument('--gps-formats', nargs='+', choices=('geojson', 'gpx', 'csv'),
+                    default=('geojson', 'gpx', 'csv'), help='Selected GPS deliverables')
+    wf.add_argument('--geo-formats', nargs='+', choices=('laz', 'las', 'ply', 'pcd', 'geojson'),
+                    default=('laz', 'geojson'), help='Automatic georeferenced cloud formats')
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
     a=p.parse_args(argv)
@@ -171,9 +195,29 @@ def run(a):
         from raven_app.insv_gps import export_gps
         if len({p.stem.casefold() for p in a.insv}) != len(a.insv):
             raise ValueError('INSV filenames must be unique within a batch')
-        reports = [export_gps(path, a.output / path.stem) for path in a.insv]
+        reports = [export_gps(path, a.output / path.stem, formats=a.formats) for path in a.insv]
         print(json.dumps(reports, indent=2, ensure_ascii=False))
         return 0 if all(r['valid_records'] for r in reports) else 2
+    if a.command=='georeference':
+        from raven_app.georeference import run_georeference
+        report = run_georeference(
+            a.insv, a.output,
+            cloud=a.cloud,
+            colmap_dir=a.colmap_dir,
+            trajectory=a.trajectory,
+            crs=a.crs,
+            yaw_deg=a.yaw_deg,
+            delta_easting_m=a.shift_e,
+            delta_northing_m=a.shift_n,
+            delta_elevation_m=a.shift_z,
+            generate_orthophoto_file=a.orthophoto,
+            ortho_gsd_m=a.ortho_gsd,
+            export_geojson_files=not a.no_geojson,
+            export_cloud_files=not a.no_cloud,
+            export_colmap_files=not a.no_colmap,
+        )
+        print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
+        return 0 if report.get('status') == 'accepted' else 2
     if a.command=='inspect-bag':
         from raven_app.bag_io import inspect_bags
         print(json.dumps(inspect_bags(a.bag),indent=2));return 0
@@ -229,18 +273,29 @@ def run(a):
             use_vulkan=not a.no_vulkan,
             export_ply=a.export_ply,
             export_pcd=a.export_pcd,
-            export_colmap=a.export_colmap
+            export_colmap=a.export_colmap,
+            process_gps=a.process_gps,
+            gps_formats=a.gps_formats,
+            geo_formats=a.geo_formats,
         )
     raise ValueError('Unknown command')
 
 
 def main(argv=None):
-    for stream in (sys.stdout,sys.stderr):
-        if hasattr(stream,'reconfigure'):stream.reconfigure(encoding='utf-8',errors='replace',line_buffering=True)
-    if hasattr(signal,'SIGBREAK'):
-        signal.signal(signal.SIGBREAK,signal.default_int_handler)
-    try:return run(parse(argv))
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+    if hasattr(signal, 'SIGBREAK'):
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
+    try:
+        return run(parse(argv))
     except KeyboardInterrupt:
-        print('Cancelled.',file=sys.stderr);return 130
+        print('Cancelled.', file=sys.stderr)
+        return 130
     except Exception as e:
-        print(f'RavenCalibrator: {e}',file=sys.stderr);return 2
+        print(f'RavenCalibrator: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

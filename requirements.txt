@@ -3,6 +3,11 @@ scipy>=1.10
 opencv-python>=4.7
 rosbags>=0.9
 pillow>=9.0
+tifffile>=2024.1.30
 open3d>=0.17
+pyproj>=3.6
+laspy>=2.5
+lazrs>=0.6
 
 av>=11.0.0
+piexif>=1.1.3

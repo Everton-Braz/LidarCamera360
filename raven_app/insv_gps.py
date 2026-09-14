@@ -126,16 +126,21 @@ def extract_gps(path):
     return rows, fixes, report
 
 
-def export_gps(path, output):
-    """Export raw records, deduplicated valid fixes, GPX and an honest quality report."""
+def export_gps(path, output, formats=None):
+    """Export selected metadata formats; never infer a cloud transform or clock offset."""
+    selected = set(('csv', 'gpx') if formats is None else formats)
+    if not selected or not selected <= {'csv', 'gpx', 'geojson'}:
+        raise ValueError('Select one or more GPS formats: csv, gpx, geojson')
     rows, fixes, report = extract_gps(path)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    for filename, records in (("gps_raw.csv", rows), ("gps.csv", fixes)):
+    files = {}
+    for filename, records in ((("gps_raw.csv", rows), ("gps.csv", fixes)) if 'csv' in selected else ()):
         with (output / filename).open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=FIELDS)
             writer.writeheader()
             writer.writerows(records)
+        files[filename] = str((output / filename).resolve())
     namespace = "http://www.topografix.com/GPX/1/1"
     ET.register_namespace("", namespace)
     def tag(name):
@@ -149,6 +154,39 @@ def export_gps(path, output):
             point = ET.SubElement(segment, tag("trkpt"), lat=str(row["latitude_deg"]), lon=str(row["longitude_deg"]))
             ET.SubElement(point, tag("ele")).text = str(row["altitude_m"])
             ET.SubElement(point, tag("time")).text = row["timestamp_utc"]
-    ET.ElementTree(root).write(output / "gps.gpx", encoding="utf-8", xml_declaration=True)
+    if 'gpx' in selected:
+        ET.ElementTree(root).write(output / "gps.gpx", encoding="utf-8", xml_declaration=True)
+        files['gps.gpx'] = str((output / 'gps.gpx').resolve())
+    if 'geojson' in selected:
+        # RFC 7946 positions are longitude/latitude. Unknown GPS height datum is
+        # a property, not an asserted WGS84 ellipsoidal third ordinate.
+        features = [
+            {'type': 'Feature', 'geometry': {'type': 'Point',
+                'coordinates': [r['longitude_deg'], r['latitude_deg']]},
+             'properties': {'kind': 'gps_fix', 'timestamp_utc': r['timestamp_utc'],
+                'timestamp_epoch': r['timestamp_epoch'], 'altitude_m': r['altitude_m'],
+                'altitude_datum': 'unspecified', 'source_insv': str(Path(path).resolve())}}
+            for r in fixes]
+        segments, segment = [], []
+        previous = None
+        for r in fixes:
+            if previous is not None and (r['timestamp_epoch'] - previous['timestamp_epoch'] > 10 or
+                    abs(r['longitude_deg'] - previous['longitude_deg']) > 180):
+                if len(segment) >= 2:
+                    segments.append(segment)
+                segment = []
+            segment.append([r['longitude_deg'], r['latitude_deg']])
+            previous = r
+        if len(segment) >= 2:
+            segments.append(segment)
+        for segment in segments:
+            features.append({'type': 'Feature', 'geometry': {'type': 'LineString', 'coordinates': segment},
+                             'properties': {'kind': 'gps_track', 'max_gap_seconds': 10,
+                                            'time_mapping': 'GPS UTC; video mapping unverified'}})
+        (output / 'gps.geojson').write_text(json.dumps({'type': 'FeatureCollection', 'features': features},
+            indent=2, ensure_ascii=False, allow_nan=False) + '\n', encoding='utf-8')
+        files['gps.geojson'] = str((output / 'gps.geojson').resolve())
+    report['selected_formats'] = sorted(selected)
+    report['output_files'] = files
     (output / "gps_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return report

@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import (QIcon, QPalette, QColor, QKeySequence,
     QPixmap, QPainter, QPdfWriter, QPageSize, QShortcut)
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
 from PyQt6.QtWidgets import (QApplication, QColorDialog, QFileDialog, QHBoxLayout,
-    QMainWindow, QSplitter, QVBoxLayout, QWidget)
+    QMainWindow, QScrollArea, QSplitter, QVBoxLayout, QWidget)
 from qfluentwidgets import (BodyLabel, CardWidget, CaptionLabel, ComboBox, FluentIcon,
     DoubleSpinBox, ListWidget, Slider, SubtitleLabel, ToolButton,
     ToggleToolButton, RoundMenu, Action, MenuAnimationType, qconfig, isDarkTheme)
@@ -66,6 +67,18 @@ class _CloudLoadWorker(QThread):
             self.loaded.emit(self.slot, load_cloud(self.path))
         except Exception as exc:
             self.failed.emit(self.slot, str(exc))
+
+
+class _ViewerExportWorker(QThread):
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, operation, *args, **kwargs):
+        super().__init__(); self.operation, self.args, self.kwargs = operation, args, kwargs
+
+    def run(self):
+        try: self.completed.emit(self.operation(*self.args, **self.kwargs))
+        except Exception as exc: self.failed.emit(str(exc))
 
 
 class PointCloudViewerWindow(QMainWindow):
@@ -253,12 +266,16 @@ class PointCloudViewerWindow(QMainWindow):
         self.fit_button.clicked.connect(lambda: self.renderer.fit_all())
         row2.addWidget(self.fit_button)
 
+        self.measure_toggle = self._tool(FluentIcon.RIGHT_ARROW, tr("Show or hide measurements"), tools)
+        self.measure_toggle.clicked.connect(self._toggle_measurements)
+        row2.addWidget(self.measure_toggle)
+
         row2.addStretch(1)
         tools_layout.addLayout(row2)
 
         root_layout.addWidget(tools)
 
-        # Main Central Area: 3D Viewport + Measurements Sidebar
+        # Main Central Area: single 3D scene with compact tools and measurements.
         split = QSplitter(Qt.Orientation.Horizontal, root)
         split.setChildrenCollapsible(False)
         render_card = CardWidget(split)
@@ -267,7 +284,21 @@ class PointCloudViewerWindow(QMainWindow):
         self.renderer = CloudView(render_card)
         render_layout.addWidget(self.renderer)
 
-        measure_card = CardWidget(split)
+        side = QWidget(split)
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        from raven_app.viewer_edit_panel import ViewerEditPanel
+        self.edit_panel = ViewerEditPanel(self.renderer)
+        self.edit_panel.save_requested.connect(self._save_modified_cloud)
+        self.edit_panel.orthophoto_requested.connect(self._generate_orthophoto)
+        edit_scroll = QScrollArea(side)
+        edit_scroll.setWidgetResizable(True)
+        edit_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        edit_scroll.setWidget(self.edit_panel)
+        side_layout.addWidget(edit_scroll)
+
+        measure_card = CardWidget(side)
+        self.measure_card = measure_card
         measure_layout = QVBoxLayout(measure_card)
         measure_layout.setContentsMargins(14, 14, 14, 14)
         measure_layout.setSpacing(8)
@@ -298,6 +329,7 @@ class PointCloudViewerWindow(QMainWindow):
 
         self.measurements = ListWidget(measure_card)
         self.measurements.setAlternatingRowColors(True)
+        self.measurements.setMaximumHeight(100)
         measure_layout.addWidget(self.measurements, 1)
 
         action_row = QHBoxLayout()
@@ -312,7 +344,7 @@ class PointCloudViewerWindow(QMainWindow):
         action_row.addStretch(1)
         measure_layout.addLayout(action_row)
 
-        self.status = BodyLabel(tr("Load two PCD or PLY clouds to compare. Files must share the same coordinate system."), measure_card)
+        self.status = BodyLabel(tr("Open a PCD, PLY, LAS or LAZ cloud. Enable the base map for georeferenced files."), measure_card)
         self.status.setWordWrap(True)
         measure_layout.addWidget(self.status)
 
@@ -320,10 +352,15 @@ class PointCloudViewerWindow(QMainWindow):
         hints.setWordWrap(True)
         measure_layout.addWidget(hints)
 
+        side_layout.addWidget(measure_card, 1)
+        measure_card.hide()
         split.addWidget(render_card)
-        split.addWidget(measure_card)
-        split.setSizes([840, 300])
+        split.addWidget(side)
+        split.setSizes([840, 360])
         root_layout.addWidget(split, 1)
+        root_layout.addWidget(self.status)
+        self._dataset_context = dict(insv=None, trajectory=None, output=None, colmap_dir=None)
+        self._edit_worker = None
         self.setCentralWidget(root)
 
         # Compatibility attributes
@@ -349,6 +386,16 @@ class PointCloudViewerWindow(QMainWindow):
         qconfig.themeChanged.connect(self._sync_theme)
         self._sync_theme()
 
+    def _toggle_measurements(self):
+        visible = not self.measure_card.isVisible()
+        self.measure_card.setVisible(visible)
+        self.measure_toggle.setToolTip(tr("Hide measurements") if visible else tr("Show measurements"))
+
+    def set_dataset_context(self, *, insv=None, trajectory=None, output=None, colmap_dir=None):
+        cloud = self._dataset_context.get('cloud')
+        self._dataset_context = dict(insv=insv, trajectory=trajectory, output=output, colmap_dir=colmap_dir)
+        if cloud:
+            self._dataset_context['cloud'] = cloud
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+S"), self, self._save_view)
         QShortcut(QKeySequence("Ctrl+C"), self, self._copy_view)
@@ -515,7 +562,7 @@ class PointCloudViewerWindow(QMainWindow):
         self.renderer.update()
 
     def _choose_cloud(self, slot):
-        path, _ = QFileDialog.getOpenFileName(self, tr("Open point cloud"), "", tr("Point clouds (*.pcd *.ply);;All files (*.*)"))
+        path, _ = QFileDialog.getOpenFileName(self, tr("Open point cloud"), "", tr("Point clouds (*.pcd *.ply *.las *.laz);;All files (*.*)"))
         if path:
             self._load_cloud(slot, path)
 
@@ -541,6 +588,8 @@ class PointCloudViewerWindow(QMainWindow):
 
     def _on_cloud_loaded(self, slot, cloud):
         self.renderer.set_cloud(slot, cloud)
+        if slot == 0:
+            self._dataset_context['cloud'] = str(cloud.path)
         if hasattr(self, 'clip_dialog'):
             self.clip_dialog.set_bounds_from_clouds(self.renderer.clouds)
 
@@ -566,7 +615,61 @@ class PointCloudViewerWindow(QMainWindow):
             except Exception as exc:
                 self.status.setText(tr("Could not export measurements: {error}").format(error=exc))
 
+    def _start_edit_worker(self, worker, message):
+        self._edit_worker = worker
+        self.edit_panel.set_busy(True)
+        worker.completed.connect(self._edit_worker_done)
+        worker.failed.connect(self._edit_worker_failed)
+        worker.finished.connect(lambda: self._edit_worker_finished(worker))
+        self.status.setText(message)
+        worker.start()
+
+    def _edit_worker_finished(self, worker):
+        if self._edit_worker is worker:
+            self._edit_worker = None
+        self.edit_panel.set_busy(False)
+        worker.deleteLater()
+
+    def _edit_worker_done(self, result):
+        self.status.setText(tr("Operation completed: {path}").format(path=str((result or {}).get("output", result))[:180]))
+
+    def _edit_worker_failed(self, message):
+        self.status.setText(tr("Operation failed: {error}").format(error=message))
+
+    def _save_modified_cloud(self, slot):
+        cloud = self.renderer.clouds[int(slot)]
+        if cloud is None:
+            self.status.setText(tr("Load a cloud before saving.")); return
+        path, _ = QFileDialog.getSaveFileName(self, tr("Save modified cloud"), cloud.path.stem + ".ply",
+                                              tr("Point clouds (*.las *.laz *.ply *.pcd)"))
+        if not path: return
+        from raven_app.cloud_export import save_cloud
+        snapshot = replace(cloud)
+        self._start_edit_worker(_ViewerExportWorker(save_cloud, snapshot, path), tr("Saving modified cloud..."))
+
+    def _generate_orthophoto(self, slot, gsd):
+        cloud = self.renderer.clouds[int(slot)]
+        if cloud is None:
+            self.status.setText(tr("Load a cloud before generating an orthophoto.")); return
+        path, _ = QFileDialog.getSaveFileName(self, tr("Save orthophoto"), cloud.path.stem + "_orthophoto.tif", tr("GeoTIFF (*.tif *.tiff)"))
+        if not path: return
+        from raven_app.orthophoto import generate_orthophoto
+        snapshot = replace(cloud)
+        epsg = None
+        if snapshot.crs_wkt:
+            try:
+                import pyproj
+                epsg = pyproj.CRS.from_wkt(snapshot.crs_wkt).to_epsg()
+            except Exception:
+                epsg = None
+        worker = _ViewerExportWorker(generate_orthophoto, snapshot, path, gsd_m=float(gsd), crs_wkt=snapshot.crs_wkt, crs_epsg=epsg)
+        self._start_edit_worker(worker, tr("Generating orthophoto..."))
+
     def closeEvent(self, event):
+        if self._edit_worker is not None and self._edit_worker.isRunning():
+            self.status.setText(tr("Waiting for export or orthophoto generation to finish..."))
+            event.ignore()
+            return
         if hasattr(self, 'clip_dialog') and self.clip_dialog.isVisible():
             self.clip_dialog.close()
         if self._workers:

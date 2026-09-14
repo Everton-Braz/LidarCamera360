@@ -25,7 +25,8 @@ def main():
     a = p.parse_args()
 
     # Validate required runtime modules are installed
-    for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets'):
+    for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets',
+                   'pyproj', 'laspy', 'lazrs', 'piexif', 'tifffile'):
         spec = importlib.util.find_spec(module)
         if spec is None or not spec.origin:
             raise SystemExit(f'{module} must be installed. Check requirements.txt.')
@@ -70,6 +71,10 @@ def main():
         '--collect-submodules', 'rosbags',
         '--collect-all', 'qfluentwidgets',
         '--collect-all', 'av',
+        '--collect-all', 'pyproj',
+        '--collect-all', 'laspy',
+        '--collect-all', 'lazrs',
+        '--collect-all', 'tifffile',
         '--add-data', f'{ROOT / "FAST-LIVO2/config"};FAST-LIVO2/config',
         '--add-data', f'{ROOT / "calibracao_rigida_raven_insta360.json"};.',
         '--add-data', f'{stage};.',

@@ -3,6 +3,7 @@ import csv
 import math
 from itertools import product
 import numpy as np
+from raven_app.i18n import tr
 from PyQt6.QtCore import Qt, QPointF, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QMatrix4x4, QSurfaceFormat, QLinearGradient, QFont, QPolygonF
 from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShader, QOpenGLShaderProgram, QOpenGLFunctions_2_1
@@ -97,6 +98,15 @@ class CloudView(QOpenGLWidget):
         self.current_preset = 'iso'
         self.measurements = []; self.pending = []; self._last = None; self._press = None; self._drag_split = False
         self._dragged = False
+        self._original_points = [None, None]
+        self._adjustments = [(0.0, np.zeros(3)), (0.0, np.zeros(3))]
+        self.basemap_enabled = False
+        self.basemap_provider = 'satellite'
+        from raven_app.basemap_layer import BaseMapLayer, MapTileRenderer
+        self.basemap_layer = BaseMapLayer(self)
+        self.basemap_layer.changed.connect(self.update)
+        self.basemap_layer.status.connect(self.status_changed.emit)
+        self._map_renderer = MapTileRenderer()
 
     @property
     def color_mode(self) -> str:
@@ -107,11 +117,15 @@ class CloudView(QOpenGLWidget):
         return self.colormaps[0]
 
     def set_cloud(self, slot, cloud):
-        first = not any(c is not None for c in self.clouds)
+        # Rebase again when replacing the only loaded cloud (e.g. local -> UTM).
+        # GPU vertices stay near zero while measurements retain original doubles.
+        first = self.clouds[1 - slot] is None
         if first:
             lo, hi = cloud.points.min(axis=0), cloud.points.max(axis=0)
             self.origin = lo + (hi-lo)*.5
         self.clouds[slot] = cloud
+        self._original_points[slot] = cloud.points
+        self._adjustments[slot] = (0.0, np.zeros(3, dtype=np.float64))
         self._scalar_ranges.clear()
         self.error = ''
         step = max(1, math.ceil(len(cloud.points)/self.MAX_DRAW_POINTS))
@@ -125,6 +139,8 @@ class CloudView(QOpenGLWidget):
             self.scene_radius = max(self.scene_radius, float(np.linalg.norm(bounds-self.origin-self.target, axis=1).max()))
         suffix = f'; preview sampled to {len(self._indices[slot]):,} points' if step > 1 else ''
         self.status_changed.emit(f"{'AB'[slot]}: {cloud.path.name} | {len(cloud.points):,} valid points{suffix}. Coordinates unchanged.")
+        if slot == 0 or self.clouds[0] is None:
+            self.basemap_layer.configure(cloud)
         self.update()
 
     def set_point_size(self, size: float):
@@ -133,6 +149,63 @@ class CloudView(QOpenGLWidget):
             self.point_size = new_size
             self.point_size_changed.emit(self.point_size)
             self.update()
+
+    def clear_cloud(self, slot):
+        """Remove a comparison cloud and release its GPU buffer on the next paint."""
+        self.clouds[slot] = None
+        self._original_points[slot] = None
+        self._adjustments[slot] = (0.0, np.zeros(3, dtype=np.float64))
+        self._indices[slot] = None
+        self._dirty.add(slot)
+        self._scalar_ranges.clear()
+        self.clear_measurements()
+        other = self.clouds[1 - slot]
+        if other is not None:
+            self.fit_all()
+        self.basemap_layer.configure(other)
+        self.update()
+
+    def set_basemap_enabled(self, enabled: bool):
+        self.basemap_enabled = bool(enabled)
+        self.basemap_layer.set_enabled(enabled)
+        self.update()
+
+    def set_basemap_provider(self, provider: str):
+        provider = str(provider).lower()
+        if provider in ('satellite', 'street'):
+            self.basemap_provider = provider
+            self.basemap_layer.set_provider(provider)
+            self.update()
+
+    def apply_cloud_adjustment(self, slot: int, yaw_deg: float, translation_xyz):
+        """Preview an absolute adjustment relative to the loaded original cloud."""
+        if not 0 <= int(slot) < 2 or self.clouds[slot] is None or self._original_points[slot] is None:
+            return
+        slot = int(slot)
+        original = self._original_points[slot]
+        center = original.mean(axis=0)
+        angle = math.radians(float(yaw_deg))
+        c, s = math.cos(angle), math.sin(angle)
+        rot = np.array(((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0)))
+        shift = np.asarray(translation_xyz, dtype=np.float64).reshape(3)
+        if not np.isfinite([yaw_deg, *shift]).all():
+            raise ValueError('Adjustment values must be finite')
+        adjusted = np.empty_like(original)
+        for start in range(0, len(original), 500000):
+            adjusted[start:start+500000] = (original[start:start+500000] - center) @ rot.T + center + shift
+        self.clouds[slot].points = adjusted
+        self._adjustments[slot] = (float(yaw_deg), shift.copy())
+        self.clear_measurements()
+        self._scalar_ranges.clear(); self._dirty.add(slot); self.fit_all(); self.update()
+
+    def reset_cloud_adjustment(self, slot: int):
+        if not 0 <= int(slot) < 2 or self.clouds[int(slot)] is None or self._original_points[int(slot)] is None:
+            return
+        slot = int(slot)
+        self.clouds[slot].points = self._original_points[slot]
+        self._adjustments[slot] = (0.0, np.zeros(3, dtype=np.float64))
+        self.clear_measurements()
+        self._scalar_ranges.clear(); self._dirty.add(slot); self.fit_all(); self.update()
 
     def set_background_color(self, color: QColor | str):
         self.bg_color = QColor(color)
@@ -343,6 +416,7 @@ void main(){
 
     def _cleanup(self):
         self.makeCurrent()
+        self._map_renderer.cleanup()
         for buf in self._buffers:
             if buf is not None: buf.destroy()
         self._buffers = [None, None]
@@ -352,6 +426,11 @@ void main(){
 
     def _upload(self, slot):
         cloud = self.clouds[slot]; ids = self._indices[slot]
+        if cloud is None:
+            if self._buffers[slot] is not None:
+                self._buffers[slot].destroy()
+                self._buffers[slot] = None
+            return
         packed = np.empty((len(ids),6),dtype=np.float32)
         packed[:,:3] = cloud.points[ids]-self.origin; packed[:,3:] = self._get_colors(slot)
         if self._buffers[slot] is not None: self._buffers[slot].destroy()
@@ -369,6 +448,11 @@ void main(){
                 gl.glViewport(0,0,width,height); gl.glDisable(0x0C11)
                 gl.glClearColor(self.bg_color.redF(), self.bg_color.greenF(), self.bg_color.blueF(), 1.)
                 gl.glClear(0x4000|0x0100)
+                try:
+                    self._map_renderer.draw(self.basemap_layer, gl, self._matrix()[0], self.origin)
+                except Exception as exc:
+                    self.basemap_layer.enabled = False
+                    self.status_changed.emit('Map renderer: ' + str(exc))
                 gl.glEnable(0x0B71); gl.glDepthFunc(0x0201); gl.glDisable(0x0BE2)
                 gl.glPointSize(float(self.point_size*ratio))
                 for slot in sorted(self._dirty): self._upload(slot)
@@ -411,10 +495,20 @@ void main(){
         text_pen = QColor('#18222d') if is_light else QColor('#d8e7f2')
         p.setPen(text_pen)
 
+        if self.basemap_layer.enabled and any(t.get('image') is not None for t in self.basemap_layer.tiles):
+            label = self.basemap_layer.attribution
+            width = p.fontMetrics().horizontalAdvance(label) + 16
+            p.fillRect(self.width()-width-8, self.height()-27, width, 23, QColor(0, 0, 0, 180))
+            p.setPen(QColor('white'))
+            p.drawText(self.width()-width, self.height()-11, label)
+            p.setPen(text_pen)
+
         if self.error:
             p.drawText(self.rect(),Qt.AlignmentFlag.AlignCenter,'3D renderer unavailable\n'+self.error); return
         if not any(c is not None for c in self.clouds):
-            p.drawText(self.rect(),Qt.AlignmentFlag.AlignCenter,'Open cloud A and cloud B to compare\nPCD / PLY | shared coordinates | measurements in metres'); return
+            p.drawText(self.rect(),Qt.AlignmentFlag.AlignCenter,
+                       tr('Open a point cloud to explore in 3D') + '\n' +
+                       tr('Add a second cloud to compare • PCD / PLY / LAS / LAZ')); return
         for slot,c in enumerate(self.clouds):
             if c is not None:
                 label=p.fontMetrics().elidedText(f"{'AB'[slot]}  {c.path.name}",Qt.TextElideMode.ElideMiddle,max(80,self.width()//2-32))

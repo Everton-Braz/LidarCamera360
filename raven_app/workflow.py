@@ -29,6 +29,29 @@ from raven_app.bag_io import export_bags
 from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, frame_time
 
 
+def process_gps_metadata(insv_path, output_dir, formats=('geojson', 'gpx', 'csv')):
+    """Export GPS metadata independently of reconstruction, without placing geometry."""
+    from raven_app.insv_gps import export_gps
+    selected = set(formats)
+    if not selected or not selected <= {'csv', 'gpx', 'geojson'}:
+        raise ValueError('Select one or more GPS formats: csv, gpx, geojson')
+    try:
+        report = export_gps(insv_path, output_dir, formats=selected)
+        report['status'] = 'complete' if report['valid_records'] else 'no_valid_gps'
+    except ValueError as exc:
+        # Unsupported/missing telemetry should not cancel SLAM and colorization.
+        # File/permission failures still propagate instead of reporting success.
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        report = {'status': 'unavailable', 'source_insv': str(Path(insv_path).resolve()),
+                  'reason': str(exc), 'unique_fixes': 0, 'valid_records': 0,
+                  'georeferencing_status': 'gps_metadata_unavailable',
+                  'selected_formats': sorted(selected), 'output_files': {}}
+    report['geometry_transformed'] = False
+    (Path(output_dir) / 'gps_report.json').write_text(
+        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + '\n', encoding='utf-8')
+    return report
+
+
 def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 2.0) -> bool:
     return extract_insv_frames_pyav(insv_path, output_dir, fps=fps)
 
@@ -404,7 +427,10 @@ def execute_unified_workflow(
     export_ply: bool = True,
     export_pcd: bool = True,
     use_vulkan: bool = True,
-    export_colmap: bool = True
+    export_colmap: bool = True,
+    process_gps: bool = False,
+    gps_formats=('geojson', 'gpx', 'csv'),
+    geo_formats=('laz', 'geojson'),
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -427,6 +453,12 @@ def execute_unified_workflow(
     print(f" Recalibrate: {'YES (Dynamic SfM-to-LiDAR)' if recalibrate else 'NO (Static)'}")
     print(f" Deliverables: PLY={export_ply}, PCD={export_pcd}, COLMAP/3DGS={export_colmap}")
     print("=" * 80)
+
+    if process_gps:
+        print("\n[GPS] Extracting native GPS metadata and selected formats...")
+        gps_report = process_gps_metadata(insv_path, deliverables_dir / 'gps', gps_formats)
+        print(f"[GPS] {gps_report['unique_fixes']} unique fixes; {gps_report['georeferencing_status']}")
+        print(f"[GPS] Metadata saved in {deliverables_dir / 'gps'}")
 
     # --------------------------------------------------------------------------
     # STAGE 1: Extract frames from INSV
@@ -525,6 +557,8 @@ def execute_unified_workflow(
     # STAGE 5: Point Cloud Colorization
     # --------------------------------------------------------------------------
     print("\n[STAGE 5/5] Running Point Cloud Colorization...")
+    cloud_state_before = {p: p.stat().st_mtime_ns for p in deliverables_dir.iterdir()
+                          if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}}
     sfm_done = False
     if method in ("sfm", "all") and sparse_bin.is_file():
         try:
@@ -535,6 +569,22 @@ def execute_unified_workflow(
 
     if method in ("direct", "all") or (method == "sfm" and not sfm_done):
         pipeline.colorize_via_direct_rigid(output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan)
+
+    # Automatic placement is deliberately after colorization so only this run's
+    # produced clouds are considered, and before local-format cleanup.
+    if process_gps:
+        from raven_app.automatic_georeference import automatic_georeference
+        produced = [p for p in deliverables_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}
+                    and (p not in cloud_state_before or p.stat().st_mtime_ns != cloud_state_before[p])]
+        gps_info = None
+        try:
+            from raven_app.georeference import calculate_insv_gps
+            gps_info = calculate_insv_gps(insv_path)
+        except ValueError:
+            gps_info = {'records': []}
+        automatic_georeference(insv_path, deliverables_dir, candidate_clouds=produced,
+                               formats=geo_formats, trajectory_path=raw_trj, gps_info=gps_info)
 
     # --------------------------------------------------------------------------
     # Packaging Deliverables

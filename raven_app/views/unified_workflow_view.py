@@ -153,7 +153,9 @@ class UnifiedWorkflowView(QWidget):
         grid.setVerticalSpacing(10)
 
         # SLAM options
-        self.lio_switch = SwitchButton(text=tr("LiDAR + IMU Odometry (Fast LIO)"))
+        self.lio_switch = SwitchButton(text=tr("Enable LiDAR + IMU Odometry (Fast LIO)"))
+        self.lio_switch.setOnText(tr("LiDAR + IMU (LIO)"))
+        self.lio_switch.setOffText(tr("LiDAR + camera + IMU (VIO)"))
         self.lio_switch.setChecked(True)
         grid.addWidget(self.lio_switch, 0, 0)
 
@@ -239,6 +241,11 @@ class UnifiedWorkflowView(QWidget):
         self.vulkan_chk.setChecked(True)
         config_layout.addWidget(self.vulkan_chk)
 
+        self.process_gps_chk = CheckBox(tr("Automatically georeference using INSV GPS (when available)"))
+        self.process_gps_chk.setChecked(True)
+        self.process_gps_chk.stateChanged.connect(self._toggle_gps_formats)
+        config_layout.addWidget(self.process_gps_chk)
+
         layout.addWidget(config_card)
 
         # ----------------------------------------------------------------------
@@ -265,6 +272,35 @@ class UnifiedWorkflowView(QWidget):
         self.chk_colmap = CheckBox(tr("Metric-Scaled 3DGS COLMAP Dataset"))
         self.chk_colmap.setChecked(True)
         output_layout.addWidget(self.chk_colmap)
+
+        self.georef_formats_label = CaptionLabel(tr("Automatic georeferenced cloud formats:"))
+        output_layout.addWidget(self.georef_formats_label)
+        georef_formats_layout = QHBoxLayout()
+        self.chk_geo_laz = CheckBox(tr("LAZ")); self.chk_geo_laz.setChecked(True)
+        self.chk_geo_las = CheckBox(tr("LAS"))
+        self.chk_geo_ply = CheckBox(tr("PLY"))
+        self.chk_geo_pcd = CheckBox(tr("PCD"))
+        self.chk_geo_geojson = CheckBox(tr("GeoJSON")); self.chk_geo_geojson.setChecked(True)
+        for checkbox in (self.chk_geo_laz, self.chk_geo_las, self.chk_geo_ply, self.chk_geo_pcd, self.chk_geo_geojson):
+            georef_formats_layout.addWidget(checkbox)
+        georef_formats_layout.addStretch()
+        output_layout.addLayout(georef_formats_layout)
+
+        self.gps_formats_label = CaptionLabel(tr("GPS metadata formats (select one or more):"))
+        output_layout.addWidget(self.gps_formats_label)
+        gps_formats_layout = QHBoxLayout()
+        self.chk_gps_geojson = CheckBox(tr("GeoJSON"))
+        self.chk_gps_geojson.setChecked(True)
+        self.chk_gps_gpx = CheckBox(tr("GPX"))
+        self.chk_gps_gpx.setChecked(True)
+        self.chk_gps_csv = CheckBox(tr("CSV"))
+        self.chk_gps_csv.setChecked(True)
+        gps_formats_layout.addWidget(self.chk_gps_geojson)
+        gps_formats_layout.addWidget(self.chk_gps_gpx)
+        gps_formats_layout.addWidget(self.chk_gps_csv)
+        gps_formats_layout.addStretch()
+        output_layout.addLayout(gps_formats_layout)
+        self._toggle_gps_formats()
 
         layout.addWidget(output_card)
 
@@ -339,6 +375,13 @@ class UnifiedWorkflowView(QWidget):
     def _toggle_auto_sync(self, state):
         self.dt_input.setEnabled(not self.auto_sync_chk.isChecked())
 
+    def _toggle_gps_formats(self, state=None):
+        enabled = self.process_gps_chk.isChecked()
+        for checkbox in (self.chk_gps_geojson, self.chk_gps_gpx, self.chk_gps_csv,
+                         self.chk_geo_laz, self.chk_geo_las, self.chk_geo_ply,
+                         self.chk_geo_pcd, self.chk_geo_geojson):
+            checkbox.setEnabled(enabled)
+
     def _browse_bag(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select ROS Bag (.bag)", "", "ROS Bag files (*.bag);;All files (*.*)"
@@ -403,6 +446,37 @@ class UnifiedWorkflowView(QWidget):
             )
             return
 
+        if self.process_gps_chk.isChecked() and not any(
+            checkbox.isChecked() for checkbox in (
+                self.chk_gps_geojson, self.chk_gps_gpx, self.chk_gps_csv
+            )
+        ):
+            InfoBar.error(
+                title=tr("GPS output format required"),
+                content=tr("Select at least one GPS metadata format or disable GPS processing."),
+                orient=Qt.Orientation.Horizontal,
+                position=InfoBarPosition.TOP,
+                duration=3500,
+                parent=self
+            )
+            return
+
+        if self.process_gps_chk.isChecked() and not any(
+            checkbox.isChecked() for checkbox in (
+                self.chk_geo_laz, self.chk_geo_las, self.chk_geo_ply,
+                self.chk_geo_pcd, self.chk_geo_geojson
+            )
+        ):
+            InfoBar.error(
+                title=tr("Georeferenced output format required"),
+                content=tr("Select at least one georeferenced output format or disable automatic GPS georeferencing."),
+                orient=Qt.Orientation.Horizontal,
+                position=InfoBarPosition.TOP,
+                duration=3500,
+                parent=self
+            )
+            return
+
         method_key = ["sfm", "direct", "all"][self.method_combo.currentIndex()]
 
         args = [
@@ -427,6 +501,8 @@ class UnifiedWorkflowView(QWidget):
 
         if self.lio_switch.isChecked():
             args.append("--lio")
+        else:
+            args.append("--vio")
 
         if not self.auto_sync_chk.isChecked() and self.dt_input.text().strip():
             args.extend(["--dt", self.dt_input.text().strip()])
@@ -440,6 +516,23 @@ class UnifiedWorkflowView(QWidget):
             args.append("--export-pcd")
         if self.chk_colmap.isChecked():
             args.append("--export-colmap")
+
+        if self.process_gps_chk.isChecked():
+            args.append("--process-gps")
+            gps_formats = []
+            if self.chk_gps_geojson.isChecked():
+                gps_formats.append("geojson")
+            if self.chk_gps_gpx.isChecked():
+                gps_formats.append("gpx")
+            if self.chk_gps_csv.isChecked():
+                gps_formats.append("csv")
+            args.extend(["--gps-formats", *gps_formats])
+            geo_formats = [name for name, checkbox in (
+                ("laz", self.chk_geo_laz), ("las", self.chk_geo_las),
+                ("ply", self.chk_geo_ply), ("pcd", self.chk_geo_pcd),
+                ("geojson", self.chk_geo_geojson)) if checkbox.isChecked()]
+            if geo_formats:
+                args.extend(["--geo-formats", *geo_formats])
 
         self.log_console.appendPlainText(f"\n>>> Starting Unified Workflow: {' '.join(args)}\n")
         self.runner.start_job(args)
@@ -514,7 +607,9 @@ class UnifiedWorkflowView(QWidget):
         self.btn_browse_out.setText(tr("Browse"))
 
         self.config_title.setText(tr("2. Pipeline Processing Options"))
-        self.lio_switch.setText(tr("LiDAR + IMU Odometry (Fast LIO)"))
+        self.lio_switch.setText(tr("Enable LiDAR + IMU Odometry (Fast LIO)"))
+        self.lio_switch.setOnText(tr("LiDAR + IMU (LIO)"))
+        self.lio_switch.setOffText(tr("LiDAR + camera + IMU (VIO)"))
         self.threads_caption.setText(tr("CPU Threads:"))
         self.lidar_caption.setText(tr("LiDAR Topic:"))
         self.imu_caption.setText(tr("IMU Topic:"))
@@ -536,11 +631,17 @@ class UnifiedWorkflowView(QWidget):
 
         self.recalibrate_chk.setText(tr("Auto-Recalibrate Spatial Extrinsics from SfM Alignment"))
         self.vulkan_chk.setText(tr("Enable Vulkan GPU Compute Acceleration"))
+        self.process_gps_chk.setText(tr("Automatically georeference using INSV GPS (when available)"))
         self.output_title.setText(tr("3. Select Deliverables to Generate"))
         self.output_subtitle.setText(tr("Choose which output formats will be built in this run:"))
         self.chk_ply.setText(tr("Export Colored Point Cloud (.PLY)"))
         self.chk_pcd.setText(tr("Export Colored Point Cloud (.PCD)"))
         self.chk_colmap.setText(tr("Metric-Scaled 3DGS COLMAP Dataset"))
+        self.georef_formats_label.setText(tr("Automatic georeferenced cloud formats:"))
+        self.gps_formats_label.setText(tr("GPS metadata formats (select one or more):"))
+        self.chk_gps_geojson.setText(tr("GeoJSON"))
+        self.chk_gps_gpx.setText(tr("GPX"))
+        self.chk_gps_csv.setText(tr("CSV"))
         self.btn_run.setText(tr("Start Unified Workflow"))
         self.btn_cancel.setText(tr("Cancel & Save"))
         self.log_title.setText(tr("Live Workflow Execution Console"))
