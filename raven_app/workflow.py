@@ -28,6 +28,14 @@ from raven_app.cli import engine, resources
 from raven_app.bag_io import export_bags
 from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, frame_time
 
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, 'reconfigure'):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+
 
 def process_gps_metadata(insv_path, output_dir, formats=('geojson', 'gpx', 'csv')):
     """Export GPS metadata independently of reconstruction, without placing geometry."""
@@ -573,18 +581,23 @@ def execute_unified_workflow(
     # Automatic placement is deliberately after colorization so only this run's
     # produced clouds are considered, and before local-format cleanup.
     if process_gps:
-        from raven_app.automatic_georeference import automatic_georeference
-        produced = [p for p in deliverables_dir.iterdir()
-                    if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}
-                    and (p not in cloud_state_before or p.stat().st_mtime_ns != cloud_state_before[p])]
-        gps_info = None
         try:
-            from raven_app.georeference import calculate_insv_gps
-            gps_info = calculate_insv_gps(insv_path)
-        except ValueError:
-            gps_info = {'records': []}
-        automatic_georeference(insv_path, deliverables_dir, candidate_clouds=produced,
-                               formats=geo_formats, trajectory_path=raw_trj, gps_info=gps_info)
+            from raven_app.automatic_georeference import automatic_georeference
+            produced = [p for p in deliverables_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}
+                        and (p not in cloud_state_before or p.stat().st_mtime_ns != cloud_state_before[p])]
+            gps_info = None
+            try:
+                from raven_app.georeference import calculate_insv_gps
+                gps_info = calculate_insv_gps(insv_path)
+            except ValueError:
+                gps_info = {'records': []}
+            automatic_georeference(insv_path, deliverables_dir, candidate_clouds=produced,
+                                   formats=geo_formats, trajectory_path=raw_trj, gps_info=gps_info)
+        except ImportError as e:
+            print(f"[!] Automatic georeferencing skipped: dependency missing ({e}). Install with 'pip install -r requirements.txt'.")
+        except Exception as e:
+            print(f"[!] Automatic georeferencing notice: {e}")
 
     # --------------------------------------------------------------------------
     # Packaging Deliverables

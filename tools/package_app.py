@@ -89,10 +89,17 @@ def main():
         cmd += ['--add-data', f'{ROOT / "locales"};locales']
     if not a.incremental:
         cmd.append('--clean')
-    # Conda-based Python keeps the stdlib SQLite runtime outside its DLLs folder.
+    # Conda-based Python keeps the stdlib SQLite and zstd runtimes outside its DLLs folder.
     sqlite = Path(sys.base_prefix) / 'Library/bin/sqlite3.dll'
     if sqlite.is_file():
         cmd += ['--add-binary', f'{sqlite};.']
+    conda_zstd = Path(sys.base_prefix) / 'Library/bin/zstd.dll'
+    if conda_zstd.is_file():
+        cmd += ['--add-binary', f'{conda_zstd};.']
+        bin_zstd = ROOT / 'bin/zstd.dll'
+        if bin_zstd.is_file() and bin_zstd.read_bytes() != conda_zstd.read_bytes():
+            shutil.copy2(conda_zstd, bin_zstd)
+
     if (ROOT / 'docs/STANDALONE.md').is_file():
         cmd += ['--add-data', f'{ROOT / "docs/STANDALONE.md"};docs']
 

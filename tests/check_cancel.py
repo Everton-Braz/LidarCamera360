@@ -11,9 +11,13 @@ root=Path(__file__).resolve().parents[1]
 output=root/'build/validation'/('cancel-'+str(time.time_ns()))
 log=root/'build/cancel-check.log'
 with log.open('w',encoding='utf-8') as f:
-    child=subprocess.Popen([str(root/'dist/RavenCalibrator/RavenCalibrator.exe'),'--headless','slam',
+    exe = next((p for p in (root / 'dist/LidarCamera360/LidarCamera360.exe', root / 'dist/RavenCalibrator/RavenCalibrator.exe') if p.is_file()), None)
+    if not exe:
+        raise FileNotFoundError('Packaged executable not found in dist/')
+    child=subprocess.Popen([str(exe),'--headless','slam',
         '--bag',str(a.bag),'--lio','--output',str(output)],stdout=f,stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+
     try:
         deadline=time.monotonic()+20
         while time.monotonic()<deadline and child.poll() is None:

@@ -496,36 +496,18 @@ class PointCloudViewerWindow(QMainWindow):
         self.clip_button.setChecked(self.clip_dialog.isVisible())
 
     def _save_view(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            tr("Save View As"),
-            "point_cloud_view.png",
-            tr("PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;PDF Document (*.pdf);;Bitmap (*.bmp);;All Files (*.*)")
-        )
-        if not path:
-            return
-        img = self.renderer.grabFramebuffer()
-        if path.lower().endswith('.pdf'):
-            try:
-                writer = QPdfWriter(path)
-                writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-                writer.setResolution(300)
-                painter = QPainter(writer)
-                page_rect = writer.pageLayout().paintRectPixels(writer.resolution())
-                scaled = img.scaled(page_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                x = (page_rect.width() - scaled.width()) // 2
-                y = (page_rect.height() - scaled.height()) // 2
-                painter.drawImage(x, y, scaled)
-                painter.end()
-                self.status.setText(tr("Exported view to PDF: {path}").format(path=Path(path).name))
-            except Exception as exc:
-                self.status.setText(tr("Could not export PDF: {error}").format(error=exc))
+        from raven_app.export_view_dialog import ExportViewDialog
+        dialog = ExportViewDialog(self.renderer, self)
+        dialog.export_completed.connect(self._on_export_completed)
+        dialog.exec()
+
+    def _on_export_completed(self, path: str, fmt: str, w: int, h: int):
+        if path == "clipboard":
+            self.status.setText(tr("Snapshot ({w} × {h}) copied to clipboard.").format(w=w, h=h))
+        elif fmt == "pdf":
+            self.status.setText(tr("Exported view to PDF ({w} × {h}): {path}").format(w=w, h=h, path=Path(path).name))
         else:
-            try:
-                img.save(path)
-                self.status.setText(tr("Saved snapshot to {path}").format(path=Path(path).name))
-            except Exception as exc:
-                self.status.setText(tr("Could not save image: {error}").format(error=exc))
+            self.status.setText(tr("Saved snapshot ({w} × {h}) to {path}").format(w=w, h=h, path=Path(path).name))
 
     def _copy_view(self):
         try:
@@ -541,8 +523,16 @@ class PointCloudViewerWindow(QMainWindow):
             dialog = QPrintDialog(printer, self)
             if dialog.exec() == QPrintDialog.DialogCode.Accepted:
                 painter = QPainter(printer)
-                img = self.renderer.grabFramebuffer()
                 rect = painter.viewport()
+                target_w, target_h = rect.width(), rect.height()
+                try:
+                    img = self.renderer.render_to_image(
+                        target_w, target_h,
+                        include_overlays=True,
+                        point_size_multiplier=1.0,
+                    )
+                except Exception:
+                    img = self.renderer.grabFramebuffer()
                 scaled = img.scaled(rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 x = (rect.width() - scaled.width()) // 2
                 y = (rect.height() - scaled.height()) // 2

@@ -5,8 +5,8 @@ from itertools import product
 import numpy as np
 from raven_app.i18n import tr
 from PyQt6.QtCore import Qt, QPointF, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen, QMatrix4x4, QSurfaceFormat, QLinearGradient, QFont, QPolygonF
-from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShader, QOpenGLShaderProgram, QOpenGLFunctions_2_1
+from PyQt6.QtGui import QColor, QPainter, QPen, QMatrix4x4, QSurfaceFormat, QLinearGradient, QFont, QPolygonF, QImage
+from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShader, QOpenGLShaderProgram, QOpenGLFunctions_2_1, QOpenGLFramebufferObject
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from raven_app.viewer_geometry import camera_matrix, project_points, measurement_value
 
@@ -439,47 +439,69 @@ void main(){
         buf.allocate(packed.ctypes.data, packed.nbytes); buf.release()
         self._buffers[slot] = buf
 
+    def _render_gl_scene(self, gl, width: int, height: int, point_size_scale: float = 1.0):
+        gl.glViewport(0, 0, width, height)
+        gl.glDisable(0x0C11)
+        gl.glClearColor(self.bg_color.redF(), self.bg_color.greenF(), self.bg_color.blueF(), 1.0)
+        gl.glClear(0x4000 | 0x0100)
+        aspect = max(width, 1) / max(height, 1)
+        matrix = camera_matrix(self.target, self.yaw, self.elevation, self.half_height, aspect, self.scene_radius)[0]
+        try:
+            self._map_renderer.draw(self.basemap_layer, gl, matrix, self.origin)
+        except Exception as exc:
+            self.basemap_layer.enabled = False
+            self.status_changed.emit('Map renderer: ' + str(exc))
+        gl.glEnable(0x0B71)
+        gl.glDepthFunc(0x0201)
+        gl.glDisable(0x0BE2)
+        gl.glPointSize(float(self.point_size * point_size_scale))
+        for slot in sorted(self._dirty):
+            self._upload(slot)
+        self._dirty.clear()
+        self._program.bind()
+        self._program.setUniformValue('mvp', QMatrix4x4(matrix.ravel().tolist()))
+        self._program.setUniformValue('clip_enabled', 1 if self.clipping_enabled else 0)
+        rel_min = self.clip_min - self.origin
+        rel_max = self.clip_max - self.origin
+        self._program.setUniformValue('clip_min', float(rel_min[0]), float(rel_min[1]), float(rel_min[2]))
+        self._program.setUniformValue('clip_max', float(rel_max[0]), float(rel_max[1]), float(rel_max[2]))
+
+        both = all(c is not None for c in self.clouds)
+        cut = round(width * self.split)
+        for slot, cloud in enumerate(self.clouds):
+            if cloud is None:
+                continue
+            if both:
+                gl.glEnable(0x0C11)
+                gl.glScissor(0 if slot == 0 else cut, 0, cut if slot == 0 else width - cut, height)
+            else:
+                gl.glDisable(0x0C11)
+            gl.glClear(0x0100)
+            self._buffers[slot].bind()
+            self._program.enableAttributeArray(0)
+            self._program.enableAttributeArray(1)
+            self._program.setAttributeBuffer(0, 0x1406, 0, 3, 24)
+            self._program.setAttributeBuffer(1, 0x1406, 12, 3, 24)
+            gl.glDrawArrays(0x0000, 0, len(self._indices[slot]))
+            self._program.disableAttributeArray(0)
+            self._program.disableAttributeArray(1)
+            self._buffers[slot].release()
+        self._program.release()
+        gl.glDisable(0x0C11)
+        gl.glDisable(0x0B71)
+
     def paintGL(self):
         painter = QPainter(self)
         painter.beginNativePainting()
         try:
             if self._gl is not None and self._program is not None and not self.error:
-                gl = self._gl; ratio = self.devicePixelRatioF(); width, height = round(self.width()*ratio),round(self.height()*ratio)
-                gl.glViewport(0,0,width,height); gl.glDisable(0x0C11)
-                gl.glClearColor(self.bg_color.redF(), self.bg_color.greenF(), self.bg_color.blueF(), 1.)
-                gl.glClear(0x4000|0x0100)
-                try:
-                    self._map_renderer.draw(self.basemap_layer, gl, self._matrix()[0], self.origin)
-                except Exception as exc:
-                    self.basemap_layer.enabled = False
-                    self.status_changed.emit('Map renderer: ' + str(exc))
-                gl.glEnable(0x0B71); gl.glDepthFunc(0x0201); gl.glDisable(0x0BE2)
-                gl.glPointSize(float(self.point_size*ratio))
-                for slot in sorted(self._dirty): self._upload(slot)
-                self._dirty.clear()
-                self._program.bind()
-                self._program.setUniformValue('mvp', QMatrix4x4(self._matrix()[0].ravel().tolist()))
-                self._program.setUniformValue('clip_enabled', 1 if self.clipping_enabled else 0)
-                rel_min = self.clip_min - self.origin
-                rel_max = self.clip_max - self.origin
-                self._program.setUniformValue('clip_min', float(rel_min[0]), float(rel_min[1]), float(rel_min[2]))
-                self._program.setUniformValue('clip_max', float(rel_max[0]), float(rel_max[1]), float(rel_max[2]))
-
-                both = all(c is not None for c in self.clouds); cut=round(width*self.split)
-                for slot,cloud in enumerate(self.clouds):
-                    if cloud is None: continue
-                    if both:
-                        gl.glEnable(0x0C11); gl.glScissor(0 if slot==0 else cut,0,cut if slot==0 else width-cut,height)
-                    else: gl.glDisable(0x0C11)
-                    gl.glClear(0x0100)
-                    self._buffers[slot].bind()
-                    self._program.enableAttributeArray(0); self._program.enableAttributeArray(1)
-                    self._program.setAttributeBuffer(0,0x1406,0,3,24); self._program.setAttributeBuffer(1,0x1406,12,3,24)
-                    gl.glDrawArrays(0x0000,0,len(self._indices[slot]))
-                    self._program.disableAttributeArray(0); self._program.disableAttributeArray(1); self._buffers[slot].release()
-                self._program.release(); gl.glDisable(0x0C11); gl.glDisable(0x0B71)
+                ratio = self.devicePixelRatioF()
+                width = round(self.width() * ratio)
+                height = round(self.height() * ratio)
+                self._render_gl_scene(self._gl, width, height, point_size_scale=ratio)
         except Exception as exc:
-            self.error = str(exc); self.status_changed.emit('Renderer error: '+self.error)
+            self.error = str(exc)
+            self.status_changed.emit('Renderer error: ' + self.error)
         finally:
             painter.endNativePainting()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -490,61 +512,78 @@ void main(){
         finally:
             painter.end()
 
-    def _overlay(self, p):
+    def _overlay(self, p, width=None, height=None, scale=1.0, show_labels=True, show_hud=True, show_measurements=True):
+        w = self.width() if width is None else int(width)
+        h = self.height() if height is None else int(height)
+        s = float(scale)
+
         is_light = self.bg_color.lightnessF() > 0.55
         text_pen = QColor('#18222d') if is_light else QColor('#d8e7f2')
         p.setPen(text_pen)
 
         if self.basemap_layer.enabled and any(t.get('image') is not None for t in self.basemap_layer.tiles):
             label = self.basemap_layer.attribution
-            width = p.fontMetrics().horizontalAdvance(label) + 16
-            p.fillRect(self.width()-width-8, self.height()-27, width, 23, QColor(0, 0, 0, 180))
+            attr_font = p.font()
+            attr_font.setPointSize(max(6, round(8 * s)))
+            p.setFont(attr_font)
+            attr_w = p.fontMetrics().horizontalAdvance(label) + round(16 * s)
+            attr_h = round(23 * s)
+            p.fillRect(w - attr_w - round(8 * s), h - round(27 * s), attr_w, attr_h, QColor(0, 0, 0, 180))
             p.setPen(QColor('white'))
-            p.drawText(self.width()-width, self.height()-11, label)
+            p.drawText(w - attr_w, h - round(11 * s), label)
             p.setPen(text_pen)
 
         if self.error:
-            p.drawText(self.rect(),Qt.AlignmentFlag.AlignCenter,'3D renderer unavailable\n'+self.error); return
+            p.drawText(0, 0, w, h, Qt.AlignmentFlag.AlignCenter, '3D renderer unavailable\n' + self.error)
+            return
         if not any(c is not None for c in self.clouds):
-            p.drawText(self.rect(),Qt.AlignmentFlag.AlignCenter,
+            p.drawText(0, 0, w, h, Qt.AlignmentFlag.AlignCenter,
                        tr('Open a point cloud to explore in 3D') + '\n' +
-                       tr('Add a second cloud to compare • PCD / PLY / LAS / LAZ')); return
-        for slot,c in enumerate(self.clouds):
-            if c is not None:
-                label=p.fontMetrics().elidedText(f"{'AB'[slot]}  {c.path.name}",Qt.TextElideMode.ElideMiddle,max(80,self.width()//2-32))
-                x=14 if slot==0 else max(14,self.width()-p.fontMetrics().horizontalAdvance(label)-14)
-                p.drawText(x,24,label)
+                       tr('Add a second cloud to compare • PCD / PLY / LAS / LAZ'))
+            return
+
+        if show_labels:
+            lbl_font = p.font()
+            lbl_font.setPointSize(max(7, round(9 * s)))
+            p.setFont(lbl_font)
+            for slot, c in enumerate(self.clouds):
+                if c is not None:
+                    label = p.fontMetrics().elidedText(f"{'AB'[slot]}  {c.path.name}", Qt.TextElideMode.ElideMiddle, max(round(80 * s), w // 2 - round(32 * s)))
+                    x = round(14 * s) if slot == 0 else max(round(14 * s), w - p.fontMetrics().horizontalAdvance(label) - round(14 * s))
+                    p.drawText(int(x), int(round(24 * s)), label)
 
         # Redesigned Modern Split Slider
         if all(c is not None for c in self.clouds):
-            x = self.width() * self.split
-            p.setPen(QPen(QColor(0, 0, 0, 70), 3))
-            p.drawLine(QPointF(x, 26), QPointF(x, self.height()))
-            p.setPen(QPen(QColor('#00d2df'), 1.8))
-            p.drawLine(QPointF(x, 26), QPointF(x, self.height()))
+            x = w * self.split
+            p.setPen(QPen(QColor(0, 0, 0, 70), max(1.0, 3.0 * s)))
+            p.drawLine(QPointF(x, 26 * s), QPointF(x, h))
+            p.setPen(QPen(QColor('#00d2df'), max(1.0, 1.8 * s)))
+            p.drawLine(QPointF(x, 26 * s), QPointF(x, h))
 
-            handle_w, handle_h = 32, 46
-            hy = self.height() // 2 - handle_h // 2
+            handle_w, handle_h = round(32 * s), round(46 * s)
+            hy = h // 2 - handle_h // 2
             hx = int(x) - handle_w // 2
 
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 80))
-            p.drawRoundedRect(hx - 1, hy + 2, handle_w + 2, handle_h, 16, 16)
+            p.drawRoundedRect(hx - 1, hy + round(2 * s), handle_w + 2, handle_h, round(16 * s), round(16 * s))
 
             pill_grad = QLinearGradient(hx, hy, hx, hy + handle_h)
             pill_grad.setColorAt(0.0, QColor(32, 46, 62, 245))
             pill_grad.setColorAt(0.5, QColor(20, 30, 42, 250))
             pill_grad.setColorAt(1.0, QColor(14, 22, 32, 255))
             p.setBrush(pill_grad)
-            p.setPen(QPen(QColor('#00d2df'), 1.5))
-            p.drawRoundedRect(hx, hy, handle_w, handle_h, 15, 15)
+            p.setPen(QPen(QColor('#00d2df'), max(1.0, 1.5 * s)))
+            p.drawRoundedRect(hx, hy, handle_w, handle_h, round(15 * s), round(15 * s))
 
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor('#ffffff'))
-            p.drawPolygon(QPolygonF([QPointF(x - 3, hy + handle_h//2), QPointF(x - 8, hy + handle_h//2 - 5), QPointF(x - 8, hy + handle_h//2 + 5)]))
-            p.drawPolygon(QPolygonF([QPointF(x + 3, hy + handle_h//2), QPointF(x + 8, hy + handle_h//2 - 5), QPointF(x + 8, hy + handle_h//2 + 5)]))
+            arr_sz = round(5 * s)
+            p.drawPolygon(QPolygonF([QPointF(x - 3 * s, hy + handle_h // 2), QPointF(x - 8 * s, hy + handle_h // 2 - arr_sz), QPointF(x - 8 * s, hy + handle_h // 2 + arr_sz)]))
+            p.drawPolygon(QPolygonF([QPointF(x + 3 * s, hy + handle_h // 2), QPointF(x + 8 * s, hy + handle_h // 2 - arr_sz), QPointF(x + 8 * s, hy + handle_h // 2 + arr_sz)]))
 
-        matrix = self._matrix()[0]
+        aspect = max(w, 1) / max(h, 1)
+        matrix = camera_matrix(self.target, self.yaw, self.elevation, self.half_height, aspect, self.scene_radius)[0]
 
         # 3D Clipping Box wireframe guide
         if self.clipping_enabled and any(c is not None for c in self.clouds):
@@ -554,93 +593,165 @@ void main(){
                 [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
                 [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
             ])
-            screen_pts, depths = project_points(corners - self.origin, matrix, self.width(), self.height())
+            screen_pts, depths = project_points(corners - self.origin, matrix, w, h)
             edges = [
-                (0,1), (1,2), (2,3), (3,0),
-                (4,5), (5,6), (6,7), (7,4),
-                (0,4), (1,5), (2,6), (3,7)
+                (0, 1), (1, 2), (2, 3), (3, 0),
+                (4, 5), (5, 6), (6, 7), (7, 4),
+                (0, 4), (1, 5), (2, 6), (3, 7)
             ]
             p.save()
-            p.setPen(QPen(QColor('#26cad3'), 1.3, Qt.PenStyle.DashLine))
+            p.setPen(QPen(QColor('#26cad3'), max(1.0, 1.3 * s), Qt.PenStyle.DashLine))
             for i1, i2 in edges:
                 if -1 <= depths[i1] <= 1 or -1 <= depths[i2] <= 1:
                     p.drawLine(QPointF(*screen_pts[i1]), QPointF(*screen_pts[i2]))
             p.restore()
 
-        for record in self.measurements + ([{'points':self.pending,'label':'Pending'}] if self.pending else []):
-            xyz=np.array([r['xyz'] for r in record['points']]); screen,depth=project_points(xyz-self.origin,matrix,self.width(),self.height())
-            p.setPen(QPen(QColor('#ffd166'),2)); p.setBrush(QColor('#ffd166'))
-            for i,(x,y) in enumerate(screen):
-                if -1<=depth[i]<=1:
-                    p.drawEllipse(QPointF(x,y),4,4)
-                    if i and -1<=depth[i-1]<=1: p.drawLine(QPointF(*screen[i-1]),QPointF(x,y))
-            if len(screen) and -1<=depth[-1]<=1:
-                p.drawText(QPointF(*screen[-1])+QPointF(9,-9),record['label'].split(' | ')[0])
+        if show_measurements:
+            m_font = p.font()
+            m_font.setPointSize(max(7, round(9 * s)))
+            p.setFont(m_font)
+            for record in self.measurements + ([{'points': self.pending, 'label': 'Pending'}] if self.pending else []):
+                xyz = np.array([r['xyz'] for r in record['points']])
+                screen, depth = project_points(xyz - self.origin, matrix, w, h)
+                p.setPen(QPen(QColor('#ffd166'), max(1.0, 2.0 * s)))
+                p.setBrush(QColor('#ffd166'))
+                dot_r = max(2.0, 4.0 * s)
+                for i, (sx, sy) in enumerate(screen):
+                    if -1 <= depth[i] <= 1:
+                        p.drawEllipse(QPointF(sx, sy), dot_r, dot_r)
+                        if i and -1 <= depth[i - 1] <= 1:
+                            p.drawLine(QPointF(*screen[i - 1]), QPointF(sx, sy))
+                if len(screen) and -1 <= depth[-1] <= 1:
+                    p.drawText(QPointF(*screen[-1]) + QPointF(9 * s, -9 * s), record['label'].split(' | ')[0])
 
-        # Orthographic ruler, independent of the file coordinate origin.
-        per_pixel=2*self.half_height/max(1,self.height()); raw=per_pixel*100
-        magnitude=10**math.floor(math.log10(max(raw,1e-15))); value=next(v*magnitude for v in (1,2,5,10) if v*magnitude>=raw)
-        length=value/per_pixel; y=self.height()-24
-        p.setPen(QPen(text_pen, 2)); p.drawLine(QPointF(16,y),QPointF(16+length,y)); p.drawText(16,y-7,f'{value:g} m')
+        if show_hud:
+            # Orthographic ruler, independent of the file coordinate origin.
+            per_pixel = 2 * self.half_height / max(1, h)
+            raw = per_pixel * (100 * s)
+            magnitude = 10 ** math.floor(math.log10(max(raw, 1e-15)))
+            value = next(v * magnitude for v in (1, 2, 5, 10) if v * magnitude >= raw)
+            length = value / per_pixel
+            ry = h - round(24 * s)
+            p.setPen(QPen(text_pen, max(1.0, 2.0 * s)))
+            p.drawLine(QPointF(round(16 * s), ry), QPointF(round(16 * s) + length, ry))
+            ruler_font = p.font()
+            ruler_font.setPointSize(max(7, round(9 * s)))
+            p.setFont(ruler_font)
+            p.drawText(round(16 * s), ry - round(7 * s), f'{value:g} m')
 
-        # Scalar / Elevation HUD legend card(s)
-        scalar_slots = [s for s, c in enumerate(self.clouds) if c is not None and self.color_modes[s] != 'rgb']
-        if scalar_slots:
-            card_w, card_h = 78, 142
-            base_cx = self.width() - card_w - 14
-            cy = self.height() - card_h - 14
+            # Scalar / Elevation HUD legend card(s)
+            scalar_slots = [sl for sl, cl in enumerate(self.clouds) if cl is not None and self.color_modes[sl] != 'rgb']
+            if scalar_slots:
+                card_w, card_h = round(78 * s), round(142 * s)
+                base_cx = w - card_w - round(14 * s)
+                cy = h - card_h - round(14 * s)
 
-            # Dedup if both slots have identical mode and colormap
-            slots_to_draw = []
-            for s in scalar_slots:
-                key = (self.color_modes[s], self.colormaps[s])
-                if not any(key == (self.color_modes[x], self.colormaps[x]) for x in slots_to_draw):
-                    slots_to_draw.append(s)
+                slots_to_draw = []
+                for sl in scalar_slots:
+                    key = (self.color_modes[sl], self.colormaps[sl])
+                    if not any(key == (self.color_modes[x], self.colormaps[x]) for x in slots_to_draw):
+                        slots_to_draw.append(sl)
 
-            for idx, slot in enumerate(reversed(slots_to_draw)):
-                cx = base_cx - idx * (card_w + 8)
-                smode = self.color_modes[slot]
-                scmap = self.colormaps[slot]
-                field_name = 'z' if smode in ('height', 'z') else smode
-                vmin, vmax = self._get_scalar_range(field_name)
+                for idx, slot in enumerate(reversed(slots_to_draw)):
+                    cx = base_cx - idx * (card_w + round(8 * s))
+                    smode = self.color_modes[slot]
+                    scmap = self.colormaps[slot]
+                    field_name = 'z' if smode in ('height', 'z') else smode
+                    vmin, vmax = self._get_scalar_range(field_name)
 
-                p.save()
-                p.setPen(QPen(QColor('#384b60'), 1))
-                p.setBrush(QColor(18, 26, 36, 220))
-                p.drawRoundedRect(cx, cy, card_w, card_h, 6, 6)
+                    p.save()
+                    p.setPen(QPen(QColor('#384b60'), max(1.0, 1.0 * s)))
+                    p.setBrush(QColor(18, 26, 36, 220))
+                    p.drawRoundedRect(cx, cy, card_w, card_h, round(6 * s), round(6 * s))
 
-                title_map = {'height': 'Height', 'z': 'Height', 'intensity': 'Intensity', 'x': 'X Axis', 'y': 'Y Axis'}
-                title = title_map.get(smode, smode.title())
-                if len(slots_to_draw) > 1:
-                    title = f"{'AB'[slot]}: {title}"
-                p.setPen(QColor('#9ac3e6'))
-                f = p.font()
-                f.setBold(True); f.setPointSize(8); p.setFont(f)
-                p.drawText(cx, cy + 4, card_w, 16, Qt.AlignmentFlag.AlignHCenter, title)
+                    title_map = {'height': 'Height', 'z': 'Height', 'intensity': 'Intensity', 'x': 'X Axis', 'y': 'Y Axis'}
+                    title = title_map.get(smode, smode.title())
+                    if len(slots_to_draw) > 1:
+                        title = f"{'AB'[slot]}: {title}"
+                    p.setPen(QColor('#9ac3e6'))
+                    f = p.font()
+                    f.setBold(True)
+                    f.setPointSize(max(6, round(8 * s)))
+                    p.setFont(f)
+                    p.drawText(cx, cy + round(4 * s), card_w, round(16 * s), Qt.AlignmentFlag.AlignHCenter, title)
 
-                bar_x, bar_y, bar_w, bar_h = cx + 8, cy + 24, 12, 104
-                grad = QLinearGradient(bar_x, bar_y + bar_h, bar_x, bar_y)
-                lut = get_lut(scmap)
-                for i in range(8):
-                    stop = i / 7.0
-                    idx_val = int(stop * 255)
-                    c = lut[idx_val]
-                    grad.setColorAt(stop, QColor.fromRgbF(float(c[0]), float(c[1]), float(c[2])))
+                    bar_x = cx + round(8 * s)
+                    bar_y = cy + round(24 * s)
+                    bar_w = round(12 * s)
+                    bar_h = round(104 * s)
+                    grad = QLinearGradient(bar_x, bar_y + bar_h, bar_x, bar_y)
+                    lut = get_lut(scmap)
+                    for i in range(8):
+                        stop = i / 7.0
+                        idx_val = int(stop * 255)
+                        c = lut[idx_val]
+                        grad.setColorAt(stop, QColor.fromRgbF(float(c[0]), float(c[1]), float(c[2])))
 
-                p.setPen(QPen(QColor('#556b82'), 1))
-                p.setBrush(grad)
-                p.drawRect(bar_x, bar_y, bar_w, bar_h)
+                    p.setPen(QPen(QColor('#556b82'), max(1.0, 1.0 * s)))
+                    p.setBrush(grad)
+                    p.drawRect(bar_x, bar_y, bar_w, bar_h)
 
-                f.setBold(False); f.setPointSize(7); p.setFont(f)
-                p.setPen(QColor('#e2eef8'))
-                unit = 'm' if smode in ('height', 'z', 'x', 'y') else ''
-                t_top = f"{vmax:+.1f}{unit}" if unit else f"{vmax:.0f}"
-                t_mid = f"{(vmax+vmin)*0.5:+.1f}{unit}" if unit else f"{(vmax+vmin)*0.5:.0f}"
-                t_bot = f"{vmin:+.1f}{unit}" if unit else f"{vmin:.0f}"
-                p.drawText(bar_x + bar_w + 4, bar_y + 9, t_top)
-                p.drawText(bar_x + bar_w + 4, bar_y + bar_h // 2 + 4, t_mid)
-                p.drawText(bar_x + bar_w + 4, bar_y + bar_h - 1, t_bot)
-                p.restore()
+                    f.setBold(False)
+                    f.setPointSize(max(5, round(7 * s)))
+                    p.setFont(f)
+                    p.setPen(QColor('#e2eef8'))
+                    unit = 'm' if smode in ('height', 'z', 'x', 'y') else ''
+                    t_top = f"{vmax:+.1f}{unit}" if unit else f"{vmax:.0f}"
+                    t_mid = f"{(vmax+vmin)*0.5:+.1f}{unit}" if unit else f"{(vmax+vmin)*0.5:.0f}"
+                    t_bot = f"{vmin:+.1f}{unit}" if unit else f"{vmin:.0f}"
+                    p.drawText(bar_x + bar_w + round(4 * s), bar_y + round(9 * s), t_top)
+                    p.drawText(bar_x + bar_w + round(4 * s), bar_y + bar_h // 2 + round(4 * s), t_mid)
+                    p.drawText(bar_x + bar_w + round(4 * s), bar_y + bar_h - round(1 * s), t_bot)
+                    p.restore()
+
+    def render_to_image(
+        self,
+        width: int,
+        height: int,
+        include_overlays: bool = True,
+        point_size_multiplier: float = 1.0,
+        show_labels: bool = True,
+        show_hud: bool = True,
+        show_measurements: bool = True,
+    ) -> QImage:
+        """Render the 3D point cloud scene to an off-screen QImage at arbitrary resolution."""
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid render dimensions: {width}x{height}")
+        self.makeCurrent()
+        try:
+            if self._gl is None or self._program is None:
+                self.initializeGL()
+            fbo = QOpenGLFramebufferObject(width, height, QOpenGLFramebufferObject.Attachment.CombinedDepthStencil)
+            if not fbo.isValid():
+                fbo = QOpenGLFramebufferObject(width, height, QOpenGLFramebufferObject.Attachment.Depth)
+            if not fbo.isValid():
+                raise RuntimeError(tr("OpenGL cannot create framebuffer of size {w}x{h} on this hardware.").format(w=width, h=height))
+            fbo.bind()
+            screen_h = max(self.height(), 1)
+            scale = max(width / max(self.width(), 1), height / screen_h)
+            pt_scale = scale * point_size_multiplier
+            self._render_gl_scene(self._gl, width, height, point_size_scale=pt_scale)
+            fbo.release()
+            img = fbo.toImage()
+            if img.isNull():
+                raise RuntimeError(tr("Failed to read image from framebuffer object."))
+            if include_overlays:
+                p = QPainter(img)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+                self._overlay(
+                    p,
+                    width=width,
+                    height=height,
+                    scale=scale,
+                    show_labels=show_labels,
+                    show_hud=show_hud,
+                    show_measurements=show_measurements,
+                )
+                p.end()
+            return img
+        finally:
+            self.doneCurrent()
 
     def pick_point(self, x, y):
         loaded=[i for i,c in enumerate(self.clouds) if c is not None]

@@ -5,8 +5,12 @@ import subprocess
 import tempfile
 
 
-ROOT=Path(__file__).resolve().parents[1]
-EXE=ROOT/'build/native/Release/fastlivo2.exe'
+ROOT = Path(__file__).resolve().parents[1]
+EXE = ROOT / 'build/native/Release/fastlivo2.exe'
+if not EXE.is_file():
+    EXE = ROOT / 'bin/fastlivo2.exe'
+
+
 with tempfile.TemporaryDirectory(prefix='raven-native-') as tmp:
     tmp=Path(tmp)
     cases=[b'not-flv2',b'FLV2\x01\0\0\0'+struct.pack('<BdI',1,1.,6),
