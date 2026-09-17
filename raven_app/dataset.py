@@ -9,13 +9,15 @@ TRAJECTORY_COLORS = 'trajectory_colorized'
 
 def trajectory_path(dataset):
     directory = Path(dataset) / 'slam_out' / 'result'
-    preferred = directory / 'trajectory.txt'
-    if preferred.is_file():
-        return preferred
-    legacy = directory / 'Raven_3DMakerPro_Scan.txt'
-    if legacy.is_file():
-        return legacy
-    return preferred
+    for name in ('trajectory.txt', 'Eagle_Scan.txt', 'Eagle_X6_Scan.txt', 'Raven_3DMakerPro_Scan.txt'):
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    if directory.is_dir():
+        txts = sorted(directory.glob('*.txt'))
+        if txts:
+            return txts[0]
+    return directory / 'trajectory.txt'
 
 
 def calibration_path(dataset=None, explicit=None):

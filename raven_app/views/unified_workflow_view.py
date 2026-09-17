@@ -12,34 +12,8 @@ from qfluentwidgets import (
     SmoothScrollArea
 )
 from raven_app.process_runner import ProcessRunner
+from raven_app.bag_io import detect_bag_topics
 from raven_app.i18n import tr
-
-
-class UnifiedWorkflowView(QWidget):
-    """WinUI Fluent view providing single-screen end-to-end processing.
-
-    Inputs: ROS Bag (.bag) + Insta360 Video (.insv) + Output Folder
-    Workflow: Video Extraction -> SLAM -> Gyro Sync -> Colorization -> Deliverables
-    Outputs: .PLY, .PCD, and COLMAP Dataset ready for 3DGS Training.
-    """
-
-    def __init__(self, runner: ProcessRunner, parent=None):
-        super().__init__(parent)
-        self.setObjectName("UnifiedWorkflowView")
-        self.runner = runner
-        self._init_ui()
-        self._connect_signals()
-
-    def _init_ui(self):
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Scroll area to comfortably accommodate all cards
-        scroll = SmoothScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
-
-        content = QWidget()
 
 
 class UnifiedWorkflowView(QWidget):
@@ -114,7 +88,7 @@ class UnifiedWorkflowView(QWidget):
         self.insv_label = BodyLabel(tr("Insta360 Video (.insv):"))
         self.insv_label.setFixedWidth(170)
         self.insv_input = LineEdit()
-        self.insv_input.setPlaceholderText(tr("Select Insta360 X4 8K video (.insv or .mp4)..."))
+        self.insv_input.setPlaceholderText(tr("Select Insta360 X4 / X6 video (.insv or .mp4)..."))
         self.btn_browse_insv = PushButton(tr("Browse"), icon=FluentIcon.VIDEO)
         self.btn_browse_insv.clicked.connect(self._browse_insv)
         insv_row.addWidget(self.insv_label)
@@ -152,12 +126,19 @@ class UnifiedWorkflowView(QWidget):
         grid.setHorizontalSpacing(24)
         grid.setVerticalSpacing(10)
 
-        # SLAM options
-        self.lio_switch = SwitchButton(text=tr("Enable LiDAR + IMU Odometry (Fast LIO)"))
-        self.lio_switch.setOnText(tr("LiDAR + IMU (LIO)"))
-        self.lio_switch.setOffText(tr("LiDAR + camera + IMU (VIO)"))
-        self.lio_switch.setChecked(True)
-        grid.addWidget(self.lio_switch, 0, 0)
+        # Scanner Preset Selector
+        scanner_row = QHBoxLayout()
+        self.scanner_label = CaptionLabel(tr("Scanner Hardware Preset:"))
+        self.scanner_combo = ComboBox()
+        self.scanner_combo.addItems([
+            tr("Auto-Detect (Eagle / Raven)"),
+            tr("Eagle (Livox Mid-360)"),
+            tr("Raven (Vanjee 722z)")
+        ])
+        self.scanner_combo.currentIndexChanged.connect(self._on_preset_changed)
+        scanner_row.addWidget(self.scanner_label)
+        scanner_row.addWidget(self.scanner_combo)
+        grid.addLayout(scanner_row, 0, 0)
 
         threads_layout = QHBoxLayout()
         self.threads_caption = CaptionLabel(tr("CPU Threads:"))
@@ -167,6 +148,13 @@ class UnifiedWorkflowView(QWidget):
         threads_layout.addWidget(self.threads_caption)
         threads_layout.addWidget(self.threads_spin)
         grid.addLayout(threads_layout, 0, 1)
+
+        # SLAM options
+        self.lio_switch = SwitchButton(text=tr("Enable LiDAR + IMU Odometry (Fast LIO)"))
+        self.lio_switch.setOnText(tr("LiDAR + IMU (LIO)"))
+        self.lio_switch.setOffText(tr("LiDAR + camera + IMU (VIO)"))
+        self.lio_switch.setChecked(True)
+        grid.addWidget(self.lio_switch, 1, 0, 1, 2)
 
         # Topics
         topics_layout = QHBoxLayout()
@@ -180,7 +168,7 @@ class UnifiedWorkflowView(QWidget):
         self.imu_topic.setText("/vanjee_imu_packets")
         topics_layout.addWidget(self.imu_caption)
         topics_layout.addWidget(self.imu_topic)
-        grid.addLayout(topics_layout, 1, 0, 1, 2)
+        grid.addLayout(topics_layout, 2, 0, 1, 2)
 
         # Separator line
         sep = QFrame()
@@ -372,6 +360,37 @@ class UnifiedWorkflowView(QWidget):
         self.runner.log_received.connect(self._on_log_received)
         self.runner.error_occurred.connect(self._on_error_occurred)
 
+    def _on_preset_changed(self, index: int):
+        if index == 1:  # Eagle
+            self.lidar_topic.setText("/livox/lidar")
+            self.imu_topic.setText("/livox/imu")
+        elif index == 2:  # Raven
+            self.lidar_topic.setText("/vanjee_722z")
+            self.imu_topic.setText("/vanjee_imu_packets")
+        else:  # Auto-Detect
+            bag = self.bag_input.text().strip()
+            if bag and Path(bag).is_file():
+                self._auto_detect_bag(bag)
+
+    def _auto_detect_bag(self, bag_path: str):
+        try:
+            detected = detect_bag_topics([bag_path])
+            if detected.get('lidar_topic'):
+                self.lidar_topic.setText(detected['lidar_topic'])
+            if detected.get('imu_topic'):
+                self.imu_topic.setText(detected['imu_topic'])
+            stype = detected.get('scanner_type', '')
+            if stype == 'eagle':
+                self.scanner_combo.blockSignals(True)
+                self.scanner_combo.setCurrentIndex(1)
+                self.scanner_combo.blockSignals(False)
+            elif stype == 'raven':
+                self.scanner_combo.blockSignals(True)
+                self.scanner_combo.setCurrentIndex(2)
+                self.scanner_combo.blockSignals(False)
+        except Exception:
+            pass
+
     def _toggle_auto_sync(self, state):
         self.dt_input.setEnabled(not self.auto_sync_chk.isChecked())
 
@@ -388,6 +407,7 @@ class UnifiedWorkflowView(QWidget):
         )
         if path:
             self.bag_input.setText(path)
+            self._auto_detect_bag(path)
             # Auto-suggest output folder if empty
             if not self.out_input.text().strip():
                 p = Path(path)
@@ -478,12 +498,14 @@ class UnifiedWorkflowView(QWidget):
             return
 
         method_key = ["sfm", "direct", "all"][self.method_combo.currentIndex()]
+        scanner_key = ["auto", "eagle", "raven"][self.scanner_combo.currentIndex()]
 
         args = [
             "workflow",
             "--bag", bag,
             "--insv", insv,
             "--output", out,
+            "--scanner", scanner_key,
             "--lidar-topic", self.lidar_topic.text().strip() or "/vanjee_722z",
             "--imu-topic", self.imu_topic.text().strip() or "/vanjee_imu_packets",
             "--threads", str(self.threads_spin.value()),
@@ -600,13 +622,14 @@ class UnifiedWorkflowView(QWidget):
         self.bag_input.setPlaceholderText(tr("Select merged or raw ROS1 bag file (.bag)..."))
         self.btn_browse_bag.setText(tr("Browse"))
         self.insv_label.setText(tr("Insta360 Video (.insv):"))
-        self.insv_input.setPlaceholderText(tr("Select Insta360 X4 8K video (.insv or .mp4)..."))
+        self.insv_input.setPlaceholderText(tr("Select Insta360 X4 / X6 video (.insv or .mp4)..."))
         self.btn_browse_insv.setText(tr("Browse"))
         self.out_label.setText(tr("Output Directory:"))
         self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
         self.btn_browse_out.setText(tr("Browse"))
 
         self.config_title.setText(tr("2. Pipeline Processing Options"))
+        self.scanner_label.setText(tr("Scanner Hardware Preset:"))
         self.lio_switch.setText(tr("Enable LiDAR + IMU Odometry (Fast LIO)"))
         self.lio_switch.setOnText(tr("LiDAR + IMU (LIO)"))
         self.lio_switch.setOffText(tr("LiDAR + camera + IMU (VIO)"))

@@ -82,6 +82,7 @@ class InspectView(QWidget):
 
         self.lbl_duration = StrongBodyLabel("Duration: --")
         self.lbl_msgs = StrongBodyLabel("Total Messages: --")
+        self.lbl_scanner = CaptionLabel("Scanner Profile: --")
         self.lbl_lidar = CaptionLabel("Detected LiDAR: --")
         self.lbl_imu = CaptionLabel("Detected IMU: --")
         self.lbl_cam = CaptionLabel("Detected Camera: --")
@@ -89,6 +90,7 @@ class InspectView(QWidget):
         stat_col1 = QVBoxLayout()
         stat_col1.addWidget(self.lbl_duration)
         stat_col1.addWidget(self.lbl_msgs)
+        stat_col1.addWidget(self.lbl_scanner)
 
         stat_col2 = QVBoxLayout()
         stat_col2.addWidget(self.lbl_lidar)
@@ -172,6 +174,7 @@ class InspectView(QWidget):
         best_lidar = None
         best_imu = None
         best_cam = None
+        scanner_name = "Generic ROS Bag"
 
         for row, conn in enumerate(connections):
             topic = conn.get('topic', '')
@@ -182,17 +185,27 @@ class InspectView(QWidget):
             self.table.setItem(row, 1, QTableWidgetItem(msgtype))
             self.table.setItem(row, 2, QTableWidgetItem(f"{count:,}"))
 
-            if 'PointCloud2' in msgtype or 'vanjee_722z' in topic:
+            if 'CustomMsg' in msgtype or '/livox/lidar' in topic:
                 best_lidar = topic
-            if 'Imu' in msgtype or 'imu' in topic:
-                best_imu = topic
-            if 'Image' in msgtype or 'camera' in topic:
-                best_cam = topic
+                scanner_name = "Eagle (Livox Mid-360)"
+            elif ('PointCloud2' in msgtype or 'vanjee_722z' in topic or 'lidar' in topic.lower() or 'points' in topic.lower()) and not best_lidar:
+                best_lidar = topic
+                if 'vanjee' in topic.lower():
+                    scanner_name = "Raven (Vanjee 722z)"
+
+            if 'Imu' in msgtype or 'imu' in topic.lower():
+                if not best_imu or '/livox/imu' in topic or '/vanjee_imu_packets' in topic:
+                    best_imu = topic
+            if 'Image' in msgtype or 'camera' in topic.lower() or 'image' in topic.lower():
+                if not best_cam:
+                    best_cam = topic
 
         self._detected_lidar = best_lidar or "/vanjee_722z"
         self._detected_imu = best_imu or "/vanjee_imu_packets"
         self._detected_cam = best_cam or "/camera_front/image/compressed"
+        self._detected_scanner = scanner_name
 
+        self.lbl_scanner.setText(f"Scanner Profile: {scanner_name}")
         self.lbl_lidar.setText(f"Detected LiDAR: {self._detected_lidar}")
         self.lbl_imu.setText(f"Detected IMU: {self._detected_imu}")
         self.lbl_cam.setText(f"Detected Camera: {self._detected_cam}")

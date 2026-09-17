@@ -7,10 +7,11 @@ from PyQt6.QtWidgets import (
 from qfluentwidgets import (
     CardWidget, ElevatedCardWidget, TitleLabel, SubtitleLabel, BodyLabel,
     CaptionLabel, StrongBodyLabel, PrimaryPushButton, PushButton, ToolButton,
-    LineEdit, SpinBox, SwitchButton, ProgressBar, IndeterminateProgressBar,
+    LineEdit, SpinBox, ComboBox, SwitchButton, ProgressBar, IndeterminateProgressBar,
     PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
 )
 from raven_app.process_runner import ProcessRunner
+from raven_app.bag_io import detect_bag_topics
 from raven_app.i18n import tr
 
 
@@ -81,20 +82,35 @@ class SlamView(QWidget):
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         card_layout.addWidget(sep)
 
-        # LIO mode and Topic settings
+        # Scanner Preset and Threads
+        preset_row = QHBoxLayout()
+        self.scanner_label = BodyLabel(tr("Scanner Hardware Preset:"))
+        self.scanner_combo = ComboBox()
+        self.scanner_combo.addItems([
+            tr("Auto-Detect (Eagle / Raven)"),
+            tr("Eagle (Livox Mid-360)"),
+            tr("Raven (Vanjee 722z)")
+        ])
+        self.scanner_combo.currentIndexChanged.connect(self._on_preset_changed)
+        preset_row.addWidget(self.scanner_label)
+        preset_row.addWidget(self.scanner_combo)
+        preset_row.addStretch()
+
+        self.threads_label = BodyLabel(tr("CPU Threads:"))
+        self.threads_spin = SpinBox()
+        self.threads_spin.setRange(1, 64)
+        self.threads_spin.setValue(4)
+        preset_row.addWidget(self.threads_label)
+        preset_row.addWidget(self.threads_spin)
+        card_layout.addLayout(preset_row)
+
+        # LIO mode switch
         toggle_row = QHBoxLayout()
         self.lio_switch = SwitchButton(text=tr("LiDAR + IMU mode (camera fusion disabled)"))
         self.lio_switch.setChecked(True)
         self.lio_switch.checkedChanged.connect(self._toggle_lio)
         toggle_row.addWidget(self.lio_switch)
         toggle_row.addStretch()
-
-        self.threads_label = BodyLabel(tr("CPU Threads:"))
-        self.threads_spin = SpinBox()
-        self.threads_spin.setRange(1, 64)
-        self.threads_spin.setValue(4)
-        toggle_row.addWidget(self.threads_label)
-        toggle_row.addWidget(self.threads_spin)
         card_layout.addLayout(toggle_row)
 
         # Topic configuration row
@@ -186,12 +202,46 @@ class SlamView(QWidget):
     def _toggle_lio(self, checked: bool):
         self.cam_input.setEnabled(not checked)
 
+    def _on_preset_changed(self, index: int):
+        if index == 1:  # Eagle
+            self.lidar_input.setText("/livox/lidar")
+            self.imu_input.setText("/livox/imu")
+        elif index == 2:  # Raven
+            self.lidar_input.setText("/vanjee_722z")
+            self.imu_input.setText("/vanjee_imu_packets")
+        else:  # Auto-Detect
+            bag = self.bag_input.text().strip()
+            if bag and Path(bag).is_file():
+                self._auto_detect_bag(bag)
+
+    def _auto_detect_bag(self, bag_path: str):
+        try:
+            detected = detect_bag_topics([bag_path])
+            if detected.get('lidar_topic'):
+                self.lidar_input.setText(detected['lidar_topic'])
+            if detected.get('imu_topic'):
+                self.imu_input.setText(detected['imu_topic'])
+            if detected.get('image_topic'):
+                self.cam_input.setText(detected['image_topic'])
+            stype = detected.get('scanner_type', '')
+            if stype == 'eagle':
+                self.scanner_combo.blockSignals(True)
+                self.scanner_combo.setCurrentIndex(1)
+                self.scanner_combo.blockSignals(False)
+            elif stype == 'raven':
+                self.scanner_combo.blockSignals(True)
+                self.scanner_combo.setCurrentIndex(2)
+                self.scanner_combo.blockSignals(False)
+        except Exception:
+            pass
+
     def _browse_bag(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select ROS Bag", "", "ROS Bag files (*.bag);;All files (*.*)"
         )
         if path:
             self.bag_input.setText(path)
+            self._auto_detect_bag(path)
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -238,10 +288,13 @@ class SlamView(QWidget):
             )
             return
 
+        scanner_key = ["auto", "eagle", "raven"][self.scanner_combo.currentIndex()]
+
         args = [
             'slam',
             '--bag', bag,
             '--output', out,
+            '--scanner', scanner_key,
             '--lidar-topic', self.lidar_input.text().strip() or '/vanjee_722z',
             '--imu-topic', self.imu_input.text().strip() or '/vanjee_imu_packets',
             '--threads', str(self.threads_spin.value())
@@ -326,6 +379,7 @@ class SlamView(QWidget):
         self.out_label.setText(tr("Output Folder:"))
         self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
         self.out_browse.setText(tr("Browse"))
+        self.scanner_label.setText(tr("Scanner Hardware Preset:"))
         self.lio_switch.setText(tr("LiDAR + IMU mode (camera fusion disabled)"))
         self.threads_label.setText(tr("CPU Threads:"))
         self.lidar_label.setText(tr("LiDAR Topic:"))
@@ -339,4 +393,3 @@ class SlamView(QWidget):
         if not self.runner.is_busy:
             self.status_title.setText(tr("Status: Ready"))
             self.status_desc.setText(tr("Ready to start FAST-LIVO2 mapping execution."))
-

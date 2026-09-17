@@ -66,36 +66,56 @@ def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 2.0) -> 
 
 def extract_insv_gyro(insv_path: Path):
     """Extract gyroscope angular velocities and timestamps from INSV binary trailer."""
-    header_size = 72
-    with open(insv_path, "rb") as fin:
-        fin.seek(-header_size, 2)
-        header = fin.read(header_size)
-        magic = header[header_size - 32:]
-        if magic != b"8db42d694ccc418790edff439fe026bf":
+    path = Path(insv_path)
+    with path.open("rb") as stream:
+        size = stream.seek(0, 2)
+        if size < 78:
+            raise ValueError("INSV file is too short for a trailer")
+        stream.seek(size - 72)
+        header = stream.read(72)
+        if header[-32:] != b"8db42d694ccc418790edff439fe026bf":
             raise ValueError("Invalid INSV magic footer")
 
-        extra_size = struct.unpack('<I', header[32:36])[0]
-        file_size = fin.seek(0, 2)
-        extra_start = file_size - extra_size
+        length = struct.unpack_from("<I", header, 32)[0]
+        if not 78 <= length <= size:
+            raise ValueError("Invalid INSV trailer length")
+        start, end = size - length, size - 72
 
-        fin.seek(-(header_size + 6 + 250), 2)
-        offsets_data = fin.read(250)
-        offsets = {}
-        for i in range(0, len(offsets_data), 10):
-            oid, ofmt, osize, ooff = struct.unpack('<BBII', offsets_data[i:i + 10])
-            if oid > 0:
-                offsets[oid] = (ofmt, osize, ooff)
+        stream.seek(end - 6)
+        fmt, kind, count = struct.unpack("<BBI", stream.read(6))
+        entries = {}
+        if kind == 0 and fmt == 0:
+            if count % 10 or count > length - 78:
+                raise ValueError("Malformed INSV trailer directory")
+            stream.seek(end - 6 - count)
+            directory = stream.read(count)
+            for k, f, c, offset in struct.iter_unpack("<BBII", directory):
+                if k and c:
+                    entries[k] = (f, c, offset)
+        else:
+            curr_end = end
+            while curr_end > start:
+                if curr_end - start < 6:
+                    break
+                stream.seek(curr_end - 6)
+                f, k, c = struct.unpack("<BBI", stream.read(6))
+                begin = curr_end - 6 - c
+                if begin < start:
+                    break
+                if k and c and k not in entries:
+                    entries[k] = (f, c, begin - start)
+                curr_end = begin
 
-        if 3 not in offsets or 4 not in offsets:
+        if 3 not in entries or 4 not in entries:
             raise ValueError("INSV lacks gyro or exposure telemetry track")
 
-        _, g_size, g_off = offsets[3]
-        fin.seek(extra_start + g_off)
-        gyro_bytes = fin.read(g_size)
+        _, g_size, g_off = entries[3]
+        stream.seek(start + g_off)
+        gyro_bytes = stream.read(g_size)
 
-        _, e_size, e_off = offsets[4]
-        fin.seek(extra_start + e_off)
-        exp_bytes = fin.read(e_size)
+        _, e_size, e_off = entries[4]
+        stream.seek(start + e_off)
+        exp_bytes = stream.read(e_size)
 
     cam_imu_raw = np.frombuffer(gyro_bytes, dtype=[
         ('t', '<u8'),
@@ -115,16 +135,26 @@ def extract_insv_gyro(insv_path: Path):
     return t_cam_s, cam_gyro_norm
 
 
-def auto_sync_imu_gyro(bag_path: Path, insv_path: Path, imu_topic: str = "/vanjee_imu_packets") -> float:
+def auto_sync_imu_gyro(bag_path: Path, insv_path: Path, imu_topic: str = None) -> float:
     """Calculate sub-millisecond time offset Δt via cross-correlation of camera and LiDAR gyros."""
     print("[*] Performing programmatic IMU gyro cross-correlation for time sync...")
     try:
         from rosbags.highlevel import AnyReader
+        from raven_app.bag_io import detect_bag_topics
         t_cam_s, cam_gyro_norm = extract_insv_gyro(insv_path)
+
+        if not imu_topic:
+            detected = detect_bag_topics([bag_path])
+            imu_topic = detected['imu_topic']
 
         lidar_t = []
         lidar_wx, lidar_wy, lidar_wz = [], [], []
         with AnyReader([bag_path]) as reader:
+            conn_topics = {c.topic for c in reader.connections}
+            if imu_topic not in conn_topics:
+                detected = detect_bag_topics([bag_path])
+                imu_topic = detected['imu_topic']
+
             for conn, _, raw in reader.messages():
                 if conn.topic == imu_topic:
                     msg = reader.deserialize(raw, conn.msgtype)
@@ -170,7 +200,7 @@ def auto_sync_imu_gyro(bag_path: Path, insv_path: Path, imu_topic: str = "/vanje
 
 def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0) -> Path:
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
-    
+
     If Spirula SfM reconstruction exists, transforms it directly into the LiDAR metric coordinate frame.
     Otherwise, synthesizes camera poses from the SLAM trajectory with calibrated extrinsics.
     """
@@ -244,6 +274,10 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
     print("  [+] Written cameras.txt")
 
     trj_path = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+    if not trj_path.is_file() and (dataset_dir / "slam_out" / "result").is_dir():
+        txts = sorted((dataset_dir / "slam_out" / "result").glob("*.txt"))
+        if txts:
+            trj_path = txts[0]
     images_txt = sparse_out / "images.txt"
 
     if trj_path.is_file():
@@ -492,15 +526,24 @@ def execute_unified_workflow(
     slam_out = output_dir / "slam_out"
     raw_pcd = slam_out / "pcd" / "all_raw_points.pcd"
     raw_trj = slam_out / "result" / "Raven_3DMakerPro_Scan.txt"
+    if not raw_trj.is_file() and (slam_out / "result").is_dir():
+        txts = sorted((slam_out / "result").glob("*.txt"))
+        if txts:
+            raw_trj = txts[0]
+
+    is_eagle = ('livox' in (lidar_topic or '').lower()) or ('eagle' in str(bag_path).lower()) or (lidar_topic == '/livox/lidar')
 
     if raw_pcd.is_file() and raw_trj.is_file():
-        print("[*] Existing SLAM trajectory and PCD found. Re-using output.")
+        print(f"[*] Existing SLAM trajectory ({raw_trj.name}) and PCD found. Re-using output.")
     else:
         eng = engine()
         if not eng.is_file():
             raise FileNotFoundError(f"Native engine missing at {eng}; run tools/build_windows.ps1")
 
-        config_path = resources() / "FAST-LIVO2/config/raven.yaml"
+        if is_eagle and (resources() / "FAST-LIVO2/config/eagle.yaml").is_file():
+            config_path = resources() / "FAST-LIVO2/config/eagle.yaml"
+        else:
+            config_path = resources() / "FAST-LIVO2/config/raven.yaml"
         camera_path = resources() / "FAST-LIVO2/config/camera_raven.yaml"
         cmd = [
             str(eng), "--input", "-", "--config", str(config_path),
@@ -523,6 +566,11 @@ def execute_unified_workflow(
             if code != 0:
                 raise RuntimeError(f"FAST-LIVO2 SLAM execution failed with exit code {code}")
 
+        if not raw_trj.is_file() and (slam_out / "result").is_dir():
+            txts = sorted((slam_out / "result").glob("*.txt"))
+            if txts:
+                raw_trj = txts[0]
+
     # --------------------------------------------------------------------------
     # STAGE 4: SfM Alignment & Dynamic Spatial Extrinsics Recalibration
     # --------------------------------------------------------------------------
@@ -532,7 +580,12 @@ def execute_unified_workflow(
     if not calib.is_file():
         calib = output_dir / "calibracao_rigida_auto.json"
     if not calib.is_file():
-        calib = resources() / "calibracao_rigida_raven_insta360.json"
+        if is_eagle and (resources() / "configs/rig_profile_eagle.json").is_file():
+            calib = resources() / "configs/rig_profile_eagle.json"
+        elif (resources() / "configs/rig_profile.json").is_file():
+            calib = resources() / "configs/rig_profile.json"
+        else:
+            calib = resources() / "calibracao_rigida_raven_insta360.json"
 
     sparse_bin = output_dir / "sparse" / "0" / "points3D.bin"
     if (method in ("sfm", "all") or run_spirula) and not sparse_bin.is_file():

@@ -86,7 +86,7 @@ def automatic_georeference(insv_path, deliverables_dir, candidate_clouds=None,
             if fmt == 'geojson':
                 continue
             target = geo_dir / f'{source.stem}_georeferenced.{fmt}'
-            save_cloud(transformed, target)
+            save_cloud(transformed, target, overwrite=True)
             sidecar = target.with_suffix(target.suffix + '.georef.json')
             sidecar.write_text(json.dumps({'source': str(source.resolve()), 'transform': transform,
                                             'quality': transform['quality'], 'validation': transform['validation']}, indent=2) + '\n', encoding='utf-8')

@@ -36,9 +36,10 @@ def finite(value):
 
 def bag_options(p):
     p.add_argument('--bag',type=Path,nargs='+',required=True,help='One merged bag, or non-overlapping split bags')
-    p.add_argument('--lidar-topic',default='/vanjee_722z')
-    p.add_argument('--imu-topic',default='/vanjee_imu_packets')
-    p.add_argument('--image-topic',default='/camera_front/image_raw')
+    p.add_argument('--scanner', '--preset', choices=['auto', 'raven', 'eagle'], default='auto', help='Scanner preset (auto, raven, eagle)')
+    p.add_argument('--lidar-topic', default=None, help='LiDAR topic (default: auto-detected)')
+    p.add_argument('--imu-topic', default=None, help='IMU topic (default: auto-detected)')
+    p.add_argument('--image-topic', default=None, help='Camera topic (default: auto-detected)')
     p.add_argument('--lio',action='store_true',help='LiDAR + IMU, without camera measurements')
     p.add_argument('--time-field',default='timestamp')
     p.add_argument('--time-unit',choices=['seconds','milliseconds','microseconds','nanoseconds'],default='seconds')
@@ -84,8 +85,8 @@ def parse(argv=None):
     bag_options(export);export.add_argument('--output',type=Path,required=True)
     slam=sub.add_parser('slam',help='Run native FAST-LIVO2 directly from bags')
     bag_options(slam)
-    slam.add_argument('--config',type=Path,default=resources()/'FAST-LIVO2/config/raven.yaml')
-    slam.add_argument('--camera',type=Path,default=resources()/'FAST-LIVO2/config/camera_raven.yaml')
+    slam.add_argument('--config',type=Path,default=None)
+    slam.add_argument('--camera',type=Path,default=None)
     slam.add_argument('--output',type=Path,required=True)
     slam.add_argument('--threads',type=int,choices=range(1,257),metavar='1..256',default=min(4,os.cpu_count() or 1))
     color=sub.add_parser('colorize',help='Run the existing calibration and colorization pipeline')
@@ -100,8 +101,9 @@ def parse(argv=None):
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
     wf.add_argument('--insv',type=Path,required=True,help='Insta360 video file')
     wf.add_argument('--output',type=Path,required=True,help='Output directory for deliverables')
-    wf.add_argument('--lidar-topic',default='/vanjee_722z')
-    wf.add_argument('--imu-topic',default='/vanjee_imu_packets')
+    wf.add_argument('--scanner', '--preset', choices=['auto', 'raven', 'eagle'], default='auto', help='Scanner preset (auto, raven, eagle)')
+    wf.add_argument('--lidar-topic', default=None, help='LiDAR topic (default: auto-detected)')
+    wf.add_argument('--imu-topic', default=None, help='IMU topic (default: auto-detected)')
     wf.add_argument('--lio',action='store_true',default=True,help='LiDAR + IMU SLAM')
     wf.add_argument('--vio', action='store_false', dest='lio', help='LiDAR + camera + IMU SLAM')
     wf.add_argument('--threads',type=int,default=min(4,os.cpu_count() or 1))
@@ -131,7 +133,15 @@ def parse(argv=None):
 
 
 def export_options(a):
-    return {k:getattr(a,k) for k in ('lidar_topic','imu_topic','image_topic','lio','time_field','time_unit','time_origin')}
+    opts = {k: getattr(a, k) for k in ('lidar_topic', 'imu_topic', 'image_topic', 'lio', 'time_field', 'time_unit', 'time_origin') if hasattr(a, k)}
+    preset = getattr(a, 'scanner', 'auto')
+    if preset == 'eagle':
+        if not opts.get('lidar_topic'): opts['lidar_topic'] = '/livox/lidar'
+        if not opts.get('imu_topic'): opts['imu_topic'] = '/livox/imu'
+    elif preset == 'raven':
+        if not opts.get('lidar_topic'): opts['lidar_topic'] = '/vanjee_722z'
+        if not opts.get('imu_topic'): opts['imu_topic'] = '/vanjee_imu_packets'
+    return opts
 
 
 def run(a):
@@ -227,14 +237,31 @@ def run(a):
         with a.output.open('xb') as f: result=export_bags(a.bag,f,**export_options(a))
         print(json.dumps(result));return 0
     if a.command=='slam':
-        from raven_app.bag_io import export_bags
+        from raven_app.bag_io import export_bags, detect_bag_topics
         if not engine().is_file():raise FileNotFoundError('Native engine missing; run tools/build_windows.ps1')
-        cmd=[str(engine()),'--input','-','--config',str(a.config),'--camera',str(a.camera),
+        detected = detect_bag_topics(a.bag)
+        lidar_t = a.lidar_topic or detected['lidar_topic']
+        imu_t = a.imu_topic or detected['imu_topic']
+        is_eagle = (getattr(a, 'scanner', 'auto') == 'eagle') or ('livox' in lidar_t.lower()) or (detected['scanner_type'] == 'eagle')
+
+        config = a.config
+        if not config:
+            if is_eagle and (resources() / "FAST-LIVO2/config/eagle.yaml").is_file():
+                config = resources() / "FAST-LIVO2/config/eagle.yaml"
+            else:
+                config = resources() / "FAST-LIVO2/config/raven.yaml"
+
+        camera = a.camera or (resources() / 'FAST-LIVO2/config/camera_raven.yaml')
+
+        cmd=[str(engine()),'--input','-','--config',str(config),'--camera',str(camera),
              '--output',str(a.output),'--threads',str(a.threads)]
         if a.lio:cmd.append('--lio')
+        opts = export_options(a)
+        opts['lidar_topic'] = lidar_t
+        opts['imu_topic'] = imu_t
         with subprocess.Popen(cmd,stdin=subprocess.PIPE) as child:
             try:
-                export_bags(a.bag,child.stdin,**export_options(a))
+                export_bags(a.bag,child.stdin,**opts)
                 child.stdin.close()
                 return child.wait()
             except BaseException:
@@ -247,8 +274,9 @@ def run(a):
     if a.command=='colorize':
         from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
         dataset=a.dataset.resolve()
-        for f in ('slam_out/pcd/all_raw_points.pcd','slam_out/result/Raven_3DMakerPro_Scan.txt'):
-            if not (dataset/f).is_file():raise FileNotFoundError(f'Missing dataset input: {f}')
+        trj = pipeline.get_slam_trajectory_path(dataset)
+        if not (dataset/'slam_out/pcd/all_raw_points.pcd').is_file() or not trj.is_file():
+            raise FileNotFoundError(f'Missing dataset inputs: all_raw_points.pcd or SLAM trajectory ({trj.name})')
         for cam in ('cam0','cam1'):
             if not any((dataset/'images'/cam).glob('*.jpg')):raise ValueError(f'Missing extracted frames in images/{cam}')
         if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset):raise RuntimeError('Spirula reconstruction failed')
@@ -258,12 +286,27 @@ def run(a):
         return 0
     if a.command=='workflow':
         from raven_app.workflow import execute_unified_workflow
+        from raven_app.bag_io import detect_bag_topics
+        lidar_t = a.lidar_topic
+        imu_t = a.imu_topic
+        preset = getattr(a, 'scanner', 'auto')
+        if preset == 'eagle':
+            if not lidar_t: lidar_t = '/livox/lidar'
+            if not imu_t: imu_t = '/livox/imu'
+        elif preset == 'raven':
+            if not lidar_t: lidar_t = '/vanjee_722z'
+            if not imu_t: imu_t = '/vanjee_imu_packets'
+        elif not lidar_t or not imu_t:
+            detected = detect_bag_topics([a.bag])
+            if not lidar_t: lidar_t = detected['lidar_topic']
+            if not imu_t: imu_t = detected['imu_topic']
+
         return execute_unified_workflow(
             a.bag, a.insv, a.output,
             lio=a.lio,
             threads=a.threads,
-            lidar_topic=a.lidar_topic,
-            imu_topic=a.imu_topic,
+            lidar_topic=lidar_t,
+            imu_topic=imu_t,
             fps=a.fps,
             method=a.method,
             calib_json=a.calib,

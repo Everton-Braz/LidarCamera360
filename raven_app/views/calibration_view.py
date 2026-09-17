@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 )
 from qfluentwidgets import (
     CardWidget, TitleLabel, SubtitleLabel, BodyLabel,
-    CaptionLabel, StrongBodyLabel, PushButton,
+    CaptionLabel, StrongBodyLabel, PushButton, ComboBox,
     PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
 )
 from raven_app.i18n import tr
@@ -114,13 +114,21 @@ class CalibrationView(QWidget):
 
         json_actions = QHBoxLayout()
         json_actions.setSpacing(8)
-        self.btn_reload = PushButton("Reload", icon=FluentIcon.SYNC)
+        self.profile_combo = ComboBox()
+        self.profile_combo.addItems([
+            tr("Raven (3DMakerPro + Insta360)"),
+            tr("Eagle (Livox + Insta360)"),
+            tr("Load Custom JSON File...")
+        ])
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
+        self.btn_reload = PushButton(tr("Reload"), icon=FluentIcon.SYNC)
         self.btn_reload.clicked.connect(self._load_calibration)
-        self.btn_save = PushButton("Save Changes", icon=FluentIcon.SAVE)
+        self.btn_save = PushButton(tr("Save Changes"), icon=FluentIcon.SAVE)
         self.btn_save.clicked.connect(self._save_calibration)
-        self.btn_export = PushButton("Export As...", icon=FluentIcon.SHARE)
+        self.btn_export = PushButton(tr("Export As..."), icon=FluentIcon.SHARE)
         self.btn_export.clicked.connect(self._export_calibration)
 
+        json_actions.addWidget(self.profile_combo)
         json_actions.addWidget(self.btn_reload)
         json_actions.addWidget(self.btn_save)
         json_actions.addWidget(self.btn_export)
@@ -133,6 +141,24 @@ class CalibrationView(QWidget):
         )
         json_layout.addWidget(self.json_edit)
         layout.addWidget(json_card, stretch=1)
+
+    def _on_profile_selected(self, index: int):
+        root = get_app_root()
+        if index == 0:  # Raven
+            self._calib_path = root / "calibracao_rigida_raven_insta360.json"
+            if not self._calib_path.is_file():
+                self._calib_path = root / "configs" / "rig_profile.json"
+            self._load_calibration()
+        elif index == 1:  # Eagle
+            self._calib_path = root / "configs" / "rig_profile_eagle.json"
+            self._load_calibration()
+        elif index == 2:  # Custom
+            path, _ = QFileDialog.getOpenFileName(
+                self, tr("Select Rig Calibration JSON"), "", "JSON files (*.json);;All files (*.*)"
+            )
+            if path:
+                self._calib_path = Path(path)
+                self._load_calibration()
 
     def _load_calibration(self):
         if self._calib_path.is_file():

@@ -84,7 +84,28 @@ def load_pcd(path):
     return xyz
 
 
+def get_slam_trajectory_path(dataset_dir):
+    """Find the SLAM trajectory file dynamically regardless of scanner model."""
+    result_dir = Path(dataset_dir) / "slam_out" / "result"
+    for name in ("Eagle_Scan.txt", "Eagle_X6_Scan.txt", "Raven_3DMakerPro_Scan.txt", "trajectory.txt"):
+        p = result_dir / name
+        if p.is_file():
+            return p
+    if result_dir.is_dir():
+        txts = sorted(result_dir.glob("*.txt"))
+        if txts:
+            return txts[0]
+    return result_dir / "Eagle_Scan.txt"
+
+
 def load_trajectory(path):
+    path = Path(path)
+    if not path.is_file():
+        # Try finding any trajectory file in the same directory
+        if path.parent.is_dir():
+            txts = sorted(path.parent.glob("*.txt"))
+            if txts:
+                path = txts[0]
     print(f"[*] Loading SLAM trajectory: {path.name}...")
     data = np.loadtxt(path)
     timestamps = data[:, 0]
@@ -466,7 +487,7 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None):
     """Executa o alinhamento de alta precisão Sim(3) + ICP entre COLMAP e LiDAR"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
-    slam_trj = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+    slam_trj = get_slam_trajectory_path(dataset_dir)
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
     print("=" * 80)
@@ -924,7 +945,7 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
 def recalibrate_from_sfm(dataset_dir, fps=2.0):
     """Recalibrate with high precision os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
     sparse_dir = dataset_dir / "sparse" / "0"
-    slam_trj = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+    slam_trj = get_slam_trajectory_path(dataset_dir)
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
     al = current_alignment(dataset_dir, fps)
@@ -1263,7 +1284,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     t_LC1 = T_LC1[:3, 3]
 
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
-    slam_trj = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+    slam_trj = get_slam_trajectory_path(dataset_dir)
 
     # Determinar sincronização temporal
     dt_sync = dt_override

@@ -13,7 +13,7 @@ _FORMATS = {".las", ".laz", ".ply", ".pcd"}
 _CHUNK = 262_144
 
 
-def _validate(cloud: CloudData, output: Path, formats) -> str:
+def _validate(cloud: CloudData, output: Path, formats, overwrite: bool = False) -> str:
     suffix = output.suffix.lower()
     if suffix not in _FORMATS:
         raise ValueError(f"unsupported output format: {output.suffix or output.name}")
@@ -22,7 +22,7 @@ def _validate(cloud: CloudData, output: Path, formats) -> str:
             raise ValueError("output path must differ from cloud source path")
     except OSError:
         pass
-    if output.exists():
+    if output.exists() and not overwrite:
         raise FileExistsError(f"refusing to overwrite existing output: {output}")
     if formats is not None:
         if isinstance(formats, str):
@@ -121,11 +121,13 @@ def _write_las(cloud: CloudData, output: Path) -> None:
     las.write(output)
 
 
-def save_cloud(cloud: CloudData, output: Path, formats=None) -> dict:
+def save_cloud(cloud: CloudData, output: Path, formats=None, overwrite: bool = False) -> dict:
     """Write *cloud* to a new file and return paths/count/CRS metadata."""
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    suffix = _validate(cloud, output, formats)
+    suffix = _validate(cloud, output, formats, overwrite=overwrite)
+    if output.exists() and overwrite:
+        output.unlink()
     if suffix == ".pcd":
         _write_pcd(cloud, output)
     elif suffix == ".ply":
