@@ -54,23 +54,35 @@ def _rgb(cloud: CloudData, start: int, end: int) -> np.ndarray:
 
 def _write_pcd(cloud: CloudData, output: Path) -> None:
     n = len(cloud.points)
-    fields = "x y z r g b" + (" intensity" if cloud.intensities is not None else "")
-    sizes = "8 8 8 1 1 1" + (" 8" if cloud.intensities is not None else "")
-    types = "F F F U U U" + (" F" if cloud.intensities is not None else "")
-    counts = "1 1 1 1 1 1" + (" 1" if cloud.intensities is not None else "")
+    intensity = cloud.intensities is not None
+    xyz = np.asarray(cloud.points)
+    needs_f8 = np.nanmax(np.abs(xyz)) > 100000.0
+    coord_size = "8" if needs_f8 else "4"
+    coord_dt = "<f8" if needs_f8 else "<f4"
+
+    fields = "x y z rgb" + (" intensity" if intensity else "")
+    sizes = f"{coord_size} {coord_size} {coord_size} 4" + (f" {coord_size}" if intensity else "")
+    types = "F F F F" + (" F" if intensity else "")
+    counts = "1 1 1 1" + (" 1" if intensity else "")
     header = (f"VERSION .7\nFIELDS {fields}\nSIZE {sizes}\nTYPE {types}\nCOUNT {counts}\n"
               f"WIDTH {n}\nHEIGHT 1\nPOINTS {n}\nDATA binary\n").encode("ascii")
-    dt = np.dtype([(x, "<f8") for x in ("x", "y", "z")] +
-                  [(x, "u1") for x in ("r", "g", "b")] +
-                  ([('intensity', '<f8')] if cloud.intensities is not None else []))
+    dt = np.dtype([(x, coord_dt) for x in ("x", "y", "z")] +
+                  [("rgb", "<f4")] +
+                  ([('intensity', coord_dt)] if intensity else []))
     with output.open("xb") as f:
         f.write(header)
         for start in range(0, n, _CHUNK):
             end = min(n, start + _CHUNK)
             rec = np.empty(end - start, dtype=dt)
-            rec["x"], rec["y"], rec["z"] = np.asarray(cloud.points[start:end], dtype=np.float64).T
-            rec["r"], rec["g"], rec["b"] = _rgb(cloud, start, end).T
-            if cloud.intensities is not None:
+            rec["x"], rec["y"], rec["z"] = xyz[start:end].T
+            rgb_u8 = _rgb(cloud, start, end)
+            rgb_packed = (
+                (rgb_u8[:, 0].astype(np.uint32) << 16)
+                | (rgb_u8[:, 1].astype(np.uint32) << 8)
+                | (rgb_u8[:, 2].astype(np.uint32))
+            ).view(np.float32)
+            rec["rgb"] = rgb_packed
+            if intensity:
                 rec["intensity"] = np.asarray(cloud.intensities[start:end], dtype=np.float64)
             f.write(rec.tobytes())
 

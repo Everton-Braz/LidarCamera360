@@ -223,13 +223,30 @@ class PointCloudViewerWindow(QMainWindow):
         self.bg_button.clicked.connect(self._show_bg_menu)
         row2.addWidget(self.bg_button)
 
-        # 3D Clipping Box Button
+        # 3D Clipping Box Button (CloudCompare style in viewport)
         self.clip_button = ToggleToolButton(FluentIcon.CUT, tools)
         self.clip_button.setToolTip(tr("3D Clipping Box (X/Y/Z Crop)"))
         self.clip_button.setAccessibleName(tr("3D Clipping Box"))
         self.clip_button.setFixedSize(38, 38)
-        self.clip_button.clicked.connect(self._toggle_clipping_dialog)
+        self.clip_button.clicked.connect(self._toggle_clipping_box)
         row2.addWidget(self.clip_button)
+
+        row2.addSpacing(4)
+
+        # Move & Rotate Transform buttons in Toolbar
+        self.move_tool_button = ToggleToolButton(FluentIcon.MOVE, tools)
+        self.move_tool_button.setToolTip(tr("Move tool: Drag cloud or axes in viewport"))
+        self.move_tool_button.setAccessibleName(tr("Move tool"))
+        self.move_tool_button.setFixedSize(38, 38)
+        self.move_tool_button.clicked.connect(self._toggle_move_tool)
+        row2.addWidget(self.move_tool_button)
+
+        self.rotate_tool_button = ToggleToolButton(FluentIcon.ROTATE, tools)
+        self.rotate_tool_button.setToolTip(tr("Rotate tool: Drag cloud or ring in viewport"))
+        self.rotate_tool_button.setAccessibleName(tr("Rotate tool"))
+        self.rotate_tool_button.setFixedSize(38, 38)
+        self.rotate_tool_button.clicked.connect(self._toggle_rotate_tool)
+        row2.addWidget(self.rotate_tool_button)
 
         row2.addSpacing(8)
         row2.addWidget(CaptionLabel(tr("View"), tools))
@@ -378,7 +395,12 @@ class PointCloudViewerWindow(QMainWindow):
         self.renderer.measurement_added.connect(self._replace_measurements)
         self.renderer.status_changed.connect(self.status.setText)
 
-        # Clipping Dialog
+        # Clipping Box & Transform signals
+        self.renderer.clipping_box_mode_changed.connect(self._on_clipping_box_mode_changed)
+        self.renderer.transform_mode_changed.connect(self._on_transform_mode_changed)
+        self.renderer.export_clipped_requested.connect(self._export_clipped_cloud)
+
+        # Retain clipping dialog instance for headless/legacy compatibility
         self.clip_dialog = ClippingBoxDialog(self)
         self.clip_dialog.clipping_changed.connect(self._on_clipping_changed)
         self.clip_dialog.finished.connect(lambda _: self.clip_button.setChecked(False))
@@ -480,6 +502,74 @@ class PointCloudViewerWindow(QMainWindow):
         col = QColorDialog.getColor(current, self, tr("Choose Background Color"))
         if col.isValid():
             self.renderer.set_background_color(col)
+
+    def _toggle_clipping_box(self, checked: bool = False):
+        if checked:
+            self.renderer.set_clipping_box_mode(True)
+        else:
+            self.renderer.set_clipping_box_visible(False)
+
+    def _on_clipping_box_mode_changed(self, enabled: bool):
+        self.clip_button.blockSignals(True)
+        self.clip_button.setChecked(enabled)
+        self.clip_button.blockSignals(False)
+
+    def _toggle_move_tool(self, checked: bool = False):
+        if checked:
+            self.renderer.set_transform_mode('translate')
+        else:
+            self.renderer.set_transform_mode(None)
+
+    def _toggle_rotate_tool(self, checked: bool = False):
+        if checked:
+            self.renderer.set_transform_mode('rotate')
+        else:
+            self.renderer.set_transform_mode(None)
+
+    def _on_transform_mode_changed(self, mode: str):
+        m = str(mode).lower()
+        self.move_tool_button.blockSignals(True)
+        self.rotate_tool_button.blockSignals(True)
+        self.move_tool_button.setChecked(m == 'translate')
+        self.rotate_tool_button.setChecked(m == 'rotate')
+        self.move_tool_button.blockSignals(False)
+        self.rotate_tool_button.blockSignals(False)
+
+    def _export_clipped_cloud(self):
+        slot = self.renderer.active_transform_slot
+        cloud = self.renderer.clouds[slot]
+        if cloud is None:
+            slot = 0 if self.renderer.clouds[0] is not None else 1
+            cloud = self.renderer.clouds[slot]
+        if cloud is None:
+            self.status.setText(tr("Load a cloud before exporting."))
+            return
+
+        pts, cols, ints = self.renderer.get_clipped_points(slot)
+        if len(pts) == 0:
+            self.status.setText(tr("No points inside current clipping box to export."))
+            return
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            tr("Export Clipped Cloud"),
+            f"{cloud.path.stem}_clipped.ply",
+            tr("Point clouds (*.ply *.las *.laz *.pcd)")
+        )
+        if not out_path:
+            return
+
+        from raven_app.cloud_io import CloudData
+        from raven_app.cloud_export import save_cloud
+        clipped_cloud = CloudData(
+            path=Path(out_path),
+            points=pts,
+            colors=cols if cols is not None else np.zeros((len(pts), 3), dtype=np.float32),
+            intensities=ints,
+            original_count=len(pts),
+            crs_wkt=cloud.crs_wkt
+        )
+        self._start_edit_worker(_ViewerExportWorker(save_cloud, clipped_cloud, out_path), tr("Exporting clipped cloud..."))
 
     def _toggle_clipping_dialog(self, checked: bool = False):
         if checked:

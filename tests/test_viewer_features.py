@@ -81,6 +81,123 @@ class ViewerFeaturesTests(unittest.TestCase):
         np.testing.assert_allclose(view.clip_max, c_max)
         view.deleteLater()
 
+    def test_viewport_clipping_box(self):
+        view = CloudView()
+        self.assertFalse(view.clipping_box_mode)
+        view.set_clipping_box_mode(True)
+        self.assertTrue(view.clipping_box_mode)
+        self.assertTrue(view.clipping_enabled)
+
+        # Invert toggle
+        self.assertFalse(view.clip_invert)
+        view.set_clip_invert(True)
+        self.assertTrue(view.clip_invert)
+
+        # Load dummy cloud and test reset_clipping_to_clouds and get_clipped_points
+        pts = np.array([
+            [-10.0, -10.0, 0.0],
+            [0.0, 0.0, 5.0],
+            [10.0, 10.0, 10.0],
+        ], dtype=np.float64)
+        colors = np.ones((3, 3), dtype=np.float32)
+        cloud = CloudData(path=Path("test.pcd"), points=pts, colors=colors, original_count=3)
+        view.set_cloud(0, cloud)
+
+        view.reset_clipping_to_clouds()
+        self.assertLessEqual(view.clip_min[0], -10.0)
+        self.assertGreaterEqual(view.clip_max[0], 10.0)
+
+        # Set tight clipping bounds around center point [0, 0, 5]
+        view.set_clip_invert(False)
+        view.set_clipping_bounds(np.array([-1.0, -1.0, 4.0], dtype=np.float32), np.array([1.0, 1.0, 6.0], dtype=np.float32), enabled=True)
+        clipped_pts, _, _ = view.get_clipped_points(0)
+        self.assertEqual(len(clipped_pts), 1)
+        np.testing.assert_allclose(clipped_pts[0], [0.0, 0.0, 5.0])
+
+        # Test inverted clip
+        view.set_clip_invert(True)
+        inv_pts, _, _ = view.get_clipped_points(0)
+        self.assertEqual(len(inv_pts), 2)
+
+        # Test persistent sliced view: hiding box keeps clipping enabled
+        view.set_clipping_box_mode(True)
+        self.assertTrue(view.clipping_box_mode)
+        self.assertTrue(view.clipping_enabled)
+        view.set_clipping_box_visible(False)
+        self.assertFalse(view.clipping_box_visible)
+        self.assertTrue(view.clipping_enabled)
+
+        # Disabling clipping turns off both
+        view.set_clipping_enabled(False)
+        self.assertFalse(view.clipping_enabled)
+        self.assertFalse(view.clipping_box_mode)
+        view.deleteLater()
+
+    def test_rotatable_obb_clipping(self):
+        view = CloudView()
+        pts = np.array([
+            [5.0, 0.0, 0.0],
+            [0.0, 5.0, 0.0],
+        ], dtype=np.float64)
+        colors = np.ones((2, 3), dtype=np.float32)
+        cloud = CloudData(path=Path("test_obb.pcd"), points=pts, colors=colors, original_count=2)
+        view.set_cloud(0, cloud)
+
+        # Local box: extents [2.0, 8.0, 2.0] at center [0, 0, 0]
+        # At yaw = 0, pt [5, 0, 0] is outside (5 > 2), pt [0, 5, 0] is inside (5 <= 8)
+        view.set_clip_box(np.array([0.0, 0.0, 0.0]), np.array([2.0, 8.0, 2.0]), yaw_deg=0.0, enabled=True)
+        clipped, _, _ = view.get_clipped_points(0)
+        self.assertEqual(len(clipped), 1)
+        np.testing.assert_allclose(clipped[0], [0.0, 5.0, 0.0])
+
+        # Rotate box by 90 degrees: local X aligns with world Y, local Y aligns with -world X
+        # Now pt [5, 0, 0] is along local Y (dist 5 <= 8 -> inside!)
+        # and pt [0, 5, 0] is along local X (dist 5 > 2 -> outside!)
+        view.set_clip_yaw(90.0)
+        clipped, _, _ = view.get_clipped_points(0)
+        self.assertEqual(len(clipped), 1)
+        np.testing.assert_allclose(clipped[0], [5.0, 0.0, 0.0])
+
+        view.deleteLater()
+
+    def test_viewport_transform_tools(self):
+        view = CloudView()
+        self.assertIsNone(view.transform_mode)
+
+        # Mode toggles
+        view.set_transform_mode('translate')
+        self.assertEqual(view.transform_mode, 'translate')
+
+        view.set_transform_mode('rotate')
+        self.assertEqual(view.transform_mode, 'rotate')
+
+        view.set_transform_mode(None)
+        self.assertIsNone(view.transform_mode)
+
+        # Cloud adjustment preview and full apply
+        pts = np.array([
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+        ], dtype=np.float64)
+        cloud = CloudData(path=Path("dummy.ply"), points=pts, colors=np.ones((2, 3), dtype=np.float32), original_count=2)
+        view.set_cloud(0, cloud)
+
+        # Apply 90 degree yaw rotation with preview
+        view.apply_cloud_adjustment(0, 90.0, (5.0, 0.0, 0.0), is_preview=True)
+        yaw, shift = view._adjustments[0]
+        self.assertAlmostEqual(yaw, 90.0)
+        np.testing.assert_allclose(shift, [5.0, 0.0, 0.0])
+
+        # Full apply
+        view.apply_cloud_adjustment(0, 90.0, (5.0, 0.0, 0.0), is_preview=False)
+        # Center is (0, 0, 0). Point [1, 0, 0] rotated 90 deg yaw is [0, 1, 0] + shift [5, 0, 0] -> [5, 1, 0]
+        np.testing.assert_allclose(view.clouds[0].points[0], [5.0, 1.0, 0.0], atol=1e-5)
+
+        # Reset
+        view.reset_cloud_adjustment(0)
+        np.testing.assert_allclose(view.clouds[0].points[0], [1.0, 0.0, 0.0], atol=1e-5)
+        view.deleteLater()
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -4,8 +4,8 @@ import math
 from itertools import product
 import numpy as np
 from raven_app.i18n import tr
-from PyQt6.QtCore import Qt, QPointF, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen, QMatrix4x4, QSurfaceFormat, QLinearGradient, QFont, QPolygonF, QImage
+from PyQt6.QtCore import Qt, QPointF, pyqtSignal, QRectF
+from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QMatrix4x4, QSurfaceFormat, QLinearGradient, QFont, QPolygonF, QImage, QPainterPath, QCursor
 from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLShader, QOpenGLShaderProgram, QOpenGLFunctions_2_1, QOpenGLFramebufferObject
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from raven_app.viewer_geometry import camera_matrix, project_points, measurement_value
@@ -74,6 +74,11 @@ class CloudView(QOpenGLWidget):
     view_preset_changed = pyqtSignal(str)
     color_mode_changed = pyqtSignal(str)
     colormap_changed = pyqtSignal(str)
+    clipping_box_mode_changed = pyqtSignal(bool)
+    clipping_bounds_changed = pyqtSignal(object, object, bool)
+    transform_mode_changed = pyqtSignal(str)
+    cloud_transformed = pyqtSignal(int, float, object)
+    export_clipped_requested = pyqtSignal()
     MAX_DRAW_POINTS = 5_000_000
 
     def __init__(self, parent=None):
@@ -92,8 +97,35 @@ class CloudView(QOpenGLWidget):
         self.colormaps = ['turbo', 'viridis']
         self.bg_color = QColor('#0b1017')
         self.clipping_enabled = False
+        self.clipping_box_mode = False
+        self.clipping_box_visible = False
+        self.clip_invert = False
+        self.clip_center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.clip_extents = np.array([1e9, 1e9, 1e9], dtype=np.float32)
+        self.clip_yaw = 0.0
         self.clip_min = np.array([-1e9, -1e9, -1e9], dtype=np.float32)
         self.clip_max = np.array([1e9, 1e9, 1e9], dtype=np.float32)
+        self._active_clipping_handle: str | None = None
+        self._hovered_clipping_handle: str | None = None
+        self._clipping_drag_start_pos = None
+        self._clipping_drag_start_center = None
+        self._clipping_drag_start_extents = None
+        self._clipping_drag_start_yaw = 0.0
+        self._clipping_drag_start_bounds = None
+        self._clipping_box_screen_center = (0.0, 0.0)
+        self._clipping_handle_screens: dict = {}
+        self._clipping_hud_rects: dict = {}
+        self._clipping_min_badge_rects: dict = {}
+        self._hovered_hud_btn: str | None = None
+
+        self.transform_mode: str | None = None  # None, 'translate', 'rotate'
+        self.active_transform_slot: int = 0
+        self._active_gizmo_axis: str | None = None  # 'x', 'y', 'z', 'free', 'yaw'
+        self._hovered_gizmo_axis: str | None = None
+        self._transform_drag_start_pos = None
+        self._transform_drag_start_val = None
+        self._gizmo_handle_screens: dict = {}
+
         self._scalar_ranges: dict[str, tuple[float, float]] = {}
         self.current_preset = 'iso'
         self.measurements = []; self.pending = []; self._last = None; self._press = None; self._drag_split = False
@@ -124,7 +156,7 @@ class CloudView(QOpenGLWidget):
             lo, hi = cloud.points.min(axis=0), cloud.points.max(axis=0)
             self.origin = lo + (hi-lo)*.5
         self.clouds[slot] = cloud
-        self._original_points[slot] = cloud.points
+        self._original_points[slot] = cloud.points.copy()
         self._adjustments[slot] = (0.0, np.zeros(3, dtype=np.float64))
         self._scalar_ranges.clear()
         self.error = ''
@@ -177,8 +209,8 @@ class CloudView(QOpenGLWidget):
             self.basemap_layer.set_provider(provider)
             self.update()
 
-    def apply_cloud_adjustment(self, slot: int, yaw_deg: float, translation_xyz):
-        """Preview an absolute adjustment relative to the loaded original cloud."""
+    def apply_cloud_adjustment(self, slot: int, yaw_deg: float, translation_xyz, is_preview: bool = False, refit: bool = False):
+        """Preview or apply an adjustment relative to the loaded original cloud."""
         if not 0 <= int(slot) < 2 or self.clouds[slot] is None or self._original_points[slot] is None:
             return
         slot = int(slot)
@@ -190,36 +222,188 @@ class CloudView(QOpenGLWidget):
         shift = np.asarray(translation_xyz, dtype=np.float64).reshape(3)
         if not np.isfinite([yaw_deg, *shift]).all():
             raise ValueError('Adjustment values must be finite')
-        adjusted = np.empty_like(original)
-        for start in range(0, len(original), 500000):
-            adjusted[start:start+500000] = (original[start:start+500000] - center) @ rot.T + center + shift
-        self.clouds[slot].points = adjusted
+
         self._adjustments[slot] = (float(yaw_deg), shift.copy())
+
+        if is_preview:
+            # Fast preview during active dragging: only transform the sampled indices used for GPU drawing
+            ids = self._indices[slot]
+            if ids is not None and len(ids) > 0:
+                sampled_orig = original[ids]
+                self.clouds[slot].points[ids] = (sampled_orig - center) @ rot.T + center + shift
+        else:
+            # Full transform on release or explicit apply
+            adjusted = np.empty_like(original)
+            for start in range(0, len(original), 500000):
+                adjusted[start:start+500000] = (original[start:start+500000] - center) @ rot.T + center + shift
+            self.clouds[slot].points = adjusted
+
         self.clear_measurements()
-        self._scalar_ranges.clear(); self._dirty.add(slot); self.fit_all(); self.update()
+        self._scalar_ranges.clear()
+        self._dirty.add(slot)
+        if refit:
+            self.fit_all()
+        self.update()
 
     def reset_cloud_adjustment(self, slot: int):
         if not 0 <= int(slot) < 2 or self.clouds[int(slot)] is None or self._original_points[int(slot)] is None:
             return
         slot = int(slot)
-        self.clouds[slot].points = self._original_points[slot]
+        self.clouds[slot].points = self._original_points[slot].copy()
         self._adjustments[slot] = (0.0, np.zeros(3, dtype=np.float64))
         self.clear_measurements()
-        self._scalar_ranges.clear(); self._dirty.add(slot); self.fit_all(); self.update()
+        self._scalar_ranges.clear()
+        self._dirty.add(slot)
+        self.update()
 
     def set_background_color(self, color: QColor | str):
         self.bg_color = QColor(color)
         self.update()
 
     def set_clipping_enabled(self, enabled: bool):
+        """Toggle point cloud clipping shader effect."""
         self.clipping_enabled = bool(enabled)
+        if not self.clipping_enabled:
+            self.clipping_box_mode = False
+            self.clipping_box_visible = False
+            self._active_clipping_handle = None
+            self._hovered_clipping_handle = None
+            self.clipping_box_mode_changed.emit(False)
         self.update()
 
     def set_clipping_bounds(self, c_min: np.ndarray, c_max: np.ndarray, enabled: bool = True):
         self.clip_min = np.asarray(c_min, dtype=np.float32)
         self.clip_max = np.asarray(c_max, dtype=np.float32)
+        self.clip_center = (self.clip_min + self.clip_max) * 0.5
+        self.clip_extents = np.maximum((self.clip_max - self.clip_min) * 0.5, 0.05)
         self.clipping_enabled = bool(enabled)
+        self.clipping_bounds_changed.emit(self.clip_min, self.clip_max, self.clipping_enabled)
         self.update()
+
+    def set_clip_box(self, center: np.ndarray, extents: np.ndarray, yaw_deg: float = 0.0, enabled: bool | None = None):
+        self.clip_center = np.asarray(center, dtype=np.float32)
+        self.clip_extents = np.maximum(np.asarray(extents, dtype=np.float32), 0.05)
+        self.clip_yaw = float(yaw_deg)
+        self.clip_min = self.clip_center - self.clip_extents
+        self.clip_max = self.clip_center + self.clip_extents
+        if enabled is not None:
+            self.clipping_enabled = bool(enabled)
+        self.clipping_bounds_changed.emit(self.clip_min, self.clip_max, self.clipping_enabled)
+        self.update()
+
+    def set_clip_yaw(self, yaw_deg: float):
+        self.clip_yaw = float(yaw_deg)
+        self.clipping_bounds_changed.emit(self.clip_min, self.clip_max, self.clipping_enabled)
+        self.update()
+
+    def set_clipping_box_mode(self, enabled: bool):
+        self.clipping_box_mode = bool(enabled)
+        self.clipping_box_visible = bool(enabled)
+        if self.clipping_box_mode:
+            if np.any(self.clip_extents > 1e8) or self.clip_extents[0] <= 0:
+                self.reset_clipping_to_clouds()
+            else:
+                self.clipping_enabled = True
+            self.status_changed.emit(tr("3D Clipping Box active. Drag arrows to resize, rings to rotate, or center to move."))
+        else:
+            self._active_clipping_handle = None
+            self._hovered_clipping_handle = None
+        self.clipping_box_mode_changed.emit(self.clipping_box_mode)
+        self.update()
+
+    def set_clipping_box_visible(self, visible: bool):
+        """Toggle 3D box wireframe/handles/HUD visibility while keeping shader slice active."""
+        self.clipping_box_visible = bool(visible)
+        self.clipping_box_mode = bool(visible)
+        self._active_clipping_handle = None
+        self._hovered_clipping_handle = None
+        self.clipping_box_mode_changed.emit(self.clipping_box_mode)
+        self.update()
+
+    def align_clipping_box_to_cloud(self):
+        """Snap clipping box yaw to the active transform cloud's rotation angle."""
+        slot = self.active_transform_slot
+        if 0 <= slot < len(self._adjustments):
+            yaw, _ = self._adjustments[slot]
+            self.set_clip_yaw(yaw)
+            self.status_changed.emit(tr(f"Clipping box aligned to Cloud {'AB'[slot]} (Yaw: {yaw:+.2f}°)."))
+
+    def set_clip_invert(self, invert: bool):
+        self.clip_invert = bool(invert)
+        self.update()
+
+    def reset_clipping_to_clouds(self):
+        valid = [c for c in self.clouds if c is not None and c.points is not None and len(c.points) > 0]
+        if not valid:
+            self.clip_center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            self.clip_extents = np.array([10.0, 10.0, 10.0], dtype=np.float32)
+            self.clip_yaw = 0.0
+            self.clip_min = np.array([-10.0, -10.0, -10.0], dtype=np.float32)
+            self.clip_max = np.array([10.0, 10.0, 10.0], dtype=np.float32)
+        else:
+            all_lo = np.min([c.points.min(axis=0) for c in valid], axis=0)
+            all_hi = np.max([c.points.max(axis=0) for c in valid], axis=0)
+            margin = np.maximum((all_hi - all_lo) * 0.02, 0.2)
+            center = (all_lo + all_hi) * 0.5
+            extents = (all_hi - all_lo) * 0.5 + margin
+            self.clip_center = np.asarray(center, dtype=np.float32)
+            self.clip_extents = np.asarray(extents, dtype=np.float32)
+            self.clip_yaw = 0.0
+            self.clip_min = np.asarray(all_lo - margin, dtype=np.float32)
+            self.clip_max = np.asarray(all_hi + margin, dtype=np.float32)
+        self.clipping_enabled = True
+        self.clipping_box_visible = True
+        self.clipping_box_mode = True
+        self.clipping_bounds_changed.emit(self.clip_min, self.clip_max, True)
+        self.clipping_box_mode_changed.emit(True)
+        self.update()
+
+    def get_clipped_points(self, slot: int = 0) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+        """Return (points, colors, intensities) inside current clipping box for the specified slot."""
+        if not 0 <= slot < 2 or self.clouds[slot] is None:
+            return np.empty((0, 3)), None, None
+        cloud = self.clouds[slot]
+        pts = cloud.points
+        center = self.clip_center
+        ext = self.clip_extents
+        rad = math.radians(self.clip_yaw)
+        c, s = math.cos(rad), math.sin(rad)
+        dx = pts[:, 0] - center[0]
+        dy = pts[:, 1] - center[1]
+        dz = pts[:, 2] - center[2]
+        loc_x = c * dx + s * dy
+        loc_y = -s * dx + c * dy
+        loc_z = dz
+        mask = (np.abs(loc_x) <= ext[0]) & (np.abs(loc_y) <= ext[1]) & (np.abs(loc_z) <= ext[2])
+        if self.clip_invert:
+            mask = ~mask
+        clipped_pts = pts[mask]
+        clipped_cols = cloud.colors[mask] if cloud.colors is not None else None
+        clipped_ints = cloud.intensities[mask] if cloud.intensities is not None else None
+        return clipped_pts, clipped_cols, clipped_ints
+
+    def set_transform_mode(self, mode: str | None):
+        m = str(mode).lower() if mode else None
+        if m in ('translate', 'move'):
+            self.transform_mode = 'translate'
+            self.mode = 'navigate'
+            self.status_changed.emit(tr("Move mode: Click and drag cloud in viewport or drag 3D axis arrows."))
+        elif m in ('rotate', 'rot'):
+            self.transform_mode = 'rotate'
+            self.mode = 'navigate'
+            self.status_changed.emit(tr("Rotate mode: Click and drag rotation ring or cloud to rotate."))
+        else:
+            self.transform_mode = None
+            self._active_gizmo_axis = None
+            self._hovered_gizmo_axis = None
+            self.status_changed.emit(tr("Navigate mode: Drag to orbit; right drag to pan; wheel to zoom."))
+        self.transform_mode_changed.emit(self.transform_mode or '')
+        self.update()
+
+    def set_active_transform_slot(self, slot: int):
+        if 0 <= int(slot) < 2:
+            self.active_transform_slot = int(slot)
+            self.update()
 
     def set_color_mode(self, slot_or_mode, mode: str | None = None):
         if mode is None:
@@ -391,14 +575,24 @@ void main(){
             fragment = '''#version 120
 varying vec3 rgb;
 varying vec3 world_pos;
-uniform vec3 clip_min;
-uniform vec3 clip_max;
+uniform vec3 clip_center_rel;
+uniform vec3 clip_extents;
+uniform float clip_cos;
+uniform float clip_sin;
 uniform int clip_enabled;
+uniform int clip_invert;
 void main(){
     if (clip_enabled != 0) {
-        if (world_pos.x < clip_min.x || world_pos.x > clip_max.x ||
-            world_pos.y < clip_min.y || world_pos.y > clip_max.y ||
-            world_pos.z < clip_min.z || world_pos.z > clip_max.z) {
+        vec3 d = world_pos - clip_center_rel;
+        vec3 p_local = vec3(
+            clip_cos * d.x + clip_sin * d.y,
+            -clip_sin * d.x + clip_cos * d.y,
+            d.z
+        );
+        bool outside = (abs(p_local.x) > clip_extents.x ||
+                        abs(p_local.y) > clip_extents.y ||
+                        abs(p_local.z) > clip_extents.z);
+        if (clip_invert != 0 ? !outside : outside) {
             discard;
         }
     }
@@ -461,10 +655,13 @@ void main(){
         self._program.bind()
         self._program.setUniformValue('mvp', QMatrix4x4(matrix.ravel().tolist()))
         self._program.setUniformValue('clip_enabled', 1 if self.clipping_enabled else 0)
-        rel_min = self.clip_min - self.origin
-        rel_max = self.clip_max - self.origin
-        self._program.setUniformValue('clip_min', float(rel_min[0]), float(rel_min[1]), float(rel_min[2]))
-        self._program.setUniformValue('clip_max', float(rel_max[0]), float(rel_max[1]), float(rel_max[2]))
+        self._program.setUniformValue('clip_invert', 1 if self.clip_invert else 0)
+        rel_center = self.clip_center - self.origin
+        self._program.setUniformValue('clip_center_rel', float(rel_center[0]), float(rel_center[1]), float(rel_center[2]))
+        self._program.setUniformValue('clip_extents', float(self.clip_extents[0]), float(self.clip_extents[1]), float(self.clip_extents[2]))
+        rad = math.radians(self.clip_yaw)
+        self._program.setUniformValue('clip_cos', float(math.cos(rad)))
+        self._program.setUniformValue('clip_sin', float(math.sin(rad)))
 
         both = all(c is not None for c in self.clouds)
         cut = round(width * self.split)
@@ -511,6 +708,439 @@ void main(){
             painter.drawText(20, 40, f"Overlay error: {exc}")
         finally:
             painter.end()
+
+    def _draw_clipping_min_badge(self, p: QPainter, w: int, h: int, s: float):
+        """Draw minimal floating pill badge indicating active clipping when 3D box is hidden."""
+        self._clipping_min_badge_rects.clear()
+        p.save()
+        badge_w = round(260 * s)
+        badge_h = round(34 * s)
+        hx = (w - badge_w) // 2
+        hy = round(14 * s)
+
+        p.setPen(QPen(QColor(56, 75, 96, 220), max(1.0, 1.2 * s)))
+        p.setBrush(QColor(14, 20, 28, 235))
+        p.drawRoundedRect(QRectF(hx, hy, badge_w, badge_h), 17 * s, 17 * s)
+
+        f = p.font(); f.setPointSize(max(7, round(8.5 * s))); f.setBold(True); p.setFont(f)
+        p.setPen(QColor('#00d2df'))
+        p.drawText(round(hx + 14 * s), round(hy + 22 * s), "✂ " + tr("Clipping Active"))
+
+        # Edit Box button
+        edit_text = tr("Edit Box")
+        ew = round((p.fontMetrics().horizontalAdvance(edit_text) + 16) * s)
+        eh = round(24 * s)
+        ey = hy + (badge_h - eh) // 2
+        ex = hx + badge_w - ew - round(36 * s)
+        edit_rect = QRectF(ex, ey, ew, eh)
+        self._clipping_min_badge_rects['edit_box'] = edit_rect
+
+        is_edit_hover = (self._hovered_hud_btn == 'edit_box')
+        p.setPen(QPen(QColor('#00d2df' if is_edit_hover else '#3b4b5e'), 1.0))
+        p.setBrush(QColor(0, 210, 223, 50) if is_edit_hover else QColor(255, 255, 255, 18))
+        p.drawRoundedRect(edit_rect, 12 * s, 12 * s)
+        p.setPen(QColor('#ffffff' if is_edit_hover else '#c2d6ea'))
+        p.drawText(edit_rect, Qt.AlignmentFlag.AlignCenter, edit_text)
+
+        # Close button
+        cx_btn = ex + ew + round(6 * s)
+        close_rect = QRectF(cx_btn, ey, round(24 * s), eh)
+        self._clipping_min_badge_rects['close'] = close_rect
+        is_close_hover = (self._hovered_hud_btn == 'close_min')
+        p.setPen(QPen(QColor('#ff4757' if is_close_hover else '#3b4b5e'), 1.0))
+        p.setBrush(QColor(255, 71, 87, 50) if is_close_hover else QColor(255, 255, 255, 18))
+        p.drawRoundedRect(close_rect, 12 * s, 12 * s)
+        p.setPen(QColor('#ff4757' if is_close_hover else '#c2d6ea'))
+        p.drawText(close_rect, Qt.AlignmentFlag.AlignCenter, "✕")
+
+        p.restore()
+
+    def _draw_clipping_box(self, p: QPainter, w: int, h: int, s: float, matrix: np.ndarray):
+        if not (self.clipping_enabled or self.clipping_box_mode or self.clipping_box_visible) or not any(c is not None for c in self.clouds):
+            return
+
+        if not self.clipping_box_visible:
+            if self.clipping_enabled:
+                self._draw_clipping_min_badge(p, w, h, s)
+            return
+
+        C = self.clip_center
+        E = self.clip_extents
+        ex, ey, ez = float(E[0]), float(E[1]), float(E[2])
+        rad = math.radians(self.clip_yaw)
+        cos_y, sin_y = math.cos(rad), math.sin(rad)
+
+        # 8 rotated corner points in world coordinates
+        loc_corners = np.array([
+            [-ex, -ey, -ez],
+            [ ex, -ey, -ez],
+            [ ex,  ey, -ez],
+            [-ex,  ey, -ez],
+            [-ex, -ey,  ez],
+            [ ex, -ey,  ez],
+            [ ex,  ey,  ez],
+            [-ex,  ey,  ez],
+        ], dtype=np.float32)
+
+        rot_x = cos_y * loc_corners[:, 0] - sin_y * loc_corners[:, 1]
+        rot_y = sin_y * loc_corners[:, 0] + cos_y * loc_corners[:, 1]
+        rot_corners = np.column_stack([rot_x + C[0], rot_y + C[1], loc_corners[:, 2] + C[2]])
+
+        screen_pts, depths = project_points(rot_corners - self.origin, matrix, w, h)
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7)
+        ]
+
+        # Draw wireframe edges in signature CloudCompare yellow
+        p.save()
+        box_color = QColor('#fbc531')
+        p.setPen(QPen(box_color, max(1.2, 1.8 * s), Qt.PenStyle.SolidLine))
+        for i1, i2 in edges:
+            if -1.0 <= depths[i1] <= 1.0 or -1.0 <= depths[i2] <= 1.0:
+                p.drawLine(QPointF(*screen_pts[i1]), QPointF(*screen_pts[i2]))
+
+        # Horizontal Yaw Rotation Ring around the box waist
+        sc_c, d_c = project_points((C - self.origin).reshape(1, 3), matrix, w, h)
+        if -1.0 <= d_c[0] <= 1.0:
+            cx, cy = float(sc_c[0, 0]), float(sc_c[0, 1])
+            self._clipping_box_screen_center = (cx, cy)
+            r_ring_world = max(ex, ey) * 1.25 + 0.3
+            ang = np.linspace(0, 2 * math.pi, 48)
+            ring_w_pts = np.column_stack([
+                C[0] + r_ring_world * np.cos(ang),
+                C[1] + r_ring_world * np.sin(ang),
+                np.full_like(ang, C[2])
+            ])
+            sc_ring, d_ring = project_points(ring_w_pts - self.origin, matrix, w, h)
+            ring_valid = np.all((-1.0 <= d_ring) & (d_ring <= 1.0))
+            if ring_valid:
+                ring_path = QPainterPath()
+                ring_path.moveTo(QPointF(*sc_ring[0]))
+                for pt in sc_ring[1:]:
+                    ring_path.lineTo(QPointF(*pt))
+                ring_path.closeSubpath()
+                is_rot_hover = (self._hovered_clipping_handle == 'rot_yaw')
+                p.setPen(QPen(QColor(0, 210, 223, 220 if is_rot_hover else 120), max(1.2, (2.0 if is_rot_hover else 1.4) * s), Qt.PenStyle.DashLine))
+                p.drawPath(ring_path)
+
+        # 6 Interactive Face Handles
+        self._clipping_handle_screens.clear()
+        pixel_scale = 2.0 * self.half_height / max(1, h)
+        L_world = 30.0 * s * pixel_scale
+
+        faces = [
+            ('x_min', np.array([-cos_y, -sin_y, 0.0]), QColor('#ff4757'), 'X Min', 0, -1),
+            ('x_max', np.array([ cos_y,  sin_y, 0.0]), QColor('#ff4757'), 'X Max', 0, 1),
+            ('y_min', np.array([ sin_y, -cos_y, 0.0]), QColor('#2ed573'), 'Y Min', 1, -1),
+            ('y_max', np.array([-sin_y,  cos_y, 0.0]), QColor('#2ed573'), 'Y Max', 1, 1),
+            ('z_min', np.array([0.0, 0.0, -1.0]), QColor('#1e90ff'), 'Z Min', 2, -1),
+            ('z_max', np.array([0.0, 0.0,  1.0]), QColor('#1e90ff'), 'Z Max', 2, 1),
+        ]
+
+        stem_len = 24.0 * s
+        for key, normal, color, label, axis_idx, sign in faces:
+            face_pt = C + normal * E[axis_idx]
+            sc_pt, d_pt = project_points((face_pt - self.origin).reshape(1, 3), matrix, w, h)
+            if not (-1.0 <= d_pt[0] <= 1.0):
+                continue
+            sx, sy = float(sc_pt[0, 0]), float(sc_pt[0, 1])
+            sc_tip, _ = project_points((face_pt + normal * L_world - self.origin).reshape(1, 3), matrix, w, h)
+            tx, ty = float(sc_tip[0, 0]), float(sc_tip[0, 1])
+            vx, vy = tx - sx, ty - sy
+            dist = math.hypot(vx, vy)
+            if dist < 1e-2:
+                continue
+            ux, uy = vx / dist, vy / dist
+            perp_x, perp_y = -uy, ux
+
+            ax = sx + ux * stem_len
+            ay = sy + uy * stem_len
+
+            is_active = (self._active_clipping_handle == key)
+            is_hover = (self._hovered_clipping_handle == key)
+            is_ring_hover = (self._hovered_clipping_handle == key + '_rot')
+
+            # Store for resizing: key -> (sx, sy, ax, ay, ux, uy, axis_idx, sign, normal)
+            self._clipping_handle_screens[key] = (sx, sy, ax, ay, ux, uy, axis_idx, sign, normal)
+            # Store face ring for rotation: key + '_rot' -> (sx, sy, ring_radius)
+            self._clipping_handle_screens[key + '_rot'] = (sx, sy, 14.0 * s)
+
+            if is_active or is_hover or is_ring_hover:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 255, 255, 90))
+                p.drawEllipse(QPointF(sx, sy), 16.0 * s, 16.0 * s)
+
+            # Draw Ring / Torus at face center
+            p.save()
+            p.translate(sx, sy)
+            p.rotate(math.degrees(math.atan2(uy, ux)) + 90.0)
+            ring_w = (15.0 if is_ring_hover else 12.0) * s
+            ring_h = (7.0 if is_ring_hover else 5.0) * s
+            p.setPen(QPen(QColor('white') if is_ring_hover else color.lighter(130), max(1.5, 2.0 * s)))
+            p.setBrush(QColor(color.red(), color.green(), color.blue(), 220 if is_ring_hover else 180))
+            p.drawEllipse(QPointF(0, 0), ring_w, ring_h)
+            p.restore()
+
+            # Draw Arrow Stem
+            p.setPen(QPen(color, max(2.0, (3.2 if is_hover else 2.6) * s)))
+            p.drawLine(QPointF(sx, sy), QPointF(ax, ay))
+
+            # Draw Arrowhead Cone
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color.lighter(120) if is_hover else color)
+            cone_tip = QPointF(ax + ux * (8.0 * s), ay + uy * (8.0 * s))
+            cone_b1 = QPointF(ax - ux * (2.0 * s) + perp_x * (5.5 * s), ay - uy * (2.0 * s) + perp_y * (5.5 * s))
+            cone_b2 = QPointF(ax - ux * (2.0 * s) - perp_x * (5.5 * s), ay - uy * (2.0 * s) - perp_y * (5.5 * s))
+            p.drawPolygon(QPolygonF([cone_tip, cone_b1, cone_b2]))
+
+            if is_hover or is_active:
+                dim_extent = 2.0 * E[axis_idx]
+                tag_text = f"{label}: {dim_extent:.2f} m"
+                f = p.font(); f.setPointSize(max(7, round(8.5 * s))); f.setBold(True); p.setFont(f)
+                tw = p.fontMetrics().horizontalAdvance(tag_text) + 12 * s
+                th = 20.0 * s
+                p.setPen(QPen(color, 1.0))
+                p.setBrush(QColor(15, 23, 34, 235))
+                p.drawRoundedRect(QRectF(ax + ux * 10 * s - tw / 2, ay + uy * 10 * s - th / 2, tw, th), 4 * s, 4 * s)
+                p.setPen(QColor('white'))
+                p.drawText(QRectF(ax + ux * 10 * s - tw / 2, ay + uy * 10 * s - th / 2, tw, th), Qt.AlignmentFlag.AlignCenter, tag_text)
+            elif is_ring_hover:
+                tag_text = f"{tr('Drag ring to rotate box')} ({self.clip_yaw:+.1f}°)"
+                f = p.font(); f.setPointSize(max(7, round(8.5 * s))); f.setBold(True); p.setFont(f)
+                tw = p.fontMetrics().horizontalAdvance(tag_text) + 12 * s
+                th = 20.0 * s
+                p.setPen(QPen(QColor('#00d2df'), 1.0))
+                p.setBrush(QColor(15, 23, 34, 235))
+                p.drawRoundedRect(QRectF(sx - tw / 2, sy - th - 12 * s, tw, th), 4 * s, 4 * s)
+                p.setPen(QColor('#00d2df'))
+                p.drawText(QRectF(sx - tw / 2, sy - th - 12 * s, tw, th), Qt.AlignmentFlag.AlignCenter, tag_text)
+
+        # Center 4-way translation widget
+        if -1.0 <= d_c[0] <= 1.0:
+            cx, cy = float(sc_c[0, 0]), float(sc_c[0, 1])
+            is_c_active = (self._active_clipping_handle == 'center')
+            is_c_hover = (self._hovered_clipping_handle == 'center')
+            self._clipping_handle_screens['center'] = (cx, cy, 18.0 * s)
+
+            if is_c_active or is_c_hover:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 234, 0, 90))
+                p.drawEllipse(QPointF(cx, cy), 18.0 * s, 18.0 * s)
+
+            p.setPen(QPen(QColor('#0b1017'), max(1.0, 1.5 * s)))
+            p.setBrush(QColor('#f1c40f'))
+            cr = 6.0 * s
+            p.drawEllipse(QPointF(cx, cy), cr, cr)
+
+            arr_dist = 14.0 * s
+            for dx_dir, dy_dir in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                p.drawLine(QPointF(cx + dx_dir * cr, cy + dy_dir * cr), QPointF(cx + dx_dir * arr_dist, cy + dy_dir * arr_dist))
+                tip = QPointF(cx + dx_dir * (arr_dist + 4 * s), cy + dy_dir * (arr_dist + 4 * s))
+                b1 = QPointF(cx + dx_dir * arr_dist - dy_dir * 3 * s, cy + dy_dir * arr_dist + dx_dir * 3 * s)
+                b2 = QPointF(cx + dx_dir * arr_dist + dy_dir * 3 * s, cy + dy_dir * arr_dist - dx_dir * 3 * s)
+                p.drawPolygon(QPolygonF([tip, b1, b2]))
+
+            if is_c_hover or is_c_active:
+                lbl = tr("Move entire box")
+                f = p.font(); f.setPointSize(max(7, round(8.5 * s))); f.setBold(True); p.setFont(f)
+                tw = p.fontMetrics().horizontalAdvance(lbl) + 12 * s
+                th = 20.0 * s
+                p.setPen(QPen(QColor('#f1c40f'), 1.0))
+                p.setBrush(QColor(15, 23, 34, 235))
+                p.drawRoundedRect(QRectF(cx - tw / 2, cy - th - 12 * s, tw, th), 4 * s, 4 * s)
+                p.setPen(QColor('#f1c40f'))
+                p.drawText(QRectF(cx - tw / 2, cy - th - 12 * s, tw, th), Qt.AlignmentFlag.AlignCenter, lbl)
+
+        # In-Viewport Floating HUD Pill
+        self._clipping_hud_rects.clear()
+        hud_w = round(560 * s)
+        hud_h = round(38 * s)
+        hx = (w - hud_w) // 2
+        hy = round(14 * s)
+
+        p.setPen(QPen(QColor(56, 75, 96, 220), max(1.0, 1.2 * s)))
+        p.setBrush(QColor(14, 20, 28, 240))
+        p.drawRoundedRect(QRectF(hx, hy, hud_w, hud_h), 19 * s, 19 * s)
+
+        f = p.font(); f.setPointSize(max(7, round(9 * s))); f.setBold(True); p.setFont(f)
+        p.setPen(QColor('#fbc531'))
+        p.drawText(round(hx + 14 * s), round(hy + 24 * s), "✂ " + tr("3D Clip"))
+
+        f.setBold(False); f.setPointSize(max(6, round(8 * s))); p.setFont(f)
+        p.setPen(QColor('#8ec5fc'))
+        dim_str = f"{2*ex:.1f} × {2*ey:.1f} × {2*ez:.1f} m"
+        p.drawText(round(hx + 76 * s), round(hy + 24 * s), dim_str)
+
+        # Yaw indicator
+        f.setBold(True); p.setFont(f)
+        p.setPen(QColor('#00d2df'))
+        yaw_str = f"∡ {self.clip_yaw:+.1f}°"
+        p.drawText(round(hx + 195 * s), round(hy + 24 * s), yaw_str)
+
+        btn_defs = [
+            ('align', tr("Align"), False),
+            ('reset', tr("Reset Box"), False),
+            ('invert', tr("Invert Clip"), self.clip_invert),
+            ('export', tr("Export"), False),
+            ('hide', "👁 " + tr("Hide Box"), False),
+            ('close', "✕", False),
+        ]
+        bx = hx + round(262 * s)
+        for b_name, b_text, b_active in btn_defs:
+            f.setPointSize(max(6, round(8 * s)))
+            f.setBold(b_active or b_name == 'close')
+            p.setFont(f)
+            bw = round((26 if b_name == 'close' else p.fontMetrics().horizontalAdvance(b_text) + 12) * s)
+            bh = round(24 * s)
+            by = hy + (hud_h - bh) // 2
+            btn_rect = QRectF(bx, by, bw, bh)
+            self._clipping_hud_rects[b_name] = btn_rect
+
+            is_btn_hover = (self._hovered_hud_btn == b_name)
+            p.setPen(QPen(QColor('#00d2df' if b_active else ('#68829e' if is_btn_hover else '#3b4b5e')), 1.0))
+            if b_active:
+                p.setBrush(QColor(0, 210, 223, 70))
+            elif is_btn_hover:
+                p.setBrush(QColor(255, 255, 255, 35))
+            else:
+                p.setBrush(QColor(255, 255, 255, 15))
+            p.drawRoundedRect(btn_rect, 12 * s, 12 * s)
+
+            p.setPen(QColor('#00d2df') if b_active else (QColor('#ffffff') if is_btn_hover else QColor('#c2d6ea')))
+            p.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, b_text)
+            bx += bw + round(5 * s)
+
+        p.restore()
+
+    def _draw_transform_gizmo(self, p: QPainter, w: int, h: int, s: float, matrix: np.ndarray):
+        if not self.transform_mode or self.clouds[self.active_transform_slot] is None or self._original_points[self.active_transform_slot] is None:
+            return
+
+        slot = self.active_transform_slot
+        original = self._original_points[slot]
+        center = original.mean(axis=0)
+        yaw, shift = self._adjustments[slot]
+        pivot = center + shift
+
+        sc_p, d_p = project_points((pivot - self.origin).reshape(1, 3), matrix, w, h)
+        if not (-1.0 <= d_p[0] <= 1.0):
+            return
+
+        px, py = float(sc_p[0, 0]), float(sc_p[0, 1])
+        pixel_scale = 2.0 * self.half_height / max(1, h)
+        self._gizmo_handle_screens.clear()
+        self._gizmo_handle_screens['pivot'] = (px, py)
+
+        p.save()
+
+        slot_lbl = 'A' if slot == 0 else 'B'
+        if self.transform_mode == 'translate':
+            mode_txt = f"↔ " + tr("Move Cloud {slot}").format(slot=slot_lbl)
+        else:
+            mode_txt = f"🔄 " + tr("Rotate Cloud {slot}").format(slot=slot_lbl)
+
+        f = p.font(); f.setPointSize(max(7, round(8.5 * s))); f.setBold(True); p.setFont(f)
+        badge_w = p.fontMetrics().horizontalAdvance(mode_txt) + 16 * s
+        badge_h = 26 * s
+        bx = w - badge_w - 14 * s
+        by = 14 * s
+        p.setPen(QPen(QColor('#00d2df'), 1.2 * s))
+        p.setBrush(QColor(14, 22, 32, 235))
+        p.drawRoundedRect(QRectF(bx, by, badge_w, badge_h), 13 * s, 13 * s)
+        p.setPen(QColor('#ffffff'))
+        p.drawText(QRectF(bx, by, badge_w, badge_h), Qt.AlignmentFlag.AlignCenter, mode_txt)
+
+        if self.transform_mode == 'translate':
+            arrow_len = 70.0 * s
+            L_w = arrow_len * pixel_scale
+            axes = [
+                ('x', np.array([1.0, 0.0, 0.0]), QColor('#ff4757'), 'X'),
+                ('y', np.array([0.0, 1.0, 0.0]), QColor('#2ed573'), 'Y'),
+                ('z', np.array([0.0, 0.0, 1.0]), QColor('#1e90ff'), 'Z'),
+            ]
+
+            is_center_active = (self._active_gizmo_axis == 'free')
+            is_center_hover = (self._hovered_gizmo_axis == 'center')
+            self._gizmo_handle_screens['center'] = (px, py, 11.0 * s)
+
+            p.setPen(QPen(QColor('#ffffff') if is_center_hover else QColor('#ffd166'), max(1.5, 2.0 * s)))
+            p.setBrush(QColor('#ffd166') if not is_center_hover else QColor('#ffeaa7'))
+            p.drawEllipse(QPointF(px, py), 8.0 * s, 8.0 * s)
+
+            for key, u_vec, color, label in axes:
+                tip_w = pivot + u_vec * L_w
+                sc_t, _ = project_points((tip_w - self.origin).reshape(1, 3), matrix, w, h)
+                tx, ty = float(sc_t[0, 0]), float(sc_t[0, 1])
+                vx, vy = tx - px, ty - py
+                dist = math.hypot(vx, vy)
+                if dist < 1e-2:
+                    continue
+                ux, uy = vx / dist, vy / dist
+                perp_x, perp_y = -uy, ux
+
+                is_active = (self._active_gizmo_axis == key)
+                is_hover = (self._hovered_gizmo_axis == key)
+                self._gizmo_handle_screens[key] = (px, py, tx, ty)
+
+                if is_active or is_hover:
+                    p.setPen(QPen(QColor(255, 255, 255, 120), max(4.0, 6.0 * s)))
+                    p.drawLine(QPointF(px, py), QPointF(tx, ty))
+
+                p.setPen(QPen(color, max(2.2, 3.0 * s)))
+                p.drawLine(QPointF(px, py), QPointF(tx, ty))
+
+                cone_tip = QPointF(tx + ux * (8.0 * s), ty + uy * (8.0 * s))
+                b1 = QPointF(tx - ux * (2.0 * s) + perp_x * (5.5 * s), ty - uy * (2.0 * s) + perp_y * (5.5 * s))
+                b2 = QPointF(tx - ux * (2.0 * s) - perp_x * (5.5 * s), ty - uy * (2.0 * s) - perp_y * (5.5 * s))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(color)
+                p.drawPolygon(QPolygonF([cone_tip, b1, b2]))
+
+                f.setPointSize(max(7, round(8.5 * s))); f.setBold(True); p.setFont(f)
+                p.setPen(color.lighter(140))
+                p.drawText(QPointF(tx + ux * (14.0 * s) - 4 * s, ty + uy * (14.0 * s) + 4 * s), label)
+
+        elif self.transform_mode == 'rotate':
+            ring_r_px = 85.0 * s
+            L_w = ring_r_px * pixel_scale
+            N = 48
+            ring_pts = []
+            for k in range(N + 1):
+                ang = 2.0 * math.pi * (k % N) / N
+                pt_w = pivot + np.array([L_w * math.cos(ang), L_w * math.sin(ang), 0.0])
+                sc_k, _ = project_points((pt_w - self.origin).reshape(1, 3), matrix, w, h)
+                ring_pts.append(QPointF(float(sc_k[0, 0]), float(sc_k[0, 1])))
+
+            is_active = (self._active_gizmo_axis == 'yaw')
+            is_hover = (self._hovered_gizmo_axis == 'yaw')
+            self._gizmo_handle_screens['yaw'] = (px, py, ring_r_px)
+
+            ring_col = QColor('#00d2df')
+            if is_active or is_hover:
+                p.setPen(QPen(QColor(0, 210, 223, 100), max(5.0, 7.0 * s)))
+                p.drawPolyline(ring_pts)
+
+            p.setPen(QPen(ring_col, max(2.2, 3.0 * s)))
+            p.drawPolyline(ring_pts)
+
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(ring_col)
+            p.drawEllipse(QPointF(px, py), 5.0 * s, 5.0 * s)
+
+            if is_active:
+                yaw_txt = f"Yaw: {yaw:+.1f}°"
+                f.setPointSize(max(8, round(10 * s))); f.setBold(True); p.setFont(f)
+                tw = p.fontMetrics().horizontalAdvance(yaw_txt) + 16 * s
+                th = 24 * s
+                p.setPen(QPen(ring_col, 1.2 * s))
+                p.setBrush(QColor(14, 20, 28, 240))
+                p.drawRoundedRect(QRectF(px - tw / 2, py - ring_r_px - th - 8 * s, tw, th), 6 * s, 6 * s)
+                p.setPen(QColor('#ffffff'))
+                p.drawText(QRectF(px - tw / 2, py - ring_r_px - th - 8 * s, tw, th), Qt.AlignmentFlag.AlignCenter, yaw_txt)
+
+        p.restore()
 
     def _overlay(self, p, width=None, height=None, scale=1.0, show_labels=True, show_hud=True, show_measurements=True):
         w = self.width() if width is None else int(width)
@@ -585,26 +1215,11 @@ void main(){
         aspect = max(w, 1) / max(h, 1)
         matrix = camera_matrix(self.target, self.yaw, self.elevation, self.half_height, aspect, self.scene_radius)[0]
 
-        # 3D Clipping Box wireframe guide
-        if self.clipping_enabled and any(c is not None for c in self.clouds):
-            x0, y0, z0 = self.clip_min
-            x1, y1, z1 = self.clip_max
-            corners = np.array([
-                [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
-                [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
-            ])
-            screen_pts, depths = project_points(corners - self.origin, matrix, w, h)
-            edges = [
-                (0, 1), (1, 2), (2, 3), (3, 0),
-                (4, 5), (5, 6), (6, 7), (7, 4),
-                (0, 4), (1, 5), (2, 6), (3, 7)
-            ]
-            p.save()
-            p.setPen(QPen(QColor('#26cad3'), max(1.0, 1.3 * s), Qt.PenStyle.DashLine))
-            for i1, i2 in edges:
-                if -1 <= depths[i1] <= 1 or -1 <= depths[i2] <= 1:
-                    p.drawLine(QPointF(*screen_pts[i1]), QPointF(*screen_pts[i2]))
-            p.restore()
+        # 3D Clipping Box & Interactive Handles (CloudCompare style)
+        self._draw_clipping_box(p, w, h, s, matrix)
+
+        # 3D Viewport Transform Gizmo (Move / Rotate)
+        self._draw_transform_gizmo(p, w, h, s, matrix)
 
         if show_measurements:
             m_font = p.font()
@@ -804,30 +1419,415 @@ void main(){
                 for vertex,r in enumerate(m['points'],1):
                     writer.writerow([n,m['type'],m['value'],m['unit'],vertex,r['cloud'],r['source'],r['index'],*r['xyz']])
 
-    def mousePressEvent(self,event):
-        self.setFocus(); self._press=event.position(); self._last=event.position()
+    def mousePressEvent(self, event):
+        self.setFocus()
+        pos = event.position()
+        self._press = pos
+        self._last = pos
         self._dragged = False
-        self._drag_split=event.button()==Qt.MouseButton.LeftButton and all(c is not None for c in self.clouds) and abs(event.position().x()-self.width()*self.split)<10
 
-    def mouseMoveEvent(self,event):
-        if self._last is None: return
-        if self._press is not None and (event.position()-self._press).manhattanLength() >= 5:
+        # 1. Check Minimal Floating Badge Buttons click (when box is hidden)
+        if self.clipping_enabled and not self.clipping_box_visible and self._clipping_min_badge_rects:
+            for b_name, rect in self._clipping_min_badge_rects.items():
+                if rect.contains(pos):
+                    if b_name == 'edit_box':
+                        self.set_clipping_box_visible(True)
+                    elif b_name == 'close':
+                        self.set_clipping_enabled(False)
+                    return
+
+        # 2. Check Floating Clipping HUD Buttons click (when box is visible)
+        if self.clipping_box_visible and self._clipping_hud_rects:
+            for b_name, rect in self._clipping_hud_rects.items():
+                if rect.contains(pos):
+                    if b_name == 'align':
+                        self.align_clipping_box_to_cloud()
+                    elif b_name == 'reset':
+                        self.reset_clipping_to_clouds()
+                    elif b_name == 'invert':
+                        self.set_clip_invert(not self.clip_invert)
+                    elif b_name == 'export':
+                        self.export_clipped_requested.emit()
+                    elif b_name == 'hide':
+                        self.set_clipping_box_visible(False)
+                    elif b_name == 'close':
+                        self.set_clipping_enabled(False)
+                    return
+
+        # 3. Check 3D Clipping Box Handles click
+        if self.clipping_box_visible and event.button() == Qt.MouseButton.LeftButton:
+            hit_handle = None
+
+            # 3a. Check Face Ring Rotation Handles (near face center sx, sy)
+            for key in ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max'):
+                r_info = self._clipping_handle_screens.get(key + '_rot')
+                if r_info:
+                    sx, sy, r_radius = r_info
+                    if math.hypot(pos.x() - sx, pos.y() - sy) <= 15:
+                        hit_handle = 'rot_yaw'
+                        break
+
+            # 3b. Check Center 4-way translation widget
+            if hit_handle is None:
+                c_info = self._clipping_handle_screens.get('center')
+                if c_info:
+                    cx, cy, _ = c_info
+                    if math.hypot(pos.x() - cx, pos.y() - cy) <= 18:
+                        hit_handle = 'center'
+
+            # 3c. Check Face Resize Handles (near arrow tip ax, ay or stem)
+            if hit_handle is None:
+                for key in ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max'):
+                    info = self._clipping_handle_screens.get(key)
+                    if info:
+                        sx, sy, ax, ay, ux, uy, axis_idx, sign, normal = info
+                        # Check arrow tip
+                        if math.hypot(pos.x() - ax, pos.y() - ay) <= 18:
+                            hit_handle = key
+                            break
+                        # Check along stem line
+                        vx, vy = ax - sx, ay - sy
+                        L2 = vx * vx + vy * vy
+                        if L2 > 0:
+                            t = max(0.0, min(1.0, ((pos.x() - sx) * vx + (pos.y() - sy) * vy) / L2))
+                            nx, ny = sx + t * vx, sy + t * vy
+                            if math.hypot(pos.x() - nx, pos.y() - ny) <= 12:
+                                hit_handle = key
+                                break
+
+            # 3d. Check Horizontal Rotation Ring
+            if hit_handle is None and self._hovered_clipping_handle == 'rot_yaw':
+                hit_handle = 'rot_yaw'
+
+            if hit_handle is not None:
+                self._active_clipping_handle = hit_handle
+                self._clipping_drag_start_pos = pos
+                self._clipping_drag_start_center = self.clip_center.copy()
+                self._clipping_drag_start_extents = self.clip_extents.copy()
+                self._clipping_drag_start_yaw = float(self.clip_yaw)
+                self.update()
+                return
+
+        # 4. Check Viewport Transform Gizmo & Cloud Click
+        if self.transform_mode in ('translate', 'rotate') and event.button() == Qt.MouseButton.LeftButton:
+            slot = self.active_transform_slot
+            if self.clouds[slot] is not None and self._original_points[slot] is not None:
+                hit_gizmo = None
+                if self.transform_mode == 'translate':
+                    c_info = self._gizmo_handle_screens.get('center')
+                    if c_info and math.hypot(pos.x() - c_info[0], pos.y() - c_info[1]) <= c_info[2]:
+                        hit_gizmo = 'free'
+                    else:
+                        for axis in ('x', 'y', 'z'):
+                            info = self._gizmo_handle_screens.get(axis)
+                            if info:
+                                px, py, tx, ty = info
+                                vx, vy = tx - px, ty - py
+                                L2 = vx * vx + vy * vy
+                                if L2 > 0:
+                                    t = max(0.0, min(1.0, ((pos.x() - px) * vx + (pos.y() - py) * vy) / L2))
+                                    nx, ny = px + t * vx, py + t * vy
+                                    if math.hypot(pos.x() - nx, pos.y() - ny) <= 14:
+                                        hit_gizmo = axis
+                                        break
+                elif self.transform_mode == 'rotate':
+                    r_info = self._gizmo_handle_screens.get('yaw')
+                    if r_info:
+                        px, py, r_px = r_info
+                        dist = math.hypot(pos.x() - px, pos.y() - py)
+                        if abs(dist - r_px) <= 16 or dist <= 12:
+                            hit_gizmo = 'yaw'
+
+                # If gizmo handle wasn't hit directly, check if clicking directly on the point cloud
+                if hit_gizmo is None:
+                    picked = self.pick_point(pos.x(), pos.y())
+                    if picked is not None and (all(c is None for c in self.clouds[1:]) or picked.get('cloud') == 'AB'[slot]):
+                        hit_gizmo = 'free' if self.transform_mode == 'translate' else 'yaw'
+
+                if hit_gizmo is not None:
+                    self._active_gizmo_axis = hit_gizmo
+                    self._transform_drag_start_pos = pos
+                    self._transform_drag_start_val = (float(self._adjustments[slot][0]), self._adjustments[slot][1].copy())
+                    self.update()
+                    return
+
+        # 5. Fallback to normal navigation / split / picking
+        self._drag_split = event.button() == Qt.MouseButton.LeftButton and all(c is not None for c in self.clouds) and abs(pos.x() - self.width() * self.split) < 10
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self._last is None:
+            self._handle_hover(pos)
+            return
+
+        if self._press is not None and (pos - self._press).manhattanLength() >= 4:
             self._dragged = True
-        delta=event.position()-self._last; self._last=event.position()
-        if self._drag_split: self.set_split(event.position().x()/max(1,self.width())); return
-        if event.buttons() & (Qt.MouseButton.RightButton|Qt.MouseButton.MiddleButton) or (event.buttons() & Qt.MouseButton.LeftButton and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
-            _,right,up=self._matrix(); scale=2*self.half_height/max(self.height(),1)
-            self.target+=(-right*delta.x()+up*delta.y())*scale; self.update()
+        delta = pos - self._last
+        self._last = pos
+
+        # 1. Dragging Clipping Handle
+        if self._active_clipping_handle is not None:
+            total_delta = pos - self._clipping_drag_start_pos
+            pixel_scale = 2.0 * self.half_height / max(1, self.height())
+            _, right, up = self._matrix()
+
+            if self._active_clipping_handle == 'center':
+                d_shift = (right * total_delta.x() - up * total_delta.y()) * pixel_scale
+                self.clip_center = np.asarray(self._clipping_drag_start_center + d_shift, dtype=np.float32)
+                self.clip_min = self.clip_center - self.clip_extents
+                self.clip_max = self.clip_center + self.clip_extents
+            elif self._active_clipping_handle == 'rot_yaw':
+                cx, cy = self._clipping_box_screen_center
+                start_angle = math.atan2(self._clipping_drag_start_pos.y() - cy, self._clipping_drag_start_pos.x() - cx)
+                curr_angle = math.atan2(pos.y() - cy, pos.x() - cx)
+                d_angle = math.degrees(curr_angle - start_angle)
+                if self.elevation < 0:
+                    d_angle = -d_angle
+                new_yaw = (self._clipping_drag_start_yaw - d_angle + 180.0) % 360.0 - 180.0
+                self.clip_yaw = float(new_yaw)
+            else:
+                info = self._clipping_handle_screens.get(self._active_clipping_handle)
+                if info:
+                    sx, sy, ax, ay, ux, uy, axis_idx, sign, normal = info
+                    proj_dist = (total_delta.x() * ux + total_delta.y() * uy) * pixel_scale
+                    start_ext = self._clipping_drag_start_extents
+                    start_c = self._clipping_drag_start_center
+                    new_half = max(0.05, float(start_ext[axis_idx] + proj_dist * 0.5))
+                    delta_half = new_half - float(start_ext[axis_idx])
+                    new_ext = start_ext.copy()
+                    new_ext[axis_idx] = new_half
+                    new_center = start_c + normal * delta_half
+                    self.clip_extents = np.asarray(new_ext, dtype=np.float32)
+                    self.clip_center = np.asarray(new_center, dtype=np.float32)
+                    self.clip_min = self.clip_center - self.clip_extents
+                    self.clip_max = self.clip_center + self.clip_extents
+
+            self.clipping_bounds_changed.emit(self.clip_min, self.clip_max, True)
+            self.update()
+            return
+
+        # 2. Dragging Transform Gizmo / Cloud Object
+        if self._active_gizmo_axis is not None:
+            slot = self.active_transform_slot
+            total_delta = pos - self._transform_drag_start_pos
+            start_yaw, start_shift = self._transform_drag_start_val
+            pixel_scale = 2.0 * self.half_height / max(1, self.height())
+            _, right, up = self._matrix()
+
+            if self._active_gizmo_axis == 'free':
+                d_shift = (right * total_delta.x() - up * total_delta.y()) * pixel_scale
+                new_shift = start_shift + d_shift
+                self.apply_cloud_adjustment(slot, start_yaw, new_shift, is_preview=True)
+                self.cloud_transformed.emit(slot, start_yaw, new_shift)
+            elif self._active_gizmo_axis in ('x', 'y', 'z'):
+                axis_idx = {'x': 0, 'y': 1, 'z': 2}[self._active_gizmo_axis]
+                u_world = np.zeros(3)
+                u_world[axis_idx] = 1.0
+                sx = float(np.dot(u_world, right))
+                sy = float(-np.dot(u_world, up))
+                mag = math.hypot(sx, sy)
+                if mag > 1e-3:
+                    ux, uy = sx / mag, sy / mag
+                    proj_dist = (total_delta.x() * ux + total_delta.y() * uy) * pixel_scale
+                    new_shift = start_shift.copy()
+                    new_shift[axis_idx] += proj_dist
+                    self.apply_cloud_adjustment(slot, start_yaw, new_shift, is_preview=True)
+                    self.cloud_transformed.emit(slot, start_yaw, new_shift)
+            elif self._active_gizmo_axis == 'yaw':
+                pivot_info = self._gizmo_handle_screens.get('pivot')
+                if pivot_info:
+                    px, py = pivot_info
+                    start_angle = math.atan2(self._transform_drag_start_pos.y() - py, self._transform_drag_start_pos.x() - px)
+                    curr_angle = math.atan2(pos.y() - py, pos.x() - px)
+                    d_angle = math.degrees(curr_angle - start_angle)
+                    if self.elevation < 0:
+                        d_angle = -d_angle
+                    new_yaw = (start_yaw - d_angle + 180.0) % 360.0 - 180.0
+                    self.apply_cloud_adjustment(slot, new_yaw, start_shift, is_preview=True)
+                    self.cloud_transformed.emit(slot, new_yaw, start_shift)
+            self.update()
+            return
+
+        # 3. Normal navigation / split
+        if self._drag_split:
+            self.set_split(pos.x() / max(1, self.width()))
+            return
+
+        if event.buttons() & (Qt.MouseButton.RightButton | Qt.MouseButton.MiddleButton) or (event.buttons() & Qt.MouseButton.LeftButton and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            _, right, up = self._matrix()
+            scale = 2 * self.half_height / max(self.height(), 1)
+            self.target += (-right * delta.x() + up * delta.y()) * scale
+            self.update()
         elif event.buttons() & Qt.MouseButton.LeftButton and self._dragged:
-            self.yaw-=delta.x()*.4; self.elevation=float(np.clip(self.elevation+delta.y()*.4,-89.9999,89.9999))
+            self.yaw -= delta.x() * 0.4
+            self.elevation = float(np.clip(self.elevation + delta.y() * 0.4, -89.9999, 89.9999))
             self.current_preset = 'custom'
             self.view_preset_changed.emit('custom')
             self.update()
 
-    def mouseReleaseEvent(self,event):
-        if self._press is not None and not self._dragged and not self._drag_split and event.button()==Qt.MouseButton.LeftButton and self.mode!='navigate' and (event.position()-self._press).manhattanLength()<5 and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            self._add_pick(self.pick_point(event.position().x(),event.position().y()))
-        self._press=None; self._last=None; self._drag_split=False
+        self._handle_hover(pos)
+
+    def _handle_hover(self, pos):
+        hover_changed = False
+        new_cursor = Qt.CursorShape.ArrowCursor
+
+        # 1. Minimal Badge hover
+        badge_btn = None
+        if self.clipping_enabled and not self.clipping_box_visible and self._clipping_min_badge_rects:
+            for b_name, rect in self._clipping_min_badge_rects.items():
+                if rect.contains(pos):
+                    badge_btn = b_name
+                    new_cursor = Qt.CursorShape.PointingHandCursor
+                    break
+        if badge_btn != self._hovered_hud_btn and not self.clipping_box_visible:
+            self._hovered_hud_btn = badge_btn
+            hover_changed = True
+
+        # 2. Floating HUD hover
+        hud_btn = None
+        if self.clipping_box_visible and self._clipping_hud_rects:
+            for b_name, rect in self._clipping_hud_rects.items():
+                if rect.contains(pos):
+                    hud_btn = b_name
+                    new_cursor = Qt.CursorShape.PointingHandCursor
+                    break
+        if self.clipping_box_visible and hud_btn != self._hovered_hud_btn:
+            self._hovered_hud_btn = hud_btn
+            hover_changed = True
+
+        # 3. Clipping handles hover
+        if self.clipping_box_visible and hud_btn is None:
+            clip_hover = None
+
+            # Check face rings (rotation)
+            for key in ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max'):
+                r_info = self._clipping_handle_screens.get(key + '_rot')
+                if r_info:
+                    sx, sy, r_radius = r_info
+                    if math.hypot(pos.x() - sx, pos.y() - sy) <= 15:
+                        clip_hover = key + '_rot'
+                        new_cursor = Qt.CursorShape.PointingHandCursor
+                        break
+
+            # Check center 4-way translation
+            if clip_hover is None:
+                c_info = self._clipping_handle_screens.get('center')
+                if c_info:
+                    cx, cy, _ = c_info
+                    if math.hypot(pos.x() - cx, pos.y() - cy) <= 18:
+                        clip_hover = 'center'
+                        new_cursor = Qt.CursorShape.SizeAllCursor
+
+            # Check face resize arrows
+            if clip_hover is None:
+                for key in ('x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max'):
+                    info = self._clipping_handle_screens.get(key)
+                    if info:
+                        sx, sy, ax, ay, ux, uy, axis_idx, sign, normal = info
+                        if math.hypot(pos.x() - ax, pos.y() - ay) <= 18:
+                            clip_hover = key
+                            new_cursor = Qt.CursorShape.PointingHandCursor
+                            break
+                        vx, vy = ax - sx, ay - sy
+                        L2 = vx * vx + vy * vy
+                        if L2 > 0:
+                            t = max(0.0, min(1.0, ((pos.x() - sx) * vx + (pos.y() - sy) * vy) / L2))
+                            nx, ny = sx + t * vx, sy + t * vy
+                            if math.hypot(pos.x() - nx, pos.y() - ny) <= 12:
+                                clip_hover = key
+                                new_cursor = Qt.CursorShape.PointingHandCursor
+                                break
+
+            # Check rotation ring proximity around center
+            if clip_hover is None:
+                cx, cy = self._clipping_box_screen_center
+                d_c = math.hypot(pos.x() - cx, pos.y() - cy)
+                ex, ey = float(self.clip_extents[0]), float(self.clip_extents[1])
+                pixel_scale = 2.0 * self.half_height / max(1, self.height())
+                r_ring_px = (max(ex, ey) * 1.25 + 0.3) / max(1e-4, pixel_scale)
+                if abs(d_c - r_ring_px) <= 16:
+                    clip_hover = 'rot_yaw'
+                    new_cursor = Qt.CursorShape.PointingHandCursor
+
+            if clip_hover != self._hovered_clipping_handle:
+                self._hovered_clipping_handle = clip_hover
+                hover_changed = True
+
+        # 4. Gizmo handles hover
+        if self.transform_mode in ('translate', 'rotate') and hud_btn is None and self._hovered_clipping_handle is None:
+            gizmo_hover = None
+            if self.transform_mode == 'translate':
+                c_info = self._gizmo_handle_screens.get('center')
+                if c_info and math.hypot(pos.x() - c_info[0], pos.y() - c_info[1]) <= c_info[2]:
+                    gizmo_hover = 'center'
+                    new_cursor = Qt.CursorShape.SizeAllCursor
+                else:
+                    for axis in ('x', 'y', 'z'):
+                        info = self._gizmo_handle_screens.get(axis)
+                        if info:
+                            px, py, tx, ty = info
+                            vx, vy = tx - px, ty - py
+                            L2 = vx * vx + vy * vy
+                            if L2 > 0:
+                                t = max(0.0, min(1.0, ((pos.x() - px) * vx + (pos.y() - py) * vy) / L2))
+                                nx, ny = px + t * vx, py + t * vy
+                                if math.hypot(pos.x() - nx, pos.y() - ny) <= 14:
+                                    gizmo_hover = axis
+                                    new_cursor = Qt.CursorShape.SizeAllCursor
+                                    break
+            elif self.transform_mode == 'rotate':
+                r_info = self._gizmo_handle_screens.get('yaw')
+                if r_info:
+                    px, py, r_px = r_info
+                    dist = math.hypot(pos.x() - px, pos.y() - py)
+                    if abs(dist - r_px) <= 16:
+                        gizmo_hover = 'yaw'
+                        new_cursor = Qt.CursorShape.PointingHandCursor
+
+            if gizmo_hover is None:
+                slot = self.active_transform_slot
+                if self.clouds[slot] is not None:
+                    p_info = self._gizmo_handle_screens.get('pivot')
+                    if p_info and math.hypot(pos.x() - p_info[0], pos.y() - p_info[1]) <= 60:
+                        new_cursor = Qt.CursorShape.OpenHandCursor if self.transform_mode == 'translate' else Qt.CursorShape.PointingHandCursor
+
+            if gizmo_hover != self._hovered_gizmo_axis:
+                self._hovered_gizmo_axis = gizmo_hover
+                hover_changed = True
+
+        if hover_changed:
+            self.setCursor(new_cursor)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._active_clipping_handle is not None:
+            self._active_clipping_handle = None
+            self._clipping_drag_start_pos = None
+            self._clipping_drag_start_center = None
+            self._clipping_drag_start_extents = None
+            self._clipping_drag_start_bounds = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+            return
+
+        if self._active_gizmo_axis is not None:
+            slot = self.active_transform_slot
+            yaw, shift = self._adjustments[slot]
+            self.apply_cloud_adjustment(slot, yaw, shift, is_preview=False)
+            self.cloud_transformed.emit(slot, yaw, shift)
+            self._active_gizmo_axis = None
+            self._transform_drag_start_pos = None
+            self._transform_drag_start_val = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+            return
+
+        if self._press is not None and not self._dragged and not self._drag_split and event.button() == Qt.MouseButton.LeftButton and self.mode != 'navigate' and (event.position() - self._press).manhattanLength() < 5 and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self._add_pick(self.pick_point(event.position().x(), event.position().y()))
+
+        self._press = None
+        self._last = None
+        self._drag_split = False
 
     def wheelEvent(self,event):
         old_height = self.half_height
