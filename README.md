@@ -24,7 +24,11 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 
 > [!NOTE]
 > **Hardware & Rig Compatibility:**  
-> **LidarCamera360** was developed and pre-calibrated specifically for the **3DMakerPro Raven LiDAR Scanner** coupled with an **Insta360 X4 360° Camera** (+18.5 cm vertical lever arm). However, its architecture is completely modular and sensor-agnostic: it can be easily adapted to any other mobile or handheld scanning setup (e.g. Ouster, Hesai, Velodyne, RoboSense, or VanJee LiDARs paired with dual-fisheye or perspective camera arrays) by customizing the rigid extrinsic geometry and camera model in [`configs/rig_profile.json`](configs/rig_profile.json) and adjusting the topic mappings in [`FAST-LIVO2/config/`](FAST-LIVO2/config/).
+> **LidarCamera360** comes pre-calibrated and out-of-the-box ready for:
+> - **3DMakerPro Raven LiDAR Scanner + Insta360 X4** (+18.5 cm vertical lever arm, `configs/rig_profile.json`, `FAST-LIVO2/config/raven.yaml`)
+> - **3DMakerPro Eagle LiDAR Scanner + Insta360 X6** (Livox CustomMsg protocol, `configs/rig_profile_eagle.json`, `FAST-LIVO2/config/eagle.yaml`)
+>
+> Its modular architecture is completely sensor-agnostic: it can be easily adapted to any mobile or handheld scanning setup (e.g., Livox, Ouster, Hesai, Velodyne, RoboSense, or VanJee LiDARs paired with dual-fisheye or perspective camera arrays) by customizing the rigid extrinsic geometry and camera model in [`configs/rig_profile.json`](configs/rig_profile.json) and adjusting topic mappings in [`FAST-LIVO2/config/`](FAST-LIVO2/config/).
 
 ---
 
@@ -32,10 +36,11 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 
 1. **In-Process ROS Bag Inspection & Processing (Zero ROS Required)**
    - Operates natively on Windows without WSL, Docker, or ROS master daemons.
-   - Reads ROS1 `.bag` files, parses `sensor_msgs/PointCloud2` (with per-point timing), IMU packets, and compressed camera topics.
+   - Reads ROS1 `.bag` files, parses `sensor_msgs/PointCloud2` (with per-point timing), `livox_ros_driver2/CustomMsg`, IMU packets, and compressed camera topics.
 
 2. **Native Offline FAST-LIVO2 SLAM Engine**
    - Bundled MSVC C++17 offline estimator (`fastlivo2.exe`).
+   - Supports standard point clouds and Livox/Eagle high-rate scan formats.
    - Produces high-accuracy LiDAR odometry, 6-DoF trajectories, and dense point cloud maps directly from raw packets.
 
 3. **High-Throughput INSV Video Frame Extraction**
@@ -50,17 +55,29 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 5. **Thin Prism Fisheye Optical Modeling & Multi-Modal Calibration**
    - Complete 12-parameter Thin Prism fisheye distortion model ($f_x, f_y, c_x, c_y, k_1..k_4, p_1, p_2, s_{x1}, s_{y1}$).
    - Horn/Umeyama Sim(3) metric scale recovery and robust point-to-plane Trimmed ICP fine registration.
-   - Pre-configured nominal rig profile for the 3DMakerPro Raven LiDAR + Insta360 X4 rig (+18.5 cm vertical lever arm).
+   - Pre-configured profiles for **Raven + Insta360 X4** and **Eagle + Insta360 X6**.
 
 6. **Dual-Method High-Resolution 3D Colorization**
    - **Method 1 (Reconstruction / SfM Spirula Consensus)**: Gold standard multi-view consensus projection, resolving occlusion via Z-Buffer and sharpness weighting with Vulkan compute shaders (`vulkan_colorizer.exe` with CPU fallback).
    - **Method 2 (Trajectory / Direct Rigid)**: High-speed projection directly along the SLAM trajectory with optional SfM trajectory drift correction.
 
-7. **Export to Photogrammetry, 3DGS & GIS**
-   - Generates metric COLMAP datasets (`cameras.txt`, `images.txt`, `points3D.txt`) ready for Gaussian Splatting (3DGS) and RealityCapture / RealityScan.
-   - Exports GIS-ready LAZ/PLY/PCD with Compound CRS (SIRGAS 2000 / UTM).
+7. **Interactive 3D OBB Clipping Box & Transform Gizmos**
+   - Interactive 3D Oriented Bounding Box (OBB) rotation around Z (Yaw), axis pull arrows with anchored opposite face, and horizontal rotation ring.
+   - Persistent sliced view: keep cuts active in the viewport while hiding box gizmos for pristine inspection.
+   - Sub-volume point cloud cropping and export (PLY, PCD, LAS, XYZ).
 
-8. **Modern Fluent UI & Multilingual Localization (i18n)**
+8. **Metric LiDAR 3DGS Seed Initialization (Gaussian Splatting)**
+   - Exports metric colorized LiDAR point clouds directly as 3D Gaussian Splatting seeds (`points3D.ply`, `points3D.bin`, `points3D.txt`) into COLMAP workspace.
+   - Out-of-the-box compatibility with Inria 3DGS, Nerfstudio (splatfacto), PostShot, Spirula Studio, and LichtFeld Studio.
+   - Intelligent density subsampling to prevent CUDA VRAM blowouts while providing dense geometric scaffolding.
+
+9. **Automated Georeferencing, GCPs & GeoTIFF Orthophotos**
+   - Automated GNSS/INSV trajectory georeferencing & Ground Control Points (GCP) alignment.
+   - High-resolution GeoTIFF orthophoto export with world files (.tfw) and embedded spatial reference.
+   - Native INSV GPS extraction and satellite track quality reporting (DOP, fix type, accuracy metrics).
+   - Georeferenced LAZ / LAS 1.4 export with Compound CRS (SIRGAS 2000 / UTM).
+
+10. **Modern Fluent UI & Multilingual Localization (i18n)**
    - Microsoft WinUI 3 Fluent Design System with Mica and Acrylic materials, dark/light theme switching.
    - Runtime localization supporting **English**, **Português (Brasil)**, **Español**, **Français**, **Deutsch**, **简体中文**, and **日本語**.
 
