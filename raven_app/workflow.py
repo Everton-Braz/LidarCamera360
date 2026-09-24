@@ -17,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional, Tuple, Dict, Any
 
 import cv2
 import numpy as np
@@ -198,8 +199,11 @@ def auto_sync_imu_gyro(bag_path: Path, insv_path: Path, imu_topic: str = None) -
         return 1.892
 
 
-def load_lidar_seed_points(dataset_dir: Path, max_points: int = 1500000):
-    """Load colorized or raw LiDAR points to use as dense geometric 3DGS seed."""
+def load_lidar_seed_points(dataset_dir: Path, max_points: Optional[int] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Load colorized or raw LiDAR points to use as dense geometric 3DGS seed.
+
+    Defaults to 100% full raw sensor density unless max_points is explicitly set.
+    """
     ply_candidates = sorted((dataset_dir / "deliverables").glob("lidar_colored_*.ply"))
     if not ply_candidates:
         ply_candidates = sorted(dataset_dir.glob("*.ply"))
@@ -259,17 +263,19 @@ def load_lidar_seed_points(dataset_dir: Path, max_points: int = 1500000):
     if xyz is None or len(xyz) == 0:
         return None, None
 
-    if len(xyz) > max_points:
+    if max_points is not None and max_points > 0 and len(xyz) > max_points:
         step = max(1, len(xyz) // max_points)
         xyz = xyz[::step]
         rgb = rgb[::step]
-        print(f"  [*] Subsampled LiDAR 3DGS seed to {len(xyz):,} points (step={step}) for optimal 3DGS training initialization")
+        print(f"  [*] Subsampled LiDAR 3DGS seed to {len(xyz):,} points (step={step})")
+    else:
+        print(f"  [+] Using 100% full raw density: {len(xyz):,} metric LiDAR points as 3DGS seed")
 
     return xyz, rgb
 
 
 def write_colmap_points3d(dst_dir: Path, xyz: np.ndarray, rgb: np.ndarray, errors: np.ndarray = None):
-    """Write points3D.ply, points3D.bin, and points3D.txt in COLMAP format."""
+    """Write points3D.ply, points3D.bin, and points3D.txt in COLMAP format using fast vectorized buffers."""
     n = len(xyz)
     dst_dir.mkdir(parents=True, exist_ok=True)
     if errors is None:
@@ -301,37 +307,214 @@ def write_colmap_points3d(dst_dir: Path, xyz: np.ndarray, rgb: np.ndarray, error
         f.write(header)
         f.write(arr.tobytes())
 
-    # 2. Write binary COLMAP (points3D.bin)
+    # 2. Write binary COLMAP (points3D.bin) via fast vectorized structured array
     bin_path = dst_dir / "points3D.bin"
+    bin_dt = np.dtype([
+        ("id", "<u8"),
+        ("x", "<f8"), ("y", "<f8"), ("z", "<f8"),
+        ("r", "u1"), ("g", "u1"), ("b", "u1"),
+        ("error", "<f8"),
+        ("track_len", "<u8")
+    ], align=False)
+    bin_arr = np.empty(n, dtype=bin_dt)
+    bin_arr["id"] = np.arange(1, n + 1, dtype=np.uint64)
+    bin_arr["x"] = xyz[:, 0]
+    bin_arr["y"] = xyz[:, 1]
+    bin_arr["z"] = xyz[:, 2]
+    bin_arr["r"] = rgb[:, 0]
+    bin_arr["g"] = rgb[:, 1]
+    bin_arr["b"] = rgb[:, 2]
+    bin_arr["error"] = errors
+    bin_arr["track_len"] = 0
     with open(bin_path, "wb") as f:
         f.write(struct.pack("<Q", n))
-        for i in range(n):
-            pid = i + 1
-            f.write(struct.pack("<Q3d3BdQ", pid, float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]),
-                                int(rgb[i, 0]), int(rgb[i, 1]), int(rgb[i, 2]), float(errors[i]), 0))
+        f.write(bin_arr.tobytes())
 
-    # 3. Write text COLMAP (points3D.txt)
+    # 3. Write text COLMAP (points3D.txt) in buffered chunks
     txt_path = dst_dir / "points3D.txt"
+    chunk_size = 250000
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("# 3D point list with one line of data per point:\n")
         f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
-        for i in range(n):
-            f.write(f"{i + 1} {xyz[i, 0]:.6f} {xyz[i, 1]:.6f} {xyz[i, 2]:.6f} "
-                    f"{int(rgb[i, 0])} {int(rgb[i, 1])} {int(rgb[i, 2])} {errors[i]:.4f}\n")
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            chunk_xyz = xyz[start:end]
+            chunk_rgb = rgb[start:end]
+            chunk_err = errors[start:end]
+            lines = [
+                f"{start + i + 1} {chunk_xyz[i, 0]:.6f} {chunk_xyz[i, 1]:.6f} {chunk_xyz[i, 2]:.6f} "
+                f"{chunk_rgb[i, 0]} {chunk_rgb[i, 1]} {chunk_rgb[i, 2]} {chunk_err[i]:.4f}\n"
+                for i in range(len(chunk_xyz))
+            ]
+            f.writelines(lines)
 
-    # Copy points3D.ply to root of colmap_3dgs if dst_dir is sparse/0
+    # Link points3D.ply to root of colmap_3dgs if dst_dir is sparse/0 for root loaders without duplicating disk space
     if dst_dir.parent.name == "sparse" and dst_dir.name == "0":
         try:
-            shutil.copy2(ply_path, dst_dir.parent.parent / "points3D.ply")
+            root_ply = dst_dir.parent.parent / "points3D.ply"
+            if root_ply.exists():
+                root_ply.unlink()
+            try:
+                os.link(ply_path, root_ply)
+            except Exception:
+                try:
+                    root_ply.symlink_to(ply_path)
+                except Exception:
+                    shutil.copy2(ply_path, root_ply)
         except Exception:
             pass
 
 
-def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0) -> Path:
+def fuse_colmap_points3d(sparse_dir: Path, lidar_xyz: np.ndarray, lidar_rgb: np.ndarray) -> Tuple[int, int, int]:
+    """Fuse reconstruction SfM points (preserving 2D camera tracks) and dense LiDAR points into a single model."""
+    pts_bin = sparse_dir / "points3D.bin"
+    pts_ply = sparse_dir / "points3D.ply"
+    pts_txt = sparse_dir / "points3D.txt"
+
+    n_lidar = len(lidar_xyz)
+    if not pts_bin.is_file():
+        write_colmap_points3d(sparse_dir, lidar_xyz, lidar_rgb)
+        return 0, n_lidar, n_lidar
+
+    # 1. Preserve pure SfM reconstruction points as points3D_sfm_sparse.*
+    sfm_sparse_bin = sparse_dir / "points3D_sfm_sparse.bin"
+    sfm_sparse_ply = sparse_dir / "points3D_sfm_sparse.ply"
+    sfm_sparse_txt = sparse_dir / "points3D_sfm_sparse.txt"
+    if not sfm_sparse_bin.is_file():
+        try:
+            shutil.copy2(pts_bin, sfm_sparse_bin)
+            if pts_ply.is_file():
+                shutil.copy2(pts_ply, sfm_sparse_ply)
+            if pts_txt.is_file():
+                shutil.copy2(pts_txt, sfm_sparse_txt)
+        except Exception:
+            pass
+
+    # 2. Read SfM points binary data & tracks
+    with open(sfm_sparse_bin, "rb") as f:
+        n_sfm = struct.unpack("<Q", f.read(8))[0]
+        sfm_bin_bytes = f.read()
+
+    # Read SfM coordinates & colors from PLY (sub-millisecond)
+    sfm_xyz = np.empty((0, 3), dtype=np.float64)
+    sfm_rgb = np.empty((0, 3), dtype=np.uint8)
+    if sfm_sparse_ply.is_file():
+        try:
+            with open(sfm_sparse_ply, "rb") as f:
+                while True:
+                    line = f.readline().decode("latin1", errors="ignore").strip()
+                    if line == "end_header":
+                        break
+                dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")])
+                sfm_data = np.fromfile(f, dtype=dt, count=n_sfm)
+                sfm_xyz = np.column_stack([sfm_data["x"], sfm_data["y"], sfm_data["z"]]).astype(np.float64)
+                sfm_rgb = np.column_stack([sfm_data["r"], sfm_data["g"], sfm_data["b"]]).astype(np.uint8)
+        except Exception as e:
+            print(f"  [!] Note reading sfm ply: {e}")
+
+    n_total = n_sfm + n_lidar
+    print(f"  [*] Fusing {n_sfm:,} SfM reconstruction points with {n_lidar:,} metric LiDAR points -> Total: {n_total:,} points")
+
+    # 3. Write fused points3D.bin
+    with open(pts_bin, "wb") as f:
+        f.write(struct.pack("<Q", n_total))
+        f.write(sfm_bin_bytes)
+
+        # Append LiDAR points with track_len=0
+        bin_dt = np.dtype([
+            ("id", "<u8"),
+            ("x", "<f8"), ("y", "<f8"), ("z", "<f8"),
+            ("r", "u1"), ("g", "u1"), ("b", "u1"),
+            ("error", "<f8"),
+            ("track_len", "<u8")
+        ], align=False)
+        lidar_arr = np.empty(n_lidar, dtype=bin_dt)
+        lidar_arr["id"] = np.arange(n_sfm + 1, n_total + 1, dtype=np.uint64)
+        lidar_arr["x"] = lidar_xyz[:, 0]
+        lidar_arr["y"] = lidar_xyz[:, 1]
+        lidar_arr["z"] = lidar_xyz[:, 2]
+        lidar_arr["r"] = lidar_rgb[:, 0]
+        lidar_arr["g"] = lidar_rgb[:, 1]
+        lidar_arr["b"] = lidar_rgb[:, 2]
+        lidar_arr["error"] = 0.1
+        lidar_arr["track_len"] = 0
+        f.write(lidar_arr.tobytes())
+
+    # 4. Write fused points3D.ply
+    fused_xyz = np.vstack([sfm_xyz, lidar_xyz]) if len(sfm_xyz) > 0 else lidar_xyz
+    fused_rgb = np.vstack([sfm_rgb, lidar_rgb]) if len(sfm_rgb) > 0 else lidar_rgb
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {len(fused_xyz)}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    ).encode("ascii")
+    dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")])
+    arr = np.empty(len(fused_xyz), dtype=dt)
+    arr["x"] = fused_xyz[:, 0]
+    arr["y"] = fused_xyz[:, 1]
+    arr["z"] = fused_xyz[:, 2]
+    arr["r"] = fused_rgb[:, 0]
+    arr["g"] = fused_rgb[:, 1]
+    arr["b"] = fused_rgb[:, 2]
+    with open(pts_ply, "wb") as f:
+        f.write(header)
+        f.write(arr.tobytes())
+
+    # Link root points3D.ply
+    if sparse_dir.parent.name == "sparse" and sparse_dir.name == "0":
+        try:
+            root_ply = sparse_dir.parent.parent / "points3D.ply"
+            if root_ply.exists():
+                root_ply.unlink()
+            try:
+                os.link(pts_ply, root_ply)
+            except Exception:
+                try:
+                    root_ply.symlink_to(pts_ply)
+                except Exception:
+                    shutil.copy2(pts_ply, root_ply)
+        except Exception:
+            pass
+
+    # 5. Write fused points3D.txt
+    chunk_size = 250000
+    with open(pts_txt, "w", encoding="utf-8") as f:
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        if sfm_sparse_txt.is_file():
+            with open(sfm_sparse_txt, "r", encoding="utf-8", errors="ignore") as f_sfm:
+                for line in f_sfm:
+                    if not line.startswith("#") and line.strip():
+                        f.write(line)
+        err_val = 0.1
+        for start in range(0, n_lidar, chunk_size):
+            end = min(start + chunk_size, n_lidar)
+            c_xyz = lidar_xyz[start:end]
+            c_rgb = lidar_rgb[start:end]
+            lines = [
+                f"{n_sfm + start + i + 1} {c_xyz[i, 0]:.6f} {c_xyz[i, 1]:.6f} {c_xyz[i, 2]:.6f} "
+                f"{c_rgb[i, 0]} {c_rgb[i, 1]} {c_rgb[i, 2]} {err_val:.4f}\n"
+                for i in range(len(c_xyz))
+            ]
+            f.writelines(lines)
+
+    return n_sfm, n_lidar, n_total
+
+
+def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0, max_points: Optional[int] = None) -> Path:
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
 
     Transforms camera poses into the LiDAR metric coordinate frame and seeds the model with
     the true metric LiDAR point cloud (points3D.ply, points3D.bin, points3D.txt).
+    For reconstruction-based workflows (SfM), fuses SfM points (with tracks) and LiDAR points.
+    For trajectory-based workflows (SLAM), uses the full raw LiDAR point cloud directly.
     """
     out_dir = dataset_dir / "colmap_3dgs"
     images_out = out_dir / "images"
@@ -351,9 +534,12 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
             target = dest_cam / f.name
             if not target.exists():
                 try:
-                    target.symlink_to(f)
+                    os.link(f, target)
                 except Exception:
-                    shutil.copy2(f, target)
+                    try:
+                        target.symlink_to(f)
+                    except Exception:
+                        shutil.copy2(f, target)
 
     # 1. Check if Spirula SfM output is available to transform to METRIC scale
     sfm_sparse = dataset_dir / "sparse" / "0"
@@ -457,23 +643,18 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
 
             print(f"  [+] Written images.txt with {img_id - 1} camera poses")
 
-    # Seed 3DGS point cloud from true metric LiDAR points
-    lidar_xyz, lidar_rgb = load_lidar_seed_points(dataset_dir)
+    # Seed 3DGS point cloud
+    lidar_xyz, lidar_rgb = load_lidar_seed_points(dataset_dir, max_points=max_points)
     if lidar_xyz is not None and len(lidar_xyz) > 0:
-        # If previous SfM points existed, preserve them as points3D_sfm_sparse
-        if (sparse_out / "points3D.bin").is_file() and not (sparse_out / "points3D_sfm_sparse.bin").is_file():
-            try:
-                shutil.copy2(sparse_out / "points3D.bin", sparse_out / "points3D_sfm_sparse.bin")
-                if (sparse_out / "points3D.ply").is_file():
-                    shutil.copy2(sparse_out / "points3D.ply", sparse_out / "points3D_sfm_sparse.ply")
-                if (sparse_out / "points3D.txt").is_file():
-                    shutil.copy2(sparse_out / "points3D.txt", sparse_out / "points3D_sfm_sparse.txt")
-            except Exception:
-                pass
-
-        print(f"  [*] Writing LiDAR 3DGS Seed: {len(lidar_xyz):,} points to points3D.ply, points3D.bin, points3D.txt...")
-        write_colmap_points3d(sparse_out, lidar_xyz, lidar_rgb)
-        print(f"  [+] LiDAR 3DGS seed successfully written to: {sparse_out / 'points3D.ply'}")
+        if poses_ready and (sparse_out / "points3D.bin").is_file():
+            # RECONSTRUCTION-BASED METHOD: Fuse SfM tracks with dense metric LiDAR points
+            n_sfm, n_lidar, n_total = fuse_colmap_points3d(sparse_out, lidar_xyz, lidar_rgb)
+            print(f"  [+] [Reconstruction-Based 3DGS] Successfully FUSED SfM sparse points ({n_sfm:,}) and metric LiDAR points ({n_lidar:,}) -> Total: {n_total:,} seed points for 3DGS!")
+        else:
+            # TRAJECTORY-BASED METHOD: Use 100% full raw metric LiDAR point cloud directly
+            print(f"  [*] [Trajectory-Based 3DGS] Writing 100% Raw Metric LiDAR Seed: {len(lidar_xyz):,} points to points3D.ply, points3D.bin, points3D.txt...")
+            write_colmap_points3d(sparse_out, lidar_xyz, lidar_rgb)
+            print(f"  [+] LiDAR 3DGS seed successfully written to: {sparse_out / 'points3D.ply'}")
     else:
         print("  [*] Using existing sparse points3D as 3DGS seed (no LiDAR cloud available).")
 
@@ -483,7 +664,7 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
 
 
 def setup_sparse_compatibility(out_dir: Path):
-    """Ensure both colmap_3dgs and colmap_3dgs/sparse work seamlessly in Spirula Studio."""
+    """Ensure both colmap_3dgs and colmap_3dgs/sparse work seamlessly in Spirula Studio without duplicating files."""
     sparse_dir = out_dir / "sparse"
     sparse_0 = sparse_dir / "0"
     if sparse_0.is_dir():
@@ -492,32 +673,16 @@ def setup_sparse_compatibility(out_dir: Path):
             dst = sparse_dir / fname
             if src.is_file() and not dst.exists():
                 try:
-                    dst.symlink_to(src)
+                    os.link(src, dst)
                 except Exception:
-                    shutil.copy2(src, dst)
-
-    images_dir = out_dir / "images"
-    sparse_images = sparse_dir / "images"
-    if images_dir.is_dir() and not sparse_images.exists():
-        try:
-            if os.name == "nt":
-                subprocess.run(["cmd", "/c", "mklink", "/J", str(sparse_images), str(images_dir)], capture_output=True)
-            if not sparse_images.exists():
-                sparse_images.symlink_to(images_dir, target_is_directory=True)
-        except Exception:
-            pass
+                    try:
+                        dst.symlink_to(src)
+                    except Exception:
+                        pass
 
 
 def _postprocess_3dgs_dataset(out_dir: Path, dataset_dir: Path):
     """Adds point cloud seed, compatibility links, and instructions to the 3DGS dataset."""
-    ply_candidates = sorted((dataset_dir / "deliverables").glob("lidar_colored_*.ply"))
-    if not ply_candidates:
-        ply_candidates = sorted(dataset_dir.glob("*.ply"))
-    if ply_candidates:
-        try:
-            shutil.copy2(ply_candidates[-1], out_dir / "points3D_lidar.ply")
-        except Exception:
-            pass
 
     readme_txt = out_dir / "README_3DGS_DATASET.txt"
     try:
@@ -601,8 +766,12 @@ def execute_unified_workflow(
     # STAGE 1: Extract frames from INSV
     # --------------------------------------------------------------------------
     print("\n[STAGE 1/5] Extracting video frames from INSV...")
+    frames_manifest = output_dir / "images" / "frames.json"
+    previous_frames = frames_manifest.stat().st_mtime_ns if frames_manifest.is_file() else None
     if not extract_insv_frames(insv_path, output_dir, fps=fps):
         raise RuntimeError("Failed to extract video frames from INSV")
+    frames_changed = previous_frames is not None and frames_manifest.stat().st_mtime_ns != previous_frames
+    is_timelapse = json.loads(frames_manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse'
 
     # --------------------------------------------------------------------------
     # STAGE 2: Time synchronization (IMU Cross-Correlation)
@@ -683,11 +852,15 @@ def execute_unified_workflow(
             calib = resources() / "calibracao_rigida_raven_insta360.json"
 
     sparse_bin = output_dir / "sparse" / "0" / "points3D.bin"
-    if (method in ("sfm", "all") or run_spirula) and not sparse_bin.is_file():
+    if (method in ("sfm", "all") or run_spirula or (frames_changed and sparse_bin.is_file())) and (not sparse_bin.is_file() or frames_changed):
         print("[*] Running Spirula SfM (Vulkan GPU Headless)...")
         try:
-            pipeline.run_spirula_sfm_auto(output_dir)
+            rebuilt = pipeline.run_spirula_sfm_auto(output_dir)
+            if frames_changed and not rebuilt:
+                raise RuntimeError("SfM rebuild failed after video frames changed")
         except Exception as e:
+            if frames_changed:
+                raise
             print(f"[!] Spirula SfM run notice: {e}")
 
     sparse_bin = output_dir / "sparse" / "0" / "points3D.bin"
@@ -697,6 +870,8 @@ def execute_unified_workflow(
             align_data = pipeline.align_colmap_to_lidar(output_dir, fps=fps, dt_hint=dt_sync)
             dt_sync = align_data.get("dt_sync_seconds", dt_sync)
         except Exception as e:
+            if is_timelapse:
+                raise RuntimeError(f'Timelapse alignment failed: {e}') from e
             print(f"[!] Metric alignment notice: {e}")
 
         if recalibrate:
@@ -707,6 +882,8 @@ def execute_unified_workflow(
                 if not calib.is_file():
                     calib = output_dir / "calibracao_rigida_auto.json"
             except Exception as e:
+                if is_timelapse:
+                    raise RuntimeError(f'Timelapse rig calibration failed: {e}') from e
                 print(f"[!] Extrinsics recalibration notice: {e}")
 
     # --------------------------------------------------------------------------

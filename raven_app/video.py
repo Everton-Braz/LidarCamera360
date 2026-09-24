@@ -13,6 +13,8 @@ import tempfile
 import cv2
 import numpy as np
 
+from raven_app.insv_telemetry import trailer_record
+
 
 def compute_laplacian_sharpness(image):
     """Compute variance of the Laplacian as a blur/sharpness metric."""
@@ -33,6 +35,28 @@ def _timestamps(path, mtime_ns, size):
     return json.loads(Path(path).read_text(encoding='utf-8'))['timestamps']
 
 
+def _timelapse_times(path):
+    """Capture seconds relative to the first exposure, matching camera gyro time."""
+    try:
+        raw = trailer_record(path, 6)
+    except ValueError as exc:
+        # Generic MP4/MKV input (including test videos named .insv) has no trailer.
+        if str(exc) not in ('Invalid INSV magic footer', 'INSV file is too short for a trailer'):
+            raise
+        return None
+    if raw is None:
+        return None
+    exposure = trailer_record(path, 4)
+    if not exposure or len(exposure) < 8 or len(raw) % 8:
+        raise ValueError('Incomplete INSV timelapse telemetry')
+    stamps = np.frombuffer(raw, dtype='<u8').astype(np.float64)
+    origin = float(int.from_bytes(exposure[:8], 'little'))
+    times = (stamps - origin) / 1e6
+    if not len(times) or not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0):
+        raise ValueError('Invalid INSV timelapse timestamps')
+    return times
+
+
 def frame_time(dataset_dir, name, fps=2.0):
     """Read measured presentation time; support older, one-based frame datasets."""
     manifest = Path(dataset_dir) / 'images' / 'frames.json'
@@ -42,6 +66,8 @@ def frame_time(dataset_dir, name, fps=2.0):
         key = str(name).replace('\\', '/')
         if key in data:
             return float(data[key])
+        if json.loads(manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse':
+            raise KeyError(f'No capture timestamp for {key}')
     digits = ''.join(filter(str.isdigit, Path(name).stem))
     return (int(digits) - 1) / fps
 
@@ -128,7 +154,7 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
     stat = insv_path.stat()
     signature = dict(source=str(insv_path.resolve()), size=stat.st_size,
                      mtime_ns=stat.st_mtime_ns, fps=fps, sharp_window=sharp_window,
-                     jpeg_quality=jpeg_quality, version=2)
+                     jpeg_quality=jpeg_quality, version=3)
     images = output_dir / 'images'
     manifest = images / 'frames.json'
     if manifest.is_file():
@@ -141,6 +167,7 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
             print('[*] Reusing completed video extraction.')
             return True
     output_dir.mkdir(parents=True, exist_ok=True)
+    capture_times = _timelapse_times(insv_path) if insv_path.suffix.lower() == '.insv' else None
     backend = _select_decoder(insv_path, decoder, threads)
     attempts = [backend] + (['cpu'] if decoder == 'auto' and backend != 'cpu' else [])
     for backend in attempts:
@@ -192,9 +219,13 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     if any(f is None for f in pair):
                         raise ValueError('Video tracks have different frame counts')
                     times = [float(f.time) - origin if f.time is not None else index / rate for f in pair]
+                    if capture_times is not None and index >= len(capture_times):
+                        raise ValueError('More video frames than timelapse timestamps')
                     index += 1
                     if abs(times[0] - times[1]) > 0.5 / rate:
                         raise ValueError('Video tracks have mismatched presentation timestamps')
+                    if capture_times is not None:
+                        times = [float(capture_times[index - 1])] * 2
                     bucket = int(math.floor(max(0.0, times[0]) * fps + 1e-7))
                     if bucket != interval:
                         save(best)
@@ -213,6 +244,8 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     finish_job()
                 if not count:
                     raise ValueError('No video frames decoded')
+                if capture_times is not None and len(capture_times) not in (index, index + 1):
+                    raise ValueError('Timelapse timestamps do not match video frame count')
                 images.mkdir(exist_ok=True)
                 manifest.unlink(missing_ok=True)
                 for cam in ('cam0', 'cam1'):
@@ -223,6 +256,7 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     for file in (stage / cam).iterdir():
                         shutil.move(str(file), target / file.name)
                 manifest.write_text(json.dumps(dict(signature=signature, timestamps=timestamps,
+                                                    time_source='insv_timelapse' if capture_times is not None else 'video_pts',
                                                     decoder=backend), indent=2), encoding='utf-8')
                 print(f'[+] Extracted {count} synchronized sharp frame pairs.')
                 return True

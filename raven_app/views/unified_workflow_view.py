@@ -198,6 +198,7 @@ class UnifiedWorkflowView(QWidget):
         self.fps_spin.setRange(0.1, 60.0)
         self.fps_spin.setValue(2.0)
         self.fps_spin.setSingleStep(0.5)
+        self.fps_spin.setToolTip("Maximum frames extracted per second of real capture time. INSV timelapse timing is detected automatically.")
         sync_row.addWidget(self.fps_caption)
         sync_row.addWidget(self.fps_spin)
 

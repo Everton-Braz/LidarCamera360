@@ -485,6 +485,10 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
 
 def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None):
     """Executa o alinhamento de alta precisão Sim(3) + ICP entre COLMAP e LiDAR"""
+    manifest = dataset_dir / 'images/frames.json'
+    if manifest.is_file() and json.loads(manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse':
+        from raven_app.timelapse_calibration import align_dataset
+        return align_dataset(dataset_dir, dt_hint)
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
     slam_trj = get_slam_trajectory_path(dataset_dir)
@@ -615,6 +619,7 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None):
 
     align_data = {
         "calibration_version": CALIBRATION_VERSION,
+        "frame_time_source": json.loads((dataset_dir / "images" / "frames.json").read_text(encoding="utf-8")).get("time_source", "video_pts") if (dataset_dir / "images" / "frames.json").is_file() else "legacy_frame_rate",
         "initial_camera_lever_body_m": c_L_phys.tolist(),
         "trajectory_rmse_cm": float(best_rmse * 100),
         "scale": float(s_comp),
@@ -633,6 +638,12 @@ def current_alignment(dataset_dir, fps=2.0):
     """Upgrade alignments made with the old inverted lever initialization."""
     path = dataset_dir / "colmap_to_lidar_alignment.json"
     saved = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+    manifest = dataset_dir / "images" / "frames.json"
+    source = json.loads(manifest.read_text(encoding='utf-8')).get('time_source', 'video_pts') if manifest.is_file() else 'legacy_frame_rate'
+    if source == 'insv_timelapse':
+        from raven_app.timelapse_calibration import VERSION
+        if saved.get('timelapse_calibration_version') != VERSION or saved.get('quality_status') != 'accepted':
+            return align_colmap_to_lidar(dataset_dir, fps, saved.get('dt_sync_seconds'))
     if saved.get('calibration_version') != CALIBRATION_VERSION:
         return align_colmap_to_lidar(dataset_dir, fps, saved.get('dt_sync_seconds'))
     return saved
@@ -963,6 +974,9 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0):
 
     def solve_lens(cam_prefix):
         cam_imgs = [im for im in images if im["name"].startswith(cam_prefix)]
+        if 'accepted_image_names' in al:
+            accepted = set(al['accepted_image_names'])
+            cam_imgs = [im for im in cam_imgs if im['name'] in accepted]
         cam_imgs.sort(key=lambda x: get_fn(x["name"]))
         R_list, t_list = [], []
         for im in cam_imgs:
@@ -989,6 +1003,11 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0):
 
     R0, t0 = solve_lens("cam0/")
     R1, t1 = solve_lens("cam1/")
+    if al.get('frame_time_source') == 'insv_timelapse':
+        if any(not .08 <= np.linalg.norm(t) <= .30 for t in (t0, t1)) or np.linalg.norm(t0-t1) > .12:
+            raise ValueError('Timelapse rig calibration rejected: implausible camera lever arm')
+        if abs(np.degrees((R0.inv()*R1).magnitude())-180.) > 5.:
+            raise ValueError('Timelapse rig calibration rejected: inconsistent front/rear rotations')
 
     T_LC0 = np.eye(4)
     T_LC0[:3, :3] = R0.as_matrix()
@@ -1011,6 +1030,7 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0):
 
     calib_dict = {
         "calibration_version": CALIBRATION_VERSION,
+        "timelapse_calibration_version": al.get('timelapse_calibration_version'),
         "scanner": "3DMakerPro_Raven_LiDAR",
         "camera": "Insta360_X4_DualFisheye",
         "lens_model": "THIN_PRISM_FISHEYE",
@@ -1072,6 +1092,10 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
 
     cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
     images = load_colmap_images(sparse_dir / "images.bin")
+    pose_overrides = {}
+    if al.get('frame_time_source') == 'insv_timelapse':
+        from raven_app.timelapse_calibration import rejected_pose_overrides
+        pose_overrides = rejected_pose_overrides(dataset_dir, al, images)
     pts_lidar = load_pcd(slam_pcd)
     n_pts = len(pts_lidar)
 
@@ -1100,6 +1124,10 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
         # Posição e orientação da câmera no referencial LiDAR
         C_lidar = s_sim * (R_sim @ im["C"]) + t_sim
         R_cw_lidar = im["R_cw"] @ R_sim.T
+        if im['name'] in pose_overrides:
+            if pose_overrides[im['name']] is None:
+                continue
+            R_cw_lidar, C_lidar = pose_overrides[im['name']]
 
         if gpu_views is not None:
             gpu_views.append((img_path, R_cw_lidar, C_lidar, params))
@@ -1264,10 +1292,12 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     with open(calib_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
+    active_alignment = {}
     if (dataset_dir / 'sparse/0/images.bin').is_file():
-        current_alignment(dataset_dir, fps)
+        active_alignment = current_alignment(dataset_dir, fps)
         if (calib_json_path.name in ('rig_calibration.json', 'calibracao_rigida_auto.json')
-                and cfg.get('calibration_version') != CALIBRATION_VERSION):
+                and (cfg.get('calibration_version') != CALIBRATION_VERSION
+                     or cfg.get('timelapse_calibration_version') != active_alignment.get('timelapse_calibration_version'))):
             cfg = recalibrate_from_sfm(dataset_dir, fps)
 
     p0 = cfg["cam0_front_intrinsics"]
@@ -1351,7 +1381,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     # Se alinhamento SfM existir, calcular correção suave de drift da trajetória (Amostragem de Keyframes)
     use_drift_correction = False
     sparse_img_bin = dataset_dir / "sparse" / "0" / "images.bin"
-    if align_json.exists() and sparse_img_bin.exists():
+    is_timelapse = active_alignment.get('frame_time_source') == 'insv_timelapse'
+    if align_json.exists() and sparse_img_bin.exists() and not is_timelapse:
         try:
             with open(align_json, "r", encoding="utf-8") as f:
                 al = json.load(f)

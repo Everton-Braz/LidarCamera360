@@ -4,7 +4,7 @@ from unittest.mock import patch
 import numpy as np
 import cv2
 import av
-from raven_app.video import extract_insv_frames_pyav, frame_time
+from raven_app.video import extract_insv_frames_pyav, frame_time, _timelapse_times
 from raven_app.vulkan_engine import colorize_views, get_vulkan_bin
 from scripts.pipeline_auto_calibrator_and_colorizer import project_thin_prism
 
@@ -45,6 +45,24 @@ class VideoTests(unittest.TestCase):
     def test_legacy_one_based(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(frame_time(tmp,'cam1/frame_000003.jpg',2),1)
+
+    def test_timelapse_uses_capture_time_for_selection_and_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); source=root/'test.insv'; self.make_video(source)
+            capture=np.arange(23,dtype=float)*2.0 + .3
+            with patch('raven_app.video._timelapse_times',return_value=capture):
+                self.assertTrue(extract_insv_frames_pyav(source,root/'out',fps=1,sharp_window=1))
+            manifest=json.loads((root/'out/images/frames.json').read_text())
+            self.assertEqual(manifest['time_source'],'insv_timelapse')
+            self.assertEqual(len(list((root/'out/images/cam0').glob('*.jpg'))),23)
+            self.assertAlmostEqual(frame_time(root/'out','cam0/frame_000023.jpg'),44.3)
+
+    def test_timelapse_count_mismatch_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); source=root/'test.insv'; self.make_video(source)
+            with patch('raven_app.video._timelapse_times',return_value=np.arange(21,dtype=float)*2):
+                self.assertFalse(extract_insv_frames_pyav(source,root/'out',fps=1))
+            self.assertFalse((root/'out/images/frames.json').exists())
 
 @unittest.skipUnless(get_vulkan_bin().is_file(),'Native Vulkan build unavailable')
 class VulkanTests(unittest.TestCase):
