@@ -42,3 +42,8 @@ option(RAVEN_BUILD_VULKAN "Build Vulkan compute colorizer" ON)
 if(RAVEN_BUILD_VULKAN)
   add_subdirectory(vulkan_colorizer)
 endif()
+
+option(RAVEN_BUILD_VULKAN_RFDETR_OPS "Build experimental Vulkan RF-DETR inference primitives" OFF)
+if(RAVEN_BUILD_VULKAN_RFDETR_OPS)
+  add_subdirectory(vulkan_rfdetr)
+endif()
