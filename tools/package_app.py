@@ -22,7 +22,11 @@ def main():
     p.add_argument('--onefile', action='store_true', help="Package as single-file portable executable")
     p.add_argument('--bundle-spirula', action='store_true', help='Compatibility flag; Spirula is always bundled')
     p.add_argument('--incremental', action='store_true', help='Reuse PyInstaller analysis cache')
+    p.add_argument('--with-person-masker', action='store_true', help='Bundle RF-DETR model and TensorRT runtime for offline masking (large)')
+    p.add_argument('--dist-root', type=Path, default=ROOT / 'dist',
+                   help='Destination root for the packaged app (default: dist)')
     a = p.parse_args()
+    dist_root = a.dist_root.resolve()
 
     # Validate required runtime modules are installed
     for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets',
@@ -63,8 +67,8 @@ def main():
         sys.executable, '-m', 'PyInstaller', '--noconfirm',
         '--name', APP_NAME,
         '--onefile' if a.onefile else '--onedir',
-        '--console',
-        '--distpath', str(ROOT / 'dist/single-file' if a.onefile else ROOT / 'dist'),
+        '--windowed',
+        '--distpath', str(dist_root / 'single-file' if a.onefile else dist_root),
         '--workpath', str(ROOT / 'build/pyinstaller'),
         '--specpath', str(ROOT / 'build'),
         '--paths', str(ROOT),
@@ -100,18 +104,32 @@ def main():
         if bin_zstd.is_file() and bin_zstd.read_bytes() != conda_zstd.read_bytes():
             shutil.copy2(conda_zstd, bin_zstd)
 
-    if (ROOT / 'docs/STANDALONE.md').is_file():
-        cmd += ['--add-data', f'{ROOT / "docs/STANDALONE.md"};docs']
-
-    for name in ('torch', 'tensorflow', 'matplotlib', 'pandas', 'IPython', 'pytest', 'open3d', 'PyQt5', 'PySide6'):
-        cmd += ['--exclude-module', name]
-
     added_binaries = set()
     def add_binary(src, dst='bin'):
         p = Path(src).resolve()
         if p not in added_binaries and p.is_file():
             added_binaries.add(p)
             cmd.extend(['--add-binary', f'{p};{dst}'])
+
+    if (ROOT / 'docs/STANDALONE.md').is_file():
+        cmd += ['--add-data', f'{ROOT / "docs/STANDALONE.md"};docs']
+
+    rfdetr_source = ROOT / 'native/rfdetr_masker'
+    masker_candidates = (ROOT / 'build/rfdetr-masker/Release/rfdetr-masker.exe',
+                         ROOT / 'bin/rfdetr-masker.exe')
+    masker_exe = next((path for path in masker_candidates if path.is_file()), None)
+    if masker_exe is None:
+        raise SystemExit('Build native/rfdetr_masker first (rfdetr-masker.exe is required for lazy RF-DETR downloads)')
+    add_binary(masker_exe, 'bin')
+    if rfdetr_source.is_dir():
+        cmd += ['--add-data', f'{rfdetr_source};licenses/rfdetr/source']
+    for notice in ('LICENSE', 'NVIDIA-TensorRT-LICENSE.txt', 'THIRD_PARTY_NOTICES.md'):
+        source = rfdetr_source / notice
+        if source.is_file():
+            shutil.copy2(source, licenses / f'RF-DETR-{notice}')
+
+    for name in ('torch', 'tensorflow', 'matplotlib', 'pandas', 'IPython', 'pytest', 'open3d', 'PyQt5', 'PySide6'):
+        cmd += ['--exclude-module', name]
 
     for f in sorted(native.glob('*')):
         if f.suffix.lower() in ('.exe', '.dll'):
@@ -142,6 +160,19 @@ def main():
             raise SystemExit(f'Missing compiled shader: {source}')
         cmd += ['--add-data', f'{source};bin/shaders']
 
+    if a.with_person_masker:
+        masker_dir = masker_exe.parent
+        model = ROOT / 'models/rfdetr-seg-medium.onnx'
+        if not model.is_file():
+            raise SystemExit('Build native/rfdetr_masker and stage models/rfdetr-seg-medium.onnx first')
+        for required in ('nvinfer_10.dll', 'nvonnxparser_10.dll', 'nvinfer_builder_resource_10.dll', 'nvinfer_plugin_10.dll'):
+            if not (masker_dir / required).is_file():
+                raise SystemExit(f'RF-DETR ONNX deployment requires {required}; stage the complete runtime')
+        for binary in masker_dir.iterdir():
+            if binary.suffix.lower() == '.dll':
+                add_binary(binary, 'bin')
+        cmd += ['--add-data', f'{model};models']
+
     entry = ROOT / 'lidarcamera360.py' if (ROOT / 'lidarcamera360.py').is_file() else ROOT / 'raven.py'
     cmd.append(str(entry))
     print(f"[*] Running PyInstaller packaging ({'ONEFILE' if a.onefile else 'ONEDIR'})...")
@@ -160,14 +191,14 @@ def main():
         env['PATH'] = os.pathsep.join([p for p in paths if Path(p).is_dir()] + ([existing] if existing else []))
     subprocess.run(cmd, check=True, cwd=ROOT, env=env)
 
-    output = ROOT / 'dist/single-file' if a.onefile else ROOT / f'dist/{APP_NAME}'
+    output = dist_root / 'single-file' if a.onefile else dist_root / APP_NAME
     output.mkdir(parents=True, exist_ok=True)
     if (ROOT / 'docs/STANDALONE.md').is_file():
         shutil.copy2(ROOT / 'docs/STANDALONE.md', output / 'README.md')
     # Also make the native engine runnable on its own, without relying on the
     # parent bootloader's DLL directory or a system Visual C++ installation.
     if a.onefile:
-        portable_target = ROOT / f'dist/{APP_NAME}_portable.exe'
+        portable_target = dist_root / f'{APP_NAME}_portable.exe'
         shutil.copy2(output / f'{APP_NAME}.exe', portable_target)
         print(f"[+] Portable executable saved to: {portable_target}")
     else:

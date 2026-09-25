@@ -34,6 +34,44 @@ def finite(value):
     return v
 
 
+def nonnegative(value):
+    v = finite(value)
+    if v < 0:
+        raise argparse.ArgumentTypeError('must be non-negative')
+    return v
+
+
+def unit_interval(value):
+    v = finite(value)
+    if not 0.0 < v < 1.0:
+        raise argparse.ArgumentTypeError('must be greater than 0 and less than 1')
+    return v
+
+
+def ratio(value):
+    v = finite(value)
+    if not 0.0 <= v <= 1.0:
+        raise argparse.ArgumentTypeError('must be between 0 and 1')
+    return v
+
+
+def add_mask_options(p):
+    p.add_argument('--mask-persons', action='store_true',
+                   help='Generate RF-DETR and configured fixed-area masks before colorization')
+    p.add_argument('--masks-dir', type=Path,
+                   help='Reuse existing person masks from this directory')
+    p.add_argument('--mask-model', type=Path,
+                   help='Optional RF-DETR ONNX/engine model path (otherwise auto-discovered)')
+    p.add_argument('--mask-threshold', type=unit_interval, default=0.5,
+                   help='RF-DETR person confidence threshold (default: 0.5)')
+    p.add_argument('--mask-margin', type=ratio, default=0.03,
+                   help='Person mask expansion as a fraction of each detection box size (default: 0.03)')
+    p.add_argument('--mask-config', type=Path,
+                   help='JSON mask settings: fisheye border cutoff and per-camera rectangles')
+    p.add_argument('--operator-radius', type=nonnegative, default=0.0,
+                   help='Operator removal radius in meters; requires --mask-persons or --masks-dir (default: off)')
+
+
 def bag_options(p):
     p.add_argument('--bag',type=Path,nargs='+',required=True,help='One merged bag, or non-overlapping split bags')
     p.add_argument('--scanner', '--preset', choices=['auto', 'raven', 'eagle'], default='auto', help='Scanner preset (auto, raven, eagle)')
@@ -54,6 +92,8 @@ def parse(argv=None):
     gui=sub.add_parser('gui',help='Open desktop controls')
     gui.add_argument('--smoke-test', action='store_true', help=argparse.SUPPRESS)
     sub.add_parser('doctor',help='Report bundled engines and numerical runtime')
+    sub.add_parser('download-mask-resources',
+                   help='Download and verify the RF-DETR model and TensorRT runtime into the user cache')
     video=sub.add_parser('extract-insv', help='Extract synchronized sharp lens frames using bundled PyAV')
     video.add_argument('--insv', type=Path, required=True)
     video.add_argument('--output', type=Path, required=True)
@@ -63,6 +103,13 @@ def parse(argv=None):
     gps.add_argument('--output', type=Path, required=True)
     gps.add_argument('--formats', nargs='+', choices=('geojson', 'gpx', 'csv'), default=None,
                      help='GPS output formats; report JSON is always written (default: CSV and GPX)')
+    masks = sub.add_parser('mask-persons', help='Generate headless RF-DETR person masks for an image dataset')
+    masks.add_argument('--dataset', type=Path, required=True)
+    masks.add_argument('--model', '--mask-model', dest='model', type=Path,
+                       help='Optional RF-DETR ONNX/engine model path (otherwise auto-discovered)')
+    masks.add_argument('--threshold', type=unit_interval, default=0.5)
+    masks.add_argument('--margin', type=ratio, default=0.03)
+    masks.add_argument('--mask-config', type=Path)
     geo=sub.add_parser('georeference', help='Calculate INSV GPS, georeference point clouds and COLMAP datasets, and export GeoJSON')
     geo.add_argument('--insv', type=Path, required=True, help='Path to Insta360 .INSV video')
     geo.add_argument('--output', type=Path, required=True, help='Output directory for georeferenced deliverables and GeoJSON')
@@ -97,6 +144,7 @@ def parse(argv=None):
     color.add_argument('--dt',type=finite)
     color.add_argument('--run-spirula',action='store_true')
     color.add_argument('--recalibrate-from-sfm',action='store_true')
+    add_mask_options(color)
     wf=sub.add_parser('workflow',help='Run end-to-end processing: Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables')
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
     wf.add_argument('--insv',type=Path,required=True,help='Insta360 video file')
@@ -122,12 +170,19 @@ def parse(argv=None):
                     default=('geojson', 'gpx', 'csv'), help='Selected GPS deliverables')
     wf.add_argument('--geo-formats', nargs='+', choices=('laz', 'las', 'ply', 'pcd', 'geojson'),
                     default=('laz', 'geojson'), help='Automatic georeferenced cloud formats')
+    add_mask_options(wf)
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
     a=p.parse_args(argv)
     if hasattr(a, 'method'):
         if a.method == 'trajectory': a.method = 'direct'
         elif a.method == 'reconstruction': a.method = 'sfm'
+    if getattr(a, 'mask_persons', False) and getattr(a, 'masks_dir', None):
+        p.error('--mask-persons and --masks-dir are mutually exclusive')
+    if getattr(a, 'mask_config', None) and getattr(a, 'command', None) in ('colorize', 'workflow') and not a.mask_persons:
+        p.error('--mask-config requires --mask-persons; existing masks use settings stored in their manifest')
+    if getattr(a, 'operator_radius', 0) > 0 and not (getattr(a, 'mask_persons', False) or getattr(a, 'masks_dir', None)):
+        p.error('--operator-radius requires --mask-persons or --masks-dir; removing a trajectory corridor can erase fixed objects')
     if a.headless and a.command in (None,'gui'):p.error('--headless requires a processing or inspection command')
     return a
 
@@ -198,6 +253,11 @@ def run(a):
             report['native_version'] = probe.stdout.strip()
         print(json.dumps(report, indent=2))
         return 0 if report.get('native_exit_code') == 0 else 2
+    if a.command == 'download-mask-resources':
+        from raven_app.mask_resources import download_progress, ensure_resources
+        model, runtime = ensure_resources(download_progress)
+        print(json.dumps({'model': str(model), 'runtime': str(runtime)}, ensure_ascii=False), flush=True)
+        return 0
     if a.command=='extract-insv':
         from raven_app.video import extract_insv_frames_pyav
         return 0 if extract_insv_frames_pyav(a.insv, a.output, fps=a.fps) else 2
@@ -208,6 +268,14 @@ def run(a):
         reports = [export_gps(path, a.output / path.stem, formats=a.formats) for path in a.insv]
         print(json.dumps(reports, indent=2, ensure_ascii=False))
         return 0 if all(r['valid_records'] for r in reports) else 2
+    if a.command=='mask-persons':
+        from raven_app.person_masks import generate_person_masks
+        masks_dir = generate_person_masks(
+            a.dataset, model_path=a.model, threshold=a.threshold, margin=a.margin,
+            mask_config=a.mask_config
+        )
+        print(json.dumps({'masks_dir': str(masks_dir)}, ensure_ascii=False))
+        return 0
     if a.command=='georeference':
         from raven_app.georeference import run_georeference
         report = run_georeference(
@@ -273,6 +341,9 @@ def run(a):
                 raise
     if a.command=='colorize':
         from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
+        if a.mask_persons:
+            from raven_app.person_masks import read_mask_config
+            read_mask_config(a.mask_config)
         dataset=a.dataset.resolve()
         trj = pipeline.get_slam_trajectory_path(dataset)
         if not (dataset/'slam_out/pcd/all_raw_points.pcd').is_file() or not trj.is_file():
@@ -281,8 +352,25 @@ def run(a):
             if not any((dataset/'images'/cam).glob('*.jpg')):raise ValueError(f'Missing extracted frames in images/{cam}')
         if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset):raise RuntimeError('Spirula reconstruction failed')
         if a.recalibrate_from_sfm:pipeline.recalibrate_from_sfm(dataset,fps=a.fps)
-        if a.method in ('sfm','all'):pipeline.colorize_via_spirula_sfm(dataset,fps=a.fps,use_vulkan=not a.no_vulkan)
-        if a.method in ('direct','all'):pipeline.colorize_via_direct_rigid(dataset,a.calib,fps=a.fps,dt_override=a.dt,use_vulkan=not a.no_vulkan)
+        masks_dir = a.masks_dir
+        if a.mask_persons:
+            from raven_app.person_masks import generate_person_masks
+            masks_dir = generate_person_masks(
+                dataset, model_path=a.mask_model,
+                threshold=a.mask_threshold, margin=a.mask_margin,
+                mask_config=a.mask_config
+            )
+        if a.method in ('sfm','all'):
+            pipeline.colorize_via_spirula_sfm(
+                dataset, fps=a.fps, use_vulkan=not a.no_vulkan,
+                masks_dir=masks_dir, operator_radius=a.operator_radius
+            )
+        if a.method in ('direct','all'):
+            pipeline.colorize_via_direct_rigid(
+                dataset, a.calib, fps=a.fps, dt_override=a.dt,
+                use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
+                operator_radius=a.operator_radius
+            )
         return 0
     if a.command=='workflow':
         from raven_app.workflow import execute_unified_workflow
@@ -320,6 +408,13 @@ def run(a):
             process_gps=a.process_gps,
             gps_formats=a.gps_formats,
             geo_formats=a.geo_formats,
+            mask_persons=a.mask_persons,
+            masks_dir=a.masks_dir,
+            mask_model=a.mask_model,
+            mask_threshold=a.mask_threshold,
+            mask_margin=a.mask_margin,
+            mask_config=a.mask_config,
+            operator_radius=a.operator_radius,
         )
     raise ValueError('Unknown command')
 

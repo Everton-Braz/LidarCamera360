@@ -2,6 +2,8 @@
 
 LidarCamera360 is a portable Windows x64 application. Keep `LidarCamera360.exe` and `_internal/` together when copying `dist/LidarCamera360/`. The single-file build is under `dist/single-file/` when extraction at startup is acceptable.
 
+RF-DETR masking resources are lazy downloads. The portable build includes the small masker executable, while the ONNX model and TensorRT runtime are fetched only when requested and stored under `%APPDATA%\RavenCalibrator`; they are not embedded in the portable executable.
+
 ## Commands
 
 ```powershell

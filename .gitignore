@@ -8,6 +8,8 @@ build/
 dist/
 bin/
 *.dll
+models/*.onnx
+models/*.engine
 
 # Large binary scan & media files
 dataset-test/

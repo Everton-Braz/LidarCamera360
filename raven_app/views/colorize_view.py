@@ -1,8 +1,9 @@
 """LiDAR point cloud colorization view."""
+import json
 from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QFrame, QDialog, QMessageBox
 )
 from qfluentwidgets import (
     CardWidget, TitleLabel, SubtitleLabel, BodyLabel,
@@ -11,6 +12,8 @@ from qfluentwidgets import (
     PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
 )
 from raven_app.process_runner import ProcessRunner
+from raven_app.mask_download import MaskResourceDownload
+from raven_app.mask_resources import resolve_model, resolve_runtime_dir
 from raven_app.i18n import tr
 
 
@@ -21,6 +24,8 @@ class ColorizeView(QWidget):
         super().__init__(parent)
         self.setObjectName("ColorizeView")
         self.runner = runner
+        self._mask_downloader = None
+        self.mask_config = None
         self._init_ui()
         self._connect_signals()
 
@@ -129,6 +134,32 @@ class ColorizeView(QWidget):
         check_row.addStretch()
         params_layout.addLayout(check_row)
 
+        mask_row = QHBoxLayout()
+        self.chk_mask_persons = CheckBox(tr("Generate masks"))
+        self.chk_mask_persons.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
+        self.btn_mask_model = PushButton(tr("Download model RF-DETR"), icon=FluentIcon.DOWNLOAD)
+        self.btn_mask_model.setToolTip(tr("Download the RF-DETR model and, when needed, its TensorRT runtime to the user cache. The portable app stays small."))
+        self.btn_mask_model.clicked.connect(self._download_rf_detr)
+        self.btn_mask_settings = PushButton(tr("Mask settings..."))
+        self.btn_mask_settings.clicked.connect(self._open_mask_settings)
+        self.operator_radius_label = BodyLabel(tr("Operator removal radius (m):"))
+        self.operator_radius_spin = DoubleSpinBox()
+        self.operator_radius_spin.setRange(0.0, 5.0)
+        self.operator_radius_spin.setDecimals(2)
+        self.operator_radius_spin.setSingleStep(0.10)
+        self.operator_radius_spin.setValue(0.0)
+        self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
+        self.operator_radius_spin.valueChanged.connect(lambda value: self.chk_mask_persons.setChecked(True) if value > 0 else None)
+        self.chk_mask_persons.toggled.connect(lambda checked: self.operator_radius_spin.setValue(0.0) if not checked else None)
+        mask_row.addWidget(self.chk_mask_persons)
+        mask_row.addWidget(self.btn_mask_model)
+        mask_row.addWidget(self.btn_mask_settings)
+        mask_row.addSpacing(12)
+        mask_row.addWidget(self.operator_radius_label)
+        mask_row.addWidget(self.operator_radius_spin)
+        mask_row.addStretch()
+        params_layout.addLayout(mask_row)
+
         layout.addWidget(params_card)
 
         # Action & Status Card
@@ -201,6 +232,68 @@ class ColorizeView(QWidget):
         if path:
             self.calib_input.setText(path)
 
+    def _download_rf_detr(self):
+        if self.runner.is_busy:
+            InfoBar.warning(title=tr('Processing is active'), content=tr('Wait for the current task to finish before downloading RF-DETR resources.'), parent=self)
+            return
+        if resolve_model() is not None and resolve_runtime_dir() is not None:
+            InfoBar.success(title=tr('RF-DETR is ready'), content=tr('The model and TensorRT runtime are already available.'), parent=self)
+            return
+        answer = QMessageBox.question(
+            self, tr('Download RF-DETR resources'),
+            tr('Verify or download the 139 MB model as needed. If the NVIDIA TensorRT runtime is missing, download about 1.3 GB; extraction may need up to 3 GB of temporary disk space. Files are cached for this Windows user and are not added to the portable app.'),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        downloader = MaskResourceDownload(self)
+        self._mask_downloader = downloader
+        downloader.progress.connect(self._on_mask_download_progress)
+        downloader.completed.connect(self._on_mask_download_completed)
+        self.btn_mask_model.setEnabled(False)
+        self.btn_run.setEnabled(False)
+        self.btn_mask_model.setText(tr('Preparing RF-DETR...'))
+        if not downloader.start():
+            self._on_mask_download_completed(2, tr('Could not start the resource downloader.'))
+
+    def _on_mask_download_progress(self, resource, percent):
+        title = tr('RF-DETR model') if resource == 'model' else (tr('Installing TensorRT') if resource == 'install' else tr('TensorRT runtime'))
+        self.btn_mask_model.setText(f'{title}: {percent}%')
+
+    def _on_mask_download_completed(self, code, output):
+        downloader, self._mask_downloader = self._mask_downloader, None
+        self.btn_mask_model.setEnabled(True)
+        self.btn_mask_model.setText(tr('Download model RF-DETR'))
+        self.btn_run.setEnabled(True)
+        if downloader is not None:
+            downloader.deleteLater()
+        if code == 0 and resolve_model() is not None and resolve_runtime_dir() is not None:
+            InfoBar.success(title=tr('RF-DETR resources ready'), content=tr('The verified model and TensorRT runtime are saved in the user cache.'), parent=self)
+        else:
+            detail = output[-700:] if output else tr('Check your internet connection and available disk space, then retry.')
+            InfoBar.error(title=tr('RF-DETR download failed'), content=detail, parent=self, duration=8000)
+
+    def _open_mask_settings(self):
+        from raven_app.mask_settings_dialog import MaskSettingsDialog
+        from raven_app.person_masks import read_mask_config
+        dataset = Path(self.ds_input.text().strip()) if self.ds_input.text().strip() else None
+        config = self.mask_config
+        settings_path = dataset / 'mask_settings.json' if dataset else None
+        if config is None and settings_path and settings_path.is_file():
+            try:
+                config = read_mask_config(settings_path)
+            except (OSError, ValueError) as exc:
+                InfoBar.error(title=tr('Invalid mask settings'), content=str(exc),
+                              position=InfoBarPosition.TOP, parent=self)
+                return
+        dialog = MaskSettingsDialog(dataset, config, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.mask_config = dialog.settings()
+            self.chk_mask_persons.setChecked(True)
+            count = sum(sum(map(len, self.mask_config[key].values())) for key in ('rectangles', 'ellipses', 'polygons'))
+            self.btn_mask_settings.setText(tr('Mask settings ({n} shapes)').format(n=count))
+
     def _clear_log(self):
         self.log_console.clear()
 
@@ -238,6 +331,24 @@ class ColorizeView(QWidget):
 
         if self.chk_recalib.isChecked():
             args.append('--recalibrate-from-sfm')
+
+        if self.chk_mask_persons.isChecked():
+            args.append('--mask-persons')
+            settings_path = Path(ds).resolve() / 'mask_settings.json'
+            if self.mask_config is not None:
+                try:
+                    temporary = settings_path.with_suffix('.tmp')
+                    temporary.write_text(json.dumps(self.mask_config, indent=2), encoding='utf-8')
+                    temporary.replace(settings_path)
+                except OSError as exc:
+                    InfoBar.error(title=tr('Cannot save mask settings'), content=str(exc),
+                                  position=InfoBarPosition.TOP, parent=self)
+                    return
+            if settings_path.is_file():
+                args.extend(['--mask-config', str(settings_path)])
+
+        if self.operator_radius_spin.value() > 0:
+            args.extend(['--operator-radius', str(self.operator_radius_spin.value())])
 
         self.log_console.appendPlainText(f"\n>>> Starting Colorization: {' '.join(args)}\n")
         self.runner.start_job(args)
@@ -319,6 +430,16 @@ class ColorizeView(QWidget):
         self.dt_label.setText(tr("Manual Δt (s):"))
         self.chk_spirula.setText(tr("Run Spirula SfM automatically if sparse reconstruction is missing"))
         self.chk_recalib.setText(tr("Recalibrate spatial extrinsics from SfM alignment"))
+        self.chk_mask_persons.setText(tr("Generate masks"))
+        self.chk_mask_persons.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
+        shapes = sum(sum(map(len, self.mask_config[key].values()))
+                     for key in ('rectangles', 'ellipses', 'polygons')) if self.mask_config else 0
+        self.btn_mask_settings.setText(tr('Mask settings ({n} shapes)').format(n=shapes) if self.mask_config else tr('Mask settings...'))
+        if self._mask_downloader is None:
+            self.btn_mask_model.setText(tr("Download model RF-DETR"))
+            self.btn_mask_model.setToolTip(tr("Download the RF-DETR model and, when needed, its TensorRT runtime to the user cache. The portable app stays small."))
+        self.operator_radius_label.setText(tr("Operator removal radius (m):"))
+        self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
         self.btn_run.setText(tr("Run Colorization"))
         self.btn_cancel.setText(tr("Cancel"))
         self.log_title.setText(tr("Colorization Log"))
@@ -327,4 +448,3 @@ class ColorizeView(QWidget):
         if not self.runner.is_busy:
             self.status_title.setText(tr("Status: Ready"))
             self.status_desc.setText(tr("Select a dataset folder with PCD trajectory and camera frames."))
-

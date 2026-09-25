@@ -77,6 +77,14 @@ void main() {
 
     if (r_px >= max_radius || u < 0.0 || u >= zbuf_scale.x * float(zbuf_size.x) - 1.0 || v < 0.0 || v >= zbuf_scale.y * float(zbuf_size.y) - 1.0) return;
 
+    // Reject all four bilinear taps if any touches an excluded person pixel.
+    // Unmasked RVC1 images have alpha 1 everywhere.
+    ivec2 pixel = ivec2(floor(uv));
+    if (texelFetch(cameraTexture, pixel, 0).a < 1.0 ||
+        texelFetch(cameraTexture, pixel + ivec2(1, 0), 0).a < 1.0 ||
+        texelFetch(cameraTexture, pixel + ivec2(0, 1), 0).a < 1.0 ||
+        texelFetch(cameraTexture, pixel + ivec2(1, 1), 0).a < 1.0) return;
+
     // 1. Occlusion Check against Z-Buffer
     int ug = clamp(int(floor(u / zbuf_scale.x)), 0, zbuf_size.x - 1);
     int vg = clamp(int(floor(v / zbuf_scale.y)), 0, zbuf_size.y - 1);

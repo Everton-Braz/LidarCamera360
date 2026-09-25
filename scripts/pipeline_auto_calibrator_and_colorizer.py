@@ -31,6 +31,7 @@ from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
 from scipy.ndimage import minimum_filter
 from raven_app.video import frame_time
+from raven_app.person_masks import load_keep_mask, keep_samples, masked_operator_keep
 from raven_app.vulkan_engine import get_vulkan_bin, colorize_views
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -1079,8 +1080,10 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0):
     return calib_dict
 
 
-def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
+def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=None, operator_radius=0.0):
     """Executa a coloração de alta precisão projetando as poses alinhadas do SfM"""
+    if operator_radius > 0 and masks_dir is None:
+        raise ValueError('Operator removal requires person masks (--mask-persons or --masks-dir); a trajectory radius alone can erase doors and walls')
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
@@ -1099,6 +1102,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
     pts_lidar = load_pcd(slam_pcd)
     n_pts = len(pts_lidar)
 
+    operator_views = []
     gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() else None
     K_VIEWS = 3
     top_scores = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS), dtype=np.float32)
@@ -1129,6 +1133,8 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
                 continue
             R_cw_lidar, C_lidar = pose_overrides[im['name']]
 
+        if operator_radius and masks_dir is not None:
+            operator_views.append((img_path, R_cw_lidar, C_lidar, params))
         if gpu_views is not None:
             gpu_views.append((img_path, R_cw_lidar, C_lidar, params))
             continue
@@ -1162,6 +1168,12 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
         flat_idx = vg * zbuf_w + ug
 
         vis_mask = visible_depths(d_c, flat_idx, zbuf_w, zbuf_h)
+        if masks_dir is not None:
+            keep_mask = load_keep_mask(img_path, dataset_dir / "images", masks_dir)
+            source = cv2.imread(str(img_path))
+            if source is None or keep_mask.shape != source.shape[:2]:
+                raise ValueError(f"Person mask dimensions do not match {img_path}")
+            vis_mask &= keep_samples(keep_mask, u_c, v_c)
         if not np.any(vis_mask):
             continue
 
@@ -1199,9 +1211,9 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
 
     print("[*] Solving statistical consensus SfM...")
     if gpu_views is not None:
-        colors = colorize_views(pts_lidar, gpu_views, dataset_dir)
+        colors = colorize_views(pts_lidar, gpu_views, dataset_dir, masks_dir=masks_dir, images_dir=dataset_dir / "images")
         if colors is None:
-            return colorize_via_spirula_sfm(dataset_dir, fps=fps, use_vulkan=False)
+            return colorize_via_spirula_sfm(dataset_dir, fps=fps, use_vulkan=False, masks_dir=masks_dir, operator_radius=operator_radius)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)
@@ -1251,6 +1263,9 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_ply = deliv_dir / f"lidar_colored_sfm_consensus_{ts}.ply"
     out_pcd = deliv_dir / f"lidar_colored_sfm_consensus_{ts}.pcd"
+    if operator_radius and masks_dir is not None:
+        keep = masked_operator_keep(pts_lidar, operator_views, dataset_dir / "images", masks_dir, operator_radius, project_thin_prism)
+        pts_lidar, colors = pts_lidar[keep], colors[keep]
     write_ply(out_ply, pts_lidar, colors)
     write_pcd(out_pcd, pts_lidar, colors)
 
@@ -1265,8 +1280,10 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True):
 # PIPELINE MÉTODO 2: DIRETO RÍGIDO (SEM SFM)
 # ==============================================================================
 
-def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_override=None, use_vulkan=True):
+def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_override=None, use_vulkan=True, masks_dir=None, operator_radius=0.0):
     """Executa a coloração direta rápida usando matriz rígida e tempo calibrado"""
+    if operator_radius > 0 and masks_dir is None:
+        raise ValueError('Operator removal requires person masks (--mask-persons or --masks-dir); a trajectory radius alone can erase doors and walls')
     if calib_json_path is None:
         rig_json = dataset_dir / "rig_calibration.json"
         auto_json = dataset_dir / "calibracao_rigida_auto.json"
@@ -1363,6 +1380,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     cam0_files = [front[name] for name in pairs]
     cam1_files = [rear[name] for name in pairs]
 
+    operator_views = []
     gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() else None
     K_VIEWS = 3
     top_scores = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS), dtype=np.float32)
@@ -1466,6 +1484,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
             R_world_cam = R_L @ R_LC
             R_cw = R_world_cam.T
 
+            if operator_radius and masks_dir is not None:
+                operator_views.append((img_path, R_cw, p_cam, params))
             if gpu_views is not None:
                 gpu_views.append((img_path, R_cw, p_cam, params))
                 continue
@@ -1498,6 +1518,12 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
             flat_idx = vg * zbuf_w + ug
 
             vis_mask = visible_depths(d_c, flat_idx, zbuf_w, zbuf_h)
+            if masks_dir is not None:
+                keep_mask = load_keep_mask(img_path, dataset_dir / "images", masks_dir)
+                source = cv2.imread(str(img_path))
+                if source is None or keep_mask.shape != source.shape[:2]:
+                    raise ValueError(f"Person mask dimensions do not match {img_path}")
+                vis_mask &= keep_samples(keep_mask, u_c, v_c)
             if not np.any(vis_mask):
                 continue
 
@@ -1535,9 +1561,9 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
 
     print("[*] Solving statistical consensus and removing projection outliers...")
     if gpu_views is not None:
-        colors = colorize_views(pts_lidar, gpu_views, dataset_dir)
+        colors = colorize_views(pts_lidar, gpu_views, dataset_dir, masks_dir=masks_dir, images_dir=dataset_dir / "images")
         if colors is None:
-            return colorize_via_direct_rigid(dataset_dir, calib_json_path, fps=fps, dt_override=dt_sync, use_vulkan=False)
+            return colorize_via_direct_rigid(dataset_dir, calib_json_path, fps=fps, dt_override=dt_sync, use_vulkan=False, masks_dir=masks_dir, operator_radius=operator_radius)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)
@@ -1587,6 +1613,9 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_ply = deliv_dir / f"lidar_colored_direct_rigid_{ts}.ply"
     out_pcd = deliv_dir / f"lidar_colored_direct_rigid_{ts}.pcd"
+    if operator_radius and masks_dir is not None:
+        keep = masked_operator_keep(pts_lidar, operator_views, dataset_dir / "images", masks_dir, operator_radius, project_thin_prism)
+        pts_lidar, colors = pts_lidar[keep], colors[keep]
     write_ply(out_ply, pts_lidar, colors)
     write_pcd(out_pcd, pts_lidar, colors)
 

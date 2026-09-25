@@ -508,13 +508,81 @@ def fuse_colmap_points3d(sparse_dir: Path, lidar_xyz: np.ndarray, lidar_rgb: np.
     return n_sfm, n_lidar, n_total
 
 
-def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0, max_points: Optional[int] = None) -> Path:
+def _copy_person_masks(dataset_dir: Path, masks_dir: Path, out_dir: Path, image_files) -> int:
+    """Validate and export keep masks alongside the COLMAP image tree."""
+    source_root = Path(masks_dir).resolve()
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"Person mask directory does not exist: {source_root}")
+    source_manifest = source_root / "manifest.json"
+    manifest_data = None
+    if source_manifest.is_file():
+        manifest_data = json.loads(source_manifest.read_text(encoding="utf-8"))
+        polarity = manifest_data.get("polarity")
+        if polarity is not None and polarity not in ("white_keep_black_person", "white_keep_black_foreground"):
+            raise ValueError(f"Unsupported person mask polarity in {source_manifest}: {polarity}")
+
+    images_root = (Path(dataset_dir) / "images").resolve()
+    mask_out = Path(out_dir) / "masks"
+    expected = set()
+    validated = []
+    for image_path in image_files:
+        relative = Path(image_path).resolve().relative_to(images_root)
+        relative_mask = Path(relative.as_posix() + ".png")
+        mask_path = source_root / relative_mask
+        if not mask_path.is_file():
+            raise FileNotFoundError(f"Missing person mask for {relative.as_posix()}: {mask_path}")
+        image = cv2.imdecode(np.fromfile(image_path, np.uint8), cv2.IMREAD_COLOR)
+        mask = cv2.imdecode(np.fromfile(mask_path, np.uint8), cv2.IMREAD_GRAYSCALE)
+        if image is None or mask is None or mask.shape != image.shape[:2]:
+            raise ValueError(f"Person mask dimensions are invalid for {relative.as_posix()}")
+        if not np.isin(mask, (0, 255)).all():
+            raise ValueError(f"Person mask must use binary white-keep/black-exclude values: {mask_path}")
+        expected.add(relative_mask.as_posix())
+        validated.append((mask_path, relative_mask))
+
+    if not validated:
+        raise ValueError("No camera images were available for person mask export")
+    mask_out.mkdir(parents=True, exist_ok=True)
+    if source_root != mask_out.resolve():
+        for old_mask in mask_out.rglob("*.jpg.png"):
+            if old_mask.relative_to(mask_out).as_posix() not in expected:
+                old_mask.unlink()
+        for source_mask, relative_mask in validated:
+            target = mask_out / relative_mask
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_mask, target)
+
+    if source_manifest.is_file():
+        if source_root != mask_out.resolve():
+            shutil.copy2(source_manifest, mask_out / "manifest.json")
+    else:
+        exported_manifest = {
+            "schema": 1,
+            "polarity": "white_keep_black_person",
+            "naming": "image_relative_name_plus_png",
+            "image_count": len(validated),
+            "sources": {
+                relative.with_suffix("").as_posix(): [
+                    (Path(dataset_dir) / "images" / relative.with_suffix("")).stat().st_size,
+                    (Path(dataset_dir) / "images" / relative.with_suffix("")).stat().st_mtime_ns,
+                ]
+                for _, relative in validated
+            },
+        }
+        (mask_out / "manifest.json").write_text(
+            json.dumps(exported_manifest, indent=2), encoding="utf-8"
+        )
+    print(f"  [+] Exported {len(validated)} validated person masks to: {mask_out}")
+    return len(validated)
+
+
+def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0, max_points: Optional[int] = None, masks_dir: Optional[Path] = None) -> Path:
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
 
     Transforms camera poses into the LiDAR metric coordinate frame and seeds the model with
     the true metric LiDAR point cloud (points3D.ply, points3D.bin, points3D.txt).
-    For reconstruction-based workflows (SfM), fuses SfM points (with tracks) and LiDAR points.
-    For trajectory-based workflows (SLAM), uses the full raw LiDAR point cloud directly.
+    Seeds the model exclusively with the true metric LiDAR point cloud at 100% full raw density.
+    If SfM tie-points exist from reconstruction, they are preserved separately in points3D_sfm_sparse.*.
     """
     out_dir = dataset_dir / "colmap_3dgs"
     images_out = out_dir / "images"
@@ -540,6 +608,9 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
                         target.symlink_to(f)
                     except Exception:
                         shutil.copy2(f, target)
+
+    if masks_dir is not None:
+        _copy_person_masks(dataset_dir, masks_dir, out_dir, cam0_files + cam1_files)
 
     # 1. Check if Spirula SfM output is available to transform to METRIC scale
     sfm_sparse = dataset_dir / "sparse" / "0"
@@ -643,18 +714,24 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
 
             print(f"  [+] Written images.txt with {img_id - 1} camera poses")
 
-    # Seed 3DGS point cloud
+    # Seed 3DGS point cloud exclusively with true metric LiDAR points (full raw points)
     lidar_xyz, lidar_rgb = load_lidar_seed_points(dataset_dir, max_points=max_points)
     if lidar_xyz is not None and len(lidar_xyz) > 0:
-        if poses_ready and (sparse_out / "points3D.bin").is_file():
-            # RECONSTRUCTION-BASED METHOD: Fuse SfM tracks with dense metric LiDAR points
-            n_sfm, n_lidar, n_total = fuse_colmap_points3d(sparse_out, lidar_xyz, lidar_rgb)
-            print(f"  [+] [Reconstruction-Based 3DGS] Successfully FUSED SfM sparse points ({n_sfm:,}) and metric LiDAR points ({n_lidar:,}) -> Total: {n_total:,} seed points for 3DGS!")
-        else:
-            # TRAJECTORY-BASED METHOD: Use 100% full raw metric LiDAR point cloud directly
-            print(f"  [*] [Trajectory-Based 3DGS] Writing 100% Raw Metric LiDAR Seed: {len(lidar_xyz):,} points to points3D.ply, points3D.bin, points3D.txt...")
-            write_colmap_points3d(sparse_out, lidar_xyz, lidar_rgb)
-            print(f"  [+] LiDAR 3DGS seed successfully written to: {sparse_out / 'points3D.ply'}")
+        # If previous SfM points existed from reconstruction, preserve them as points3D_sfm_sparse
+        if (sparse_out / "points3D.bin").is_file() and not (sparse_out / "points3D_sfm_sparse.bin").is_file():
+            try:
+                shutil.copy2(sparse_out / "points3D.bin", sparse_out / "points3D_sfm_sparse.bin")
+                if (sparse_out / "points3D.ply").is_file():
+                    shutil.copy2(sparse_out / "points3D.ply", sparse_out / "points3D_sfm_sparse.ply")
+                if (sparse_out / "points3D.txt").is_file():
+                    shutil.copy2(sparse_out / "points3D.txt", sparse_out / "points3D_sfm_sparse.txt")
+            except Exception:
+                pass
+
+        method_tag = "Reconstruction-Based" if poses_ready else "Trajectory-Based"
+        print(f"  [*] [{method_tag} 3DGS] Writing 100% full raw metric LiDAR seed ({len(lidar_xyz):,} points) to points3D.ply, points3D.bin, points3D.txt...")
+        write_colmap_points3d(sparse_out, lidar_xyz, lidar_rgb)
+        print(f"  [+] LiDAR 3DGS seed successfully written to: {sparse_out / 'points3D.ply'}")
     else:
         print("  [*] Using existing sparse points3D as 3DGS seed (no LiDAR cloud available).")
 
@@ -702,6 +779,10 @@ def _postprocess_3dgs_dataset(out_dir: Path, dataset_dir: Path):
             "COMPATIBILITY:\n"
             "- Spirula Studio: Native COLMAP dataset.\n"
             "- Nerfstudio / PostShot / LichtFeld Studio: Supported via standard COLMAP models.\n"
+            "\nOPTIONAL PERSON MASKS:\n"
+            "- When present, masks are under masks/ with the same camera-relative image name plus .png (for example, cam0/frame.jpg.png).\n"
+            "- White (255) means keep; black (0) means exclude the person.\n"
+            "- Configure your trainer to read these masks explicitly; trainers do not all load them automatically.\n"
             "================================================================================\n",
             encoding="utf-8"
         )
@@ -733,13 +814,27 @@ def execute_unified_workflow(
     process_gps: bool = False,
     gps_formats=('geojson', 'gpx', 'csv'),
     geo_formats=('laz', 'geojson'),
+    mask_persons: bool = False,
+    masks_dir: Path = None,
+    mask_model: Path = None,
+    mask_threshold: float = 0.5,
+    mask_margin: float = 0.03,
+    mask_config: Path = None,
+    operator_radius: float = 0.0,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
+    if operator_radius > 0 and not (mask_persons or masks_dir is not None):
+        raise ValueError('Operator removal requires person masks; a trajectory radius alone can erase fixed objects')
     if method == "trajectory":
         method = "direct"
     elif method == "reconstruction":
         method = "sfm"
+    if mask_persons and masks_dir is not None:
+        raise ValueError("Choose either generated person masks or --masks-dir reuse, not both")
+    if mask_persons:
+        from raven_app.person_masks import read_mask_config
+        read_mask_config(mask_config)
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     deliverables_dir = output_dir / "deliverables"
@@ -890,18 +985,42 @@ def execute_unified_workflow(
     # STAGE 5: Point Cloud Colorization
     # --------------------------------------------------------------------------
     print("\n[STAGE 5/5] Running Point Cloud Colorization...")
+    active_masks_dir = masks_dir
+    if mask_persons:
+        print("[*] Generating RF-DETR person masks before colorization...")
+        from raven_app.person_masks import generate_person_masks
+        active_masks_dir = generate_person_masks(
+            output_dir, model_path=mask_model,
+            threshold=mask_threshold, margin=mask_margin,
+            mask_config=mask_config
+        )
+    elif active_masks_dir is not None:
+        active_masks_dir = Path(active_masks_dir).resolve()
+        if not active_masks_dir.is_dir():
+            raise FileNotFoundError(f"Person mask directory does not exist: {active_masks_dir}")
+        print(f"[*] Reusing person masks from {active_masks_dir}")
+    if active_masks_dir is not None:
+        print(f"[*] Person masks: {active_masks_dir}")
+    if operator_radius > 0:
+        print(f"[*] Operator removal radius: {operator_radius:.3f} m (person-mask agreement with planar-surface protection)")
     cloud_state_before = {p: p.stat().st_mtime_ns for p in deliverables_dir.iterdir()
                           if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}}
     sfm_done = False
     if method in ("sfm", "all") and sparse_bin.is_file():
         try:
-            pipeline.colorize_via_spirula_sfm(output_dir, fps=fps, use_vulkan=use_vulkan)
+            pipeline.colorize_via_spirula_sfm(
+                output_dir, fps=fps, use_vulkan=use_vulkan,
+                masks_dir=active_masks_dir, operator_radius=operator_radius
+            )
             sfm_done = True
         except Exception as e:
             print(f"[!] SfM colorization notice: {e}")
 
     if method in ("direct", "all") or (method == "sfm" and not sfm_done):
-        pipeline.colorize_via_direct_rigid(output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan)
+        pipeline.colorize_via_direct_rigid(
+            output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
+            masks_dir=active_masks_dir, operator_radius=operator_radius
+        )
 
     # Automatic placement is deliberately after colorization so only this run's
     # produced clouds are considered, and before local-format cleanup.
@@ -938,7 +1057,8 @@ def execute_unified_workflow(
             except Exception: pass
 
     if export_colmap:
-        export_colmap_3dgs(output_dir, calib, fps=fps, dt_sync=dt_sync)
+        export_colmap_3dgs(output_dir, calib, fps=fps, dt_sync=dt_sync,
+                           masks_dir=active_masks_dir)
 
     print("\n[+] Deliverables currently in folder:")
     for deliv_item in sorted(deliverables_dir.iterdir()):

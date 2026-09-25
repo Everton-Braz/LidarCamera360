@@ -28,20 +28,22 @@ def vulkan_status():
         return {'path': str(executable), 'ready': False, 'detail': str(exc)}
 
 
-def colorize_views(points, views, work_dir, device_id=-1):
+def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images_dir=None):
     """Return RGB8, or None on native failure so callers can run the CPU fallback.
 
     Protocol RVC1: uint32 point/view counts, packed float4 points; each view is
     a UTF-8 path prefixed by uint32 length followed by 24 float32 values
     (row-major Rcw, Cworld, COLMAP's 12 intrinsic parameters).
     """
+    if masks_dir is not None and images_dir is None:
+        raise ValueError('images_dir is required for person masks')
     if not views or not len(points):
         return None
     try:
         with tempfile.TemporaryDirectory(prefix='vulkan-', dir=work_dir) as tmp:
             job, out = Path(tmp) / 'job.bin', Path(tmp) / 'rgb.bin'
             with job.open('wb') as stream:
-                stream.write(struct.pack('<4sII', b'RVC1', len(points), len(views)))
+                stream.write(struct.pack('<4sII', b'RVC2' if masks_dir is not None else b'RVC1', len(points), len(views)))
                 # Shift large survey coordinates before float32 conversion.
                 origin = np.asarray(points[0], dtype=np.float64)
                 packed = np.zeros((len(points), 4), dtype='<f4')
@@ -57,6 +59,13 @@ def colorize_views(points, views, work_dir, device_id=-1):
                         raise ValueError('Nonfinite camera parameters')
                     stream.write(struct.pack('<I', len(name)) + name)
                     values.astype('<f4').tofile(stream)
+                    if masks_dir is not None:
+                        from raven_app.person_masks import mask_path
+                        mask = mask_path(path, images_dir, masks_dir)
+                        if not mask.is_file():
+                            raise ValueError(f'Missing person mask: {mask}')
+                        encoded = str(mask.resolve()).encode('utf-8')
+                        stream.write(struct.pack('<I', len(encoded)) + encoded)
             result = subprocess.run([str(get_vulkan_bin()), '--job', str(job), '--out', str(out),
                                      '--device', str(device_id)])
             if result.returncode != 0 or not out.is_file() or out.stat().st_size != len(points)*4:

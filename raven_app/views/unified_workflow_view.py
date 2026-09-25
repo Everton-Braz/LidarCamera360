@@ -1,8 +1,10 @@
 """Unified processing workflow view."""
+import json
 from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QFrame, QDialog,
+    QMessageBox
 )
 from qfluentwidgets import (
     CardWidget, ElevatedCardWidget, TitleLabel, SubtitleLabel, BodyLabel,
@@ -12,6 +14,8 @@ from qfluentwidgets import (
     SmoothScrollArea
 )
 from raven_app.process_runner import ProcessRunner
+from raven_app.mask_download import MaskResourceDownload
+from raven_app.mask_resources import resolve_model, resolve_runtime_dir
 from raven_app.bag_io import detect_bag_topics
 from raven_app.i18n import tr
 
@@ -28,6 +32,8 @@ class UnifiedWorkflowView(QWidget):
         super().__init__(parent)
         self.setObjectName("UnifiedWorkflowView")
         self.runner = runner
+        self._mask_downloader = None
+        self.mask_config = None
         self._init_ui()
         self._connect_signals()
 
@@ -226,6 +232,32 @@ class UnifiedWorkflowView(QWidget):
         recalib_row.addStretch()
         config_layout.addLayout(recalib_row)
 
+        mask_row = QHBoxLayout()
+        self.mask_persons_chk = CheckBox(tr("Generate masks"))
+        self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
+        self.mask_model_btn = PushButton(tr("Download model RF-DETR"), icon=FluentIcon.DOWNLOAD)
+        self.mask_model_btn.setToolTip(tr("Download the RF-DETR model and, when needed, its TensorRT runtime to the user cache. The portable app stays small."))
+        self.mask_model_btn.clicked.connect(self._download_rf_detr)
+        self.mask_settings_btn = PushButton(tr("Mask settings..."))
+        self.mask_settings_btn.clicked.connect(self._open_mask_settings)
+        self.operator_radius_caption = CaptionLabel(tr("Operator removal radius (m):"))
+        self.operator_radius_spin = DoubleSpinBox()
+        self.operator_radius_spin.setRange(0.0, 5.0)
+        self.operator_radius_spin.setDecimals(2)
+        self.operator_radius_spin.setSingleStep(0.10)
+        self.operator_radius_spin.setValue(0.0)
+        self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
+        self.operator_radius_spin.valueChanged.connect(lambda value: self.mask_persons_chk.setChecked(True) if value > 0 else None)
+        self.mask_persons_chk.toggled.connect(lambda checked: self.operator_radius_spin.setValue(0.0) if not checked else None)
+        mask_row.addWidget(self.mask_persons_chk)
+        mask_row.addWidget(self.mask_model_btn)
+        mask_row.addWidget(self.mask_settings_btn)
+        mask_row.addSpacing(12)
+        mask_row.addWidget(self.operator_radius_caption)
+        mask_row.addWidget(self.operator_radius_spin)
+        mask_row.addStretch()
+        config_layout.addLayout(mask_row)
+
         self.vulkan_chk = CheckBox(tr("Enable Vulkan GPU Compute Acceleration"))
         self.vulkan_chk.setChecked(True)
         config_layout.addWidget(self.vulkan_chk)
@@ -421,6 +453,68 @@ class UnifiedWorkflowView(QWidget):
         if path:
             self.insv_input.setText(path)
 
+    def _download_rf_detr(self):
+        if self.runner.is_busy:
+            InfoBar.warning(title=tr('Processing is active'), content=tr('Wait for the current task to finish before downloading RF-DETR resources.'), parent=self)
+            return
+        if resolve_model() is not None and resolve_runtime_dir() is not None:
+            InfoBar.success(title=tr('RF-DETR is ready'), content=tr('The model and TensorRT runtime are already available.'), parent=self)
+            return
+        answer = QMessageBox.question(
+            self, tr('Download RF-DETR resources'),
+            tr('Verify or download the 139 MB model as needed. If the NVIDIA TensorRT runtime is missing, download about 1.3 GB; extraction may need up to 3 GB of temporary disk space. Files are cached for this Windows user and are not added to the portable app.'),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        downloader = MaskResourceDownload(self)
+        self._mask_downloader = downloader
+        downloader.progress.connect(self._on_mask_download_progress)
+        downloader.completed.connect(self._on_mask_download_completed)
+        self.mask_model_btn.setEnabled(False)
+        self.btn_run.setEnabled(False)
+        self.mask_model_btn.setText(tr('Preparing RF-DETR...'))
+        if not downloader.start():
+            self._on_mask_download_completed(2, tr('Could not start the resource downloader.'))
+
+    def _on_mask_download_progress(self, resource, percent):
+        title = tr('RF-DETR model') if resource == 'model' else (tr('Installing TensorRT') if resource == 'install' else tr('TensorRT runtime'))
+        self.mask_model_btn.setText(f'{title}: {percent}%')
+
+    def _on_mask_download_completed(self, code, output):
+        downloader, self._mask_downloader = self._mask_downloader, None
+        self.mask_model_btn.setEnabled(True)
+        self.mask_model_btn.setText(tr('Download model RF-DETR'))
+        self.btn_run.setEnabled(True)
+        if downloader is not None:
+            downloader.deleteLater()
+        if code == 0 and resolve_model() is not None and resolve_runtime_dir() is not None:
+            InfoBar.success(title=tr('RF-DETR resources ready'), content=tr('The verified model and TensorRT runtime are saved in the user cache.'), parent=self)
+        else:
+            detail = output[-700:] if output else tr('Check your internet connection and available disk space, then retry.')
+            InfoBar.error(title=tr('RF-DETR download failed'), content=detail, parent=self, duration=8000)
+
+    def _open_mask_settings(self):
+        from raven_app.mask_settings_dialog import MaskSettingsDialog
+        from raven_app.person_masks import read_mask_config
+        output = Path(self.out_input.text().strip()) if self.out_input.text().strip() else None
+        config = self.mask_config
+        settings_path = output / 'mask_settings.json' if output else None
+        if config is None and settings_path and settings_path.is_file():
+            try:
+                config = read_mask_config(settings_path)
+            except (OSError, ValueError) as exc:
+                InfoBar.error(title=tr('Invalid mask settings'), content=str(exc),
+                              position=InfoBarPosition.TOP, parent=self)
+                return
+        dialog = MaskSettingsDialog(output, config, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.mask_config = dialog.settings()
+            self.mask_persons_chk.setChecked(True)
+            count = sum(sum(map(len, self.mask_config[key].values())) for key in ('rectangles', 'ellipses', 'polygons'))
+            self.mask_settings_btn.setText(tr('Mask settings ({n} shapes)').format(n=count))
+
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if folder:
@@ -521,6 +615,25 @@ class UnifiedWorkflowView(QWidget):
 
         if method_key in ("sfm", "all"):
             args.append("--run-spirula")
+
+        if self.mask_persons_chk.isChecked():
+            args.append("--mask-persons")
+            settings_path = Path(out).resolve() / 'mask_settings.json'
+            if self.mask_config is not None:
+                try:
+                    settings_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = settings_path.with_suffix('.tmp')
+                    temporary.write_text(json.dumps(self.mask_config, indent=2), encoding='utf-8')
+                    temporary.replace(settings_path)
+                except OSError as exc:
+                    InfoBar.error(title=tr('Cannot save mask settings'), content=str(exc),
+                                  position=InfoBarPosition.TOP, parent=self)
+                    return
+            if settings_path.is_file():
+                args.extend(['--mask-config', str(settings_path)])
+
+        if self.operator_radius_spin.value() > 0:
+            args.extend(["--operator-radius", str(self.operator_radius_spin.value())])
 
         if self.lio_switch.isChecked():
             args.append("--lio")
@@ -654,6 +767,16 @@ class UnifiedWorkflowView(QWidget):
         self.method_combo.blockSignals(False)
 
         self.recalibrate_chk.setText(tr("Auto-Recalibrate Spatial Extrinsics from SfM Alignment"))
+        self.mask_persons_chk.setText(tr("Generate masks"))
+        self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
+        shapes = sum(sum(map(len, self.mask_config[key].values()))
+                     for key in ('rectangles', 'ellipses', 'polygons')) if self.mask_config else 0
+        self.mask_settings_btn.setText(tr('Mask settings ({n} shapes)').format(n=shapes) if self.mask_config else tr('Mask settings...'))
+        if self._mask_downloader is None:
+            self.mask_model_btn.setText(tr("Download model RF-DETR"))
+            self.mask_model_btn.setToolTip(tr("Download the RF-DETR model and, when needed, its TensorRT runtime to the user cache. The portable app stays small."))
+        self.operator_radius_caption.setText(tr("Operator removal radius (m):"))
+        self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
         self.vulkan_chk.setText(tr("Enable Vulkan GPU Compute Acceleration"))
         self.process_gps_chk.setText(tr("Automatically georeference using INSV GPS (when available)"))
         self.output_title.setText(tr("3. Select Deliverables to Generate"))

@@ -18,7 +18,7 @@ struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceSize size{};
 struct Texture { VkImage image{}; VkDeviceMemory memory{}; VkImageView view{}; Buffer staging; uint32_t w{},h{}; bool initialized{}; };
 struct Camera { float R[16]{}, C[4]{}, intrinsics[4]{}, radial[4]{}, prism[4]{}; int32_t grid[2]{960,960}; float scale[2]{}; float minZ{.15f},radius{1620}; uint32_t count{},pad{}; };
 static_assert(sizeof(Camera)==160);
-struct View { fs::path path; std::array<float,24> values; };
+struct View { fs::path path, mask; std::array<float,24> values; };
 struct Pipeline { VkDescriptorSetLayout layout{}; VkPipelineLayout pipelineLayout{}; VkPipeline pipeline{}; };
 struct Engine {
  VkInstance instance{}; VkPhysicalDevice physical{}; VkDevice device{}; VkQueue queue{}; uint32_t family{};
@@ -122,9 +122,16 @@ struct Engine {
  }
 };
 void read(std::ifstream& f,void* p,size_t n) {if(!f.read(static_cast<char*>(p),n))throw std::runtime_error("Truncated job");}
-cv::Mat decode(const fs::path& path) {
+cv::Mat decode(const fs::path& path, const fs::path& maskPath = {}) {
  std::ifstream f(path,std::ios::binary|std::ios::ate);if(!f)throw std::runtime_error("Missing JPEG: "+path.u8string());auto size=f.tellg();if(size<=0)throw std::runtime_error("Empty JPEG");std::vector<unsigned char> bytes(static_cast<size_t>(size));f.seekg(0);read(f,bytes.data(),bytes.size());
- auto bgr=cv::imdecode(bytes,cv::IMREAD_COLOR);if(bgr.empty())throw std::runtime_error("Invalid JPEG");cv::Mat rgba;cv::cvtColor(bgr,rgba,cv::COLOR_BGR2RGBA);return rgba;
+ auto bgr=cv::imdecode(bytes,cv::IMREAD_COLOR);if(bgr.empty())throw std::runtime_error("Invalid JPEG");cv::Mat rgba;cv::cvtColor(bgr,rgba,cv::COLOR_BGR2RGBA);
+ if(!maskPath.empty()) {
+  std::ifstream mf(maskPath,std::ios::binary|std::ios::ate);if(!mf)throw std::runtime_error("Missing person mask: "+maskPath.u8string());
+  auto ms=mf.tellg();if(ms<=0)throw std::runtime_error("Empty person mask");std::vector<unsigned char> mb(static_cast<size_t>(ms));mf.seekg(0);read(mf,mb.data(),mb.size());
+  auto mask=cv::imdecode(mb,cv::IMREAD_GRAYSCALE);if(mask.empty()||mask.size()!=bgr.size())throw std::runtime_error("Person mask dimensions mismatch");
+  cv::insertChannel(mask,rgba,3);
+ }
+ return rgba;
 }
 int run(int argc,char** argv) {
  fs::path job,out,shaders=fs::absolute(fs::u8path(argv[0])).parent_path()/"shaders";int dev=-1;bool probe=false;
@@ -132,19 +139,19 @@ int run(int argc,char** argv) {
  if(!probe&&(job.empty()||out.empty()))throw std::runtime_error("--job and --out are required");
  Engine e;e.init(dev);auto U=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,S=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,T=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
  auto z=e.pipeline(shaders/"occlusion_zbuf.spv",{U,S,S,T,S,S});auto color=e.pipeline(shaders/"colorize_consensus.spv",{U,S,S,T,S,S});auto resolve=e.pipeline(shaders/"resolve_consensus.spv",{S,S,S},true);if(probe)return 0;
- std::ifstream f(job,std::ios::binary);char magic[4];uint32_t n,nviews;read(f,magic,4);read(f,&n,4);read(f,&nviews,4);if(std::memcmp(magic,"RVC1",4)||!n||!nviews||nviews>1000000)throw std::runtime_error("Invalid job header");
+ std::ifstream f(job,std::ios::binary);char magic[4];uint32_t n,nviews;read(f,magic,4);read(f,&n,4);read(f,&nviews,4);bool masked=std::memcmp(magic,"RVC2",4)==0;if((std::memcmp(magic,"RVC1",4)&&!masked)||!n||!nviews||nviews>1000000)throw std::runtime_error("Invalid job header");
  auto points=e.buffer(VkDeviceSize(n)*16,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);auto staging=e.buffer(points.size,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,true);read(f,staging.mapped,size_t(points.size));
- std::vector<View> views(nviews);for(auto& v:views){uint32_t length;read(f,&length,4);if(!length||length>32768)throw std::runtime_error("Invalid path length");std::string s(length,'\0');read(f,s.data(),length);v.path=fs::u8path(s);read(f,v.values.data(),96);}
+ std::vector<View> views(nviews);for(auto& v:views){uint32_t length;read(f,&length,4);if(!length||length>32768)throw std::runtime_error("Invalid path length");std::string s(length,'\0');read(f,s.data(),length);v.path=fs::u8path(s);read(f,v.values.data(),96);if(masked){read(f,&length,4);if(!length||length>32768)throw std::runtime_error("Invalid mask path length");std::string m(length,'\0');read(f,m.data(),length);v.mask=fs::u8path(m);}}
  auto scores=e.buffer(VkDeviceSize(n)*16,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);auto colors=e.buffer(scores.size,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);auto depth=e.buffer(960*960*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);auto output=e.buffer(VkDeviceSize(n)*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT);auto readback=e.buffer(output.size,VK_BUFFER_USAGE_TRANSFER_DST_BIT,true);
  std::array<Buffer,2> ubos{e.buffer(sizeof(Camera),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,true),e.buffer(sizeof(Camera),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,true)};
- cv::setNumThreads(2);auto first=decode(views[0].path);for(auto& t:e.textures)e.texture(t,first.cols,first.rows);
+ cv::setNumThreads(2);auto first=decode(views[0].path,views[0].mask);for(auto& t:e.textures)e.texture(t,first.cols,first.rows);
  std::array<VkDescriptorSet,2> zs,cs;for(int i=0;i<2;++i){std::vector<Buffer> b{ubos[i],points,depth,{},scores,colors};zs[i]=e.set(z,b,i);cs[i]=e.set(color,b,i);}auto rs=e.set(resolve,{scores,colors,output});
  e.begin();e.copy(staging,points);vkCmdFillBuffer(e.command,scores.buffer,0,scores.size,0);vkCmdFillBuffer(e.command,colors.buffer,0,colors.size,0);e.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);e.submit();e.wait();
  std::future<cv::Mat> pending;bool inFlight=false;
  for(uint32_t i=0;i<nviews;++i) {
   auto rgba=i==0?first:pending.get();first.release();auto& tex=e.textures[i%2];if(uint32_t(rgba.cols)!=tex.w||uint32_t(rgba.rows)!=tex.h)throw std::runtime_error("Mixed image dimensions unsupported");
   std::memcpy(tex.staging.mapped,rgba.data,size_t(tex.staging.size));
-  if(i+1<nviews)pending=std::async(std::launch::async,[&,i]{return decode(views[i+1].path);});
+  if(i+1<nviews)pending=std::async(std::launch::async,[&,i]{return decode(views[i+1].path,views[i+1].mask);});
   Camera camera;auto& v=views[i].values;for(int r=0;r<3;++r)for(int c=0;c<3;++c)camera.R[c*4+r]=v[r*3+c];camera.R[15]=1;std::copy_n(v.data()+9,3,camera.C);std::copy_n(v.data()+12,4,camera.intrinsics);
   camera.radial[0]=v[16];camera.radial[1]=v[17];camera.radial[2]=v[20];camera.radial[3]=v[21];camera.prism[0]=v[18];camera.prism[1]=v[19];camera.prism[2]=v[22];camera.prism[3]=v[23];camera.scale[0]=tex.w/960.f;camera.scale[1]=tex.h/960.f;camera.radius=1620.f*std::min(tex.w,tex.h)/3840.f;camera.count=n;std::memcpy(ubos[i%2].mapped,&camera,sizeof(camera));
   if(inFlight)e.wait();e.begin();
