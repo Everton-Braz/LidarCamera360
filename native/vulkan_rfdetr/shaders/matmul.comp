@@ -1,0 +1,42 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "graph_common.glsl"
+layout(local_size_x=16,local_size_y=16) in;
+shared float leftTile[16][16];
+shared float rightTile[16][16];
+int batchBase(int slot,int batch) {
+    int base=t(slot,0), r=p(3)-2, delta=r-(t(slot,1)-2);
+    for(int d=r-1;d>=0;--d) {
+        int c=batch%p(4+d); batch/=p(4+d);
+        if(d>=delta && t(slot,4+d-delta)>1) base+=c*t(slot,12+d-delta);
+    }
+    return base;
+}
+void main() {
+    int lx=int(gl_LocalInvocationID.x),ly=int(gl_LocalInvocationID.y);
+    int row=int(gl_WorkGroupID.y)*16+ly,col=int(gl_WorkGroupID.x)*16+lx,b=int(gl_WorkGroupID.z);
+    int m=a(0),n=a(1),k=a(2),ab=batchBase(0,b),bb=batchBase(1,b);
+    float sum=0.0;
+    for(int start=0;start<k;start+=16) {
+        int ak=start+lx,bk=start+ly;
+        leftTile[ly][lx]=row<m&&ak<k ? data[ab+(a(3)!=0 ? ak*m+row : row*k+ak)] : 0.0;
+        float bv=0.0;
+        if(col<n&&bk<k) {
+            if(a(8)!=0) { // Implicit im2col: gather just the tile, never materialize it.
+                int kc=bk/(a(12)*a(13)),ky=(bk/a(12))%a(13),kx=bk%a(12);
+                int iy=(col/a(11))*a(14)-a(16)+ky*a(18);
+                int ix=(col%a(11))*a(15)-a(17)+kx*a(19);
+                if(iy>=0&&iy<a(9)&&ix>=0&&ix<a(10)) bv=data[bb+(kc*a(9)+iy)*a(10)+ix];
+            } else bv=data[bb+(a(4)!=0 ? col*k+bk : bk*n+col)];
+        }
+        rightTile[ly][lx]=bv;
+        barrier();
+        for(int q=0;q<16;++q) sum+=leftTile[ly][q]*rightTile[q][lx];
+        barrier();
+    }
+    if(row<m&&col<n) {
+        int i=(b*m+row)*n+col;
+        float bias=a(7)==2 ? data[t(2,0)+row] : (a(7)==1 ? value(2,i) : 0.0);
+        data[p(1)+i]=sum*af(5)+af(6)*bias;
+    }
+}

@@ -1,0 +1,115 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "graph_common.glsl"
+layout(local_size_x=64) in;
+float erfApprox(float x) {
+    float z=abs(x), q=1.0/(1.0+0.3275911*z);
+    float y=1.0-(((((1.061405429*q-1.453152027)*q)+1.421413741)*q-0.284496736)*q+0.254829592)*q*exp(-z*z);
+    return sign(x)*y;
+}
+float sampleZero(int base,int y,int x,int h,int w) {
+    return x<0||y<0||x>=w||y>=h ? 0.0 : data[base+y*w+x];
+}
+void main() {
+    int i=int(gl_GlobalInvocationID.x), op=p(0);
+    if(op==32) { // TopK: deterministic rank, lower index wins ties.
+        if(i>=t(0,2)) return;
+        int n=a(0), k=a(1), j=i%n, b=i/n, rank=0;
+        float v=data[t(0,0)+i];
+        for(int q=0;q<n;++q) {
+            float other=data[t(0,0)+b*n+q];
+            if(other>v || (other==v && q<j)) ++rank;
+        }
+        if(rank<k) { data[p(1)+b*k+rank]=v; data[p(20)+b*k+rank]=float(j); }
+        return;
+    }
+    if(i>=p(2)) return;
+    float v=0.0;
+    if(op<=18) {
+        float x=value(0,i);
+        if(op==0) v=x;
+        else if(op==1) v=x+value(1,i);
+        else if(op==2) v=x-value(1,i);
+        else if(op==3) v=x*value(1,i);
+        else if(op==4) v=x/value(1,i);
+        else if(op==5) v=exp(x);
+        else if(op==6) v=erfApprox(x);
+        else if(op==7) v=sqrt(x);
+        else if(op==8) v=max(x,0.0);
+        else if(op==9) v=x>=0.0 ? 1.0/(1.0+exp(-x)) : exp(x)/(1.0+exp(x));
+        else if(op==10) v=sin(x);
+        else if(op==11) v=cos(x);
+        else if(op==12) v=float(x==value(1,i));
+        else if(op==13) v=float(x>value(1,i));
+        else if(op==14) v=float(x<value(1,i));
+        else if(op==15) v=float(x!=0.0 && value(1,i)!=0.0);
+        else if(op==16) v=float(x==0.0);
+        else if(op==17) v=x!=0.0 ? value(1,i) : value(2,i);
+        else if(op==18) v=a(0)==9 ? float(x!=0.0) : (a(0)==1 ? x : trunc(x));
+    } else if(op==19) { // Transpose
+        int j=t(0,0);
+        for(int d=0;d<p(3);++d) j+=coord(i,d)*t(0,12+a(d));
+        v=data[j];
+    } else if(op==20) { // Concat
+        int axis=a(0), c=coord(i,axis), s=0;
+        while(s+1<p(22) && c>=t(s,4+axis)) { c-=t(s,4+axis); ++s; }
+        int j=t(s,0);
+        for(int d=0;d<p(3);++d) j+=(d==axis ? c : coord(i,d))*t(s,12+d);
+        v=data[j];
+    } else if(op==21 || op==26) { // Slice / Split
+        int j=t(0,0);
+        for(int d=0;d<p(3);++d) j+=(coord(i,d)*a(8+d)+a(d))*t(0,12+d);
+        v=data[j];
+    } else if(op==22) v=value(0,i); // Expand
+    else if(op==23) { // Tile
+        int j=t(0,0);
+        for(int d=0;d<p(3);++d) j+=(coord(i,d)%t(0,4+d))*t(0,12+d);
+        v=data[j];
+    } else if(op==24) { // Gather, including scalar indices
+        int axis=a(0), ir=t(1,1), ix=t(1,0), j=t(0,0);
+        for(int d=0;d<ir;++d) ix+=coord(i,axis+d)*t(1,12+d);
+        int k=int(data[ix]); if(k<0) k+=t(0,4+axis);
+        if(k<0||k>=t(0,4+axis)) { data[p(1)+i]=invalidValue(); return; }
+        for(int d=0;d<t(0,1);++d)
+            j+=(d==axis ? k : coord(i,d<axis ? d : d+ir-1))*t(0,12+d);
+        v=data[j];
+    } else if(op==25) { // GatherElements
+        int axis=a(0), k=int(data[t(1,0)+i]), j=t(0,0);
+        if(k<0) k+=t(0,4+axis);
+        if(k<0||k>=t(0,4+axis)) { data[p(1)+i]=invalidValue(); return; }
+        for(int d=0;d<p(3);++d) j+=(d==axis ? k : coord(i,d))*t(0,12+d);
+        v=data[j];
+    } else if(op==27) { // NCHW grouped convolution
+        int n=coord(i,0), oc=coord(i,1), oy=coord(i,2), ox=coord(i,3);
+        int ih=t(0,6), iw=t(0,7), ci=t(1,5), kh=t(1,6), kw=t(1,7);
+        int group=oc/(p(5)/a(6));
+        v=p(22)>2 ? data[t(2,0)+oc] : 0.0;
+        for(int c=0;c<ci;++c) for(int y=0;y<kh;++y) for(int x=0;x<kw;++x) {
+            int iy=oy*a(0)-a(2)+y*a(4), ix=ox*a(1)-a(3)+x*a(5);
+            if(iy>=0&&ix>=0&&iy<ih&&ix<iw)
+                v+=data[t(0,0)+((n*t(0,5)+group*ci+c)*ih+iy)*iw+ix]*data[t(1,0)+((oc*ci+c)*kh+y)*kw+x];
+        }
+    } else if(op==28 || op==29) { // bilinear GridSample / Resize
+        int n=coord(i,0), c=coord(i,1), y=coord(i,2), x=coord(i,3);
+        int ih=t(0,6), iw=t(0,7), base=t(0,0)+(n*t(0,5)+c)*ih*iw;
+        float sx,sy;
+        if(op==28) {
+            int grid=t(1,0)+((n*p(6)+y)*p(7)+x)*2;
+            sx=((data[grid]+1.0)*float(iw)-1.0)*0.5;
+            sy=((data[grid+1]+1.0)*float(ih)-1.0)*0.5;
+        } else {
+            sx=(float(x)+0.5)*float(iw)/float(p(7))-0.5;
+            sy=(float(y)+0.5)*float(ih)/float(p(6))-0.5;
+        }
+        int x0=int(floor(sx)),y0=int(floor(sy)),x1=x0+1,y1=y0+1;
+        float fx=sx-floor(sx),fy=sy-floor(sy);
+        if(op==29) { x0=clamp(x0,0,iw-1); x1=clamp(x1,0,iw-1); y0=clamp(y0,0,ih-1); y1=clamp(y1,0,ih-1); }
+        v=mix(mix(sampleZero(base,y0,x0,ih,iw),sampleZero(base,y0,x1,ih,iw),fx),
+              mix(sampleZero(base,y1,x0,ih,iw),sampleZero(base,y1,x1,ih,iw),fx),fy);
+    } else if(op==30 || op==31) {
+        int n=a(0),base=t(0,0)+i*n;
+        v=op==30 ? 0.0 : -3.402823e38;
+        for(int j=0;j<n;++j) v=op==30 ? v+data[base+j] : max(v,data[base+j]);
+    } else v=invalidValue();
+    data[p(1)+i]=v;
+}
