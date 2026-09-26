@@ -33,8 +33,11 @@ The CLI walks the input directory recursively and writes one 8-bit PNG for
 each image, preserving the relative path and appending `.png`. White means
 keep; black means remove a detected person. The output directory must be
 outside the input tree. It loads the model and records the Vulkan command
-buffer once, then reuses them for every image. Input normalization and final
-mask composition run on the CPU; the full ONNX tensor graph runs on Vulkan.
+buffer once, then reuses them for every image. A persistent inference thread
+overlaps GPU execution with the next image's read/preprocessing and the
+previous image's mask composition. PNG writing also runs in the background.
+Input normalization and final mask composition run on the CPU; the full ONNX
+tensor graph runs on Vulkan.
 `--device N` selects a Vulkan device by index. `--limit N` processes the first
 N sorted images. `--dump-input DIR` saves normalized FP32 tensors for parity
 diagnostics.
@@ -72,10 +75,13 @@ threshold because its current engine uses FP16, while this executor uses FP32.
 Keep cold model preparation, model loading, GPU inference, and complete image
 batch time separate when measuring speed.
 
-On a local RTX 5070 Ti, 89 images at 3840×3840 took 38.59 seconds with Vulkan
-(2.31 images/second, excluding the 1.59-second model load), versus 11.40
-seconds with the existing TensorRT FP16 backend (7.81 images/second, excluding
-its cold engine build/load). Their removal masks had 0.9885 aggregate IoU.
+On a local RTX 5070 Ti, 89 images at 3840×3840 took 10.81 and 10.75 seconds
+in repeated Vulkan runs (8.23–8.28 images/second, excluding the roughly
+1.6-second model load). The previous serial implementation took 38.64 seconds
+(2.30 images/second). PNG masks from both Vulkan implementations are byte-for-byte
+identical. With the shared decoder's one-pass distance transform, the cached
+TensorRT FP16 backend took 5.76 seconds (15.46 images/second, excluding its
+0.89-second model load). The backends' removal masks had 0.9885 aggregate IoU.
 Two frames scored below 0.78 IoU because a low-confidence second detection
 included both the operator's extended arm and some ground. Suppressing that
 entire detection removed the arm in other frames, so this backend retains the

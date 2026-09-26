@@ -2,12 +2,19 @@
 #include "ImageIo.h"
 #include "RfDetrDecode.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <thread>
 #include <windows.h>
 
 namespace fs = std::filesystem;
@@ -61,6 +68,65 @@ void dump_input(const std::vector<float> &input, const fs::path &path) {
                      input.size() * sizeof(float))),
         "Cannot write normalized input tensor");
 }
+struct InferenceResult {
+  std::vector<rvk::Output> outputs;
+  double elapsed;
+};
+class InferenceWorker {
+public:
+  explicit InferenceWorker(rvk::GraphExecutor &engine)
+      : engine_(engine), thread_([this] { loop(); }) {}
+  ~InferenceWorker() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    ready_.notify_one();
+    thread_.join();
+  }
+  std::future<InferenceResult> submit(std::vector<float> input) {
+    Job job;
+    job.input = std::move(input);
+    auto result = job.result.get_future();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      check(!pending_ && !stopping_, "Inference worker is busy");
+      pending_ = std::move(job);
+    }
+    ready_.notify_one();
+    return result;
+  }
+
+private:
+  struct Job {
+    std::vector<float> input;
+    std::promise<InferenceResult> result;
+  };
+  void loop() {
+    for (;;) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      ready_.wait(lock, [&] { return stopping_ || pending_.has_value(); });
+      if (!pending_)
+        return;
+      Job job = std::move(*pending_);
+      pending_.reset();
+      lock.unlock();
+      try {
+        auto started = Clock::now();
+        auto outputs = engine_.run(job.input);
+        job.result.set_value({std::move(outputs), seconds(started)});
+      } catch (...) {
+        job.result.set_exception(std::current_exception());
+      }
+    }
+  }
+  rvk::GraphExecutor &engine_;
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::optional<Job> pending_;
+  bool stopping_ = false;
+  std::thread thread_;
+};
 int main(int argc, char **argv) {
   try {
     std::map<std::string, std::string> opts;
@@ -163,41 +229,86 @@ int main(int argc, char **argv) {
       files.resize(limit);
     check(!files.empty(), "No images found");
     start = Clock::now();
-    for (size_t i = 0; i < files.size(); ++i) {
-      auto image = rfdetr::read_rgb_image(files[i]);
-      std::vector<float> x;
-      rfdetr::preprocess_rgb(image.pixels.data(), image.width, image.height,
-                             shape[3], shape[2], x);
+    std::array<double, 5> stage_seconds{};
+    struct PreparedFrame {
+      rfdetr::RgbImage image;
+      std::vector<float> input;
+    };
+    auto prepare = [&](size_t index) {
+      PreparedFrame frame;
+      auto stage_start = Clock::now();
+      frame.image = rfdetr::read_rgb_image(files[index]);
+      stage_seconds[0] += seconds(stage_start);
+      stage_start = Clock::now();
+      rfdetr::preprocess_rgb(frame.image.pixels.data(), frame.image.width,
+                             frame.image.height, shape[3], shape[2],
+                             frame.input);
       if (opts.count("--dump-input")) {
         auto path = fs::u8path(option("--dump-input")) /
-                    files[i].lexically_relative(input);
+                    files[index].lexically_relative(input);
         path += ".f32";
-        dump_input(x, path);
+        dump_input(frame.input, path);
       }
-      auto out = engine.run(x);
+      stage_seconds[1] += seconds(stage_start);
+      return frame;
+    };
+    InferenceWorker worker(engine);
+    std::deque<std::future<void>> writers;
+    auto current = prepare(0);
+    auto inference = worker.submit(std::move(current.input));
+    for (size_t i = 0; i < files.size(); ++i) {
+      PreparedFrame next;
+      if (i + 1 < files.size())
+        next = prepare(i + 1);
+      auto result = inference.get();
+      stage_seconds[2] += result.elapsed;
+      if (i + 1 < files.size())
+        inference = worker.submit(std::move(next.input));
+      auto stage_start = Clock::now();
       std::vector<nn::TrtTensor> tensors;
-      for (auto &o : out)
+      for (auto &o : result.outputs)
         tensors.push_back({o.name, o.shape, std::move(o.data)});
-      std::vector<uint8_t> mask(size_t(image.width) * image.height, 0);
-      rfdetr::decode_people(tensors, image.width, image.height, threshold,
-                            margin, mask);
+      std::vector<uint8_t> mask(
+          size_t(current.image.width) * current.image.height, 0);
+      rfdetr::decode_people(tensors, current.image.width, current.image.height,
+                            threshold, margin, mask);
       for (auto &p : mask)
         p = p ? 0 : 255;
+      stage_seconds[3] += seconds(stage_start);
+      stage_start = Clock::now();
       auto target = output / files[i].lexically_relative(input);
       target += ".png";
       fs::create_directories(target.parent_path());
-      auto tmp = target;
-      tmp += ".tmp";
-      rfdetr::write_gray_png(tmp, image.width, image.height, mask);
-      check(MoveFileExW(tmp.c_str(), target.c_str(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) !=
-                0,
-            "Cannot publish mask");
+      if (writers.size() >= 2) {
+        writers.front().get();
+        writers.pop_front();
+      }
+      writers.push_back(
+          std::async(std::launch::async,
+                     [target, width = current.image.width,
+                      height = current.image.height, mask = std::move(mask)] {
+                       auto tmp = target;
+                       tmp += ".tmp";
+                       rfdetr::write_gray_png(tmp, width, height, mask);
+                       check(MoveFileExW(tmp.c_str(), target.c_str(),
+                                         MOVEFILE_REPLACE_EXISTING |
+                                             MOVEFILE_WRITE_THROUGH) != 0,
+                             "Cannot publish mask: " + target.u8string());
+                     }));
+      stage_seconds[4] += seconds(stage_start);
       std::cout << "MASKS=" << i + 1 << '/' << files.size() << std::endl;
+      current = std::move(next);
     }
+    for (auto &writer : writers)
+      writer.get();
     double elapsed = seconds(start);
     std::cout << "BATCH_SECONDS=" << elapsed << " IMAGES=" << files.size()
               << " IMAGES_PER_SECOND=" << files.size() / elapsed << std::endl;
+    std::cout << "STAGE_SECONDS read=" << stage_seconds[0]
+              << " preprocess=" << stage_seconds[1]
+              << " inference=" << stage_seconds[2]
+              << " decode=" << stage_seconds[3] << " write=" << stage_seconds[4]
+              << std::endl;
     return 0;
   } catch (const std::exception &e) {
     std::cerr << "RF-DETR Vulkan: " << e.what() << '\n';

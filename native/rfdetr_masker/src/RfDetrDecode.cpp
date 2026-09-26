@@ -154,12 +154,14 @@ void distance_to(const std::vector<uint8_t>& mask, int width, int height,
 
 void offset_binary_mask(std::vector<uint8_t>& mask, int width, int height, int radius) {
     if (radius == 0 || mask.empty()) return;
-    std::vector<float> to_foreground, to_background;
-    distance_to(mask, width, height, 1, to_foreground);
-    distance_to(mask, width, height, 0, to_background);
+    // Dilation needs only distance to foreground; erosion needs only distance
+    // to background. The opposite distance is zero at every pixel being tested.
+    std::vector<float> distance;
+    distance_to(mask, width, height, radius > 0 ? 1 : 0, distance);
+    const float limit = float(radius) * float(radius);
     for (size_t i = 0; i < mask.size(); ++i) {
-        const float signed_distance = std::sqrt(to_foreground[i]) - std::sqrt(to_background[i]);
-        mask[i] = signed_distance <= float(radius) ? 1 : 0;
+        mask[i] = radius > 0 ? uint8_t(mask[i] || distance[i] <= limit)
+                             : uint8_t(mask[i] && distance[i] >= limit);
     }
 }
 
