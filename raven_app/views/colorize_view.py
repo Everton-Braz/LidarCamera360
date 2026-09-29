@@ -128,6 +128,30 @@ class ColorizeView(QWidget):
         timing_row.addStretch()
         params_layout.addLayout(timing_row)
 
+        photometric_row = QHBoxLayout()
+        self.photometric_label = BodyLabel(tr("Photometric compensation:"))
+        self.photometric_label.setFixedWidth(180)
+        self.photometric_combo = ComboBox()
+        self.photometric_combo.addItem(tr("Off"), userData="off")
+        self.photometric_combo.addItem(tr("Log-linear"), userData="loglinear")
+        self.photometric_combo.setCurrentIndex(0)
+        self.photometric_combo.setFixedWidth(130)
+        self.photometric_combo.currentIndexChanged.connect(self._update_photometric_controls)
+        self.photometric_params_label = BodyLabel(tr("Photometric parameters:"))
+        self.photometric_params_label.setFixedWidth(180)
+        self.photometric_params_input = LineEdit()
+        self.photometric_params_input.setPlaceholderText(tr("Optional fitted JSON file"))
+        self.photometric_params_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
+        self.photometric_params_browse.clicked.connect(self._browse_photometric_params)
+        photometric_row.addWidget(self.photometric_label)
+        photometric_row.addWidget(self.photometric_combo)
+        photometric_row.addSpacing(12)
+        photometric_row.addWidget(self.photometric_params_label)
+        photometric_row.addWidget(self.photometric_params_input)
+        photometric_row.addWidget(self.photometric_params_browse)
+        params_layout.addLayout(photometric_row)
+        self._update_photometric_controls()
+
         # Checkboxes
         check_row = QHBoxLayout()
         self.chk_spirula = CheckBox(tr("Run Spirula SfM automatically if sparse reconstruction is missing"))
@@ -251,6 +275,19 @@ class ColorizeView(QWidget):
         )
         if path:
             self.calib_input.setText(path)
+
+    def _browse_photometric_params(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Select photometric parameter JSON"), "", "JSON files (*.json);;All files (*.*)"
+        )
+        if path:
+            self.photometric_params_input.setText(path)
+
+    def _update_photometric_controls(self, *_):
+        enabled = self.photometric_combo.currentData() == "loglinear"
+        self.photometric_params_label.setEnabled(enabled)
+        self.photometric_params_input.setEnabled(enabled)
+        self.photometric_params_browse.setEnabled(enabled)
 
     def _download_rf_detr(self):
         if self.runner.is_busy:
@@ -405,8 +442,13 @@ class ColorizeView(QWidget):
             'colorize',
             '--dataset', ds,
             '--method', method_key,
-            '--fps', str(self.fps_spin.value())
+            '--fps', str(self.fps_spin.value()),
+            '--photometric', str(self.photometric_combo.currentData())
         ]
+
+        photometric_params = self.photometric_params_input.text().strip()
+        if photometric_params and self.photometric_combo.currentData() == "loglinear":
+            args.extend(['--photometric-params', photometric_params])
 
         calib = self.calib_input.text().strip()
         if calib and Path(calib).is_file():
@@ -520,6 +562,18 @@ class ColorizeView(QWidget):
         ])
         self.method_combo.setCurrentIndex(cur_idx)
         self.method_combo.blockSignals(False)
+
+        self.photometric_label.setText(tr("Photometric compensation:"))
+        photo_idx = self.photometric_combo.currentIndex()
+        self.photometric_combo.blockSignals(True)
+        self.photometric_combo.setItemText(0, tr("Off"))
+        self.photometric_combo.setItemText(1, tr("Log-linear"))
+        self.photometric_combo.setCurrentIndex(photo_idx)
+        self.photometric_combo.blockSignals(False)
+        self.photometric_params_label.setText(tr("Photometric parameters:"))
+        self.photometric_params_input.setPlaceholderText(tr("Optional fitted JSON file"))
+        self.photometric_params_browse.setText(tr("Browse"))
+        self._update_photometric_controls()
 
         self.fps_label.setText(tr("Extraction FPS:"))
         self.fps_spin.setToolTip(tr("Extraction rate is capped by the source video. For a 2 fps timelapse, use 2; a higher value does not create extra frames."))

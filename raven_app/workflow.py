@@ -823,6 +823,8 @@ def execute_unified_workflow(
     mask_margin: float = 0.03,
     mask_config: Path = None,
     operator_radius: float = 0.0,
+    photometric: str = "off",
+    photometric_params: Path = None,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -1018,7 +1020,8 @@ def execute_unified_workflow(
         try:
             pipeline.colorize_via_spirula_sfm(
                 output_dir, fps=fps, use_vulkan=use_vulkan,
-                masks_dir=active_masks_dir, operator_radius=operator_radius
+                masks_dir=active_masks_dir, operator_radius=operator_radius,
+                photometric=photometric, photometric_params=photometric_params
             )
             sfm_done = True
         except Exception as e:
@@ -1027,7 +1030,8 @@ def execute_unified_workflow(
     if method in ("direct", "all") or (method == "sfm" and not sfm_done):
         pipeline.colorize_via_direct_rigid(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
-            masks_dir=active_masks_dir, operator_radius=operator_radius
+            masks_dir=active_masks_dir, operator_radius=operator_radius,
+            photometric=photometric, photometric_params=photometric_params
         )
 
     # --------------------------------------------------------------------------

@@ -244,6 +244,28 @@ class UnifiedWorkflowView(QWidget):
         method_row.addStretch()
         config_layout.addLayout(method_row)
 
+        photometric_row = QHBoxLayout()
+        self.photometric_caption = CaptionLabel(tr("Photometric compensation:"))
+        self.photometric_combo = ComboBox()
+        self.photometric_combo.addItem(tr("Off"), userData="off")
+        self.photometric_combo.addItem(tr("Log-linear"), userData="loglinear")
+        self.photometric_combo.setCurrentIndex(0)
+        self.photometric_combo.setFixedWidth(130)
+        self.photometric_combo.currentIndexChanged.connect(self._update_photometric_controls)
+        self.photometric_params_caption = CaptionLabel(tr("Photometric parameters:"))
+        self.photometric_params_input = LineEdit()
+        self.photometric_params_input.setPlaceholderText(tr("Optional fitted JSON file"))
+        self.photometric_params_btn = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
+        self.photometric_params_btn.clicked.connect(self._browse_photometric_params)
+        photometric_row.addWidget(self.photometric_caption)
+        photometric_row.addWidget(self.photometric_combo)
+        photometric_row.addSpacing(12)
+        photometric_row.addWidget(self.photometric_params_caption)
+        photometric_row.addWidget(self.photometric_params_input, 1)
+        photometric_row.addWidget(self.photometric_params_btn)
+        config_layout.addLayout(photometric_row)
+        self._update_photometric_controls()
+
         recalib_row = QHBoxLayout()
         self.recalibrate_chk = CheckBox(tr("Auto-Recalibrate Spatial Extrinsics from SfM Alignment"))
         self.recalibrate_chk.setChecked(True)
@@ -522,6 +544,19 @@ class UnifiedWorkflowView(QWidget):
         if path:
             self.insv_input.setText(path)
 
+    def _browse_photometric_params(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Select photometric parameter JSON"), "", "JSON files (*.json);;All files (*.*)"
+        )
+        if path:
+            self.photometric_params_input.setText(path)
+
+    def _update_photometric_controls(self, *_):
+        enabled = self.photometric_combo.currentData() == "loglinear"
+        self.photometric_params_caption.setEnabled(enabled)
+        self.photometric_params_input.setEnabled(enabled)
+        self.photometric_params_btn.setEnabled(enabled)
+
     def _download_rf_detr(self):
         if self.runner.is_busy:
             InfoBar.warning(title=tr('Processing is active'), content=tr('Wait for the current task to finish before downloading RF-DETR resources.'), parent=self)
@@ -748,6 +783,11 @@ class UnifiedWorkflowView(QWidget):
             "--fps", str(self.fps_spin.value()),
             "--method", method_key
         ]
+
+        args.extend(["--photometric", str(self.photometric_combo.currentData())])
+        photometric_params = self.photometric_params_input.text().strip()
+        if photometric_params and self.photometric_combo.currentData() == "loglinear":
+            args.extend(["--photometric-params", photometric_params])
 
         if self.recalibrate_chk.isChecked():
             args.append("--recalibrate")
@@ -1061,6 +1101,18 @@ class UnifiedWorkflowView(QWidget):
         ])
         self.method_combo.setCurrentIndex(cur_idx)
         self.method_combo.blockSignals(False)
+
+        self.photometric_caption.setText(tr("Photometric compensation:"))
+        photo_idx = self.photometric_combo.currentIndex()
+        self.photometric_combo.blockSignals(True)
+        self.photometric_combo.setItemText(0, tr("Off"))
+        self.photometric_combo.setItemText(1, tr("Log-linear"))
+        self.photometric_combo.setCurrentIndex(photo_idx)
+        self.photometric_combo.blockSignals(False)
+        self.photometric_params_caption.setText(tr("Photometric parameters:"))
+        self.photometric_params_input.setPlaceholderText(tr("Optional fitted JSON file"))
+        self.photometric_params_btn.setText(tr("Browse"))
+        self._update_photometric_controls()
 
         self.recalibrate_chk.setText(tr("Auto-Recalibrate Spatial Extrinsics from SfM Alignment"))
         self.mask_persons_chk.setText(tr("Generate masks"))

@@ -23,14 +23,19 @@ def similarity(x, y):
 
 
 def fit_timed_poses(centers, world_to_camera, capture_times, slam_times,
-                    positions, rotations, dt_hint=None):
+                    positions, rotations, dt_hint=None, lever_arm_body_m=None):
     """Fit similarity and clock offset using consensus positions and rotations."""
     c, tc = np.asarray(centers), np.asarray(capture_times)
     ts = np.asarray(slam_times) - slam_times[0]
     if len(c) < 20 or np.any(np.diff(ts) <= 0):
         raise ValueError('Timelapse calibration requires 20 poses and monotonic SLAM times')
     interpolate = Slerp(ts, rotations)
-    arm = rotations[0].inv().apply([0., 0., .185])
+    if lever_arm_body_m is None:
+        arm = rotations[0].inv().apply([0., 0., .185])
+    else:
+        arm = np.asarray(lever_arm_body_m, dtype=float)
+        if arm.shape != (3,) or not np.all(np.isfinite(arm)):
+            raise ValueError('Camera lever arm must be a finite 3D vector in the SLAM body frame')
 
     def targets(dt):
         times = np.clip(tc - dt, ts[0], ts[-1])

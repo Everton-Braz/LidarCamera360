@@ -13,6 +13,8 @@ layout(std140, set = 0, binding = 0) uniform CameraUBO {
     float max_radius;   // 4 bytes:  1620.0
     uint num_points;    // 4 bytes:  total points
     uint pad0;          // 4 bytes
+    vec4 log_gain;      // RGB log exposure / white balance; w enables correction
+    vec4 vignette;      // achromatic k1, k2, k3 for r^2, r^4, r^6
 };
 
 struct Point3D {
@@ -37,6 +39,19 @@ layout(std430, set = 0, binding = 4) buffer TopScores {
 layout(std430, set = 0, binding = 5) buffer TopColors {
     uvec4 colors[]; // .x = color1, .y = color2, .z = color3 (each packed RGB8)
 };
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 low = lessThanEqual(c, vec3(0.04045));
+    vec3 high = pow((c + vec3(0.055)) / 1.055, vec3(2.4));
+    return mix(high, c / 12.92, low);
+}
+
+vec3 linear_to_srgb(vec3 c) {
+    c = max(c, vec3(0.0));
+    bvec3 low = lessThanEqual(c, vec3(0.0031308));
+    vec3 high = 1.055 * pow(c, vec3(1.0 / 2.4)) - vec3(0.055);
+    return mix(high, 12.92 * c, low);
+}
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -121,6 +136,21 @@ void main() {
         // Hardware bilinear texture sampling
         vec2 norm_uv = vec2((u + 0.5) / (zbuf_scale.x * float(zbuf_size.x)), (v + 0.5) / (zbuf_scale.y * float(zbuf_size.y)));
         vec3 sampled_rgb = texture(cameraTexture, norm_uv).rgb;
+
+        // RVC1/RVC2 and zero-coefficient RVC3 retain the original exact path.
+        // Correct each sampled observation in linear sRGB without rewriting
+        // or keeping a second copy of the source image.
+        if (log_gain.w > 0.5) {
+            float r_px_norm = r_px / 1620.0;
+            float r2 = r_px_norm * r_px_norm;
+            float r4 = r2 * r2;
+            float r6 = r4 * r2;
+            float vignette_log = vignette.x * r2 + vignette.y * r4 + vignette.z * r6;
+            vec3 log_correction = clamp(log_gain.xyz + vec3(vignette_log),
+                                        vec3(-0.693147181), vec3(0.693147181));
+            vec3 linear_rgb = srgb_to_linear(sampled_rgb) * exp(-log_correction);
+            sampled_rgb = linear_to_srgb(linear_rgb);
+        }
 
         uint r_u8 = uint(clamp(sampled_rgb.r * 255.0, 0.0, 255.0));
         uint g_u8 = uint(clamp(sampled_rgb.g * 255.0, 0.0, 255.0));

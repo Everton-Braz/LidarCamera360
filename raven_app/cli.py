@@ -41,6 +41,16 @@ def nonnegative(value):
     return v
 
 
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    return parsed
+
+
 def unit_interval(value):
     v = finite(value)
     if not 0.0 < v < 1.0:
@@ -72,6 +82,13 @@ def add_mask_options(p):
                    help='JSON mask settings: fisheye border cutoff and per-camera rectangles')
     p.add_argument('--operator-radius', type=nonnegative, default=0.0,
                    help='Operator removal radius in meters; requires --mask-persons or --masks-dir (default: off)')
+
+
+def add_photometric_options(p):
+    p.add_argument('--photometric', choices=('off', 'loglinear'), default='off',
+                   help='Photometric correction mode (default: off)')
+    p.add_argument('--photometric-params', type=Path,
+                   help='Fitted photometric calibration JSON (used with --photometric loglinear)')
 
 
 def bag_options(p):
@@ -121,6 +138,15 @@ def parse(argv=None):
     masks.add_argument('--margin', type=ratio, default=0.03)
     masks.add_argument('--mask-config', type=Path)
     masks.add_argument('--backend', choices=('vulkan', 'tensorrt'), default='vulkan')
+    photometric_fit = sub.add_parser('photometric-fit',
+                   help='Fit per-camera photometric compensation parameters from a dataset')
+    photometric_fit.add_argument('--dataset', type=Path, required=True)
+    photometric_fit.add_argument('--output', type=Path,
+                   help='Optional path for the fitted JSON (otherwise the fitter selects a default)')
+    photometric_fit.add_argument('--masks-dir', type=Path,
+                   help='Optional directory of masks to exclude invalid image regions')
+    photometric_fit.add_argument('--sample-points', type=positive_int, default=50000)
+    photometric_fit.add_argument('--max-observations', type=positive_int, default=500000)
     geo=sub.add_parser('georeference', help='Calculate INSV GPS, georeference point clouds and COLMAP datasets, and export GeoJSON')
     geo.add_argument('--insv', type=Path, required=True, help='Path to Insta360 .INSV video')
     geo.add_argument('--output', type=Path, required=True, help='Output directory for georeferenced deliverables and GeoJSON')
@@ -156,6 +182,7 @@ def parse(argv=None):
     color.add_argument('--run-spirula',action='store_true')
     color.add_argument('--recalibrate-from-sfm',action='store_true')
     add_mask_options(color)
+    add_photometric_options(color)
     wf=sub.add_parser('workflow',help='Run end-to-end processing: Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables')
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
     wf.add_argument('--insv',type=Path,required=True,help='Insta360 video file')
@@ -182,6 +209,7 @@ def parse(argv=None):
     wf.add_argument('--geo-formats', nargs='+', choices=('laz', 'las', 'ply', 'pcd', 'geojson'),
                     default=('laz', 'geojson'), help='Automatic georeferenced cloud formats')
     add_mask_options(wf)
+    add_photometric_options(wf)
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
     a=p.parse_args(argv)
@@ -194,6 +222,8 @@ def parse(argv=None):
         p.error('--mask-config requires --mask-persons; existing masks use settings stored in their manifest')
     if getattr(a, 'operator_radius', 0) > 0 and not (getattr(a, 'mask_persons', False) or getattr(a, 'masks_dir', None)):
         p.error('--operator-radius requires --mask-persons or --masks-dir; removing a trajectory corridor can erase fixed objects')
+    if getattr(a, 'photometric_params', None) is not None and getattr(a, 'photometric', 'off') == 'off':
+        p.error('--photometric-params requires --photometric loglinear')
     if a.headless and a.command in (None,'gui'):p.error('--headless requires a processing or inspection command')
     return a
 
@@ -254,6 +284,7 @@ def run(a):
             'scipy': scipy.__version__,
             'opencv': cv2.__version__,
             'pyav': av.__version__,
+            'photometric': {'loglinear': True, 'schema': 1, 'requires_torch': False},
             'vulkan_colorizer': vulkan_status(),
             'spirula_path': str(sp),
             'spirula_ready': ok_sp
@@ -291,6 +322,15 @@ def run(a):
             mask_config=a.mask_config, backend=a.backend
         )
         print(json.dumps({'masks_dir': str(masks_dir)}, ensure_ascii=False))
+        return 0
+    if a.command=='photometric-fit':
+        from raven_app.photometric import fit_dataset
+        report = fit_dataset(
+            a.dataset, output=a.output, masks_dir=a.masks_dir,
+            sample_points=a.sample_points, max_observations=a.max_observations
+        )
+        print(json.dumps({key: value for key, value in report.items() if key != 'views'},
+                         indent=2, ensure_ascii=False, allow_nan=False))
         return 0
     if a.command=='georeference':
         from raven_app.georeference import run_georeference
@@ -380,13 +420,15 @@ def run(a):
         if a.method in ('sfm','all'):
             pipeline.colorize_via_spirula_sfm(
                 dataset, fps=a.fps, use_vulkan=not a.no_vulkan,
-                masks_dir=masks_dir, operator_radius=a.operator_radius
+                masks_dir=masks_dir, operator_radius=a.operator_radius,
+                photometric=a.photometric, photometric_params=a.photometric_params
             )
         if a.method in ('direct','all'):
             pipeline.colorize_via_direct_rigid(
                 dataset, a.calib, fps=a.fps, dt_override=a.dt,
                 use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
-                operator_radius=a.operator_radius
+                operator_radius=a.operator_radius,
+                photometric=a.photometric, photometric_params=a.photometric_params
             )
         return 0
     if a.command=='workflow':
@@ -433,6 +475,8 @@ def run(a):
             mask_margin=a.mask_margin,
             mask_config=a.mask_config,
             operator_radius=a.operator_radius,
+            photometric=a.photometric,
+            photometric_params=a.photometric_params,
         )
     raise ValueError('Unknown command')
 

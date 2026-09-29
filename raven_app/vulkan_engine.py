@@ -12,9 +12,9 @@ from raven_app.subprocess_utils import hidden_window_options, run_hidden_stream
 
 def get_vulkan_bin():
     root = get_app_root()
-    candidates = [root / p for p in ('bin/vulkan_colorizer.exe',
+    candidates = [root / p for p in ('build/vulkan/Release/vulkan_colorizer.exe',
         'build/native/vulkan_colorizer/Release/vulkan_colorizer.exe',
-        'build/vulkan/Release/vulkan_colorizer.exe', 'native/vulkan_colorizer.exe')]
+        'bin/vulkan_colorizer.exe', 'native/vulkan_colorizer.exe')]
     return next((p for p in candidates if p.is_file()), candidates[0])
 
 
@@ -29,29 +29,77 @@ def vulkan_status():
         return {'path': str(executable), 'ready': False, 'detail': str(exc)}
 
 
-def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images_dir=None):
+def _photo_key(value):
+    """Canonicalize a camera-relative image name to camN/frame.ext."""
+    parts = [part for part in str(value).replace('\\', '/').split('/')
+             if part not in ('', '.', '..')]
+    camera_index = next((i for i in range(len(parts) - 1, -1, -1)
+                         if parts[i].casefold() in ('cam0', 'cam1')), None)
+    if camera_index is not None:
+        parts = parts[camera_index:]
+    elif len(parts) > 2:
+        parts = parts[-2:]
+    return '/'.join(parts).casefold()
+
+
+def _view_photometric(path, photometric, images_dir):
+    """Return (gain RGB, vignette k1/k2/k3) for one normalized view path."""
+    image = Path(path)
+    if images_dir is not None:
+        try:
+            name = image.resolve().relative_to(Path(images_dir).resolve()).as_posix()
+        except ValueError:
+            name = image.as_posix()
+    else:
+        name = image.as_posix()
+    key = _photo_key(name)
+    entry = photometric.get(key)
+    if entry is None:
+        return np.zeros(6, dtype='<f4')
+    if not isinstance(entry, dict):
+        raise ValueError(f'Invalid photometric coefficients for {key}')
+    gain = np.asarray(entry.get('log_gain', [0, 0, 0]), dtype=np.float64)
+    vignette = np.asarray(entry.get('vignette', [0, 0, 0]), dtype=np.float64)
+    values = np.concatenate((gain, vignette))
+    if (gain.shape != (3,) or vignette.shape != (3,) or
+            not np.isfinite(values).all() or np.max(np.abs(values)) > 4):
+        raise ValueError(f'Invalid photometric coefficients for {key}')
+    return values.astype('<f4')
+
+
+def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images_dir=None,
+                   photometric=None):
     """Return RGB8, or None on native failure so callers can run the CPU fallback.
 
-    Protocol RVC1: uint32 point/view counts, packed float4 points; each view is
+    Protocol RVC1/RVC2: uint32 point/view counts, packed float4 points; each view is
     a UTF-8 path prefixed by uint32 length followed by 24 float32 values
-    (row-major Rcw, Cworld, COLMAP's 12 intrinsic parameters).
+    (row-major Rcw, Cworld, COLMAP's 12 intrinsic parameters). RVC3 adds six
+    photometric values per view; RVC4 combines those values with person masks.
+    The six values are three log gains and three achromatic log-vignette coefficients.
     """
     if masks_dir is not None and images_dir is None:
         raise ValueError('images_dir is required for person masks')
+    if photometric is not None and not isinstance(photometric, dict):
+        raise ValueError('photometric must map normalized camera-relative image names to coefficients')
     if not views or not len(points):
         return None
     try:
+        photo_values = ([_view_photometric(view[0], photometric, images_dir)
+                         for view in views] if photometric is not None else None)
         with tempfile.TemporaryDirectory(prefix='vulkan-', dir=work_dir) as tmp:
             job, out = Path(tmp) / 'job.bin', Path(tmp) / 'rgb.bin'
             with job.open('wb') as stream:
-                stream.write(struct.pack('<4sII', b'RVC2' if masks_dir is not None else b'RVC1', len(points), len(views)))
+                magic = (b'RVC4' if photometric is not None and masks_dir is not None else
+                         b'RVC3' if photometric is not None else
+                         b'RVC2' if masks_dir is not None else b'RVC1')
+                stream.write(struct.pack('<4sII', magic, len(points), len(views)))
                 # Shift large survey coordinates before float32 conversion.
                 origin = np.asarray(points[0], dtype=np.float64)
                 packed = np.zeros((len(points), 4), dtype='<f4')
                 packed[:, :3] = points - origin
                 packed.tofile(stream)
                 del packed
-                for path, rotation, center, params in views:
+                for view_i, (path, rotation, center, params) in enumerate(views):
                     if len(params) != 12:
                         raise ValueError('Vulkan requires THIN_PRISM_FISHEYE (12 parameters)')
                     name = str(Path(path).resolve()).encode('utf-8')
@@ -67,6 +115,8 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
                             raise ValueError(f'Missing person mask: {mask}')
                         encoded = str(mask.resolve()).encode('utf-8')
                         stream.write(struct.pack('<I', len(encoded)) + encoded)
+                    if photo_values is not None:
+                        photo_values[view_i].tofile(stream)
             code = run_hidden_stream([str(get_vulkan_bin()), '--job', str(job), '--out', str(out),
                                       '--device', str(device_id)])
             if code != 0 or not out.is_file() or out.stat().st_size != len(points)*4:

@@ -42,6 +42,33 @@ class TimelapseCalibrationTests(unittest.TestCase):
                             Rotation.identity(80).as_matrix(),np.linspace(10,90,80),
                             ts,positions,Rotation.identity(101),0)
 
+    def test_uses_explicit_camera_lever_arm_in_body_frame(self):
+        ts = np.linspace(0, 120, 1201)
+        positions = np.column_stack((8*np.sin(ts/17), 6*np.cos(ts/21), .1*np.sin(ts/9)))
+        rotations = Rotation.from_euler('zyx', np.column_stack((.7*np.sin(ts/7), .15*np.sin(ts/11), .08*np.cos(ts/9))))
+        tc = np.linspace(6, 114, 60)
+        dt = 2.75
+        query = tc-dt
+        body_rotation = Slerp(ts, rotations)(query)
+        arm = np.array([.01145, .14886, .11122])
+        target = np.column_stack([np.interp(query, ts, positions[:,axis]) for axis in range(3)]) + body_rotation.apply(arm)
+        alignment = Rotation.from_euler('xyz', [.03, -.04, .5])
+        offset = np.array([-4., 3., 1.])
+        scale = 5.1
+        centers = alignment.inv().apply(target-offset)/scale
+        rig = Rotation.from_euler('xyz', [-.2, .25, .7])
+        rcw = (alignment.inv()*body_rotation*rig).inv().as_matrix()
+
+        fit, found_dt, accepted, rmse, found_arm = fit_timed_poses(
+            centers, rcw, tc, ts, positions, rotations, dt+0.4,
+            lever_arm_body_m=arm)
+
+        self.assertAlmostEqual(found_dt, dt, delta=.01)
+        self.assertAlmostEqual(fit[0], scale, delta=.01)
+        self.assertLess(rmse, .01)
+        self.assertEqual(accepted.sum(), len(tc))
+        np.testing.assert_allclose(found_arm, arm)
+
 
 if __name__ == '__main__':
     unittest.main()

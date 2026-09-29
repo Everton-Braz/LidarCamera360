@@ -1083,10 +1083,13 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0):
     return calib_dict
 
 
-def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=None, operator_radius=0.0):
+def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=None, operator_radius=0.0,
+                           photometric='off', photometric_params=None):
     """Executa a coloração de alta precisão projetando as poses alinhadas do SfM"""
     if operator_radius > 0 and masks_dir is None:
         raise ValueError('Operator removal requires person masks (--mask-persons or --masks-dir); a trajectory radius alone can erase doors and walls')
+    from raven_app.photometric import prepare, apply_rgb
+    photo_views = prepare(dataset_dir, photometric, photometric_params, masks_dir)
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
@@ -1203,6 +1206,9 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         rgb_ins = sample_bilinear(img_rgb, u_ins, v_ins)
+        if photo_views is not None:
+            rgb_ins = apply_rgb(rgb_ins, u_ins, v_ins, params,
+                                photo_views.get(im['name'].replace('\\', '/')))
 
         worst_slot = np.argmin(top_scores[idx_ins], axis=1)
         top_scores[idx_ins, worst_slot] = scores_ins
@@ -1214,9 +1220,12 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
 
     print("[*] Solving statistical consensus SfM...")
     if gpu_views is not None:
-        colors = colorize_views(pts_lidar, gpu_views, dataset_dir, masks_dir=masks_dir, images_dir=dataset_dir / "images")
+        colors = colorize_views(pts_lidar, gpu_views, dataset_dir, masks_dir=masks_dir, images_dir=dataset_dir / "images",
+                                **({'photometric': photo_views} if photo_views is not None else {}))
         if colors is None:
-            return colorize_via_spirula_sfm(dataset_dir, fps=fps, use_vulkan=False, masks_dir=masks_dir, operator_radius=operator_radius)
+            return colorize_via_spirula_sfm(dataset_dir, fps=fps, use_vulkan=False, masks_dir=masks_dir,
+                                           operator_radius=operator_radius, photometric=photometric,
+                                           photometric_params=photometric_params)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)
@@ -1283,8 +1292,11 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
 # PIPELINE MÉTODO 2: DIRETO RÍGIDO (SEM SFM)
 # ==============================================================================
 
-def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_override=None, use_vulkan=True, masks_dir=None, operator_radius=0.0):
+def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_override=None, use_vulkan=True, masks_dir=None, operator_radius=0.0,
+                            photometric='off', photometric_params=None):
     """Executa a coloração direta rápida usando matriz rígida e tempo calibrado"""
+    from raven_app.photometric import prepare, apply_rgb
+    photo_views = prepare(dataset_dir, photometric, photometric_params, masks_dir)
     if operator_radius > 0 and masks_dir is None:
         raise ValueError('Operator removal requires person masks (--mask-persons or --masks-dir); a trajectory radius alone can erase doors and walls')
     if calib_json_path is None:
@@ -1553,6 +1565,9 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
                 continue
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             rgb_ins = sample_bilinear(img_rgb, u_ins, v_ins)
+            if photo_views is not None:
+                rgb_ins = apply_rgb(rgb_ins, u_ins, v_ins, params,
+                                    photo_views.get(img_path.relative_to(dataset_dir / 'images').as_posix()))
 
             worst_slot = np.argmin(top_scores[idx_ins], axis=1)
             top_scores[idx_ins, worst_slot] = scores_ins
@@ -1564,9 +1579,12 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
 
     print("[*] Solving statistical consensus and removing projection outliers...")
     if gpu_views is not None:
-        colors = colorize_views(pts_lidar, gpu_views, dataset_dir, masks_dir=masks_dir, images_dir=dataset_dir / "images")
+        colors = colorize_views(pts_lidar, gpu_views, dataset_dir, masks_dir=masks_dir, images_dir=dataset_dir / "images",
+                                **({'photometric': photo_views} if photo_views is not None else {}))
         if colors is None:
-            return colorize_via_direct_rigid(dataset_dir, calib_json_path, fps=fps, dt_override=dt_sync, use_vulkan=False, masks_dir=masks_dir, operator_radius=operator_radius)
+            return colorize_via_direct_rigid(dataset_dir, calib_json_path, fps=fps, dt_override=dt_sync, use_vulkan=False,
+                                             masks_dir=masks_dir, operator_radius=operator_radius,
+                                             photometric=photometric, photometric_params=photometric_params)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)

@@ -146,7 +146,10 @@ def main():
     for dependency in spirula.parent.glob('*.dll'):
         add_binary(dependency, 'bin')
 
-    gpu_dirs = [ROOT / 'build/native/vulkan_colorizer/Release', ROOT / 'build/vulkan/Release', ROOT / 'bin']
+    # Prefer the current standalone Vulkan target. The legacy native path can
+    # contain an older RVC1/RVC2 protocol binary and would silently drop the
+    # optional RVC3/RVC4 photometric payload during packaging.
+    gpu_dirs = [ROOT / 'build/vulkan/Release', ROOT / 'build/native/vulkan_colorizer/Release', ROOT / 'bin']
     gpu = next((d for d in gpu_dirs if (d / 'vulkan_colorizer.exe').is_file()), None)
     if gpu is None:
         raise SystemExit('Build vulkan_colorizer before packaging')

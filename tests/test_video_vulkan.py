@@ -8,6 +8,7 @@ from raven_app.video import (extract_insv_frames_pyav, frame_time,
                              has_cached_frame_extraction, _timelapse_times,
                              video_preview_timeline, extract_video_preview_frame)
 from raven_app.vulkan_engine import colorize_views, get_vulkan_bin
+from raven_app.photometric.model import apply_rgb
 from scripts.pipeline_auto_calibrator_and_colorizer import project_thin_prism
 
 class VideoTests(unittest.TestCase):
@@ -91,6 +92,39 @@ class VideoTests(unittest.TestCase):
 
 @unittest.skipUnless(get_vulkan_bin().is_file(),'Native Vulkan build unavailable')
 class VulkanTests(unittest.TestCase):
+    def test_photometric_rvc3_matches_cpu_and_identity(self):
+        """RVC3 corrects each observation in linear sRGB and keeps zero-model bytes exact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = root / 'images'
+            camera_dir = images / 'cam0'
+            camera_dir.mkdir(parents=True)
+            rgb0 = np.array([118, 96, 72], dtype=np.uint8)
+            path = camera_dir / 'frame_000001.png'
+            # 3840 px preserves the model's physical 1620 px normalization.
+            cv2.imwrite(str(path), np.broadcast_to(rgb0[::-1], (3840, 3840, 3)).copy())
+            params = [1080, 1080, 1920, 1920] + [0] * 8
+            radii = (0.0, 760.0, 1320.0)
+            points = np.array([[np.tan(r / params[0]), 0.0, 1.0] for r in radii])
+            views = [(path, np.eye(3), np.zeros(3), params)]
+            coeff = {'log_gain': [0.18, -0.09, 0.04],
+                     'vignette': [-0.24, 0.12, 0.01]}
+            model = {'cam0/frame_000001.png': coeff}
+
+            baseline = colorize_views(points, views, root)
+            identity = colorize_views(points, views, root, images_dir=images,
+                                      photometric={})
+            corrected = colorize_views(points, views, root, images_dir=images,
+                                       photometric=model)
+            self.assertIsNotNone(baseline)
+            self.assertIsNotNone(identity)
+            self.assertIsNotNone(corrected)
+            np.testing.assert_array_equal(identity, baseline)
+            u, v, _ = project_thin_prism(points, params)
+            expected = np.stack([apply_rgb(rgb0, x, y, params, coeff)
+                                 for x, y in zip(u, v)])
+            np.testing.assert_allclose(corrected, expected, atol=1)
+
     def test_occlusion_consensus_and_large_origin(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
