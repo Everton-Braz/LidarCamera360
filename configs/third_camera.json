@@ -1,0 +1,28 @@
+{
+  "camera_name": "cam2",
+  "source_path": "",
+  "source_type": "video",
+  "enabled": true,
+  "fps": 2.0,
+  "time_offset_s": 0.0,
+  "camera_model": "PINHOLE",
+  "intrinsics": {
+    "width": 1920,
+    "height": 1080,
+    "fx": 1536.0,
+    "fy": 1536.0,
+    "cx": 960.0,
+    "cy": 540.0,
+    "k1": 0.0,
+    "k2": 0.0,
+    "p1": 0.0,
+    "p2": 0.0
+  },
+  "T_lidar_to_cam2_rigid_4x4": [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.15],
+    [0.0, 0.0, 1.0, 0.20],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "description": "Frontal smartphone camera (auxiliary image/video source for 3DGS enhancement)"
+}
