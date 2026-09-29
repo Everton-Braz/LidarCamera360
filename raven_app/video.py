@@ -135,6 +135,162 @@ def _write_pair(stage, number, frames, jpeg_quality):
         encoded.tofile(stage / f'cam{lens}/frame_{number:06d}.jpg')
 
 
+def _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality):
+    source = Path(insv_path)
+    stat = source.stat()
+    return dict(source=str(source.resolve()), size=stat.st_size,
+                mtime_ns=stat.st_mtime_ns, fps=fps, sharp_window=sharp_window,
+                jpeg_quality=jpeg_quality, version=3)
+
+
+def has_cached_frame_extraction(insv_path, output_dir, fps=2.0, sharp_window=5,
+                                jpeg_quality=95):
+    """Return whether the matching extraction manifest and every frame exist."""
+    try:
+        signature = _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality)
+        images = Path(output_dir) / 'images'
+        manifest = images / 'frames.json'
+        old = json.loads(manifest.read_text(encoding='utf-8'))
+        timestamps = old.get('timestamps')
+        return bool(old.get('signature') == signature and timestamps and all(
+            (images / name).is_file() for name in timestamps
+        ))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def video_preview_timeline(insv_path, fps=2.0):
+    """Return the selectable extraction buckets without decoding image frames."""
+    import av
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError('fps must be positive and finite')
+    path = Path(insv_path)
+    capture_times = _timelapse_times(path) if path.suffix.lower() == '.insv' else None
+    with av.open(str(path)) as container:
+        if len(container.streams.video) != 2:
+            raise ValueError('Input must contain exactly two video tracks')
+        if capture_times is not None:
+            stream = container.streams.video[0]
+            frame_count = stream.frames
+            if not frame_count:
+                rate = float(stream.average_rate or 0)
+                duration = (float(stream.duration * stream.time_base)
+                            if stream.duration and stream.time_base else
+                            float(container.duration or 0) / 1_000_000)
+                if rate > 0 and duration > 0:
+                    frame_count = int(round(duration * rate))
+            if frame_count and len(capture_times) == frame_count + 1:
+                capture_times = capture_times[:frame_count]
+            return tuple(sorted({int(math.floor(max(0.0, float(t)) * fps + 1e-7))
+                                 for t in capture_times}))
+        durations = [float(s.duration * s.time_base) for s in container.streams.video
+                     if s.duration is not None and s.time_base is not None and s.duration > 0]
+        duration = max(durations, default=0.0)
+        if not duration and container.duration:
+            duration = float(container.duration) / 1_000_000
+        if not duration:
+            stream = container.streams.video[0]
+            rate = float(stream.average_rate or 0)
+            if stream.frames and rate > 0:
+                duration = float(stream.frames) / rate
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError('Video duration is unavailable')
+        count = max(1, int(math.ceil(duration * fps - 1e-9)))
+        return tuple(range(count))
+
+
+def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
+                                sharp_window=5, *, decoder='auto', threads=None,
+                                jpeg_quality=95):
+    """Extract and publish just one synchronized lens pair for a timeline slot."""
+    import av
+    insv_path, output_dir = Path(insv_path), Path(output_dir)
+    if not isinstance(index, int) or index < 0:
+        raise ValueError('index must be a non-negative integer')
+    if not math.isfinite(fps) or fps <= 0 or not isinstance(sharp_window, int) or sharp_window < 1:
+        raise ValueError('fps must be positive and finite; sharp_window must be a positive integer')
+    if threads is None:
+        threads = max(1, min(4, (os.cpu_count() or 2) // 2))
+    if threads < 1 or not 1 <= jpeg_quality <= 100:
+        raise ValueError('Invalid decoder thread count or JPEG quality')
+    buckets = video_preview_timeline(insv_path, fps)
+    if index >= len(buckets):
+        raise ValueError(f'Frame index {index} is outside the video timeline')
+    target_bucket = buckets[index]
+    capture_times = _timelapse_times(insv_path) if insv_path.suffix.lower() == '.insv' else None
+    backend = _select_decoder(insv_path, decoder, threads)
+    attempts = [backend] + (['cpu'] if decoder == 'auto' and backend != 'cpu' else [])
+    for backend in attempts:
+        try:
+            with ExitStack() as stack:
+                sources = []
+                for lens in range(2):
+                    container, stream = _open_decoder(insv_path, lens, backend, threads)
+                    stack.enter_context(container)
+                    sources.append((container, stream))
+                rate = float(sources[0][1].average_rate or 30)
+                origin = float((sources[0][1].start_time or 0) * sources[0][1].time_base)
+                # Timelapse capture timestamps have no guaranteed relationship to PTS;
+                # decode forward but keep only the selected pair in the preview cache.
+                if capture_times is None:
+                    target_time = target_bucket / fps
+                    for container, stream in sources:
+                        offset = int(round((origin + target_time) / float(stream.time_base)))
+                        container.seek(offset, stream=stream, backward=True, any_frame=False)
+                iterators = [container.decode(stream) for container, stream in sources]
+                source_index = 0
+                candidate, candidates = None, 0
+                while True:
+                    pair = tuple(next(iterator, None) for iterator in iterators)
+                    if all(frame is None for frame in pair):
+                        break
+                    if any(frame is None for frame in pair):
+                        raise ValueError('Video tracks have different frame counts')
+                    times = [float(frame.time) - origin if frame.time is not None else source_index / rate
+                             for frame in pair]
+                    if abs(times[0] - times[1]) > 0.5 / rate:
+                        raise ValueError('Video tracks have mismatched presentation timestamps')
+                    if capture_times is not None:
+                        if source_index >= len(capture_times):
+                            raise ValueError('More video frames than timelapse timestamps')
+                        times = [float(capture_times[source_index])] * 2
+                    source_index += 1
+                    bucket = int(math.floor(max(0.0, times[0]) * fps + 1e-7))
+                    if bucket < target_bucket:
+                        continue
+                    if bucket > target_bucket:
+                        break
+                    if candidates < sharp_window:
+                        score = sum(_frame_sharpness(frame) for frame in pair)
+                        if candidate is None or score > candidate[0]:
+                            candidate = score, pair, times
+                        candidates += 1
+                    if candidates >= sharp_window:
+                        break
+                if candidate is None:
+                    raise ValueError(f'No video frame found in timeline slot {index + 1}')
+                _, pair, _ = candidate
+                number = index + 1
+                output_dir.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix='preview-', dir=output_dir) as tmp:
+                    stage = Path(tmp)
+                    for lens in range(2):
+                        (stage / f'cam{lens}').mkdir()
+                    _write_pair(stage, number, pair, jpeg_quality)
+                    images = output_dir / 'images'
+                    for lens in range(2):
+                        camera = f'cam{lens}'
+                        target = images / camera
+                        target.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(stage / camera / f'frame_{number:06d}.jpg'),
+                                    target / f'frame_{number:06d}.jpg')
+                print(f'[+] Extracted preview pair {number}/{len(buckets)}.')
+                return True
+        except Exception as exc:
+            print(f'[!] {backend} preview extraction failed: {exc}', flush=True)
+    return False
+
+
 def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                          progress_cb=None, *, decoder='auto', threads=None,
                          jpeg_quality=95):
@@ -151,21 +307,12 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
         raise ValueError('Invalid decoder thread count or JPEG quality')
     if decoder not in ('auto', 'cpu', 'cuda', 'd3d11va', 'videotoolbox', 'vaapi'):
         raise ValueError('Unsupported decoder backend')
-    stat = insv_path.stat()
-    signature = dict(source=str(insv_path.resolve()), size=stat.st_size,
-                     mtime_ns=stat.st_mtime_ns, fps=fps, sharp_window=sharp_window,
-                     jpeg_quality=jpeg_quality, version=3)
+    signature = _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality)
     images = output_dir / 'images'
     manifest = images / 'frames.json'
-    if manifest.is_file():
-        try:
-            old = json.loads(manifest.read_text(encoding='utf-8'))
-        except (ValueError, OSError):
-            old = {}
-        if old.get('signature') == signature and old.get('timestamps') and all(
-                (images / name).is_file() for name in old['timestamps']):
-            print('[*] Reusing completed video extraction.')
-            return True
+    if has_cached_frame_extraction(insv_path, output_dir, fps, sharp_window, jpeg_quality):
+        print('[*] Reusing completed video extraction.')
+        return True
     output_dir.mkdir(parents=True, exist_ok=True)
     capture_times = _timelapse_times(insv_path) if insv_path.suffix.lower() == '.insv' else None
     backend = _select_decoder(insv_path, decoder, threads)

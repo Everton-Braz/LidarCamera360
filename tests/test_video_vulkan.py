@@ -4,7 +4,9 @@ from unittest.mock import patch
 import numpy as np
 import cv2
 import av
-from raven_app.video import extract_insv_frames_pyav, frame_time, _timelapse_times
+from raven_app.video import (extract_insv_frames_pyav, frame_time,
+                             has_cached_frame_extraction, _timelapse_times,
+                             video_preview_timeline, extract_video_preview_frame)
 from raven_app.vulkan_engine import colorize_views, get_vulkan_bin
 from scripts.pipeline_auto_calibrator_and_colorizer import project_thin_prism
 
@@ -28,6 +30,8 @@ class VideoTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); source=root/'test.insv'; self.make_video(source)
             self.assertTrue(extract_insv_frames_pyav(source,root/'out',fps=1))
+            self.assertTrue(has_cached_frame_extraction(source, root/'out', fps=1))
+            self.assertFalse(has_cached_frame_extraction(source, root/'out', fps=2))
             images=root/'out/images'
             self.assertEqual(len(list(images.glob('cam0/*.jpg'))),3)
             self.assertAlmostEqual(frame_time(root/'out','cam0/frame_000001.jpg'),.2)
@@ -36,12 +40,30 @@ class VideoTests(unittest.TestCase):
             self.assertTrue(extract_insv_frames_pyav(source,root/'out',fps=1))
             self.assertTrue((images/'cam1/frame_000002.jpg').is_file())
             self.assertTrue(extract_insv_frames_pyav(source,root/'out',fps=2))
+            self.assertTrue(has_cached_frame_extraction(source, root/'out', fps=2))
             self.assertEqual(len(list(images.glob('cam0/*.jpg'))),5)
     def test_single_track_fails_without_publishing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); self.make_video(root/'test.insv',1)
             self.assertFalse(extract_insv_frames_pyav(root/'test.insv',root/'out'))
             self.assertFalse((root/'out/images/frames.json').exists())
+
+    def test_preview_extracts_only_requested_timeline_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'preview.insv'
+            self.make_video(source)
+            self.assertEqual(video_preview_timeline(source, fps=1), (0, 1, 2))
+            cache = root / 'preview-cache'
+            self.assertTrue(extract_video_preview_frame(source, cache, 0, fps=1,
+                                                        sharp_window=1, decoder='cpu'))
+            self.assertTrue(extract_video_preview_frame(source, cache, 2, fps=1,
+                                                        sharp_window=1, decoder='cpu'))
+            for camera in ('cam0', 'cam1'):
+                files = sorted((cache / 'images' / camera).glob('*.jpg'))
+                self.assertEqual([path.name for path in files],
+                                 ['frame_000001.jpg', 'frame_000003.jpg'])
+            self.assertFalse((cache / 'images' / 'frames.json').exists())
     def test_legacy_one_based(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(frame_time(tmp,'cam1/frame_000003.jpg',2),1)
@@ -49,8 +71,11 @@ class VideoTests(unittest.TestCase):
     def test_timelapse_uses_capture_time_for_selection_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); source=root/'test.insv'; self.make_video(source)
-            capture=np.arange(23,dtype=float)*2.0 + .3
+            capture=np.arange(24,dtype=float)*2.0 + .3
             with patch('raven_app.video._timelapse_times',return_value=capture):
+                timeline = video_preview_timeline(source, fps=1)
+                self.assertEqual(len(timeline), 23)
+                self.assertEqual(timeline[-1], 44)
                 self.assertTrue(extract_insv_frames_pyav(source,root/'out',fps=1,sharp_window=1))
             manifest=json.loads((root/'out/images/frames.json').read_text())
             self.assertEqual(manifest['time_source'],'insv_timelapse')

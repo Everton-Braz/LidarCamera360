@@ -15,6 +15,7 @@ laspy==2.7.0
 lazrs==0.8.2
 pillow==12.3.0
 tifffile==2026.9.9
+onnx==1.20.1
 
 
 av>=11.0.0

@@ -35,6 +35,8 @@ foreach ($dependency in $sources) {
 }
 Invoke-Checked cmake @('-S','native','-B','build/native','-G',$Generator,'-A','x64',('-DCMAKE_TOOLCHAIN_FILE=' + (Join-Path $VcpkgRoot 'scripts/buildsystems/vcpkg.cmake')))
 Invoke-Checked cmake @('--build','build/native','--config','Release','--parallel','4')
+Invoke-Checked cmake @('-S','native/vulkan_rfdetr','-B','build/vulkan-rfdetr','-G',$Generator,'-A','x64')
+Invoke-Checked cmake @('--build','build/vulkan-rfdetr','--config','Release','--target','rfdetr-vulkan','--parallel','4')
 if (-not (Test-Path -LiteralPath 'build/portable-env/Scripts/python.exe')) {
     Invoke-Checked $Python @('-m','venv','build/portable-env')
 }

@@ -30,6 +30,7 @@ def main():
 
     # Validate required runtime modules are installed
     for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets',
+                   'onnx',
                    'pyproj', 'laspy', 'lazrs', 'piexif', 'tifffile'):
         spec = importlib.util.find_spec(module)
         if spec is None or not spec.origin:
@@ -79,6 +80,7 @@ def main():
         '--collect-all', 'laspy',
         '--collect-all', 'lazrs',
         '--collect-all', 'tifffile',
+        '--hidden-import', 'onnx',
         '--add-data', f'{ROOT / "FAST-LIVO2/config"};FAST-LIVO2/config',
         '--add-data', f'{ROOT / "calibracao_rigida_raven_insta360.json"};.',
         '--add-data', f'{stage};.',
@@ -159,6 +161,34 @@ def main():
         if not source.is_file():
             raise SystemExit(f'Missing compiled shader: {source}')
         cmd += ['--add-data', f'{source};bin/shaders']
+
+    vulkan_mask_candidates = (ROOT / 'build/vulkan-rfdetr/Release/rfdetr-vulkan.exe',
+                              ROOT / 'build/vulkan-rfdetr/rfdetr-vulkan.exe',
+                              ROOT / 'bin/rfdetr-vulkan.exe')
+    vulkan_masker = next((path for path in vulkan_mask_candidates if path.is_file()), None)
+    if vulkan_masker is None:
+        raise SystemExit('Build native/vulkan_rfdetr first (rfdetr-vulkan.exe is required for Vulkan RF-DETR masks)')
+    add_binary(vulkan_masker, 'bin')
+    vulkan_mask_shaders = ('ops.comp.spv', 'matmul.comp.spv', 'reduce.comp.spv')
+    for shader in vulkan_mask_shaders:
+        candidates = (vulkan_masker.parent / 'shaders' / shader,
+                      vulkan_masker.parent.parent / shader,
+                      ROOT / 'native/vulkan_rfdetr/shaders' / shader)
+        source = next((path for path in candidates if path.is_file()), None)
+        if source is None:
+            raise SystemExit(f'Missing compiled RF-DETR Vulkan shader: {shader}')
+        cmd += ['--add-data', f'{source};bin/shaders']
+    vulkan_mask_source = ROOT / 'native/vulkan_rfdetr'
+    if vulkan_mask_source.is_dir():
+        cmd += ['--add-data', f'{vulkan_mask_source};licenses/rfdetr/vulkan-source']
+    exporter = ROOT / 'tools/export_rfdetr_vulkan.py'
+    if not exporter.is_file():
+        raise SystemExit('RF-DETR Vulkan model exporter is missing')
+    cmd += ['--add-data', f'{exporter};tools']
+    shape_overrides = ROOT / 'tools/vendor/rfdetr-seg-medium-shape-overrides.json'
+    if not shape_overrides.is_file():
+        raise SystemExit('Pinned RF-DETR static shape metadata is missing')
+    cmd += ['--add-data', f'{shape_overrides};tools/vendor']
 
     if a.with_person_masker:
         masker_dir = masker_exe.parent

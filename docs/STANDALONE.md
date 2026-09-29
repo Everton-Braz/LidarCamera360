@@ -2,7 +2,7 @@
 
 LidarCamera360 is a portable Windows x64 application. Keep `LidarCamera360.exe` and `_internal/` together when copying `dist/LidarCamera360/`. The single-file build is under `dist/single-file/` when extraction at startup is acceptable.
 
-RF-DETR masking resources are lazy downloads. The portable build includes the small masker executable, while the ONNX model and TensorRT runtime are fetched only when requested and stored under `%APPDATA%\RavenCalibrator`; they are not embedded in the portable executable.
+RF-DETR masking resources are lazy downloads. The portable build includes the small Vulkan and TensorRT executors and their shaders, while the ONNX model and generated Vulkan schedule are fetched or built only when requested and stored under `%APPDATA%\RavenCalibrator`. Vulkan is the default mask backend and does not install TensorRT. TensorRT is optional; choosing it downloads its runtime only when missing. Neither model nor runtime is embedded in the portable executable.
 
 ## Commands
 

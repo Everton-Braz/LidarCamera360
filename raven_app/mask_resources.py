@@ -1,9 +1,12 @@
-"""Lazy, hash-verified RF-DETR model and TensorRT runtime resources."""
+"""Lazy, verified RF-DETR resources for TensorRT and Vulkan mask backends."""
 import hashlib
+import importlib.util
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 import shutil
+import sys
 import time
 import urllib.request
 import zipfile
@@ -27,6 +30,8 @@ TENSORRT_DLLS = {
     'nvinfer_builder_resource_10.dll': 1_139_393_056,
     'nvinfer_plugin_10.dll': 46_949_408,
 }
+VULKAN_EXECUTABLE = 'rfdetr-vulkan.exe'
+VULKAN_SHADERS = ('ops.comp.spv', 'matmul.comp.spv', 'reduce.comp.spv')
 
 
 def _sha256(path):
@@ -37,9 +42,24 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=128)
+def _cached_sha256(path, size, modified_ns, created_ns):
+    return _sha256(path)
+
+
+def _file_sha256(path):
+    path = Path(path)
+    stat = path.stat()
+    return _cached_sha256(str(path.resolve()), stat.st_size,
+                          stat.st_mtime_ns, stat.st_ctime_ns)
+
+
 def _valid_file(path, size, digest):
     path = Path(path)
-    return path.is_file() and path.stat().st_size == size and _sha256(path) == digest
+    try:
+        return path.is_file() and path.stat().st_size == size and _file_sha256(path) == digest
+    except OSError:
+        return False
 
 
 def resolve_model(model_path=None):
@@ -55,9 +75,31 @@ def resolve_model(model_path=None):
         if not candidate.is_file():
             raise FileNotFoundError(f'RAVEN_RFDETR_MODEL does not exist: {candidate}')
         return candidate.resolve()
-    root = get_app_root()
-    candidates = (get_config_dir() / 'models' / MODEL_NAME, root / 'models' / MODEL_NAME)
-    return next((path.resolve() for path in candidates if path.is_file()), None)
+    try:
+        root = get_app_root()
+        candidates = (get_config_dir() / 'models' / MODEL_NAME, root / 'models' / MODEL_NAME)
+    except OSError:
+        candidates = (get_app_root() / 'models' / MODEL_NAME,)
+    for path in candidates:
+        try:
+            if path.is_file():
+                return path.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def model_is_ready(model_path=None):
+    """Whether the selected/default model is present and passes its integrity check."""
+    try:
+        model = resolve_model(model_path)
+        if model is None:
+            return False
+        if model_path is not None or os.environ.get('RAVEN_RFDETR_MODEL', '').strip():
+            return model.stat().st_size > 0
+        return _valid_file(model, MODEL_SIZE, MODEL_SHA256)
+    except (OSError, ValueError):
+        return False
 
 
 def resolve_masker_executable():
@@ -65,6 +107,80 @@ def resolve_masker_executable():
     candidates = (root / 'bin/rfdetr-masker.exe',
                   root / 'build/rfdetr-masker/Release/rfdetr-masker.exe')
     return next((path.resolve() for path in candidates if path.is_file()), None)
+
+
+def resolve_vulkan_executable():
+    """Find the standalone Vulkan masker shipped in the app or development tree."""
+    root = get_app_root()
+    candidates = (root / 'bin' / VULKAN_EXECUTABLE,
+                  root / 'build/vulkan-rfdetr/Release' / VULKAN_EXECUTABLE,
+                  root / 'build/vulkan-rfdetr' / VULKAN_EXECUTABLE)
+    return next((path.resolve() for path in candidates if path.is_file()), None)
+
+
+def resolve_vulkan_shaders_dir(executable=None):
+    """Resolve the compiled shader directory for a bundled or development runner."""
+    executable = Path(executable).resolve() if executable else resolve_vulkan_executable()
+    if executable is None:
+        return None
+    candidates = (executable.parent / 'shaders', executable.parent.parent)
+    for directory in candidates:
+        if all((directory / name).is_file() for name in VULKAN_SHADERS):
+            return directory.resolve()
+    return None
+
+
+def _model_digest(model):
+    if Path(model).name == MODEL_NAME and _valid_file(model, MODEL_SIZE, MODEL_SHA256):
+        return MODEL_SHA256
+    return _file_sha256(model)
+
+
+def _schedule_path(model):
+    fingerprint = _model_digest(model)
+    cache = get_config_dir() / 'models' / 'vulkan'
+    return cache / f'rfdetr-{fingerprint[:16]}.rvk', fingerprint
+
+
+def resolve_vulkan_schedule(model_path=None):
+    """Return a cached RVK schedule only when its model and file hashes match."""
+    try:
+        model = resolve_model(model_path)
+        if model is None:
+            return None
+        schedule, fingerprint = _schedule_path(model)
+        metadata_path = schedule.with_suffix(schedule.suffix + '.json')
+        if not schedule.is_file() or not metadata_path.is_file():
+            return None
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        if (metadata.get('model_sha256') != fingerprint
+                or metadata.get('schedule_bytes') != schedule.stat().st_size
+                or metadata.get('schedule_sha256') != _file_sha256(schedule)):
+            return None
+        return schedule.resolve()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def resource_status(backend='vulkan'):
+    """Describe the first missing resource for the chosen backend."""
+    if not model_is_ready():
+        return 'model-missing'
+    if backend == 'tensorrt':
+        if resolve_masker_executable() is None:
+            return 'executor-missing'
+        return 'ready' if resolve_runtime_dir() is not None else 'runtime-missing'
+    if backend == 'vulkan':
+        executable = resolve_vulkan_executable()
+        if executable is None or resolve_vulkan_shaders_dir(executable) is None:
+            return 'executor-missing'
+        return 'ready' if resolve_vulkan_schedule() is not None else 'schedule-missing'
+    raise ValueError(f'Unknown RF-DETR backend: {backend}')
+
+
+def resources_ready(backend='vulkan'):
+    """Check all files required by the chosen mask backend without downloading."""
+    return resource_status(backend) == 'ready'
 
 
 def resolve_runtime_dir():
@@ -75,14 +191,19 @@ def resolve_runtime_dir():
     if override:
         path = Path(override).expanduser()
         candidates.extend((path, path / 'bin'))
-    candidates.extend((
-        root / 'bin',
-        root / 'build/rfdetr-masker/Release',
-        get_config_dir() / f'rfdetr-runtime-{TENSORRT_VERSION}' / 'bin',
-    ))
+    candidates.extend((root / 'bin', root / 'build/rfdetr-masker/Release'))
+    try:
+        candidates.append(get_config_dir() / f'rfdetr-runtime-{TENSORRT_VERSION}' / 'bin')
+    except OSError:
+        pass
     for directory in candidates:
-        if all((directory / name).is_file() for name in TENSORRT_DLLS):
-            return directory.resolve()
+        try:
+            if all((directory / name).is_file()
+                   and (directory / name).stat().st_size == size
+                   for name, size in TENSORRT_DLLS.items()):
+                return directory.resolve()
+        except OSError:
+            continue
     return None
 
 
@@ -242,10 +363,102 @@ def ensure_runtime(progress=None):
     return target.resolve()
 
 
-def ensure_resources(progress=None):
-    model = ensure_model(progress)
-    runtime = ensure_runtime(progress)
-    return model, runtime
+def ensure_vulkan_schedule(model_path=None, progress=None):
+    """Create and cache a static Vulkan schedule from the verified ONNX model."""
+    model = ensure_model(progress) if model_path is None else resolve_model(model_path)
+    executable = resolve_vulkan_executable()
+    shaders = resolve_vulkan_shaders_dir(executable)
+    if executable is None or shaders is None:
+        raise RuntimeError('RF-DETR Vulkan executor or compiled shaders are missing from this app build')
+    cached = resolve_vulkan_schedule(model)
+    if cached is not None:
+        if progress:
+            progress('vulkan', 100)
+        return cached
+
+    schedule, fingerprint = _schedule_path(model)
+    schedule.parent.mkdir(parents=True, exist_ok=True)
+    lock = schedule.with_name(schedule.name + '.lock')
+    deadline = time.monotonic() + 6 * 60 * 60
+    descriptor = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                if not lock.exists() or time.time() - lock.stat().st_mtime > 6 * 60 * 60:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Another RF-DETR Vulkan schedule build is still active')
+            time.sleep(1)
+            cached = resolve_vulkan_schedule(model)
+            if cached is not None:
+                if progress:
+                    progress('vulkan', 100)
+                return cached
+    os.write(descriptor, str(os.getpid()).encode('ascii'))
+    os.close(descriptor)
+    try:
+        return _build_vulkan_schedule(model, schedule, fingerprint, progress)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _build_vulkan_schedule(model, schedule, fingerprint, progress=None):
+    temporary = schedule.with_name(schedule.stem + '.building.rvk')
+    temporary_manifest = temporary.with_suffix(temporary.suffix + '.json')
+    temporary.unlink(missing_ok=True)
+    temporary_manifest.unlink(missing_ok=True)
+    if progress:
+        progress('vulkan', 1)
+    exporter = get_app_root() / 'tools' / 'export_rfdetr_vulkan.py'
+    if not exporter.is_file():
+        raise RuntimeError('RF-DETR Vulkan model exporter is missing from this app build')
+    spec = importlib.util.spec_from_file_location('_rfdetr_vulkan_exporter', exporter)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'Cannot load RF-DETR Vulkan model exporter: {exporter}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        if progress:
+            progress('vulkan', 3)
+        spec.loader.exec_module(module)
+        if progress:
+            progress('vulkan', 7)
+        module.export_model(
+            model, temporary,
+            progress=lambda percent: progress('vulkan', percent) if progress else None,
+        )
+        metadata = json.loads(temporary_manifest.read_text(encoding='utf-8'))
+        if metadata.get('model_sha256') != fingerprint:
+            raise RuntimeError('Vulkan schedule was exported from a different RF-DETR model')
+        metadata['schedule_sha256'] = _file_sha256(temporary)
+        temporary.replace(schedule)
+        temporary_manifest.replace(schedule.with_suffix(schedule.suffix + '.json'))
+        sidecar = schedule.with_suffix(schedule.suffix + '.json')
+        metadata['schedule'] = str(schedule)
+        sidecar.write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        temporary_manifest.unlink(missing_ok=True)
+        raise
+    finally:
+        sys.modules.pop(spec.name, None)
+    if progress:
+        progress('vulkan', 100)
+    return schedule.resolve()
+
+
+def ensure_resources(progress=None, backend='vulkan', model_path=None):
+    model = ensure_model(progress) if model_path is None else resolve_model(model_path)
+    if backend == 'tensorrt':
+        return model, ensure_runtime(progress)
+    if backend == 'vulkan':
+        return model, ensure_vulkan_schedule(model, progress)
+    raise ValueError(f'Unknown RF-DETR backend: {backend}')
 
 
 def download_progress(resource, percent):

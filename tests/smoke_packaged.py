@@ -38,6 +38,12 @@ def main():
         VideoTests().make_video(source)
         call(['--headless','extract-insv','--insv',str(source),'--output',str(tmp/'extracted')])
         assert len(list((tmp/'extracted/images/cam1').glob('*.jpg')))==5
+        preview=tmp/'preview-cache'
+        call(['--headless','extract-insv-frame','--insv',str(source),'--output',str(preview),
+              '--fps','1','--index','2'])
+        for camera in ('cam0','cam1'):
+            assert [p.name for p in (preview/'images'/camera).glob('*.jpg')]==['frame_000003.jpg']
+        assert not (preview/'images/frames.json').exists()
         call(['--headless'],2)
         call(['colorize','--dataset',str(tmp),'--fps','nan'],2)
         dataset=tmp/'dataset';pcd=dataset/'slam_out/pcd';trj=dataset/'slam_out/result'

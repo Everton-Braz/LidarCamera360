@@ -1,7 +1,8 @@
 """Unified processing workflow view."""
 import json
+import time
 from pathlib import Path
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QFrame, QDialog,
     QMessageBox
@@ -13,9 +14,13 @@ from qfluentwidgets import (
     ProgressBar, PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition,
     SmoothScrollArea
 )
-from raven_app.process_runner import ProcessRunner
+from raven_app.process_runner import ProcessRunner, make_run_log_path
+from raven_app.workflow_progress import (
+    STAGE_NAMES, estimate_stage_seconds, load_stage_history,
+    parse_progress_line, save_stage_history, stage_duration_estimates,
+)
 from raven_app.mask_download import MaskResourceDownload
-from raven_app.mask_resources import resolve_model, resolve_runtime_dir
+from raven_app.mask_resources import resource_status, resources_ready
 from raven_app.bag_io import detect_bag_topics
 from raven_app.i18n import tr
 
@@ -34,8 +39,22 @@ class UnifiedWorkflowView(QWidget):
         self.runner = runner
         self._mask_downloader = None
         self.mask_config = None
+        self._current_log_path = None
+        self._workflow_started_at = None
+        self._stage_started_at = None
+        self._stage_root = None
+        self._current_stage = 0
+        self._current_stage_skipped = False
+        self._stage_fraction = 0.0
+        self._stage_fraction_from_log = False
+        self._stage_history = [[] for _ in STAGE_NAMES]
+        self._stage_estimates = [60.0] * len(STAGE_NAMES)
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(1000)
+        self._progress_timer.timeout.connect(self._refresh_workflow_progress)
         self._init_ui()
         self._connect_signals()
+        self._refresh_mask_resource_state()
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -204,7 +223,7 @@ class UnifiedWorkflowView(QWidget):
         self.fps_spin.setRange(0.1, 60.0)
         self.fps_spin.setValue(2.0)
         self.fps_spin.setSingleStep(0.5)
-        self.fps_spin.setToolTip("Maximum frames extracted per second of real capture time. INSV timelapse timing is detected automatically.")
+        self.fps_spin.setToolTip(tr("Extraction rate is capped by the source video. For a 2 fps timelapse, use 2; a higher value does not create extra frames."))
         sync_row.addWidget(self.fps_caption)
         sync_row.addWidget(self.fps_spin)
 
@@ -236,7 +255,14 @@ class UnifiedWorkflowView(QWidget):
         self.mask_persons_chk = CheckBox(tr("Generate masks"))
         self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
         self.mask_model_btn = PushButton(tr("Download model RF-DETR"), icon=FluentIcon.DOWNLOAD)
-        self.mask_model_btn.setToolTip(tr("Download the RF-DETR model and, when needed, its TensorRT runtime to the user cache. The portable app stays small."))
+        self.mask_backend_label = CaptionLabel(tr("Mask backend:"))
+        self.mask_backend_combo = ComboBox()
+        self.mask_backend_combo.addItem(tr("Vulkan"), userData="vulkan")
+        self.mask_backend_combo.addItem(tr("TensorRT"), userData="tensorrt")
+        self.mask_backend_combo.setCurrentIndex(0)
+        self.mask_backend_combo.currentIndexChanged.connect(self._refresh_mask_resource_state)
+        self.mask_backend_combo.currentIndexChanged.connect(self._update_mask_backend_tooltip)
+        self._update_mask_backend_tooltip()
         self.mask_model_btn.clicked.connect(self._download_rf_detr)
         self.mask_settings_btn = PushButton(tr("Mask settings..."))
         self.mask_settings_btn.clicked.connect(self._open_mask_settings)
@@ -250,16 +276,23 @@ class UnifiedWorkflowView(QWidget):
         self.operator_radius_spin.valueChanged.connect(lambda value: self.mask_persons_chk.setChecked(True) if value > 0 else None)
         self.mask_persons_chk.toggled.connect(lambda checked: self.operator_radius_spin.setValue(0.0) if not checked else None)
         mask_row.addWidget(self.mask_persons_chk)
-        mask_row.addWidget(self.mask_model_btn)
-        mask_row.addWidget(self.mask_settings_btn)
-        mask_row.addSpacing(12)
-        mask_row.addWidget(self.operator_radius_caption)
-        mask_row.addWidget(self.operator_radius_spin)
+        mask_row.addWidget(self.mask_backend_label)
+        mask_row.addWidget(self.mask_backend_combo)
         mask_row.addStretch()
         config_layout.addLayout(mask_row)
 
-        self.vulkan_chk = CheckBox(tr("Enable Vulkan GPU Compute Acceleration"))
+        mask_controls_row = QHBoxLayout()
+        mask_controls_row.addWidget(self.mask_model_btn)
+        mask_controls_row.addWidget(self.mask_settings_btn)
+        mask_controls_row.addSpacing(12)
+        mask_controls_row.addWidget(self.operator_radius_caption)
+        mask_controls_row.addWidget(self.operator_radius_spin)
+        mask_controls_row.addStretch()
+        config_layout.addLayout(mask_controls_row)
+
+        self.vulkan_chk = CheckBox(tr("Use Vulkan for point-cloud colorization"))
         self.vulkan_chk.setChecked(True)
+        self.vulkan_chk.setToolTip(tr("This setting accelerates point-cloud colorization. Choose the RF-DETR mask backend separately above."))
         config_layout.addWidget(self.vulkan_chk)
 
         self.process_gps_chk = CheckBox(tr("Automatically georeference using INSV GPS (when available)"))
@@ -329,22 +362,19 @@ class UnifiedWorkflowView(QWidget):
         # 4. Action & Status Bar
         # ----------------------------------------------------------------------
         action_card = CardWidget(content)
-        action_layout = QHBoxLayout(action_card)
+        action_layout = QVBoxLayout(action_card)
         action_layout.setContentsMargins(20, 14, 20, 14)
+        action_layout.setSpacing(10)
+
+        action_header = QHBoxLayout()
 
         status_box = QVBoxLayout()
         self.status_title = StrongBodyLabel(tr("Status: Ready"))
         self.status_desc = CaptionLabel(tr("Select Bag and INSV files, then click 'Start Unified Workflow'."))
         status_box.addWidget(self.status_title)
         status_box.addWidget(self.status_desc)
-        action_layout.addLayout(status_box)
-
-        action_layout.addStretch()
-
-        self.progress_bar = ProgressBar()
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setVisible(False)
-        action_layout.addWidget(self.progress_bar)
+        action_header.addLayout(status_box)
+        action_header.addStretch()
 
         self.btn_run = PrimaryPushButton(tr("Start Unified Workflow"), icon=FluentIcon.PLAY)
         self.btn_run.clicked.connect(self._start_workflow)
@@ -352,8 +382,43 @@ class UnifiedWorkflowView(QWidget):
         self.btn_cancel.clicked.connect(self._cancel_workflow)
         self.btn_cancel.setEnabled(False)
 
-        action_layout.addWidget(self.btn_run)
-        action_layout.addWidget(self.btn_cancel)
+        action_header.addWidget(self.btn_run)
+        action_header.addWidget(self.btn_cancel)
+        action_layout.addLayout(action_header)
+
+        overall_row = QHBoxLayout()
+        self.overall_progress_label = BodyLabel(tr("Overall progress: 0%"))
+        self.overall_progress_label.setMinimumWidth(180)
+        self.overall_progress_bar = ProgressBar()
+        self.overall_progress_bar.setRange(0, 100)
+        self.overall_progress_bar.setValue(0)
+        self.eta_label = CaptionLabel(tr("Estimated time: waiting to start"))
+        self.eta_label.setMinimumWidth(260)
+        overall_row.addWidget(self.overall_progress_label)
+        overall_row.addWidget(self.overall_progress_bar, 1)
+        overall_row.addWidget(self.eta_label)
+        action_layout.addLayout(overall_row)
+
+        self.current_step_label = StrongBodyLabel(tr("Workflow steps"))
+        action_layout.addWidget(self.current_step_label)
+        steps_grid = QGridLayout()
+        steps_grid.setHorizontalSpacing(14)
+        steps_grid.setVerticalSpacing(7)
+        self.step_progress_bars = []
+        self.step_progress_labels = []
+        for index, name in enumerate(STAGE_NAMES):
+            column = (index % 2) * 2
+            row = index // 2
+            label = CaptionLabel(f"{index + 1}. {tr(name)}")
+            bar = ProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setMinimumWidth(120)
+            self.step_progress_labels.append(label)
+            self.step_progress_bars.append(bar)
+            steps_grid.addWidget(label, row, column)
+            steps_grid.addWidget(bar, row, column + 1)
+        action_layout.addLayout(steps_grid)
         layout.addWidget(action_card)
 
         # ----------------------------------------------------------------------
@@ -367,10 +432,14 @@ class UnifiedWorkflowView(QWidget):
         log_header = QHBoxLayout()
         self.log_title = SubtitleLabel(tr("Live Workflow Execution Console"))
         self.btn_clear_log = ToolButton(FluentIcon.DELETE)
-        self.btn_clear_log.setToolTip(tr("Clear console"))
+        self.btn_clear_log.setToolTip(tr("Clear visible log (saved file remains)"))
         self.btn_clear_log.clicked.connect(self._clear_log)
+        self.btn_export_log = ToolButton(FluentIcon.DOWNLOAD)
+        self.btn_export_log.setToolTip(tr("Export log..."))
+        self.btn_export_log.clicked.connect(self._export_log)
         log_header.addWidget(self.log_title)
         log_header.addStretch()
+        log_header.addWidget(self.btn_export_log)
         log_header.addWidget(self.btn_clear_log)
         log_layout.addLayout(log_header)
 
@@ -457,43 +526,96 @@ class UnifiedWorkflowView(QWidget):
         if self.runner.is_busy:
             InfoBar.warning(title=tr('Processing is active'), content=tr('Wait for the current task to finish before downloading RF-DETR resources.'), parent=self)
             return
-        if resolve_model() is not None and resolve_runtime_dir() is not None:
-            InfoBar.success(title=tr('RF-DETR is ready'), content=tr('The model and TensorRT runtime are already available.'), parent=self)
+        backend = self.mask_backend_combo.currentData()
+        if resources_ready(backend):
+            label = tr('Vulkan') if backend == 'vulkan' else tr('TensorRT')
+            InfoBar.success(title=tr('RF-DETR is ready'), content=tr('The model and {backend} mask resources are verified.').format(backend=label), parent=self)
             return
+        if resource_status(backend) == 'executor-missing':
+            InfoBar.error(title=tr('Mask backend unavailable'), content=tr('This app build is missing the selected RF-DETR executor. Rebuild or update the app.'), parent=self)
+            return
+        if backend == 'vulkan':
+            prompt = tr('Verify or download the 139 MB RF-DETR model and prepare its Vulkan cache (~130 MB). This uses Vulkan and does not download TensorRT. Resources stay outside the portable app.')
+        else:
+            prompt = tr('Verify or download the 139 MB RF-DETR model. If needed, download about 1.3 GB of NVIDIA TensorRT runtime; extraction may need up to 3 GB of temporary disk space. Resources stay outside the portable app.')
         answer = QMessageBox.question(
-            self, tr('Download RF-DETR resources'),
-            tr('Verify or download the 139 MB model as needed. If the NVIDIA TensorRT runtime is missing, download about 1.3 GB; extraction may need up to 3 GB of temporary disk space. Files are cached for this Windows user and are not added to the portable app.'),
+            self, tr('Prepare RF-DETR masks'), prompt,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        downloader = MaskResourceDownload(self)
+        downloader = MaskResourceDownload(backend, self)
         self._mask_downloader = downloader
         downloader.progress.connect(self._on_mask_download_progress)
         downloader.completed.connect(self._on_mask_download_completed)
         self.mask_model_btn.setEnabled(False)
+        self.mask_backend_combo.setEnabled(False)
         self.btn_run.setEnabled(False)
         self.mask_model_btn.setText(tr('Preparing RF-DETR...'))
+        self.mask_model_btn.setIcon(FluentIcon.SYNC)
         if not downloader.start():
             self._on_mask_download_completed(2, tr('Could not start the resource downloader.'))
 
+    def _update_mask_backend_tooltip(self, *_args):
+        if self.mask_backend_combo.currentData() == 'vulkan':
+            text = tr('Use Vulkan for person-mask inference; no TensorRT runtime is required. Point-cloud colorization has a separate setting.')
+        else:
+            text = tr('Use NVIDIA TensorRT for person-mask inference; its optional runtime is downloaded separately. Point-cloud colorization has a separate setting.')
+        self.mask_backend_combo.setToolTip(text)
+
     def _on_mask_download_progress(self, resource, percent):
-        title = tr('RF-DETR model') if resource == 'model' else (tr('Installing TensorRT') if resource == 'install' else tr('TensorRT runtime'))
-        self.mask_model_btn.setText(f'{title}: {percent}%')
+        title = {
+            'model': tr('RF-DETR model'),
+            'runtime': tr('TensorRT runtime'),
+            'install': tr('Installing TensorRT'),
+            'vulkan': tr('Preparing Vulkan model'),
+        }.get(resource, tr('Preparing RF-DETR'))
+        self.mask_model_btn.setText(f'{title}: {percent}%' if percent else f'{title}...')
 
     def _on_mask_download_completed(self, code, output):
         downloader, self._mask_downloader = self._mask_downloader, None
         self.mask_model_btn.setEnabled(True)
-        self.mask_model_btn.setText(tr('Download model RF-DETR'))
+        self.mask_backend_combo.setEnabled(True)
         self.btn_run.setEnabled(True)
         if downloader is not None:
             downloader.deleteLater()
-        if code == 0 and resolve_model() is not None and resolve_runtime_dir() is not None:
-            InfoBar.success(title=tr('RF-DETR resources ready'), content=tr('The verified model and TensorRT runtime are saved in the user cache.'), parent=self)
+        self._refresh_mask_resource_state()
+        backend = self.mask_backend_combo.currentData()
+        if code == 0 and resources_ready(backend):
+            label = tr('Vulkan') if backend == 'vulkan' else tr('TensorRT')
+            InfoBar.success(title=tr('RF-DETR resources ready'), content=tr('The model and {backend} mask resources are verified and saved in the user cache.').format(backend=label), parent=self)
         else:
             detail = output[-700:] if output else tr('Check your internet connection and available disk space, then retry.')
             InfoBar.error(title=tr('RF-DETR download failed'), content=detail, parent=self, duration=8000)
+
+    def _refresh_mask_resource_state(self, *_args):
+        if self._mask_downloader is not None:
+            return
+        backend = self.mask_backend_combo.currentData()
+        status = resource_status(backend)
+        self.mask_model_btn.setEnabled(status != 'executor-missing')
+        if status == 'ready':
+            label = tr('Vulkan') if backend == 'vulkan' else tr('TensorRT')
+            self.mask_model_btn.setText(tr('RF-DETR ready ({backend})').format(backend=label))
+            self.mask_model_btn.setIcon(FluentIcon.ACCEPT)
+            self.mask_model_btn.setToolTip(tr('The model, selected mask executor and required resources are verified.'))
+        elif status == 'model-missing':
+            self.mask_model_btn.setText(tr('Download model RF-DETR'))
+            self.mask_model_btn.setIcon(FluentIcon.DOWNLOAD)
+            self.mask_model_btn.setToolTip(tr('Download the verified RF-DETR model and prepare the selected mask backend.'))
+        elif status == 'runtime-missing':
+            self.mask_model_btn.setText(tr('Download TensorRT runtime'))
+            self.mask_model_btn.setIcon(FluentIcon.DOWNLOAD)
+            self.mask_model_btn.setToolTip(tr('The RF-DETR model is present. Download the optional NVIDIA TensorRT runtime for this backend.'))
+        elif status == 'schedule-missing':
+            self.mask_model_btn.setText(tr('Prepare Vulkan masks'))
+            self.mask_model_btn.setIcon(FluentIcon.SYNC)
+            self.mask_model_btn.setToolTip(tr('The model is downloaded. Prepare the Vulkan schedule; TensorRT is not needed.'))
+        else:
+            self.mask_model_btn.setText(tr('Mask executor missing'))
+            self.mask_model_btn.setIcon(FluentIcon.INFO)
+            self.mask_model_btn.setToolTip(tr('Update or rebuild the app with the selected RF-DETR executor.'))
 
     def _open_mask_settings(self):
         from raven_app.mask_settings_dialog import MaskSettingsDialog
@@ -508,7 +630,10 @@ class UnifiedWorkflowView(QWidget):
                 InfoBar.error(title=tr('Invalid mask settings'), content=str(exc),
                               position=InfoBarPosition.TOP, parent=self)
                 return
-        dialog = MaskSettingsDialog(output, config, self)
+        dialog = MaskSettingsDialog(output, config, self,
+                                    backend=self.mask_backend_combo.currentData(),
+                                    insv_path=self.insv_input.text().strip() or None,
+                                    fps=self.fps_spin.value())
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.mask_config = dialog.settings()
             self.mask_persons_chk.setChecked(True)
@@ -522,6 +647,22 @@ class UnifiedWorkflowView(QWidget):
 
     def _clear_log(self):
         self.log_console.clear()
+
+    def _export_log(self):
+        source = self._current_log_path
+        default_path = str(source) if source else 'workflow.log'
+        target, _ = QFileDialog.getSaveFileName(
+            self, tr('Export workflow log'), default_path,
+            tr('Log files (*.log);;Text files (*.txt);;All files (*.*)')
+        )
+        if not target:
+            return
+        try:
+            content = source.read_text(encoding='utf-8') if source and source.is_file() else self.log_console.toPlainText()
+            Path(target).write_text(content, encoding='utf-8')
+        except OSError as exc:
+            InfoBar.error(title=tr('Cannot export log'), content=str(exc),
+                          position=InfoBarPosition.TOP, parent=self)
 
     def _start_workflow(self):
         bag = self.bag_input.text().strip()
@@ -618,6 +759,7 @@ class UnifiedWorkflowView(QWidget):
 
         if self.mask_persons_chk.isChecked():
             args.append("--mask-persons")
+            args.extend(['--mask-backend', self.mask_backend_combo.currentData()])
             settings_path = Path(out).resolve() / 'mask_settings.json'
             if self.mask_config is not None:
                 try:
@@ -670,8 +812,13 @@ class UnifiedWorkflowView(QWidget):
             if geo_formats:
                 args.extend(["--geo-formats", *geo_formats])
 
-        self.log_console.appendPlainText(f"\n>>> Starting Unified Workflow: {' '.join(args)}\n")
-        self.runner.start_job(args)
+        self._prepare_workflow_progress(out, bag, insv, method_key)
+        log_path = make_run_log_path(out, f'{Path(out).name}_workflow')
+        if self.runner.start_job(
+            args, log_path=log_path,
+            initial_log=f">>> Starting Unified Workflow: {' '.join(args)}"
+        ):
+            self._current_log_path = log_path
 
     def _cancel_workflow(self):
         self.status_title.setText("Status: Cancelling...")
@@ -682,16 +829,36 @@ class UnifiedWorkflowView(QWidget):
     def _on_job_started(self):
         self.btn_run.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.progress_bar.setVisible(True)
         self.status_title.setText("Status: Workflow Running")
-        self.status_desc.setText("Executing end-to-end LiDAR-camera processing...")
+        self.status_desc.setText("Executing end-to-end LiDAR-camera processing. SfM runs in the background.")
+        self._workflow_started_at = time.monotonic()
+        self._stage_started_at = None
+        self._current_stage = 0
+        self._current_stage_skipped = False
+        self._stage_fraction = 0.0
+        self._stage_fraction_from_log = False
+        for bar in self.step_progress_bars:
+            bar.setValue(0)
+        self.overall_progress_bar.setValue(0)
+        self.current_step_label.setText(tr("Workflow steps"))
+        self._refresh_workflow_progress()
+        self._progress_timer.start()
 
     def _on_job_finished(self, code: int):
         self.btn_run.setEnabled(True)
         self.btn_cancel.setEnabled(False)
-        self.progress_bar.setVisible(False)
+        self._progress_timer.stop()
 
         if code == 0:
+            if self._current_stage:
+                self._complete_progress_stage(self._current_stage)
+            for bar in self.step_progress_bars:
+                bar.setValue(100)
+            self.overall_progress_bar.setValue(100)
+            self.overall_progress_label.setText(tr("Overall progress: 100%"))
+            elapsed = time.monotonic() - self._workflow_started_at if self._workflow_started_at else 0
+            self.eta_label.setText(tr("Completed in {time}").format(time=self._format_duration(elapsed)))
+            self.current_step_label.setText(tr("All workflow steps completed"))
             self.status_title.setText("Status: Completed Successfully")
             self.status_desc.setText("Deliverables saved in 'deliverables/'. 3DGS dataset in 'colmap_3dgs/'.")
             InfoBar.success(
@@ -704,10 +871,11 @@ class UnifiedWorkflowView(QWidget):
             )
         elif code == 130:
             self.status_title.setText("Status: Cancelled & Flushed")
-            self.status_desc.setText("Workflow cancelled by user. Partial data saved.")
+            self.status_desc.setText("Workflow cancelled by user. Completed steps and partial data are saved.")
         else:
             self.status_title.setText(f"Status: Failed (exit code {code})")
-            self.status_desc.setText("Process encountered an error. Check console output below.")
+            current = tr(STAGE_NAMES[self._current_stage - 1]) if self._current_stage else tr("preparation")
+            self.status_desc.setText(f"Failed during {current}. Check the saved log below.")
             InfoBar.error(
                 title=tr("Workflow Failed"),
                 content=tr("Execution exited with code {code}.", code=code),
@@ -720,6 +888,133 @@ class UnifiedWorkflowView(QWidget):
     def _on_log_received(self, line: str):
         self.log_console.insertPlainText(line)
         self.log_console.ensureCursorVisible()
+        for item in line.splitlines():
+            self._update_workflow_progress_from_line(item)
+
+    def _prepare_workflow_progress(self, output_dir, bag_path, insv_path, method):
+        self._stage_root = Path(output_dir)
+        self._stage_history = load_stage_history(self._stage_root)
+        defaults = estimate_stage_seconds(
+            self._stage_root, bag_path, insv_path,
+            use_masks=self.mask_persons_chk.isChecked(),
+            use_vulkan=self.vulkan_chk.isChecked(),
+            export_colmap=self.chk_colmap.isChecked(),
+            method=method,
+            recalibrate=self.recalibrate_chk.isChecked(),
+        )
+        self._stage_estimates = stage_duration_estimates(defaults, self._stage_history)
+        total = sum(self._stage_estimates)
+        self.eta_label.setText(tr("Estimated remaining: about {time}").format(
+            time=self._format_duration(total)))
+        for index, bar in enumerate(self.step_progress_bars):
+            bar.setValue(0)
+            bar.setToolTip(tr("Approximate progress; the estimate improves from saved runs."))
+            self.step_progress_labels[index].setText(f"{index + 1}. {tr(STAGE_NAMES[index])}")
+
+    def _update_workflow_progress_from_line(self, line):
+        event = parse_progress_line(line)
+        if not event:
+            return
+        if event['kind'] == 'stage':
+            stage = min(max(event['stage'], 1), len(STAGE_NAMES))
+            name = event.get('name') or STAGE_NAMES[stage - 1]
+            if self._current_stage and stage > self._current_stage:
+                for finished in range(self._current_stage, stage):
+                    self._complete_progress_stage(finished)
+            if stage != self._current_stage:
+                self._current_stage = stage
+                self._stage_started_at = time.monotonic()
+                self._stage_fraction = 0.0
+                self._stage_fraction_from_log = False
+                self._current_stage_skipped = (
+                    stage == 5 and name.casefold().startswith('skipping'))
+            self.current_step_label.setText(tr("Step {current}/{total}: {name}").format(
+                current=stage, total=len(STAGE_NAMES), name=tr(name)))
+            self.status_desc.setText(tr("Current step: {name}").format(name=tr(name)))
+        elif event['kind'] == 'stage_fraction' and self._current_stage:
+            fraction = event['fraction']
+            self._stage_fraction = max(self._stage_fraction, fraction)
+            self._stage_fraction_from_log = True
+        elif event['kind'] == 'masks_ready' and self._current_stage == 5:
+            self._stage_fraction = max(self._stage_fraction, 0.99)
+            self._stage_fraction_from_log = True
+        elif event['kind'] == 'complete':
+            for stage in range(1, len(STAGE_NAMES) + 1):
+                self._complete_progress_stage(stage)
+            self.current_step_label.setText(tr("All workflow steps completed"))
+        self._refresh_workflow_progress()
+
+    def _complete_progress_stage(self, stage):
+        index = stage - 1
+        if index < 0 or index >= len(self.step_progress_bars):
+            return
+        if self.step_progress_bars[index].value() >= 100:
+            return
+        self.step_progress_bars[index].setValue(100)
+        if self._current_stage == stage and self._stage_started_at is not None:
+            duration = max(0.0, time.monotonic() - self._stage_started_at)
+            if not self._current_stage_skipped:
+                self._stage_history[index].append(duration)
+                self._stage_history[index] = self._stage_history[index][-5:]
+                if self._stage_root is not None:
+                    try:
+                        save_stage_history(self._stage_root, self._stage_history)
+                    except OSError:
+                        pass
+            self._stage_started_at = None
+
+    def _refresh_workflow_progress(self):
+        if self._workflow_started_at is None:
+            return
+        elapsed_total = max(0.0, time.monotonic() - self._workflow_started_at)
+        fractions = [bar.value() / 100.0 for bar in self.step_progress_bars]
+        current_remaining = 0.0
+        if self._current_stage:
+            index = self._current_stage - 1
+            stage_elapsed = max(0.0, time.monotonic() - (self._stage_started_at or time.monotonic()))
+            estimate = max(1.0, self._stage_estimates[index])
+            if not self._stage_fraction_from_log and stage_elapsed > estimate:
+                estimate = stage_elapsed * 1.25
+                self._stage_estimates[index] = estimate
+            elapsed_fraction = min(0.95, stage_elapsed / estimate)
+            fraction = max(self._stage_fraction, elapsed_fraction)
+            self._stage_fraction = fraction
+            fractions[index] = fraction
+            current_remaining = estimate * (1.0 - fraction)
+            if self._stage_fraction_from_log and fraction > 0.05:
+                current_remaining = max(current_remaining,
+                                        stage_elapsed * (1.0 - fraction) / fraction)
+
+        weights = self._stage_estimates
+        total_weight = max(1.0, sum(weights))
+        overall = sum(weight * fraction for weight, fraction in zip(weights, fractions)) / total_weight
+        percent = max(0, min(99, round(overall * 100)))
+        self.overall_progress_bar.setValue(percent)
+        self.overall_progress_label.setText(tr("Overall progress: {percent}%").format(percent=percent))
+        for index, (bar, fraction) in enumerate(zip(self.step_progress_bars, fractions)):
+            bar.setValue(100 if fraction >= 1.0 else max(0, min(99, round(fraction * 100))))
+
+        if self._current_stage:
+            future = sum(weights[self._current_stage:])
+            remaining = current_remaining + future
+            estimate_text = tr("Estimated left: about {time}").format(
+                time=self._format_duration(remaining))
+        else:
+            remaining = max(0.0, total_weight - elapsed_total)
+            estimate_text = tr("Estimated remaining: about {time}").format(
+                time=self._format_duration(remaining))
+        self.eta_label.setText(f"{self._format_duration(elapsed_total)} elapsed · {estimate_text}")
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(0, int(round(seconds)))
+        hours, rem = divmod(seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m"
+        if minutes:
+            return f"{minutes}m {seconds:02d}s"
+        return f"{seconds}s"
 
     def _on_error_occurred(self, err: str):
         self.log_console.appendPlainText(f"\n[ERROR] {err}\n")
@@ -753,6 +1048,7 @@ class UnifiedWorkflowView(QWidget):
         self.auto_sync_chk.setText(tr("Auto IMU Gyro Cross-Correlation"))
         self.dt_caption.setText(tr("Manual Δt (s):"))
         self.fps_caption.setText(tr("Extraction FPS:"))
+        self.fps_spin.setToolTip(tr("Extraction rate is capped by the source video. For a 2 fps timelapse, use 2; a higher value does not create extra frames."))
         self.method_label.setText(tr("Colorization & Recalibration:"))
 
         cur_idx = self.method_combo.currentIndex()
@@ -769,15 +1065,19 @@ class UnifiedWorkflowView(QWidget):
         self.recalibrate_chk.setText(tr("Auto-Recalibrate Spatial Extrinsics from SfM Alignment"))
         self.mask_persons_chk.setText(tr("Generate masks"))
         self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
+        self.mask_backend_label.setText(tr("Mask backend:"))
+        self.mask_backend_combo.setItemText(0, tr("Vulkan"))
+        self.mask_backend_combo.setItemText(1, tr("TensorRT"))
+        self._update_mask_backend_tooltip()
         shapes = sum(sum(map(len, self.mask_config[key].values()))
                      for key in ('rectangles', 'ellipses', 'polygons')) if self.mask_config else 0
         self.mask_settings_btn.setText(tr('Mask settings ({n} shapes)').format(n=shapes) if self.mask_config else tr('Mask settings...'))
         if self._mask_downloader is None:
-            self.mask_model_btn.setText(tr("Download model RF-DETR"))
-            self.mask_model_btn.setToolTip(tr("Download the RF-DETR model and, when needed, its TensorRT runtime to the user cache. The portable app stays small."))
+            self._refresh_mask_resource_state()
         self.operator_radius_caption.setText(tr("Operator removal radius (m):"))
         self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
-        self.vulkan_chk.setText(tr("Enable Vulkan GPU Compute Acceleration"))
+        self.vulkan_chk.setText(tr("Use Vulkan for point-cloud colorization"))
+        self.vulkan_chk.setToolTip(tr("This setting accelerates point-cloud colorization. Choose the RF-DETR mask backend separately above."))
         self.process_gps_chk.setText(tr("Automatically georeference using INSV GPS (when available)"))
         self.output_title.setText(tr("3. Select Deliverables to Generate"))
         self.output_subtitle.setText(tr("Choose which output formats will be built in this run:"))
@@ -791,8 +1091,11 @@ class UnifiedWorkflowView(QWidget):
         self.chk_gps_csv.setText(tr("CSV"))
         self.btn_run.setText(tr("Start Unified Workflow"))
         self.btn_cancel.setText(tr("Cancel & Save"))
+        for index, name in enumerate(STAGE_NAMES):
+            self.step_progress_labels[index].setText(f"{index + 1}. {tr(name)}")
         self.log_title.setText(tr("Live Workflow Execution Console"))
-        self.btn_clear_log.setToolTip(tr("Clear console"))
+        self.btn_clear_log.setToolTip(tr("Clear visible log (saved file remains)"))
+        self.btn_export_log.setToolTip(tr("Export log..."))
 
         if not self.runner.is_busy:
             self.status_title.setText(tr("Status: Ready"))

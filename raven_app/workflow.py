@@ -21,6 +21,7 @@ from typing import Optional, Tuple, Dict, Any
 
 import cv2
 import numpy as np
+from raven_app.subprocess_utils import hidden_window_options
 from scipy import signal
 from scipy.spatial.transform import Rotation as Rot
 
@@ -817,6 +818,7 @@ def execute_unified_workflow(
     mask_persons: bool = False,
     masks_dir: Path = None,
     mask_model: Path = None,
+    mask_backend: str = "vulkan",
     mask_threshold: float = 0.5,
     mask_margin: float = 0.03,
     mask_config: Path = None,
@@ -851,16 +853,10 @@ def execute_unified_workflow(
     print(f" Deliverables: PLY={export_ply}, PCD={export_pcd}, COLMAP/3DGS={export_colmap}")
     print("=" * 80)
 
-    if process_gps:
-        print("\n[GPS] Extracting native GPS metadata and selected formats...")
-        gps_report = process_gps_metadata(insv_path, deliverables_dir / 'gps', gps_formats)
-        print(f"[GPS] {gps_report['unique_fixes']} unique fixes; {gps_report['georeferencing_status']}")
-        print(f"[GPS] Metadata saved in {deliverables_dir / 'gps'}")
-
     # --------------------------------------------------------------------------
     # STAGE 1: Extract frames from INSV
     # --------------------------------------------------------------------------
-    print("\n[STAGE 1/5] Extracting video frames from INSV...")
+    print("\n[STAGE 1/7] Extracting video frames from INSV...")
     frames_manifest = output_dir / "images" / "frames.json"
     previous_frames = frames_manifest.stat().st_mtime_ns if frames_manifest.is_file() else None
     if not extract_insv_frames(insv_path, output_dir, fps=fps):
@@ -871,7 +867,7 @@ def execute_unified_workflow(
     # --------------------------------------------------------------------------
     # STAGE 2: Time synchronization (IMU Cross-Correlation)
     # --------------------------------------------------------------------------
-    print("\n[STAGE 2/5] Temporal Synchronization...")
+    print("\n[STAGE 2/7] Temporal Synchronization...")
     if dt_override is not None:
         dt_sync = dt_override
         print(f"[*] Using manual time offset Δt = {dt_sync:.4f}s")
@@ -881,7 +877,7 @@ def execute_unified_workflow(
     # --------------------------------------------------------------------------
     # STAGE 3: Run Native FAST-LIVO2 SLAM
     # --------------------------------------------------------------------------
-    print("\n[STAGE 3/5] Running FAST-LIVO2 Native SLAM...")
+    print("\n[STAGE 3/7] Running FAST-LIVO2 Native SLAM...")
     slam_out = output_dir / "slam_out"
     raw_pcd = slam_out / "pcd" / "all_raw_points.pcd"
     raw_trj = slam_out / "result" / "Raven_3DMakerPro_Scan.txt"
@@ -913,7 +909,7 @@ def execute_unified_workflow(
             cmd.append("--lio")
 
         slam_out.mkdir(parents=True, exist_ok=True)
-        with subprocess.Popen(cmd, stdin=subprocess.PIPE) as child:
+        with subprocess.Popen(cmd, stdin=subprocess.PIPE, **hidden_window_options()) as child:
             export_bags(
                 [bag_path], child.stdin,
                 lidar_topic=lidar_topic,
@@ -933,7 +929,7 @@ def execute_unified_workflow(
     # --------------------------------------------------------------------------
     # STAGE 4: SfM Alignment & Dynamic Spatial Extrinsics Recalibration
     # --------------------------------------------------------------------------
-    print("\n[STAGE 4/5] Multi-View SfM Reconstruction & Spatial Recalibration...")
+    print("\n[STAGE 4/7] Multi-View SfM Reconstruction & Spatial Recalibration...")
     from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
     calib = calib_json or (output_dir / "rig_calibration.json")
     if not calib.is_file():
@@ -964,6 +960,11 @@ def execute_unified_workflow(
         try:
             align_data = pipeline.align_colmap_to_lidar(output_dir, fps=fps, dt_hint=dt_sync)
             dt_sync = align_data.get("dt_sync_seconds", dt_sync)
+            rmse_cm = align_data.get('trajectory_rmse_cm')
+            if rmse_cm is not None and rmse_cm > 2.0:
+                print(f"[QUALITY WARNING] SfM-to-FAST-LIVO2 trajectory RMSE is {rmse_cm:.2f} cm; "
+                      "this is above the requested 1.5–2 cm wall-thickness precision.")
+                print("[QUALITY WARNING] SfM alignment improves camera poses/colorization, but the exported LiDAR XYZ still comes from FAST-LIVO2; this run does not globally correct SLAM drift.")
         except Exception as e:
             if is_timelapse:
                 raise RuntimeError(f'Timelapse alignment failed: {e}') from e
@@ -982,9 +983,11 @@ def execute_unified_workflow(
                 print(f"[!] Extrinsics recalibration notice: {e}")
 
     # --------------------------------------------------------------------------
-    # STAGE 5: Point Cloud Colorization
+    # STAGE 5: Person-mask generation
     # --------------------------------------------------------------------------
-    print("\n[STAGE 5/5] Running Point Cloud Colorization...")
+    mask_stage = ('Preparing person masks...' if mask_persons or masks_dir is not None
+                  else 'Skipping person-mask generation...')
+    print(f"\n[STAGE 5/7] {mask_stage}")
     active_masks_dir = masks_dir
     if mask_persons:
         print("[*] Generating RF-DETR person masks before colorization...")
@@ -992,7 +995,7 @@ def execute_unified_workflow(
         active_masks_dir = generate_person_masks(
             output_dir, model_path=mask_model,
             threshold=mask_threshold, margin=mask_margin,
-            mask_config=mask_config
+            mask_config=mask_config, backend=mask_backend
         )
     elif active_masks_dir is not None:
         active_masks_dir = Path(active_masks_dir).resolve()
@@ -1003,6 +1006,11 @@ def execute_unified_workflow(
         print(f"[*] Person masks: {active_masks_dir}")
     if operator_radius > 0:
         print(f"[*] Operator removal radius: {operator_radius:.3f} m (person-mask agreement with planar-surface protection)")
+
+    # --------------------------------------------------------------------------
+    # STAGE 6: Point Cloud Colorization
+    # --------------------------------------------------------------------------
+    print("\n[STAGE 6/7] Running Point Cloud Colorization...")
     cloud_state_before = {p: p.stat().st_mtime_ns for p in deliverables_dir.iterdir()
                           if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}}
     sfm_done = False
@@ -1021,6 +1029,16 @@ def execute_unified_workflow(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
             masks_dir=active_masks_dir, operator_radius=operator_radius
         )
+
+    # --------------------------------------------------------------------------
+    # STAGE 7: Georeferencing and packaging deliverables
+    # --------------------------------------------------------------------------
+    print("\n[STAGE 7/7] Georeferencing and packaging deliverables...")
+    if process_gps:
+        print("\n[GPS] Extracting native GPS metadata and selected formats...")
+        gps_report = process_gps_metadata(insv_path, deliverables_dir / 'gps', gps_formats)
+        print(f"[GPS] {gps_report['unique_fixes']} unique fixes; {gps_report['georeferencing_status']}")
+        print(f"[GPS] Metadata saved in {deliverables_dir / 'gps'}")
 
     # Automatic placement is deliberately after colorization so only this run's
     # produced clouds are considered, and before local-format cleanup.

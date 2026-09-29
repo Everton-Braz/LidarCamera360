@@ -88,14 +88,131 @@ class GuiTests(unittest.TestCase):
     def test_workflow_ui_labels_and_defaults(self):
         from raven_app.gui import create_main_window
         win = create_main_window()
+        win.resize(1400, 1000)
+        win.show()
         wf = win.workflow_view
         self.assertEqual(wf.fps_spin.value(), 2.0)
+        self.assertEqual(len(wf.step_progress_bars), 7)
+        for combo in (wf.mask_backend_combo, win.colorize_view.mask_backend_combo):
+            self.assertEqual([combo.itemText(i) for i in range(2)], ['Vulkan', 'TensorRT'])
+            combo.setCurrentIndex(0)
+            self.assertIn('Vulkan', combo.toolTip())
+            combo.setCurrentIndex(1)
+            self.assertIn('TensorRT', combo.toolTip())
+            self.assertIn('NVIDIA', combo.toolTip())
+            self.assertIn('separate', combo.toolTip())
+            combo.setCurrentIndex(0)
+        self.assertEqual(wf.overall_progress_bar.value(), 0)
         self.assertEqual(wf.recalibrate_chk.text(), "Auto-Recalibrate Spatial Extrinsics from SfM Alignment")
         self.assertEqual(wf.chk_ply.text(), "Export Colored Point Cloud (.PLY)")
         self.assertEqual(wf.chk_pcd.text(), "Export Colored Point Cloud (.PCD)")
         self.assertEqual(wf.chk_colmap.text(), "Metric-Scaled 3DGS COLMAP Dataset")
         self.assertEqual(win.colorize_view.fps_spin.value(), 2.0)
+        for view, checkbox in ((wf, wf.mask_persons_chk),
+                               (win.colorize_view, win.colorize_view.chk_mask_persons)):
+            win.switchTo(view)
+            self.app.processEvents()
+            self.assertGreaterEqual(checkbox.width(), checkbox.sizeHint().width())
+            self.assertGreater(view.btn_export_log.width(), 0)
         win.close()
+
+    def test_workflow_progress_updates_from_stage_and_vulkan_logs(self):
+        import time
+        import tempfile
+        from raven_app.process_runner import ProcessRunner
+        from raven_app.views.unified_workflow_view import UnifiedWorkflowView
+
+        with tempfile.TemporaryDirectory() as tmp:
+            view = UnifiedWorkflowView(ProcessRunner())
+            view._prepare_workflow_progress(tmp, '', '', 'sfm')
+            view._workflow_started_at = time.monotonic()
+            for stage in range(1, 6):
+                view._update_workflow_progress_from_line(
+                    f'[STAGE {stage}/7] {stage}'
+                )
+            view._update_workflow_progress_from_line('[+] 3624 combined foreground masks ready: masks')
+            self.assertEqual(view.step_progress_bars[4].value(), 99)
+            view._update_workflow_progress_from_line('[STAGE 6/7] Running Point Cloud Colorization...')
+            view._update_workflow_progress_from_line('Vulkan frames 50/100')
+            self.assertEqual(view.step_progress_bars[0].value(), 100)
+            self.assertEqual(view.step_progress_bars[4].value(), 100)
+            self.assertEqual(view.step_progress_bars[5].value(), 50)
+            self.assertGreater(view.overall_progress_bar.value(), 0)
+            view._progress_timer.stop()
+            view.deleteLater()
+
+    def test_skipped_mask_stage_is_not_added_to_timing_history(self):
+        import time
+        import tempfile
+        from raven_app.process_runner import ProcessRunner
+        from raven_app.views.unified_workflow_view import UnifiedWorkflowView
+        from raven_app.workflow_progress import load_stage_history
+
+        with tempfile.TemporaryDirectory() as tmp:
+            view = UnifiedWorkflowView(ProcessRunner())
+            view._prepare_workflow_progress(tmp, '', '', 'sfm')
+            view._workflow_started_at = time.monotonic()
+            view._update_workflow_progress_from_line('[STAGE 5/7] Skipping person-mask generation...')
+            view._update_workflow_progress_from_line('[STAGE 6/7] Running Point Cloud Colorization...')
+            self.assertEqual(view.step_progress_bars[4].value(), 100)
+            self.assertEqual(load_stage_history(tmp)[4], [])
+            view._progress_timer.stop()
+            view.deleteLater()
+
+    def test_mask_settings_extracts_only_selected_video_frames_on_demand(self):
+        import time
+        import av
+        from raven_app.mask_settings_dialog import MaskSettingsDialog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'preview.insv'
+            with av.open(str(source), 'w', format='matroska') as output:
+                streams = [output.add_stream('ffv1', rate=10) for _ in range(2)]
+                for stream in streams:
+                    stream.width = stream.height = 64
+                    stream.pix_fmt = 'yuv420p'
+                image = np.random.default_rng(2).integers(0, 256, (64, 64, 3), dtype=np.uint8)
+                import cv2
+                for index in range(12):
+                    frame_image = image if index % 6 == 2 else cv2.GaussianBlur(image, (15, 15), 5)
+                    for stream in streams:
+                        frame = av.VideoFrame.from_ndarray(frame_image, format='bgr24')
+                        for packet in stream.encode(frame):
+                            output.mux(packet)
+                for stream in streams:
+                    for packet in stream.encode():
+                        output.mux(packet)
+
+            dataset = root / 'preview-output'
+            dialog = MaskSettingsDialog(dataset, parent=None, insv_path=source, fps=1)
+            def wait_for_frame(index):
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    self.app.processEvents()
+                    path = dialog._video_preview_paths['cam0'].get(index)
+                    if path is not None and path.is_file() and dialog._frame_extraction_process is None:
+                        return
+                    time.sleep(0.01)
+                self.fail(f'preview frame {index} was not extracted')
+
+            try:
+                self.assertEqual(dialog.frame_slider.maximum(), 1)
+                wait_for_frame(0)
+                self.assertEqual(set(dialog._video_preview_paths['cam0']), {0})
+                self.assertEqual(set(dialog._video_preview_paths['cam1']), {0})
+                self.assertFalse((dataset / 'images' / 'frames.json').exists())
+                self.assertFalse((dataset / 'images').exists())
+                self.assertEqual(dialog._current_source.name, 'frame_000001.jpg')
+
+                dialog.frame_slider.setValue(1)
+                wait_for_frame(1)
+                self.assertEqual(set(dialog._video_preview_paths['cam0']), {0, 1})
+                self.assertEqual(set(dialog._video_preview_paths['cam1']), {0, 1})
+                self.assertEqual(dialog._current_source.name, 'frame_000002.jpg')
+                self.assertEqual(len(list(dialog._video_preview_root.rglob('*.jpg'))), 4)
+            finally:
+                dialog.reject()
 
 
 class WorkflowTests(unittest.TestCase):

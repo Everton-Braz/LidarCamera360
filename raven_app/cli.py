@@ -58,6 +58,8 @@ def ratio(value):
 def add_mask_options(p):
     p.add_argument('--mask-persons', action='store_true',
                    help='Generate RF-DETR and configured fixed-area masks before colorization')
+    p.add_argument('--mask-backend', choices=('vulkan', 'tensorrt'), default='vulkan',
+                   help='RF-DETR inference backend (Vulkan needs no TensorRT; default: vulkan)')
     p.add_argument('--masks-dir', type=Path,
                    help='Reuse existing person masks from this directory')
     p.add_argument('--mask-model', type=Path,
@@ -92,12 +94,20 @@ def parse(argv=None):
     gui=sub.add_parser('gui',help='Open desktop controls')
     gui.add_argument('--smoke-test', action='store_true', help=argparse.SUPPRESS)
     sub.add_parser('doctor',help='Report bundled engines and numerical runtime')
-    sub.add_parser('download-mask-resources',
-                   help='Download and verify the RF-DETR model and TensorRT runtime into the user cache')
+    download_masks = sub.add_parser('download-mask-resources',
+                   help='Download and prepare resources for the selected RF-DETR mask backend')
+    download_masks.add_argument('--backend', choices=('vulkan', 'tensorrt'), default='vulkan')
     video=sub.add_parser('extract-insv', help='Extract synchronized sharp lens frames using bundled PyAV')
     video.add_argument('--insv', type=Path, required=True)
     video.add_argument('--output', type=Path, required=True)
     video.add_argument('--fps', type=positive, default=2.)
+    video_preview = sub.add_parser('extract-insv-frame',
+                   help='Extract one synchronized sharp lens pair for a mask preview')
+    video_preview.add_argument('--insv', type=Path, required=True)
+    video_preview.add_argument('--output', type=Path, required=True)
+    video_preview.add_argument('--fps', type=positive, default=2.)
+    video_preview.add_argument('--index', type=int, required=True,
+                               help='Zero-based timeline slot to extract')
     gps=sub.add_parser('extract-gps', help='Extract native INSV GPS and assess whether it supplies a trajectory')
     gps.add_argument('--insv', type=Path, nargs='+', required=True)
     gps.add_argument('--output', type=Path, required=True)
@@ -110,6 +120,7 @@ def parse(argv=None):
     masks.add_argument('--threshold', type=unit_interval, default=0.5)
     masks.add_argument('--margin', type=ratio, default=0.03)
     masks.add_argument('--mask-config', type=Path)
+    masks.add_argument('--backend', choices=('vulkan', 'tensorrt'), default='vulkan')
     geo=sub.add_parser('georeference', help='Calculate INSV GPS, georeference point clouds and COLMAP datasets, and export GeoJSON')
     geo.add_argument('--insv', type=Path, required=True, help='Path to Insta360 .INSV video')
     geo.add_argument('--output', type=Path, required=True, help='Output directory for georeferenced deliverables and GeoJSON')
@@ -248,19 +259,24 @@ def run(a):
             'spirula_ready': ok_sp
         }
         if engine().is_file():
-            probe = subprocess.run([str(engine()), '--version'], capture_output=True, text=True)
+            from raven_app.subprocess_utils import hidden_window_options
+            probe = subprocess.run([str(engine()), '--version'], capture_output=True,
+                                   text=True, **hidden_window_options())
             report['native_exit_code'] = probe.returncode
             report['native_version'] = probe.stdout.strip()
         print(json.dumps(report, indent=2))
         return 0 if report.get('native_exit_code') == 0 else 2
     if a.command == 'download-mask-resources':
         from raven_app.mask_resources import download_progress, ensure_resources
-        model, runtime = ensure_resources(download_progress)
-        print(json.dumps({'model': str(model), 'runtime': str(runtime)}, ensure_ascii=False), flush=True)
+        model, backend_resource = ensure_resources(download_progress, backend=a.backend)
+        print(json.dumps({'model': str(model), a.backend: str(backend_resource)}, ensure_ascii=False), flush=True)
         return 0
     if a.command=='extract-insv':
         from raven_app.video import extract_insv_frames_pyav
         return 0 if extract_insv_frames_pyav(a.insv, a.output, fps=a.fps) else 2
+    if a.command=='extract-insv-frame':
+        from raven_app.video import extract_video_preview_frame
+        return 0 if extract_video_preview_frame(a.insv, a.output, a.index, fps=a.fps) else 2
     if a.command=='extract-gps':
         from raven_app.insv_gps import export_gps
         if len({p.stem.casefold() for p in a.insv}) != len(a.insv):
@@ -272,7 +288,7 @@ def run(a):
         from raven_app.person_masks import generate_person_masks
         masks_dir = generate_person_masks(
             a.dataset, model_path=a.model, threshold=a.threshold, margin=a.margin,
-            mask_config=a.mask_config
+            mask_config=a.mask_config, backend=a.backend
         )
         print(json.dumps({'masks_dir': str(masks_dir)}, ensure_ascii=False))
         return 0
@@ -327,7 +343,8 @@ def run(a):
         opts = export_options(a)
         opts['lidar_topic'] = lidar_t
         opts['imu_topic'] = imu_t
-        with subprocess.Popen(cmd,stdin=subprocess.PIPE) as child:
+        from raven_app.subprocess_utils import hidden_window_options
+        with subprocess.Popen(cmd,stdin=subprocess.PIPE,**hidden_window_options()) as child:
             try:
                 export_bags(a.bag,child.stdin,**opts)
                 child.stdin.close()
@@ -358,7 +375,7 @@ def run(a):
             masks_dir = generate_person_masks(
                 dataset, model_path=a.mask_model,
                 threshold=a.mask_threshold, margin=a.mask_margin,
-                mask_config=a.mask_config
+                mask_config=a.mask_config, backend=a.mask_backend
             )
         if a.method in ('sfm','all'):
             pipeline.colorize_via_spirula_sfm(
@@ -411,6 +428,7 @@ def run(a):
             mask_persons=a.mask_persons,
             masks_dir=a.masks_dir,
             mask_model=a.mask_model,
+            mask_backend=a.mask_backend,
             mask_threshold=a.mask_threshold,
             mask_margin=a.mask_margin,
             mask_config=a.mask_config,

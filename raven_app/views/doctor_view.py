@@ -136,7 +136,9 @@ class DoctorView(QWidget):
             self.lbl_native_status.setText("Status: [OK] Compiled & Available")
             self.lbl_native_path.setText(f"Path: {eng}")
             try:
-                probe = subprocess.run([str(eng), '--version'], capture_output=True, text=True, timeout=5)
+                from raven_app.subprocess_utils import hidden_window_options
+                probe = subprocess.run([str(eng), '--version'], capture_output=True,
+                                       text=True, timeout=5, **hidden_window_options())
                 self.lbl_native_ver.setText(f"Version: {probe.stdout.strip() or __version__}")
             except Exception as e:
                 self.lbl_native_ver.setText(f"Version check: {e}")

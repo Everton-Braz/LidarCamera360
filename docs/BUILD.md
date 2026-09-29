@@ -6,7 +6,7 @@ Developer builds need Visual Studio C++ tools and Windows SDK, CMake 3.24+, Pyth
 .\tools\build_windows.ps1 -VcpkgRoot D:\vcpkg -InstallDependencies
 ```
 
-The helper builds the native estimator and Vulkan colorizer, creates the Python packaging environment, and writes `dist/LidarCamera360/`. Use `-Generator 'Visual Studio 17 2022'` on Visual Studio 2022. Use `-OneFile` only when a self-extracting executable is required.
+The helper builds the native estimator, Vulkan colorizer, and standalone Vulkan RF-DETR masker, creates the Python packaging environment, and writes `dist/LidarCamera360/`. The build environment includes ONNX for converting the lazy-downloaded RF-DETR model into the Vulkan schedule. Use `-Generator 'Visual Studio 17 2022'` on Visual Studio 2022. Use `-OneFile` only when a self-extracting executable is required.
 
 Sophus is pinned to `a621ff2e56c56c839a6c40418d42c3c254424b5c` and Vikit to `6c886c8e5d83997806e00294826d528cea3581dd`. `native/prepare_sources.py` copies the upstream FAST-LIVO2, Sophus, and Vikit trees into a generated build tree and applies the portability layer; the supplied upstream source remains unchanged.
 

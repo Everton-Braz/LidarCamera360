@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 from raven_app.config import get_app_root
+from raven_app.subprocess_utils import hidden_window_options, run_hidden_stream
 
 
 def get_vulkan_bin():
@@ -21,7 +22,7 @@ def vulkan_status():
     executable = get_vulkan_bin()
     try:
         result = subprocess.run([str(executable), '--probe'], capture_output=True,
-                                text=True, timeout=15)
+                                text=True, timeout=15, **hidden_window_options())
         return {'path': str(executable), 'ready': result.returncode == 0,
                 'detail': (result.stdout + result.stderr).strip()}
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -66,10 +67,10 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
                             raise ValueError(f'Missing person mask: {mask}')
                         encoded = str(mask.resolve()).encode('utf-8')
                         stream.write(struct.pack('<I', len(encoded)) + encoded)
-            result = subprocess.run([str(get_vulkan_bin()), '--job', str(job), '--out', str(out),
-                                     '--device', str(device_id)])
-            if result.returncode != 0 or not out.is_file() or out.stat().st_size != len(points)*4:
-                raise RuntimeError(f'Vulkan failed or returned incomplete output ({result.returncode})')
+            code = run_hidden_stream([str(get_vulkan_bin()), '--job', str(job), '--out', str(out),
+                                      '--device', str(device_id)])
+            if code != 0 or not out.is_file() or out.stat().st_size != len(points)*4:
+                raise RuntimeError(f'Vulkan failed or returned incomplete output ({code})')
             return np.fromfile(out, dtype=np.uint8).reshape(-1, 4)[:, :3].copy()
     except (OSError, ValueError, RuntimeError) as exc:
         print(f'[!] Vulkan unavailable: {exc}. Falling back to CPU.')

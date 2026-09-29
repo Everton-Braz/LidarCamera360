@@ -19,7 +19,11 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, ComboBox, DoubleSpinBox,
 from raven_app.i18n import tr
 from raven_app.config import get_app_root, get_config_dir
 from raven_app.mask_resources import (masker_environment, resolve_masker_executable,
-                                      resolve_model, resolve_runtime_dir)
+                                      model_is_ready, resolve_model,
+                                      resolve_runtime_dir,
+                                      resolve_vulkan_executable,
+                                      resolve_vulkan_schedule,
+                                      resolve_vulkan_shaders_dir)
 from raven_app.person_masks import (apply_mask_exclusions, fisheye_cutoff_radius,
                                     normalize_mask_config, static_keep_mask)
 
@@ -394,17 +398,45 @@ class MaskCanvas(QWidget):
 class MaskSettingsDialog(QDialog):
     """Draw fixed rig exclusions on a preview; apply each to every frame of its lens."""
 
-    def __init__(self, dataset_dir, config=None, parent=None, model_path=None):
+    def __init__(self, dataset_dir, config=None, parent=None, model_path=None,
+                 backend='vulkan', insv_path=None, fps=2.0):
         super().__init__(parent)
-        self.dataset_dir = Path(dataset_dir) if dataset_dir else None
+        self.insv_path = Path(insv_path) if insv_path else None
+        self.fps = float(fps)
+        self._frames_temp = None
+        if dataset_dir:
+            self.dataset_dir = Path(dataset_dir)
+        elif self.insv_path:
+            self._frames_temp = tempfile.TemporaryDirectory(prefix='raven-mask-frames-')
+            self.dataset_dir = Path(self._frames_temp.name)
+        else:
+            self.dataset_dir = None
+        from raven_app.video import has_cached_frame_extraction
+        self._lazy_video_preview = bool(
+            self.insv_path is not None
+            and not has_cached_frame_extraction(self.insv_path, self.dataset_dir, self.fps)
+        )
         self.config = normalize_mask_config(config)
         self.model_path = model_path
+        self.backend = backend
         self.preview_paths = {}
         self.frames_by_camera = {}
         self._current_source = None
         self._person_masks = {}
         self._preview_process = None
         self._preview_temp = None
+        self._frame_extraction_process = None
+        self._frame_extraction_output = []
+        self._frame_extraction_index = None
+        self._pending_frame_extraction_index = None
+        self._video_preview_timeline = ()
+        self._video_preview_paths = {'cam0': {}, 'cam1': {}}
+        self._video_preview_temp = None
+        self._video_preview_root = None
+        self._frame_extraction_timer = QTimer(self)
+        self._frame_extraction_timer.setSingleShot(True)
+        self._frame_extraction_timer.setInterval(140)
+        self._frame_extraction_timer.timeout.connect(self._start_selected_video_frame_extraction)
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.setInterval(250)
@@ -525,14 +557,15 @@ class MaskSettingsDialog(QDialog):
         cancel.setToolTip(tr('Cancel'))
         cancel.setAccessibleName(tr('Cancel'))
         cancel.clicked.connect(self.reject)
-        save = ToolButton(FluentIcon.ACCEPT, self)
-        save.setToolTip(tr('Use these masks'))
-        save.setAccessibleName(tr('Use these masks'))
-        save.clicked.connect(self.accept)
+        self.save_button = ToolButton(FluentIcon.ACCEPT, self)
+        self.save_button.setToolTip(tr('Use these masks'))
+        self.save_button.setAccessibleName(tr('Use these masks'))
+        self.save_button.clicked.connect(self.accept)
         actions.addWidget(cancel)
-        actions.addWidget(save)
+        actions.addWidget(self.save_button)
         layout.addLayout(actions)
         self._camera_changed(self.camera_combo.currentText())
+        self._start_frame_extraction_if_needed()
 
     def _camera_changed(self, camera):
         self._stop_detection()
@@ -541,12 +574,30 @@ class MaskSettingsDialog(QDialog):
         ellipses = self.config['ellipses'].setdefault(camera, [])
         polygons = self.config['polygons'].setdefault(camera, [])
         self.canvas.set_shapes(boxes, ellipses, polygons)
+        if self._lazy_video_preview:
+            index = self.frame_slider.value()
+            count = len(self._video_preview_timeline)
+            self.frame_slider.blockSignals(True)
+            self.frame_slider.setRange(0, max(0, count - 1))
+            index = min(index, max(0, count - 1))
+            self.frame_slider.setValue(index)
+            self.frame_slider.setEnabled(count > 1)
+            self.frame_slider.blockSignals(False)
+            self._load_video_preview_frame(index)
+            if count and self._current_source is None:
+                self._schedule_video_frame_extraction(index)
+            self.show_mask_button.setToolTip(tr('Preview mask'))
+            self.show_mask_button.setAccessibleName(tr('Preview mask'))
+            self.show_mask_button.setIcon(FluentIcon.VIEW)
+            return
         folder = self.dataset_dir / 'images' / camera if self.dataset_dir else None
         frames = []
         if folder and folder.is_dir():
             frames = sorted((p for p in folder.iterdir() if p.is_file()
                              and p.suffix.lower() in ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')),
                             key=self._natural_key)
+        if self._frame_extraction_process is not None:
+            frames = []
         if camera in self.preview_paths:
             frames = [self.preview_paths[camera]]
         self.frames_by_camera[camera] = frames
@@ -559,7 +610,169 @@ class MaskSettingsDialog(QDialog):
         self.show_mask_button.setToolTip(tr('Preview mask'))
         self.show_mask_button.setAccessibleName(tr('Preview mask'))
         self.show_mask_button.setIcon(FluentIcon.VIEW)
-        self.preview_status.setText('')
+        if self._frame_extraction_process is not None:
+            self.frame_label.setText(tr('Extracting frames...'))
+            self.preview_status.setText(tr('Extracting video frames for mask preview. This may take a few minutes.'))
+        elif not frames and self.insv_path is None:
+            self.preview_status.setText(tr('No extracted frames found. Choose a preview image to see the mask.'))
+        else:
+            self.preview_status.setText('')
+
+    def _start_frame_extraction_if_needed(self):
+        if self.insv_path is None:
+            return
+        if not self._lazy_video_preview:
+            return
+        if not self.insv_path.is_file():
+            self.preview_status.setText(tr('Cannot extract preview frames: video file not found.'))
+            return
+
+        try:
+            from raven_app.video import video_preview_timeline
+            self._video_preview_timeline = video_preview_timeline(self.insv_path, self.fps)
+        except Exception as exc:
+            self.preview_status.setText(tr('Cannot read video timeline: {error}').format(error=str(exc)))
+            return
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setRange(0, max(0, len(self._video_preview_timeline) - 1))
+        self.frame_slider.setValue(0)
+        self.frame_slider.setEnabled(len(self._video_preview_timeline) > 1)
+        self.frame_slider.blockSignals(False)
+        self._video_selected_index = 0
+        self.preview_status.setText(tr('Loading the first frame for mask preview...'))
+        self._load_video_preview_frame(0)
+        self._schedule_video_frame_extraction(0, immediate=True)
+
+    def _load_video_preview_frame(self, index):
+        camera = self.camera_combo.currentText()
+        path = self._video_preview_paths.get(camera, {}).get(index)
+        if path is not None and path.is_file():
+            self._current_source = path
+            self.canvas.set_image(path)
+            self.frame_label.setText(f'{index + 1}/{len(self._video_preview_timeline)}  {path.name}')
+            self.preview_status.setText('')
+            return
+        self._current_source = None
+        self.canvas.set_image(None)
+        self.frame_label.setText(
+            tr('Loading frame {current}/{total}...').format(
+                current=index + 1, total=len(self._video_preview_timeline)))
+
+    def _schedule_video_frame_extraction(self, index, *, immediate=False):
+        if not self._video_preview_timeline or self._video_preview_paths.get(
+                self.camera_combo.currentText(), {}).get(index, Path()).is_file():
+            return
+        self._frame_extraction_timer.stop()
+        if self._frame_extraction_process is not None:
+            if self._frame_extraction_index == index:
+                return
+            self._stop_frame_extraction()
+        self._pending_frame_extraction_index = index
+        self.preview_status.setText(
+            tr('Extracting preview frame {current}/{total}...').format(
+                current=index + 1, total=len(self._video_preview_timeline)))
+        self._frame_extraction_timer.start(0 if immediate else self._frame_extraction_timer.interval())
+
+    def _start_selected_video_frame_extraction(self):
+        if self._frame_extraction_process is not None or self.insv_path is None:
+            return
+        index = self._pending_frame_extraction_index
+        if index is None or index >= len(self._video_preview_timeline):
+            return
+        if self._video_preview_temp is None:
+            self._video_preview_temp = tempfile.TemporaryDirectory(prefix='raven-mask-frame-previews-')
+            self._video_preview_root = Path(self._video_preview_temp.name)
+
+        arguments = []
+        if not getattr(sys, 'frozen', False):
+            entry = Path(__file__).resolve().parents[1] / 'raven.py'
+            if entry.is_file():
+                arguments.append(str(entry))
+            else:
+                arguments.extend(['-m', 'raven_app.cli'])
+        arguments.extend([
+            '--headless', 'extract-insv-frame', '--insv', str(self.insv_path),
+            '--output', str(self._video_preview_root), '--fps', format(self.fps, '.12g'),
+            '--index', str(index),
+        ])
+        process = QProcess(self)
+        self._frame_extraction_process = process
+        self._frame_extraction_index = index
+        self._frame_extraction_output = []
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        process.readyReadStandardOutput.connect(
+            lambda current=process: self._read_frame_extraction_output(current))
+        process.finished.connect(
+            lambda code, _status, current=process: self._frame_extraction_finished(current, code))
+        process.errorOccurred.connect(
+            lambda error, current=process: self._frame_extraction_error(current, error))
+        process.start(sys.executable, arguments)
+        if not process.waitForStarted(1500):
+            self._finish_frame_extraction_error(process, process.errorString())
+
+    def _read_frame_extraction_output(self, process):
+        data = bytes(process.readAllStandardOutput()).decode(errors='replace')
+        for line in data.splitlines():
+            line = line.strip()
+            if line:
+                self._frame_extraction_output.append(line)
+
+    def _frame_extraction_error(self, process, error):
+        if process is self._frame_extraction_process and error == QProcess.ProcessError.FailedToStart:
+            self._finish_frame_extraction_error(process, process.errorString())
+
+    def _finish_frame_extraction_error(self, process, detail):
+        if process is not self._frame_extraction_process:
+            return
+        self._frame_extraction_process = None
+        self._frame_extraction_index = None
+        process.deleteLater()
+        self.save_button.setEnabled(True)
+        self.preview_status.setText(tr('Frame extraction failed: {error}').format(error=detail))
+
+    def _frame_extraction_finished(self, process, code):
+        if process is not self._frame_extraction_process:
+            return
+        self._read_frame_extraction_output(process)
+        index = self._frame_extraction_index
+        self._frame_extraction_process = None
+        self._frame_extraction_index = None
+        process.deleteLater()
+        self.save_button.setEnabled(True)
+        paths = {}
+        if index is not None and self._video_preview_root is not None:
+            for camera in ('cam0', 'cam1'):
+                path = self._video_preview_root / 'images' / camera / f'frame_{index + 1:06d}.jpg'
+                if path.is_file():
+                    paths[camera] = path
+        if code == 0 and len(paths) == 2:
+            for camera, path in paths.items():
+                self._video_preview_paths[camera][index] = path
+            if index == getattr(self, '_video_selected_index', 0):
+                self._load_video_preview_frame(index)
+                self.preview_status.setText(tr('Frame ready. Select Preview mask to inspect the RF-DETR mask.'))
+                if self.canvas.show_mask:
+                    self._refresh_mask_preview()
+                    self.preview_timer.start()
+            return
+        detail = next((line for line in reversed(self._frame_extraction_output)
+                       if line.startswith('RavenCalibrator:') or 'failed' in line.lower()), None)
+        self.preview_status.setText(tr('Frame extraction failed: {error}').format(
+            error=detail or (self._frame_extraction_output[-1] if self._frame_extraction_output else str(code))))
+
+    def _stop_frame_extraction(self):
+        self._frame_extraction_timer.stop()
+        self._pending_frame_extraction_index = None
+        process = self._frame_extraction_process
+        self._frame_extraction_process = None
+        self._frame_extraction_index = None
+        if process is not None:
+            if process.state() != QProcess.ProcessState.NotRunning:
+                process.terminate()
+                if not process.waitForFinished(1200):
+                    process.kill()
+                    process.waitForFinished(1200)
+            process.deleteLater()
 
     @staticmethod
     def _natural_key(path):
@@ -583,6 +796,31 @@ class MaskSettingsDialog(QDialog):
         self.preview_timer.stop()
         self._stop_detection()
         self._person_masks.clear()
+        if self._lazy_video_preview:
+            self._video_selected_index = index
+            if self._frame_extraction_process is not None and self._frame_extraction_index != index:
+                self._stop_frame_extraction()
+            self.canvas.show_mask = was_mask
+            self._load_video_preview_frame(index)
+            if self._current_source is None:
+                self._schedule_video_frame_extraction(index)
+                if was_mask:
+                    self.show_mask_button.setToolTip(tr('Show image'))
+                    self.show_mask_button.setAccessibleName(tr('Show image'))
+                    self.show_mask_button.setIcon(FluentIcon.HIDE)
+                return
+            self.preview_status.setText('')
+            if was_mask:
+                self.show_mask_button.setToolTip(tr('Show image'))
+                self.show_mask_button.setAccessibleName(tr('Show image'))
+                self.show_mask_button.setIcon(FluentIcon.HIDE)
+                self._refresh_mask_preview()
+                self.preview_timer.start()
+            else:
+                self.show_mask_button.setToolTip(tr('Preview mask'))
+                self.show_mask_button.setAccessibleName(tr('Preview mask'))
+                self.show_mask_button.setIcon(FluentIcon.VIEW)
+            return
         self._load_frame(index)
         self.canvas.show_mask = was_mask
         if was_mask:
@@ -685,15 +923,23 @@ class MaskSettingsDialog(QDialog):
         if self._preview_process is not None:
             return
         root = get_app_root()
-        executable = resolve_masker_executable()
+        executable = (resolve_vulkan_executable() if self.backend == 'vulkan'
+                      else resolve_masker_executable())
         try:
             model = resolve_model(self.model_path)
         except FileNotFoundError as exc:
             self.preview_status.setText(tr('RF-DETR model unavailable: {error}').format(error=str(exc)))
             return
-        runtime = resolve_runtime_dir()
-        if executable is None or model is None or runtime is None:
-            self.preview_status.setText(tr('Fixed-area preview only. Use “Download model RF-DETR” on the main screen to install the model and TensorRT runtime.'))
+        inference_model = model
+        shaders = None
+        if self.backend == 'vulkan':
+            inference_model = resolve_vulkan_schedule(model)
+            shaders = resolve_vulkan_shaders_dir(executable)
+            backend_ready = inference_model is not None and shaders is not None
+        else:
+            backend_ready = resolve_runtime_dir() is not None
+        if executable is None or model is None or not model_is_ready(model) or not backend_ready:
+            self.preview_status.setText(tr('Fixed-area preview only. Use “Download model RF-DETR” on the main screen to prepare the selected mask backend.'))
             return
         key = self._preview_key()
         camera, source = key
@@ -711,17 +957,22 @@ class MaskSettingsDialog(QDialog):
             self._preview_temp = None
             self.preview_status.setText(tr('Cannot prepare mask preview: {error}').format(error=str(exc)))
             return
-        cache = Path(os.environ['RAVEN_RFDETR_CACHE']) if os.environ.get('RAVEN_RFDETR_CACHE') else (
-            get_config_dir() / 'rfdetr-cache' if getattr(sys, 'frozen', False) else root / 'models')
-        cache.mkdir(parents=True, exist_ok=True)
         process = QProcess(self)
         self._preview_process = process
         process.finished.connect(lambda code, _status: self._detection_finished(process, key, code))
         process.setProgram(str(executable))
-        process.setArguments(['--input', str(temporary / 'images'), '--output', str(temporary / 'masks'),
-                              '--model', str(model), '--cache-dir', str(cache), '--threshold', '0.5', '--margin', '0.03'])
+        arguments = ['--input', str(temporary / 'images'), '--output', str(temporary / 'masks'),
+                     '--model', str(inference_model), '--threshold', '0.5', '--margin', '0.03']
         environment = QProcessEnvironment.systemEnvironment()
-        environment.insert('PATH', masker_environment(executable).get('PATH', ''))
+        if self.backend == 'vulkan':
+            arguments.extend(['--shaders', str(shaders)])
+        else:
+            cache = Path(os.environ['RAVEN_RFDETR_CACHE']) if os.environ.get('RAVEN_RFDETR_CACHE') else (
+                get_config_dir() / 'rfdetr-cache' if getattr(sys, 'frozen', False) else root / 'models')
+            cache.mkdir(parents=True, exist_ok=True)
+            arguments.extend(['--cache-dir', str(cache)])
+            environment.insert('PATH', masker_environment(executable).get('PATH', ''))
+        process.setArguments(arguments)
         process.setProcessEnvironment(environment)
         process.start()
         if not process.waitForStarted(1000):
@@ -766,7 +1017,21 @@ class MaskSettingsDialog(QDialog):
 
     def done(self, result):
         self._stop_detection()
+        self._stop_frame_extraction()
+        if self._video_preview_temp is not None:
+            self._video_preview_temp.cleanup()
+            self._video_preview_temp = None
+            self._video_preview_root = None
+        if self._frames_temp is not None:
+            self._frames_temp.cleanup()
+            self._frames_temp = None
         super().done(result)
+
+    def accept(self):
+        if self._frame_extraction_process is not None or self._frame_extraction_timer.isActive():
+            self.preview_status.setText(tr('Wait for frame extraction to finish before saving mask settings.'))
+            return
+        super().accept()
 
     def settings(self):
         self.config['fisheye_border_percent'] = self.border_spin.value()

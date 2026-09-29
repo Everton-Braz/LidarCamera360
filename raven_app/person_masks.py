@@ -18,9 +18,10 @@ import numpy as np
 from PIL import Image
 
 from raven_app.config import get_app_root, get_config_dir
-from raven_app.mask_resources import (MODEL_SHA256, download_progress, ensure_model,
-                                      ensure_runtime, masker_environment,
-                                      resolve_masker_executable, resolve_model)
+from raven_app.mask_resources import (MODEL_SHA256, download_progress, ensure_resources,
+                                      masker_environment, resolve_masker_executable,
+                                      resolve_model, resolve_vulkan_executable,
+                                      resolve_vulkan_shaders_dir)
 
 
 def mask_path(image_path, images_dir, masks_dir):
@@ -311,15 +312,18 @@ def masked_operator_keep(points, views, images_dir, masks_dir, radius, project):
     return ~remove
 
 
-def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03, mask_config=None):
+def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03,
+                          mask_config=None, backend='vulkan'):
     if not math.isfinite(threshold) or not 0 < threshold < 1:
         raise ValueError('Person score threshold must be between 0 and 1')
     if not math.isfinite(margin) or not 0 <= margin <= 1:
         raise ValueError('Person mask margin must be between 0 and 1')
+    if backend not in ('vulkan', 'tensorrt'):
+        raise ValueError(f'Unknown RF-DETR mask backend: {backend}')
     config = read_mask_config(mask_config)
-    executable = resolve_masker_executable()
+    executable = resolve_vulkan_executable() if backend == 'vulkan' else resolve_masker_executable()
     if executable is None:
-        raise RuntimeError('Built-in RF-DETR runtime missing: install the masking-enabled app build')
+        raise RuntimeError(f'Built-in RF-DETR {backend} executor is missing from this app build')
     dataset = Path(dataset)
     images = dataset / 'images'
     sources = sorted(p for p in images.rglob('*') if p.suffix.lower() in ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff') and p.is_file())
@@ -334,7 +338,8 @@ def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03, 
     masks = dataset / 'masks'
     masks.mkdir(parents=True, exist_ok=True)
     manifest = masks / 'manifest.json'
-    settings = {'schema': 3, 'model_sha256': fingerprint, 'threshold': threshold, 'margin': margin,
+    settings = {'schema': 4, 'model_sha256': fingerprint, 'mask_backend': backend,
+                'threshold': threshold, 'margin': margin,
                 'polarity': 'white_keep_black_foreground', 'naming': 'image_relative_name_plus_png',
                 'mask_config': config,
                 'sources': {p.relative_to(images).as_posix(): [p.stat().st_size, p.stat().st_mtime_ns] for p in sources}}
@@ -347,22 +352,39 @@ def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03, 
             return masks
     # Only fetch resources after confirming this dataset needs fresh inference.
     # A completed mask manifest can therefore be reused without a network call.
-    if model is None:
-        model = ensure_model(download_progress)
-        with model.open('rb') as stream:
-            settings['model_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
-    ensure_runtime(download_progress)
+    model, inference_model = ensure_resources(
+        download_progress, backend=backend, model_path=model
+    )
+    with model.open('rb') as stream:
+        settings['model_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
     # Invalidate completion before running: interrupted/failed batches cannot be reused.
     manifest.unlink(missing_ok=True)
     started = time.perf_counter()
     root = get_app_root()
-    cache = Path(os.environ['RAVEN_RFDETR_CACHE']) if os.environ.get('RAVEN_RFDETR_CACHE') else (
-        get_config_dir() / 'rfdetr-cache' if getattr(sys, 'frozen', False) else root / 'models')
-    cache.mkdir(parents=True, exist_ok=True)
-    subprocess.run([str(executable), '--input', str(images.resolve()), '--output', str(masks.resolve()),
-                    '--model', str(model.resolve()), '--cache-dir', str(cache.resolve()),
-                    '--threshold', str(threshold), '--margin', str(margin)], check=True,
-                   env=masker_environment(executable))
+    # Vulkan consumes the generated RVK schedule, while TensorRT consumes the
+    # ONNX model. The TensorRT runtime directory is supplied through PATH.
+    backend_model = inference_model if backend == 'vulkan' else model
+    command = [str(executable), '--input', str(images.resolve()), '--output', str(masks.resolve()),
+               '--model', str(backend_model.resolve()), '--threshold', str(threshold),
+               '--margin', str(margin)]
+    if backend == 'tensorrt':
+        cache = Path(os.environ['RAVEN_RFDETR_CACHE']) if os.environ.get('RAVEN_RFDETR_CACHE') else (
+            get_config_dir() / 'rfdetr-cache' if getattr(sys, 'frozen', False) else root / 'models')
+        cache.mkdir(parents=True, exist_ok=True)
+        command.extend(['--cache-dir', str(cache.resolve())])
+        environment = masker_environment(executable)
+    else:
+        shaders = resolve_vulkan_shaders_dir(executable)
+        if shaders is None:
+            raise RuntimeError('RF-DETR Vulkan compiled shaders are missing from this app build')
+        command.extend(['--shaders', str(shaders)])
+        environment = os.environ.copy()
+    run_options = {'check': True, 'env': environment}
+    if os.name == 'nt':
+        # The masker is a console-subsystem executable. Keep its stdout/stderr
+        # attached to the headless CLI pipes without opening a separate window.
+        run_options['creationflags'] = subprocess.CREATE_NO_WINDOW
+    subprocess.run(command, **run_options)
     static_masks = {}
     for source in sources:
         mask = load_keep_mask(source, images, masks)

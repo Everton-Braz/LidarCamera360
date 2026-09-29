@@ -406,7 +406,9 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
 def get_best_vulkan_device() -> int:
     """Retorna o índice do melhor dispositivo Vulkan (priorizando GPU discreta dedicada como NVIDIA/AMD)."""
     try:
-        res = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, timeout=5)
+        from raven_app.subprocess_utils import hidden_window_options
+        res = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True,
+                             timeout=5, **hidden_window_options())
         current_dev = -1
         dev_scores = {}
         for line in res.stdout.splitlines():
@@ -472,9 +474,10 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
         cmd.extend(["--device", str(vulkan_dev)])
 
     t0 = time.time()
-    ret = subprocess.run(cmd)
-    if ret.returncode != 0 or not all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
-        print(f"[!] Spirula SFM exited with code {ret.returncode}")
+    from raven_app.subprocess_utils import run_hidden_stream
+    code = run_hidden_stream(cmd)
+    if code != 0 or not all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
+        print(f"[!] Spirula SFM exited with code {code}")
         return False
 
     cameras = load_colmap_cameras(sparse_dir / "cameras.bin")

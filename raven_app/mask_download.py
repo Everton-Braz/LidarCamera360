@@ -10,8 +10,11 @@ class MaskResourceDownload(QObject):
     progress = pyqtSignal(str, int)
     completed = pyqtSignal(int, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, backend='vulkan', parent=None):
         super().__init__(parent)
+        if backend not in ('vulkan', 'tensorrt'):
+            raise ValueError(f'Unknown RF-DETR backend: {backend}')
+        self.backend = backend
         self._process = None
         self._output = []
         self._pending = b''
@@ -27,11 +30,11 @@ class MaskResourceDownload(QObject):
         process.finished.connect(self._finished)
         if getattr(sys, 'frozen', False):
             process.setProgram(sys.executable)
-            process.setArguments(['--headless', 'download-mask-resources'])
+            process.setArguments(['--headless', 'download-mask-resources', '--backend', self.backend])
         else:
             entry = Path(__file__).resolve().parents[1] / 'raven.py'
             process.setProgram(sys.executable)
-            process.setArguments([str(entry), '--headless', 'download-mask-resources'])
+            process.setArguments([str(entry), '--headless', 'download-mask-resources', '--backend', self.backend])
             process.setWorkingDirectory(str(entry.parent))
         process.start()
         return True

@@ -112,7 +112,9 @@ def validate_tool(tool_type: str, path_str: str) -> tuple[bool, str]:
 
     try:
         cmd = [resolved, "--help"]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        from raven_app.subprocess_utils import hidden_window_options
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5,
+                             **hidden_window_options())
         if res.returncode == 0:
             lines = res.stdout.splitlines()
             banner = lines[0].strip() if lines else "Active"

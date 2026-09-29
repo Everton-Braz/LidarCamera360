@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Export a static ONNX graph to the RVK1 Vulkan schedule format.
 
-This tool performs shape inference and constant folding only. It never runs
-model inference on image/runtime tensors and never falls back to ONNX Runtime
-inference.  The resulting .rvk contains float32-backed constants plus enough
+This tool performs ONNX shape inference and constant folding only. It never runs
+model inference on image/runtime tensors and has no ONNX Runtime dependency.
+The resulting .rvk contains float32-backed constants plus enough
 ONNX type metadata for the native executor to implement Cast correctly.
 """
 
@@ -19,13 +19,6 @@ import struct
 import sys
 from typing import Any
 
-import numpy as np
-import onnx
-from onnx import AttributeProto, TensorProto, helper, numpy_helper
-from onnx.reference import ReferenceEvaluator
-from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
-
-
 MAX_RANK = 8
 EMPTY_OPTIONAL = 0xFFFFFFFF
 _SUPPORTED_DOMAINS = {"", "ai.onnx"}
@@ -33,6 +26,33 @@ _SUPPORTED_DOMAINS = {"", "ai.onnx"}
 
 class ExportError(ValueError):
     """The model cannot be represented by the RVK1 contract."""
+
+
+def _load_runtime(progress=None) -> None:
+    """Load the sizeable ONNX graph helpers only when Vulkan setup is requested."""
+    global np, onnx, AttributeProto, TensorProto, helper, numpy_helper
+
+    def report(percent: int) -> None:
+        if progress is not None:
+            progress(percent)
+
+    report(6)
+    import numpy as numpy_module
+    np = numpy_module
+    report(8)
+    import onnx as onnx_module
+    onnx = onnx_module
+    report(10)
+    from onnx import AttributeProto as attribute_proto
+    from onnx import TensorProto as tensor_proto
+    from onnx import helper as onnx_helper
+    from onnx import numpy_helper as onnx_numpy_helper
+    AttributeProto = attribute_proto
+    TensorProto = tensor_proto
+    helper = onnx_helper
+    numpy_helper = onnx_numpy_helper
+    report(12)
+    report(15)
 
 
 def _shape_and_type(value_info: onnx.ValueInfoProto) -> tuple[int, tuple[int, ...]] | None:
@@ -58,6 +78,40 @@ def _value_info_map(model: onnx.ModelProto) -> dict[str, tuple[int, tuple[int, .
     return result
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _apply_shape_overrides(model: onnx.ModelProto, model_sha256: str) -> bool:
+    """Apply precomputed static shapes for the pinned RF-DETR model, if available."""
+    override_path = Path(__file__).with_name("vendor") / "rfdetr-seg-medium-shape-overrides.json"
+    if not override_path.is_file():
+        return False
+    try:
+        payload = json.loads(override_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ExportError(f"cannot read bundled RF-DETR shape metadata: {exc}") from exc
+    if payload.get("model_sha256") != model_sha256:
+        return False
+
+    infos = {value.name: value for value in model.graph.value_info}
+    for item in payload.get("shapes", []):
+        name = str(item["name"])
+        value_info = helper.make_tensor_value_info(
+            name, int(item["elem_type"]), [int(dim) for dim in item["shape"]]
+        )
+        if name in infos:
+            infos[name].CopyFrom(value_info)
+        else:
+            model.graph.value_info.add().CopyFrom(value_info)
+            infos[name] = model.graph.value_info[-1]
+    return True
+
+
 def _validate_static_metadata(name: str, elem_type: int, shape: tuple[int, ...]) -> None:
     if not name:
         raise ExportError("empty tensor names are not supported")
@@ -76,38 +130,118 @@ def _known_shape(info: dict[str, tuple[int, tuple[int, ...]]], name: str) -> tup
         raise ExportError(f"shape inference did not produce a static shape for {name!r}") from exc
 
 
-def _reference_fold_node(
-    node: onnx.NodeProto,
-    inputs: dict[str, np.ndarray],
-    opset_imports: list[onnx.OperatorSetIdProto],
-) -> list[np.ndarray]:
-    input_names = [name for name in node.input if name]
-    graph_inputs = [
-        helper.make_tensor_value_info(
-            name,
-            helper.np_dtype_to_tensor_dtype(np.asarray(inputs[name]).dtype),
-            list(np.asarray(inputs[name]).shape),
-        )
-        for name in input_names
-    ]
-    # Give outputs a declared type when symbolic inference has supplied one;
-    # ReferenceEvaluator can otherwise infer it from the operator.
-    graph_outputs = [helper.make_tensor_value_info(name, TensorProto.FLOAT, []) for name in node.output if name]
-    graph = helper.make_graph([node], "rvk1_constant_fold", graph_inputs, graph_outputs)
-    model = helper.make_model(graph, opset_imports=opset_imports, producer_name="export_rfdetr_vulkan")
-    evaluator = ReferenceEvaluator(model)
-    feed = {name: inputs[name] for name in input_names}
-    result = evaluator.run(None, feed)
-    if len(result) != len(graph_outputs):
-        raise ExportError(f"constant folding {node.op_type} returned an unexpected output count")
-    arrays = [np.asarray(value) for value in result]
-    if any(array.dtype == object for array in arrays):
-        raise ExportError(f"constant folding {node.op_type} returned an unsupported object tensor")
-    return arrays
+def _constant_attribute(node: onnx.NodeProto) -> np.ndarray:
+    """Decode an ONNX Constant node without importing its optional reference runtime."""
+    attributes = {attribute.name: helper.get_attribute_value(attribute) for attribute in node.attribute}
+    if "value" in attributes:
+        return np.asarray(numpy_helper.to_array(attributes["value"]))
+    for name, dtype in (("value_float", np.float32), ("value_int", np.int64), ("value_string", np.bytes_)):
+        if name in attributes:
+            return np.asarray(attributes[name], dtype=dtype)
+    for name, dtype in (("value_floats", np.float32), ("value_ints", np.int64), ("value_strings", np.bytes_)):
+        if name in attributes:
+            return np.asarray(attributes[name], dtype=dtype)
+    raise ExportError("Constant node has no supported value attribute")
+
+
+def _fold_static_node(node: onnx.NodeProto, inputs: dict[str, np.ndarray]) -> list[np.ndarray] | None:
+    """Evaluate only constant-only nodes using NumPy; unsupported ones stay in the graph."""
+    attrs = {attribute.name: helper.get_attribute_value(attribute) for attribute in node.attribute}
+    values = [inputs.get(name) if name else None for name in node.input]
+    op = node.op_type
+
+    try:
+        if op == "Constant":
+            return [_constant_attribute(node)]
+        if op == "ConstantOfShape" and values and values[0] is not None:
+            shape = tuple(int(dimension) for dimension in np.asarray(values[0]).reshape(-1))
+            fill = (np.asarray(numpy_helper.to_array(attrs["value"])) if "value" in attrs
+                    else np.asarray([0], dtype=np.float32))
+            return [np.full(shape, fill.reshape(-1)[0], dtype=fill.dtype)]
+        if op == "Cast" and values and values[0] is not None:
+            dtype = helper.tensor_dtype_to_np_dtype(int(attrs["to"]))
+            return [np.asarray(values[0]).astype(dtype)]
+        if op == "Slice" and values and values[0] is not None:
+            starts = np.asarray(values[1]).reshape(-1).astype(np.int64)
+            ends = np.asarray(values[2]).reshape(-1).astype(np.int64)
+            axes = (np.asarray(values[3]).reshape(-1).astype(np.int64)
+                    if len(values) > 3 and values[3] is not None else np.arange(starts.size))
+            steps = (np.asarray(values[4]).reshape(-1).astype(np.int64)
+                     if len(values) > 4 and values[4] is not None else np.ones(starts.size, dtype=np.int64))
+            slices = [slice(None)] * np.asarray(values[0]).ndim
+            for start, end, axis, step in zip(starts, ends, axes, steps):
+                axis = int(axis) % len(slices)
+                slices[axis] = slice(int(start), int(end), int(step))
+            return [np.asarray(values[0])[tuple(slices)]]
+        if op == "Concat":
+            return [np.concatenate([np.asarray(value) for value in values if value is not None],
+                                   axis=int(attrs["axis"]))]
+        if op == "Div" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            left, right = np.asarray(values[0]), np.asarray(values[1])
+            if left.dtype.kind in "iu" and right.dtype.kind in "iu":
+                return [np.trunc(np.true_divide(left, right)).astype(np.result_type(left, right))]
+            return [np.divide(left, right)]
+        if op == "Expand" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            shape = tuple(int(dimension) for dimension in np.asarray(values[1]).reshape(-1))
+            source = np.asarray(values[0])
+            return [np.broadcast_to(source, np.broadcast_shapes(source.shape, shape)).copy()]
+        if op == "Where" and len(values) >= 3 and all(value is not None for value in values[:3]):
+            return [np.where(values[0], values[1], values[2])]
+        if op == "Unsqueeze" and values and values[0] is not None:
+            axes = (np.asarray(values[1]).reshape(-1).astype(np.int64)
+                    if len(values) > 1 and values[1] is not None
+                    else np.asarray(attrs["axes"], dtype=np.int64))
+            rank = np.asarray(values[0]).ndim + axes.size
+            normalized = sorted(int(axis) % rank for axis in axes)
+            result = np.asarray(values[0])
+            for axis in normalized:
+                result = np.expand_dims(result, axis=axis)
+            return [result]
+        if op == "Mul" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            return [np.multiply(values[0], values[1])]
+        if op == "Equal" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            return [np.equal(values[0], values[1])]
+        if op == "Reshape" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            shape = tuple(int(dimension) for dimension in np.asarray(values[1]).reshape(-1))
+            if int(attrs.get("allowzero", 0)) == 0:
+                shape = tuple(np.asarray(values[0]).shape[index] if dim == 0 else dim
+                              for index, dim in enumerate(shape))
+            return [np.reshape(values[0], shape)]
+        if op == "Not" and values and values[0] is not None:
+            return [np.logical_not(values[0])]
+        if op == "Add" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            return [np.add(values[0], values[1])]
+        if op == "Greater" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            return [np.greater(values[0], values[1])]
+        if op == "Tile" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            return [np.tile(values[0], tuple(int(x) for x in np.asarray(values[1]).reshape(-1)))]
+        if op == "Transpose" and values and values[0] is not None:
+            permutation = attrs.get("perm")
+            return [np.transpose(values[0], axes=permutation)]
+        if op == "Less" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            return [np.less(values[0], values[1])]
+        if op == "And" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            return [np.logical_and(values[0], values[1])]
+        if op == "ReduceSum" and values and values[0] is not None:
+            axes = (np.asarray(values[1]).reshape(-1).astype(np.int64)
+                    if len(values) > 1 and values[1] is not None
+                    else attrs.get("axes"))
+            axis = None if axes is None else tuple(int(value) for value in axes)
+            return [np.sum(values[0], axis=axis, keepdims=bool(attrs.get("keepdims", 1)))]
+        if op == "Sqrt" and values and values[0] is not None:
+            return [np.sqrt(values[0])]
+        if op == "Exp" and values and values[0] is not None:
+            return [np.exp(values[0])]
+        if op == "MatMul" and len(values) >= 2 and values[0] is not None and values[1] is not None:
+            return [np.matmul(values[0], values[1])]
+    except (ArithmeticError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+    return None
 
 
 def _fold_constant_node(node: onnx.NodeProto, opset_imports: list[onnx.OperatorSetIdProto]) -> list[np.ndarray]:
-    return _reference_fold_node(node, {}, opset_imports)
+    del opset_imports
+    return _fold_static_node(node, {})
 
 
 def _shape_node_value(
@@ -150,7 +284,7 @@ def _fold_model(
         elif node.input and all((not name) or name in constants for name in node.input):
             input_constants = {name: constants[name] for name in node.input if name}
             try:
-                folded = _reference_fold_node(node, input_constants, list(model.opset_import))
+                folded = _fold_static_node(node, input_constants)
             except Exception:
                 # Keep unsupported reference operators in the executable graph.
                 folded = None
@@ -503,23 +637,33 @@ def _serialize(
     return writer.finish(), [manifest_tensors[name] for name in ordered_names], op_counts
 
 
-def export_model(model_path: Path, output_path: Path) -> dict[str, Any]:
+def export_model(model_path: Path, output_path: Path, progress=None) -> dict[str, Any]:
+    def report(percent: int) -> None:
+        if progress is not None:
+            progress(percent)
+
     model_path = Path(model_path)
     output_path = Path(output_path)
     if not model_path.is_file():
         raise ExportError(f"model does not exist: {model_path}")
+    _load_runtime(progress)
+    model_sha256 = _sha256_file(model_path)
+    report(10)
     model = onnx.load(str(model_path), load_external_data=True)
-    try:
-        inferred = SymbolicShapeInference.infer_shapes(
-            model,
-            auto_merge=True,
-            guess_output_rank=True,
-            verbose=0,
-        )
-    except Exception as exc:
-        raise ExportError(f"symbolic shape inference failed: {exc}") from exc
-    if inferred is not None:
-        model = inferred
+    report(20)
+    if not _apply_shape_overrides(model, model_sha256):
+        try:
+            inferred = onnx.shape_inference.infer_shapes(
+                model,
+                check_type=True,
+                strict_mode=False,
+                data_prop=True,
+            )
+        except Exception as exc:
+            raise ExportError(f"ONNX shape inference failed: {exc}") from exc
+        if inferred is not None:
+            model = inferred
+    report(40)
 
     for value in (*model.graph.input, *model.graph.output):
         if value.name not in {init.name for init in model.graph.initializer}:
@@ -529,6 +673,7 @@ def export_model(model_path: Path, output_path: Path) -> dict[str, Any]:
             _validate_static_metadata(value.name, *metadata)
 
     residual, constants, info = _fold_model(model)
+    report(82)
     _remove_empty_concat_inputs(residual, constants, info)
     nodes, referenced, input_names, output_names = _prune_graph(model, residual, constants)
     _normalize_slice_sentinels(nodes, constants, info)
@@ -537,10 +682,11 @@ def export_model(model_path: Path, output_path: Path) -> dict[str, Any]:
     data, manifest_tensors, op_counts = _serialize(
         nodes, constants, info, referenced, input_names, output_names
     )
+    report(94)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(data)
-    digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    digest = model_sha256
     manifest = {
         "format": "RVK1",
         "model": str(model_path),
@@ -559,6 +705,7 @@ def export_model(model_path: Path, output_path: Path) -> dict[str, Any]:
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    report(98)
     return manifest
 
 

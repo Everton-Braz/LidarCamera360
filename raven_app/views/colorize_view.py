@@ -11,9 +11,9 @@ from qfluentwidgets import (
     LineEdit, DoubleSpinBox, ComboBox, CheckBox, ProgressBar,
     PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
 )
-from raven_app.process_runner import ProcessRunner
+from raven_app.process_runner import ProcessRunner, make_run_log_path
 from raven_app.mask_download import MaskResourceDownload
-from raven_app.mask_resources import resolve_model, resolve_runtime_dir
+from raven_app.mask_resources import resource_status, resources_ready
 from raven_app.i18n import tr
 
 
@@ -26,8 +26,10 @@ class ColorizeView(QWidget):
         self.runner = runner
         self._mask_downloader = None
         self.mask_config = None
+        self._current_log_path = None
         self._init_ui()
         self._connect_signals()
+        self._refresh_mask_resource_state()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -112,6 +114,7 @@ class ColorizeView(QWidget):
         self.fps_spin.setRange(0.1, 120.0)
         self.fps_spin.setValue(2.0)
         self.fps_spin.setSingleStep(0.5)
+        self.fps_spin.setToolTip(tr("Extraction rate is capped by the source video. For a 2 fps timelapse, use 2; a higher value does not create extra frames."))
 
         self.dt_label = BodyLabel(tr("Manual Δt (s):"))
         self.dt_input = LineEdit()
@@ -137,8 +140,15 @@ class ColorizeView(QWidget):
         mask_row = QHBoxLayout()
         self.chk_mask_persons = CheckBox(tr("Generate masks"))
         self.chk_mask_persons.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
+        self.mask_backend_label = BodyLabel(tr("Mask backend:"))
+        self.mask_backend_combo = ComboBox()
+        self.mask_backend_combo.addItem(tr("Vulkan"), userData="vulkan")
+        self.mask_backend_combo.addItem(tr("TensorRT"), userData="tensorrt")
+        self.mask_backend_combo.setCurrentIndex(0)
+        self.mask_backend_combo.currentIndexChanged.connect(self._refresh_mask_resource_state)
+        self.mask_backend_combo.currentIndexChanged.connect(self._update_mask_backend_tooltip)
+        self._update_mask_backend_tooltip()
         self.btn_mask_model = PushButton(tr("Download model RF-DETR"), icon=FluentIcon.DOWNLOAD)
-        self.btn_mask_model.setToolTip(tr("Download the RF-DETR model and, when needed, its TensorRT runtime to the user cache. The portable app stays small."))
         self.btn_mask_model.clicked.connect(self._download_rf_detr)
         self.btn_mask_settings = PushButton(tr("Mask settings..."))
         self.btn_mask_settings.clicked.connect(self._open_mask_settings)
@@ -152,13 +162,19 @@ class ColorizeView(QWidget):
         self.operator_radius_spin.valueChanged.connect(lambda value: self.chk_mask_persons.setChecked(True) if value > 0 else None)
         self.chk_mask_persons.toggled.connect(lambda checked: self.operator_radius_spin.setValue(0.0) if not checked else None)
         mask_row.addWidget(self.chk_mask_persons)
-        mask_row.addWidget(self.btn_mask_model)
-        mask_row.addWidget(self.btn_mask_settings)
-        mask_row.addSpacing(12)
-        mask_row.addWidget(self.operator_radius_label)
-        mask_row.addWidget(self.operator_radius_spin)
+        mask_row.addWidget(self.mask_backend_label)
+        mask_row.addWidget(self.mask_backend_combo)
         mask_row.addStretch()
         params_layout.addLayout(mask_row)
+
+        mask_controls_row = QHBoxLayout()
+        mask_controls_row.addWidget(self.btn_mask_model)
+        mask_controls_row.addWidget(self.btn_mask_settings)
+        mask_controls_row.addSpacing(12)
+        mask_controls_row.addWidget(self.operator_radius_label)
+        mask_controls_row.addWidget(self.operator_radius_spin)
+        mask_controls_row.addStretch()
+        params_layout.addLayout(mask_controls_row)
 
         layout.addWidget(params_card)
 
@@ -200,10 +216,14 @@ class ColorizeView(QWidget):
         log_header = QHBoxLayout()
         self.log_title = SubtitleLabel(tr("Colorization Log"))
         self.btn_clear_log = ToolButton(FluentIcon.DELETE)
-        self.btn_clear_log.setToolTip(tr("Clear log"))
+        self.btn_clear_log.setToolTip(tr("Clear visible log (saved file remains)"))
         self.btn_clear_log.clicked.connect(self._clear_log)
+        self.btn_export_log = ToolButton(FluentIcon.DOWNLOAD)
+        self.btn_export_log.setToolTip(tr("Export log..."))
+        self.btn_export_log.clicked.connect(self._export_log)
         log_header.addWidget(self.log_title)
         log_header.addStretch()
+        log_header.addWidget(self.btn_export_log)
         log_header.addWidget(self.btn_clear_log)
         log_layout.addLayout(log_header)
 
@@ -236,43 +256,96 @@ class ColorizeView(QWidget):
         if self.runner.is_busy:
             InfoBar.warning(title=tr('Processing is active'), content=tr('Wait for the current task to finish before downloading RF-DETR resources.'), parent=self)
             return
-        if resolve_model() is not None and resolve_runtime_dir() is not None:
-            InfoBar.success(title=tr('RF-DETR is ready'), content=tr('The model and TensorRT runtime are already available.'), parent=self)
+        backend = self.mask_backend_combo.currentData()
+        if resources_ready(backend):
+            label = tr('Vulkan') if backend == 'vulkan' else tr('TensorRT')
+            InfoBar.success(title=tr('RF-DETR is ready'), content=tr('The model and {backend} mask resources are verified.').format(backend=label), parent=self)
             return
+        if resource_status(backend) == 'executor-missing':
+            InfoBar.error(title=tr('Mask backend unavailable'), content=tr('This app build is missing the selected RF-DETR executor. Rebuild or update the app.'), parent=self)
+            return
+        if backend == 'vulkan':
+            prompt = tr('Verify or download the 139 MB RF-DETR model and prepare its Vulkan cache (~130 MB). This uses Vulkan and does not download TensorRT. Resources stay outside the portable app.')
+        else:
+            prompt = tr('Verify or download the 139 MB RF-DETR model. If needed, download about 1.3 GB of NVIDIA TensorRT runtime; extraction may need up to 3 GB of temporary disk space. Resources stay outside the portable app.')
         answer = QMessageBox.question(
-            self, tr('Download RF-DETR resources'),
-            tr('Verify or download the 139 MB model as needed. If the NVIDIA TensorRT runtime is missing, download about 1.3 GB; extraction may need up to 3 GB of temporary disk space. Files are cached for this Windows user and are not added to the portable app.'),
+            self, tr('Prepare RF-DETR masks'), prompt,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        downloader = MaskResourceDownload(self)
+        downloader = MaskResourceDownload(backend, self)
         self._mask_downloader = downloader
         downloader.progress.connect(self._on_mask_download_progress)
         downloader.completed.connect(self._on_mask_download_completed)
         self.btn_mask_model.setEnabled(False)
+        self.mask_backend_combo.setEnabled(False)
         self.btn_run.setEnabled(False)
         self.btn_mask_model.setText(tr('Preparing RF-DETR...'))
+        self.btn_mask_model.setIcon(FluentIcon.SYNC)
         if not downloader.start():
             self._on_mask_download_completed(2, tr('Could not start the resource downloader.'))
 
     def _on_mask_download_progress(self, resource, percent):
-        title = tr('RF-DETR model') if resource == 'model' else (tr('Installing TensorRT') if resource == 'install' else tr('TensorRT runtime'))
-        self.btn_mask_model.setText(f'{title}: {percent}%')
+        title = {
+            'model': tr('RF-DETR model'),
+            'runtime': tr('TensorRT runtime'),
+            'install': tr('Installing TensorRT'),
+            'vulkan': tr('Preparing Vulkan model'),
+        }.get(resource, tr('Preparing RF-DETR'))
+        self.btn_mask_model.setText(f'{title}: {percent}%' if percent else f'{title}...')
 
     def _on_mask_download_completed(self, code, output):
         downloader, self._mask_downloader = self._mask_downloader, None
         self.btn_mask_model.setEnabled(True)
-        self.btn_mask_model.setText(tr('Download model RF-DETR'))
+        self.mask_backend_combo.setEnabled(True)
         self.btn_run.setEnabled(True)
         if downloader is not None:
             downloader.deleteLater()
-        if code == 0 and resolve_model() is not None and resolve_runtime_dir() is not None:
-            InfoBar.success(title=tr('RF-DETR resources ready'), content=tr('The verified model and TensorRT runtime are saved in the user cache.'), parent=self)
+        self._refresh_mask_resource_state()
+        backend = self.mask_backend_combo.currentData()
+        if code == 0 and resources_ready(backend):
+            label = tr('Vulkan') if backend == 'vulkan' else tr('TensorRT')
+            InfoBar.success(title=tr('RF-DETR resources ready'), content=tr('The model and {backend} mask resources are verified and saved in the user cache.').format(backend=label), parent=self)
         else:
             detail = output[-700:] if output else tr('Check your internet connection and available disk space, then retry.')
             InfoBar.error(title=tr('RF-DETR download failed'), content=detail, parent=self, duration=8000)
+
+    def _refresh_mask_resource_state(self, *_args):
+        if self._mask_downloader is not None:
+            return
+        backend = self.mask_backend_combo.currentData()
+        status = resource_status(backend)
+        self.btn_mask_model.setEnabled(status != 'executor-missing')
+        if status == 'ready':
+            label = tr('Vulkan') if backend == 'vulkan' else tr('TensorRT')
+            self.btn_mask_model.setText(tr('RF-DETR ready ({backend})').format(backend=label))
+            self.btn_mask_model.setIcon(FluentIcon.ACCEPT)
+            self.btn_mask_model.setToolTip(tr('The model, selected mask executor and required resources are verified.'))
+        elif status == 'model-missing':
+            self.btn_mask_model.setText(tr('Download model RF-DETR'))
+            self.btn_mask_model.setIcon(FluentIcon.DOWNLOAD)
+            self.btn_mask_model.setToolTip(tr('Download the verified RF-DETR model and prepare the selected mask backend.'))
+        elif status == 'runtime-missing':
+            self.btn_mask_model.setText(tr('Download TensorRT runtime'))
+            self.btn_mask_model.setIcon(FluentIcon.DOWNLOAD)
+            self.btn_mask_model.setToolTip(tr('The RF-DETR model is present. Download the optional NVIDIA TensorRT runtime for this backend.'))
+        elif status == 'schedule-missing':
+            self.btn_mask_model.setText(tr('Prepare Vulkan masks'))
+            self.btn_mask_model.setIcon(FluentIcon.SYNC)
+            self.btn_mask_model.setToolTip(tr('The model is downloaded. Prepare the Vulkan schedule; TensorRT is not needed.'))
+        else:
+            self.btn_mask_model.setText(tr('Mask executor missing'))
+            self.btn_mask_model.setIcon(FluentIcon.INFO)
+            self.btn_mask_model.setToolTip(tr('Update or rebuild the app with the selected RF-DETR executor.'))
+
+    def _update_mask_backend_tooltip(self, *_args):
+        if self.mask_backend_combo.currentData() == 'vulkan':
+            text = tr('Use Vulkan for person-mask inference; no TensorRT runtime is required. Point-cloud colorization has a separate setting.')
+        else:
+            text = tr('Use NVIDIA TensorRT for person-mask inference; its optional runtime is downloaded separately. Point-cloud colorization has a separate setting.')
+        self.mask_backend_combo.setToolTip(text)
 
     def _open_mask_settings(self):
         from raven_app.mask_settings_dialog import MaskSettingsDialog
@@ -287,7 +360,8 @@ class ColorizeView(QWidget):
                 InfoBar.error(title=tr('Invalid mask settings'), content=str(exc),
                               position=InfoBarPosition.TOP, parent=self)
                 return
-        dialog = MaskSettingsDialog(dataset, config, self)
+        dialog = MaskSettingsDialog(dataset, config, self,
+                                    backend=self.mask_backend_combo.currentData())
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.mask_config = dialog.settings()
             self.chk_mask_persons.setChecked(True)
@@ -296,6 +370,22 @@ class ColorizeView(QWidget):
 
     def _clear_log(self):
         self.log_console.clear()
+
+    def _export_log(self):
+        source = self._current_log_path
+        default_path = str(source) if source else 'colorization.log'
+        target, _ = QFileDialog.getSaveFileName(
+            self, tr('Export colorization log'), default_path,
+            tr('Log files (*.log);;Text files (*.txt);;All files (*.*)')
+        )
+        if not target:
+            return
+        try:
+            content = source.read_text(encoding='utf-8') if source and source.is_file() else self.log_console.toPlainText()
+            Path(target).write_text(content, encoding='utf-8')
+        except OSError as exc:
+            InfoBar.error(title=tr('Cannot export log'), content=str(exc),
+                          position=InfoBarPosition.TOP, parent=self)
 
     def _start_colorization(self):
         ds = self.ds_input.text().strip()
@@ -334,6 +424,7 @@ class ColorizeView(QWidget):
 
         if self.chk_mask_persons.isChecked():
             args.append('--mask-persons')
+            args.extend(['--mask-backend', self.mask_backend_combo.currentData()])
             settings_path = Path(ds).resolve() / 'mask_settings.json'
             if self.mask_config is not None:
                 try:
@@ -350,8 +441,12 @@ class ColorizeView(QWidget):
         if self.operator_radius_spin.value() > 0:
             args.extend(['--operator-radius', str(self.operator_radius_spin.value())])
 
-        self.log_console.appendPlainText(f"\n>>> Starting Colorization: {' '.join(args)}\n")
-        self.runner.start_job(args)
+        log_path = make_run_log_path(ds, f'{Path(ds).name}_colorization')
+        if self.runner.start_job(
+            args, log_path=log_path,
+            initial_log=f">>> Starting Colorization: {' '.join(args)}"
+        ):
+            self._current_log_path = log_path
 
     def _cancel(self):
         self.btn_cancel.setEnabled(False)
@@ -427,23 +522,28 @@ class ColorizeView(QWidget):
         self.method_combo.blockSignals(False)
 
         self.fps_label.setText(tr("Extraction FPS:"))
+        self.fps_spin.setToolTip(tr("Extraction rate is capped by the source video. For a 2 fps timelapse, use 2; a higher value does not create extra frames."))
         self.dt_label.setText(tr("Manual Δt (s):"))
         self.chk_spirula.setText(tr("Run Spirula SfM automatically if sparse reconstruction is missing"))
         self.chk_recalib.setText(tr("Recalibrate spatial extrinsics from SfM alignment"))
         self.chk_mask_persons.setText(tr("Generate masks"))
         self.chk_mask_persons.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
+        self.mask_backend_label.setText(tr("Mask backend:"))
+        self.mask_backend_combo.setItemText(0, tr("Vulkan"))
+        self.mask_backend_combo.setItemText(1, tr("TensorRT"))
+        self._update_mask_backend_tooltip()
         shapes = sum(sum(map(len, self.mask_config[key].values()))
                      for key in ('rectangles', 'ellipses', 'polygons')) if self.mask_config else 0
         self.btn_mask_settings.setText(tr('Mask settings ({n} shapes)').format(n=shapes) if self.mask_config else tr('Mask settings...'))
         if self._mask_downloader is None:
-            self.btn_mask_model.setText(tr("Download model RF-DETR"))
-            self.btn_mask_model.setToolTip(tr("Download the RF-DETR model and, when needed, its TensorRT runtime to the user cache. The portable app stays small."))
+            self._refresh_mask_resource_state()
         self.operator_radius_label.setText(tr("Operator removal radius (m):"))
         self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
         self.btn_run.setText(tr("Run Colorization"))
         self.btn_cancel.setText(tr("Cancel"))
         self.log_title.setText(tr("Colorization Log"))
-        self.btn_clear_log.setToolTip(tr("Clear log"))
+        self.btn_clear_log.setToolTip(tr("Clear visible log (saved file remains)"))
+        self.btn_export_log.setToolTip(tr("Export log..."))
 
         if not self.runner.is_busy:
             self.status_title.setText(tr("Status: Ready"))

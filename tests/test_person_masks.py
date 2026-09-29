@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -10,6 +11,41 @@ from raven_app.vulkan_engine import colorize_views, get_vulkan_bin
 
 
 class PersonMaskTests(unittest.TestCase):
+    def test_tensorrt_executor_receives_onnx_model_not_runtime_folder(self):
+        import os
+        import raven_app.person_masks as person_masks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = root / 'images' / 'cam0'
+            images.mkdir(parents=True)
+            source = images / 'frame.png'
+            cv2.imwrite(str(source), np.full((32, 32, 3), 120, np.uint8))
+            model = root / 'rfdetr.onnx'
+            model.write_bytes(b'test model fingerprint')
+            runtime = root / 'TensorRT' / 'bin'
+            executable = root / 'rfdetr-masker.exe'
+
+            def fake_run(command, **options):
+                out = Path(command[command.index('--output') + 1])
+                destination = out / 'cam0' / 'frame.png.png'
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(destination), np.full((32, 32), 255, np.uint8))
+
+            with patch.object(person_masks, 'resolve_masker_executable', return_value=executable), \
+                    patch.object(person_masks, 'resolve_model', return_value=model), \
+                    patch.object(person_masks, 'ensure_resources', return_value=(model, runtime)), \
+                    patch.object(person_masks, 'masker_environment', return_value={'PATH': str(runtime)}), \
+                    patch.object(person_masks.subprocess, 'run', side_effect=fake_run) as run:
+                person_masks.generate_person_masks(root, model_path=model, backend='tensorrt')
+
+            command = run.call_args.args[0]
+            self.assertEqual(Path(command[command.index('--model') + 1]).resolve(), model.resolve())
+            self.assertNotEqual(Path(command[command.index('--model') + 1]).resolve(), runtime.resolve())
+            self.assertEqual(run.call_args.kwargs['env']['PATH'], str(runtime))
+            if os.name == 'nt':
+                self.assertEqual(run.call_args.kwargs['creationflags'], person_masks.subprocess.CREATE_NO_WINDOW)
+
     def test_bilinear_boundary_and_polarity(self):
         mask = np.full((5, 5), 255, np.uint8)
         mask[2, 2] = 0
