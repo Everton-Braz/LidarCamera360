@@ -39,6 +39,7 @@ class UnifiedWorkflowView(QWidget):
         self.runner = runner
         self._mask_downloader = None
         self.mask_config = None
+        self.third_camera_config = None
         self._current_log_path = None
         self._workflow_started_at = None
         self._stage_started_at = None
@@ -120,6 +121,23 @@ class UnifiedWorkflowView(QWidget):
         insv_row.addWidget(self.insv_input)
         insv_row.addWidget(self.btn_browse_insv)
         inputs_layout.addLayout(insv_row)
+
+        # Row 2.5: Auxiliary Image/Video Source (Third Camera / Smartphone)
+        aux_row = QHBoxLayout()
+        self.aux_label = BodyLabel(tr("Auxiliary Camera:"))
+        self.aux_label.setFixedWidth(170)
+        self.aux_input = LineEdit()
+        self.aux_input.setPlaceholderText(tr("Optional: Smartphone video or image folder for 3DGS..."))
+        self.aux_input.setReadOnly(True)
+        self.btn_add_source = PushButton(tr("Add Source Image/Video..."), icon=FluentIcon.ADD)
+        self.btn_add_source.clicked.connect(self._open_add_source_dialog)
+        self.btn_clear_source = PushButton(tr("Clear"), icon=FluentIcon.DELETE)
+        self.btn_clear_source.clicked.connect(self._clear_aux_source)
+        aux_row.addWidget(self.aux_label)
+        aux_row.addWidget(self.aux_input)
+        aux_row.addWidget(self.btn_add_source)
+        aux_row.addWidget(self.btn_clear_source)
+        inputs_layout.addLayout(aux_row)
 
         # Row 3: Output Folder
         out_row = QHBoxLayout()
@@ -249,8 +267,9 @@ class UnifiedWorkflowView(QWidget):
         self.photometric_combo = ComboBox()
         self.photometric_combo.addItem(tr("Off"), userData="off")
         self.photometric_combo.addItem(tr("Log-linear"), userData="loglinear")
+        self.photometric_combo.addItem(tr("PPISP + bilateral grid"), userData="ppisp-bilateral")
         self.photometric_combo.setCurrentIndex(0)
-        self.photometric_combo.setFixedWidth(130)
+        self.photometric_combo.setFixedWidth(190)
         self.photometric_combo.currentIndexChanged.connect(self._update_photometric_controls)
         self.photometric_params_caption = CaptionLabel(tr("Photometric parameters:"))
         self.photometric_params_input = LineEdit()
@@ -544,6 +563,27 @@ class UnifiedWorkflowView(QWidget):
         if path:
             self.insv_input.setText(path)
 
+    def _open_add_source_dialog(self):
+        from raven_app.views.add_source_dialog import AddSourceDialog
+        dialog = AddSourceDialog(parent=self, config=self.third_camera_config)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.third_camera_config = dialog.get_config()
+            if (
+                self.third_camera_config
+                and self.third_camera_config.enabled
+                and self.third_camera_config.source_path
+            ):
+                src_name = Path(self.third_camera_config.source_path).name
+                self.aux_input.setText(
+                    f"{self.third_camera_config.camera_name}: {src_name} ({self.third_camera_config.camera_model})"
+                )
+            else:
+                self.aux_input.clear()
+
+    def _clear_aux_source(self):
+        self.third_camera_config = None
+        self.aux_input.clear()
+
     def _browse_photometric_params(self):
         path, _ = QFileDialog.getOpenFileName(
             self, tr("Select photometric parameter JSON"), "", "JSON files (*.json);;All files (*.*)"
@@ -552,7 +592,7 @@ class UnifiedWorkflowView(QWidget):
             self.photometric_params_input.setText(path)
 
     def _update_photometric_controls(self, *_):
-        enabled = self.photometric_combo.currentData() == "loglinear"
+        enabled = self.photometric_combo.currentData() != "off"
         self.photometric_params_caption.setEnabled(enabled)
         self.photometric_params_input.setEnabled(enabled)
         self.photometric_params_btn.setEnabled(enabled)
@@ -786,8 +826,20 @@ class UnifiedWorkflowView(QWidget):
 
         args.extend(["--photometric", str(self.photometric_combo.currentData())])
         photometric_params = self.photometric_params_input.text().strip()
-        if photometric_params and self.photometric_combo.currentData() == "loglinear":
+        if photometric_params and self.photometric_combo.currentData() != "off":
             args.extend(["--photometric-params", photometric_params])
+
+        if (
+            self.third_camera_config
+            and self.third_camera_config.enabled
+            and self.third_camera_config.source_path
+        ):
+            out_p = Path(out)
+            out_p.mkdir(parents=True, exist_ok=True)
+            cfg_path = out_p / "third_camera.json"
+            from raven_app.third_camera import save_third_camera_config
+            save_third_camera_config(self.third_camera_config, cfg_path)
+            args.extend(["--third-camera", str(cfg_path)])
 
         if self.recalibrate_chk.isChecked():
             args.append("--recalibrate")
@@ -1073,6 +1125,10 @@ class UnifiedWorkflowView(QWidget):
         self.insv_label.setText(tr("Insta360 Video (.insv):"))
         self.insv_input.setPlaceholderText(tr("Select Insta360 X4 / X6 video (.insv or .mp4)..."))
         self.btn_browse_insv.setText(tr("Browse"))
+        self.aux_label.setText(tr("Auxiliary Camera:"))
+        self.aux_input.setPlaceholderText(tr("Optional: Smartphone video or image folder for 3DGS..."))
+        self.btn_add_source.setText(tr("Add Source Image/Video..."))
+        self.btn_clear_source.setText(tr("Clear"))
         self.out_label.setText(tr("Output Directory:"))
         self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
         self.btn_browse_out.setText(tr("Browse"))
@@ -1107,6 +1163,7 @@ class UnifiedWorkflowView(QWidget):
         self.photometric_combo.blockSignals(True)
         self.photometric_combo.setItemText(0, tr("Off"))
         self.photometric_combo.setItemText(1, tr("Log-linear"))
+        self.photometric_combo.setItemText(2, tr("PPISP + bilateral grid"))
         self.photometric_combo.setCurrentIndex(photo_idx)
         self.photometric_combo.blockSignals(False)
         self.photometric_params_caption.setText(tr("Photometric parameters:"))

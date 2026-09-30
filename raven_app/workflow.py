@@ -577,7 +577,9 @@ def _copy_person_masks(dataset_dir: Path, masks_dir: Path, out_dir: Path, image_
     return len(validated)
 
 
-def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0, max_points: Optional[int] = None, masks_dir: Optional[Path] = None) -> Path:
+def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0,
+                       max_points: Optional[int] = None, masks_dir: Optional[Path] = None,
+                       third_camera: Optional[Any] = None) -> Path:
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
 
     Transforms camera poses into the LiDAR metric coordinate frame and seeds the model with
@@ -609,6 +611,26 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
                         target.symlink_to(f)
                     except Exception:
                         shutil.copy2(f, target)
+
+    if third_camera and getattr(third_camera, "enabled", True):
+        cam_name = getattr(third_camera, "camera_name", "cam2")
+        cam_src = dataset_dir / "images" / cam_name
+        if cam_src.is_dir():
+            cam_files = sorted(cam_src.glob("*.jpg"))
+            dest_cam = images_out / cam_name
+            dest_cam.mkdir(parents=True, exist_ok=True)
+            for f in cam_files:
+                target = dest_cam / f.name
+                if not target.exists():
+                    try:
+                        os.link(f, target)
+                    except Exception:
+                        try:
+                            target.symlink_to(f)
+                        except Exception:
+                            shutil.copy2(f, target)
+            if masks_dir is not None:
+                _copy_person_masks(dataset_dir, masks_dir, out_dir, cam_files)
 
     if masks_dir is not None:
         _copy_person_masks(dataset_dir, masks_dir, out_dir, cam0_files + cam1_files)
@@ -736,6 +758,16 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
     else:
         print("  [*] Using existing sparse points3D as 3DGS seed (no LiDAR cloud available).")
 
+    if third_camera and getattr(third_camera, "enabled", True):
+        from raven_app.third_camera import synthesize_third_camera_poses, inject_third_camera_into_colmap
+        try:
+            cam2_poses = synthesize_third_camera_poses(dataset_dir, third_camera, fps=fps, dt_sync=dt_sync)
+            if cam2_poses:
+                inject_third_camera_into_colmap(sparse_out, third_camera, cam2_poses, camera_id=3)
+                print(f"  [+] Injected {len(cam2_poses)} auxiliary poses ({third_camera.camera_name}) into 3DGS COLMAP dataset")
+        except Exception as e:
+            print(f"  [!] Warning: Failed to inject third camera poses: {e}")
+
     _postprocess_3dgs_dataset(out_dir, dataset_dir)
     print(f"[+] COLMAP 3DGS dataset generation complete: {out_dir}")
     return out_dir
@@ -825,6 +857,7 @@ def execute_unified_workflow(
     operator_radius: float = 0.0,
     photometric: str = "off",
     photometric_params: Path = None,
+    third_camera: Optional[Any] = None,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -843,6 +876,23 @@ def execute_unified_workflow(
     output_dir.mkdir(parents=True, exist_ok=True)
     deliverables_dir = output_dir / "deliverables"
     deliverables_dir.mkdir(parents=True, exist_ok=True)
+
+    third_cfg = None
+    if third_camera:
+        from raven_app.third_camera import (
+            ThirdCameraConfig,
+            load_third_camera_config,
+        )
+        if isinstance(third_camera, ThirdCameraConfig):
+            third_cfg = third_camera
+        elif isinstance(third_camera, (str, Path)):
+            p = Path(third_camera)
+            if p.is_file() and p.suffix.lower() == ".json":
+                third_cfg = load_third_camera_config(p)
+            elif p.exists():
+                third_cfg = ThirdCameraConfig(source_path=str(p), enabled=True)
+        elif isinstance(third_camera, dict):
+            third_cfg = ThirdCameraConfig.from_dict(third_camera)
 
     print("=" * 80)
     print(" RAVENCALIBRATOR UNIFIED WORKFLOW STUDIO")
@@ -865,6 +915,15 @@ def execute_unified_workflow(
         raise RuntimeError("Failed to extract video frames from INSV")
     frames_changed = previous_frames is not None and frames_manifest.stat().st_mtime_ns != previous_frames
     is_timelapse = json.loads(frames_manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse'
+
+    if third_cfg and third_cfg.enabled and third_cfg.source_path:
+        print(f"\n[*] Extracting auxiliary frames from third camera ({third_cfg.camera_name})...")
+        from raven_app.third_camera import extract_third_camera_frames
+        try:
+            extracted_aux, _ = extract_third_camera_frames(third_cfg, output_dir, target_fps=fps)
+            print(f"[+] Successfully extracted {len(extracted_aux)} frames for {third_cfg.camera_name}")
+        except Exception as e:
+            print(f"[!] Warning: Third camera frame extraction notice: {e}")
 
     # --------------------------------------------------------------------------
     # STAGE 2: Time synchronization (IMU Cross-Correlation)
@@ -984,6 +1043,15 @@ def execute_unified_workflow(
                     raise RuntimeError(f'Timelapse rig calibration failed: {e}') from e
                 print(f"[!] Extrinsics recalibration notice: {e}")
 
+    if third_cfg and third_cfg.enabled and third_cfg.source_path:
+        print(f"\n[*] Aligning third camera ({third_cfg.camera_name}) mounting extrinsics to rig...")
+        from raven_app.third_camera import align_third_camera_to_rig, save_third_camera_config
+        try:
+            third_cfg = align_third_camera_to_rig(output_dir, third_cfg, rig_profile_path=calib, fps=fps)
+            save_third_camera_config(third_cfg, output_dir / "third_camera_calibrated.json")
+        except Exception as e:
+            print(f"[!] Warning: Third camera alignment notice: {e}")
+
     # --------------------------------------------------------------------------
     # STAGE 5: Person-mask generation
     # --------------------------------------------------------------------------
@@ -1080,7 +1148,7 @@ def execute_unified_workflow(
 
     if export_colmap:
         export_colmap_3dgs(output_dir, calib, fps=fps, dt_sync=dt_sync,
-                           masks_dir=active_masks_dir)
+                           masks_dir=active_masks_dir, third_camera=third_cfg)
 
     print("\n[+] Deliverables currently in folder:")
     for deliv_item in sorted(deliverables_dir.iterdir()):

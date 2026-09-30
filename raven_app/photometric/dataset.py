@@ -176,15 +176,23 @@ def collect_observations(dataset, masks_dir=None, sample_points=50000, max_obser
     return {key: value[keep] for key, value in obs.items()}, names, lens_names
 
 
-def fit_dataset(dataset, output=None, masks_dir=None, sample_points=50000, max_observations=500000):
+def fit_dataset(dataset, output=None, masks_dir=None, sample_points=50000, max_observations=500000,
+                mode='loglinear'):
+    if mode not in ('loglinear', 'ppisp-bilateral'):
+        raise ValueError('Unsupported photometric mode')
     root = Path(dataset)
-    destination = Path(output) if output else root / 'photometric/photometric_params.json'
+    filename = 'ppisp_bilateral_params.json' if mode == 'ppisp-bilateral' else 'photometric_params.json'
+    destination = Path(output) if output else root / 'photometric' / filename
     if destination.suffix.lower() != '.json':
         destination = destination / 'photometric_params.json'
     start = time.perf_counter()
     obs, names, lens_names = collect_observations(root, masks_dir, sample_points, max_observations)
     sampled = time.perf_counter()
     model = fit_observations(obs, names, lens_names)
+    if mode == 'ppisp-bilateral':
+        from .advanced import fit_advanced
+        model = fit_advanced(obs, names, lens_names, model)
+    model['mode'] = mode
     model['fingerprint'] = fingerprint(root, masks_dir)
     model['settings'] = {'sample_points': sample_points, 'max_observations': max_observations,
                          'sampler': 'verified_sfm_tracks_quarter_jpeg', 'seed': 20260929}
@@ -201,11 +209,14 @@ def fit_dataset(dataset, output=None, masks_dir=None, sample_points=50000, max_o
     return {'parameters': str(destination), **model}
 
 
-def prepare_model(dataset, params=None, masks_dir=None):
-    path = Path(params) if params else Path(dataset) / 'photometric/photometric_params.json'
+def prepare_model(dataset, params=None, masks_dir=None, mode=None):
+    filename = 'ppisp_bilateral_params.json' if mode == 'ppisp-bilateral' else 'photometric_params.json'
+    path = Path(params) if params else Path(dataset) / 'photometric' / filename
     signature = fingerprint(dataset, masks_dir)
     if path.is_file():
         model = load_model(path)
+        if mode is not None and model.get('mode', 'loglinear') != mode:
+            raise ValueError('Photometric parameter mode does not match the requested correction')
         if model.get('fingerprint') == signature:
             print(f'[photometric] reusing validated parameters: {path}', flush=True)
             return model
@@ -213,4 +224,4 @@ def prepare_model(dataset, params=None, masks_dir=None):
             raise ValueError('Photometric parameters belong to different images/model/masks; refit')
     elif params is not None:
         raise FileNotFoundError(path)
-    return fit_dataset(dataset, path, masks_dir)
+    return fit_dataset(dataset, path, masks_dir, mode=mode or 'loglinear')

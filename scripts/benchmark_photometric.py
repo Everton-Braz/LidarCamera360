@@ -18,6 +18,8 @@ def main():
     parser.add_argument('--cloud', type=Path, required=True, help='Application binary XYZ/RGB PLY')
     parser.add_argument('--params', type=Path, required=True)
     parser.add_argument('--alignment', type=Path)
+    parser.add_argument('--calibration', type=Path, help='Rig sidecar paired with candidate alignment')
+    parser.add_argument('--only-after', action='store_true', help='Reuse a previously generated baseline')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--masks-dir', type=Path)
     args = parser.parse_args()
@@ -49,6 +51,10 @@ def main():
     points = data['xyz'].astype(np.float64)
     del data
     alignment = json.loads((args.alignment or args.dataset / 'colmap_to_lidar_alignment.json').read_text())
+    if args.calibration is not None and not args.calibration.is_file():
+        raise FileNotFoundError(args.calibration)
+    if args.alignment is not None and alignment.get('lever_arm_refinement', {}).get('accepted') and args.calibration is None:
+        raise ValueError('Refined alignment requires its paired --calibration sidecar')
     rotation, translation = np.array(alignment['R']), np.array(alignment['t'])
     cameras = load_colmap_cameras(args.dataset / 'sparse/0/cameras.bin')
     images = load_colmap_images(args.dataset / 'sparse/0/images.bin')
@@ -57,7 +63,7 @@ def main():
     # only and uses the already exported calibration sidecar instead.
     overrides = {}
     if alignment.get('frame_time_source') == 'insv_timelapse':
-        calibration_candidates = [args.dataset / 'rig_calibration.json']
+        calibration_candidates = ([args.calibration] if args.calibration else []) + [args.dataset / 'rig_calibration.json']
         calibration_candidates += sorted((args.dataset / 'deliverables').glob('rig_calibration_*.json'))
         calibration_path = next((path for path in calibration_candidates if path.is_file()), None)
         if calibration_path is None:
@@ -92,15 +98,21 @@ def main():
             c = alignment['scale'] * (rotation @ im['C']) + translation
         views.append((args.dataset / 'images' / im['name'], r, c, cameras[im['cam_id']]['params']))
     results = {'points': len(points), 'views': len(views), 'alignment': str(args.alignment),
+               'calibration': str(args.calibration),
                'photometric_metrics': model['metrics'], 'fit_timing': model['timing'],
                'note': 'Identical input XYZ for off/on; timings include native I/O, exclude PLY export.'}
-    for name, coefficients in (('before', None), ('after', model['views'])):
+    runs = [('after', model['views'])] if args.only_after else [('before', None), ('after', model['views'])]
+    for name, coefficients in runs:
         started = time.perf_counter()
         colors = colorize_views(points, views, args.output, masks_dir=args.masks_dir,
                                 images_dir=args.dataset / 'images', photometric=coefficients)
         if colors is None:
             raise RuntimeError('Native benchmark failed; refusing incomparable CPU fallback')
         results[name + '_seconds'] = time.perf_counter() - started
+        results[name + '_color_summary'] = {
+            'mean_rgb': np.mean(colors, axis=0).tolist(),
+            'fallback_gray_points': int(np.count_nonzero(np.all(colors == 180, axis=1))),
+            'note': 'Gray count is a coverage proxy; real surfaces can also have RGB 180.'}
         write_ply(args.output / (name + '.ply'), points, colors)
         del colors
         (args.output / 'benchmark.json').write_text(json.dumps(results, indent=2))

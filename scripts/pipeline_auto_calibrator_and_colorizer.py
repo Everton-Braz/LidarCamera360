@@ -957,13 +957,13 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
         return None
 
 
-def recalibrate_from_sfm(dataset_dir, fps=2.0):
+def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=True):
     """Recalibrate with high precision os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_trj = get_slam_trajectory_path(dataset_dir)
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
-    al = current_alignment(dataset_dir, fps)
+    al = alignment if alignment is not None else current_alignment(dataset_dir, fps)
     s_sim = al["scale"]
     R_sim = np.array(al["R"])
     t_sim = np.array(al["t"])
@@ -1069,17 +1069,17 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0):
         calib_dict[field].update(width=camera['width'], height=camera['height'])
     calib_dict['transform_convention'] = 'camera_to_trajectory_body'
 
-    deliv_dir = dataset_dir / "deliverables"
-    deliv_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    with open(dataset_dir / "rig_calibration.json", "w", encoding="utf-8") as f:
-        json.dump(calib_dict, f, indent=2)
-    with open(dataset_dir / "calibracao_rigida_auto.json", "w", encoding="utf-8") as f:
-        json.dump(calib_dict, f, indent=2)
-    with open(deliv_dir / f"rig_calibration_{ts}.json", "w", encoding="utf-8") as f:
-        json.dump(calib_dict, f, indent=2)
-
-    print(f"  [+] Dynamic calibration saved to: {dataset_dir / 'rig_calibration.json'}")
+    if write_outputs:
+        deliv_dir = dataset_dir / "deliverables"
+        deliv_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with open(dataset_dir / "rig_calibration.json", "w", encoding="utf-8") as f:
+            json.dump(calib_dict, f, indent=2)
+        with open(dataset_dir / "calibracao_rigida_auto.json", "w", encoding="utf-8") as f:
+            json.dump(calib_dict, f, indent=2)
+        with open(deliv_dir / f"rig_calibration_{ts}.json", "w", encoding="utf-8") as f:
+            json.dump(calib_dict, f, indent=2)
+        print(f"  [+] Dynamic calibration saved to: {dataset_dir / 'rig_calibration.json'}")
     return calib_dict
 
 

@@ -104,6 +104,30 @@ class PhotometricTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'refit'):
                 prepare_model(root, path)
 
+    def test_advanced_model_rejects_invalid_grid_homography_and_mode(self):
+        from raven_app.photometric.dataset import prepare_model, fingerprint
+        coeff = {'log_gain': [0] * 3, 'vignette': [0] * 3,
+                 'ppisp_h': np.eye(3).reshape(-1).tolist(),
+                 'bilateral_grid': np.zeros((4, 3, 3, 3)).tolist()}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'params.json'
+            model = {'schema': 2, 'color_space': 'srgb', 'mode': 'ppisp-bilateral',
+                     'views': {'cam0/a.jpg': coeff}, 'fingerprint': fingerprint(root)}
+            path.write_text(json.dumps(model))
+            self.assertEqual(load_model(path), model)
+            with self.assertRaisesRegex(ValueError, 'mode'):
+                prepare_model(root, path, mode='loglinear')
+            coeff['bilateral_grid'][0][0][0][0] = .36
+            path.write_text(json.dumps(model))
+            with self.assertRaisesRegex(ValueError, 'bilateral'):
+                load_model(path)
+            coeff['bilateral_grid'][0][0][0][0] = 0
+            coeff['ppisp_h'] = [0.] * 9
+            path.write_text(json.dumps(model))
+            with self.assertRaisesRegex(ValueError, 'homography'):
+                load_model(path)
+
 
 if __name__ == '__main__':
     unittest.main()

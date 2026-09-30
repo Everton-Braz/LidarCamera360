@@ -38,12 +38,15 @@ def apply_rgb(rgb, u, v, camera_params, coeff=None):
                   (r2 * (k[0] + r2 * (k[1] + r2 * k[2])))[..., None])
     corrected = to_linear(rgb) * np.exp(-np.clip(log_factor,
                                                 -MAX_LOG_CORRECTION, MAX_LOG_CORRECTION))
+    if 'ppisp_h' in coeff or 'bilateral_grid' in coeff:
+        from .advanced import apply_linear
+        corrected = apply_linear(np.clip(corrected, 0, 1), u, v, coeff)
     return np.clip(np.rint(to_srgb(corrected)), 0, 255).astype(np.uint8)
 
 
 def load_model(path):
     model = json.loads(Path(path).read_text(encoding='utf-8'))
-    if model.get('schema') != VERSION or model.get('color_space') != 'srgb':
+    if model.get('schema') not in (VERSION, 2) or model.get('color_space') != 'srgb':
         raise ValueError('Unsupported photometric model schema/color space')
     if not isinstance(model.get('views'), dict):
         raise ValueError('Missing photometric views')
@@ -56,6 +59,19 @@ def load_model(path):
                 raise ValueError('Invalid photometric coefficients')
             if np.max(np.abs(values)) > 4:
                 raise ValueError('Photometric coefficients exceed safe limits')
+        if 'ppisp_h' in coeff:
+            h = np.asarray(coeff['ppisp_h'], dtype=float)
+            if (h.shape != (9,) or not np.isfinite(h).all() or
+                    np.max(np.abs(h)) > 4 or abs(h[8] - 1) > 1e-5 or
+                    abs(np.linalg.det(h.reshape(3, 3))) < 1e-5):
+                raise ValueError('Invalid PPISP homography')
+        if 'bilateral_grid' in coeff:
+            grid = np.asarray(coeff['bilateral_grid'], dtype=float)
+            if (grid.shape != (4, 3, 3, 3) or not np.isfinite(grid).all() or
+                    np.max(np.abs(grid)) > .350001):
+                raise ValueError('Invalid bilateral grid')
+        if model.get('schema') == VERSION and ('ppisp_h' in coeff or 'bilateral_grid' in coeff):
+            raise ValueError('Advanced coefficients require photometric schema 2')
     return model
 
 

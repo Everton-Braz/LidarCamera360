@@ -85,10 +85,10 @@ def add_mask_options(p):
 
 
 def add_photometric_options(p):
-    p.add_argument('--photometric', choices=('off', 'loglinear'), default='off',
+    p.add_argument('--photometric', choices=('off', 'loglinear', 'ppisp-bilateral'), default='off',
                    help='Photometric correction mode (default: off)')
     p.add_argument('--photometric-params', type=Path,
-                   help='Fitted photometric calibration JSON (used with --photometric loglinear)')
+                   help='Fitted photometric calibration JSON (used with a photometric correction mode)')
 
 
 def bag_options(p):
@@ -147,6 +147,8 @@ def parse(argv=None):
                    help='Optional directory of masks to exclude invalid image regions')
     photometric_fit.add_argument('--sample-points', type=positive_int, default=50000)
     photometric_fit.add_argument('--max-observations', type=positive_int, default=500000)
+    photometric_fit.add_argument('--mode', choices=('loglinear', 'ppisp-bilateral'), default='loglinear',
+                   help='Photometric model to fit (default: loglinear)')
     geo=sub.add_parser('georeference', help='Calculate INSV GPS, georeference point clouds and COLMAP datasets, and export GeoJSON')
     geo.add_argument('--insv', type=Path, required=True, help='Path to Insta360 .INSV video')
     geo.add_argument('--output', type=Path, required=True, help='Output directory for georeferenced deliverables and GeoJSON')
@@ -183,6 +185,8 @@ def parse(argv=None):
     color.add_argument('--recalibrate-from-sfm',action='store_true')
     add_mask_options(color)
     add_photometric_options(color)
+    color.add_argument('--third-camera', type=Path, default=None,
+                       help='Optional path to third camera JSON configuration, video file, or image folder')
     wf=sub.add_parser('workflow',help='Run end-to-end processing: Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables')
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
     wf.add_argument('--insv',type=Path,required=True,help='Insta360 video file')
@@ -208,6 +212,8 @@ def parse(argv=None):
                     default=('geojson', 'gpx', 'csv'), help='Selected GPS deliverables')
     wf.add_argument('--geo-formats', nargs='+', choices=('laz', 'las', 'ply', 'pcd', 'geojson'),
                     default=('laz', 'geojson'), help='Automatic georeferenced cloud formats')
+    wf.add_argument('--third-camera', type=Path, default=None,
+                    help='Optional path to third camera JSON configuration, video file, or image folder')
     add_mask_options(wf)
     add_photometric_options(wf)
     for command_parser in (color, wf):
@@ -223,7 +229,7 @@ def parse(argv=None):
     if getattr(a, 'operator_radius', 0) > 0 and not (getattr(a, 'mask_persons', False) or getattr(a, 'masks_dir', None)):
         p.error('--operator-radius requires --mask-persons or --masks-dir; removing a trajectory corridor can erase fixed objects')
     if getattr(a, 'photometric_params', None) is not None and getattr(a, 'photometric', 'off') == 'off':
-        p.error('--photometric-params requires --photometric loglinear')
+        p.error('--photometric-params requires --photometric to be enabled')
     if a.headless and a.command in (None,'gui'):p.error('--headless requires a processing or inspection command')
     return a
 
@@ -284,7 +290,11 @@ def run(a):
             'scipy': scipy.__version__,
             'opencv': cv2.__version__,
             'pyav': av.__version__,
-            'photometric': {'loglinear': True, 'schema': 1, 'requires_torch': False},
+            'photometric': {
+                'modes': ['off', 'loglinear', 'ppisp-bilateral'],
+                'schema': 2,
+                'requires_torch': False,
+            },
             'vulkan_colorizer': vulkan_status(),
             'spirula_path': str(sp),
             'spirula_ready': ok_sp
@@ -327,7 +337,8 @@ def run(a):
         from raven_app.photometric import fit_dataset
         report = fit_dataset(
             a.dataset, output=a.output, masks_dir=a.masks_dir,
-            sample_points=a.sample_points, max_observations=a.max_observations
+            sample_points=a.sample_points, max_observations=a.max_observations,
+            mode=a.mode,
         )
         print(json.dumps({key: value for key, value in report.items() if key != 'views'},
                          indent=2, ensure_ascii=False, allow_nan=False))
@@ -477,6 +488,7 @@ def run(a):
             operator_radius=a.operator_radius,
             photometric=a.photometric,
             photometric_params=a.photometric_params,
+            third_camera=a.third_camera,
         )
     raise ValueError('Unknown command')
 

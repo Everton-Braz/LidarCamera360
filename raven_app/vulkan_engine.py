@@ -67,6 +67,36 @@ def _view_photometric(path, photometric, images_dir):
     return values.astype('<f4')
 
 
+def _view_advanced(path, photometric, images_dir):
+    """Return PPISP H (row-major) and a [D,H,W,RGB] log-gain grid."""
+    image = Path(path)
+    if images_dir is not None:
+        try:
+            name = image.resolve().relative_to(Path(images_dir).resolve()).as_posix()
+        except ValueError:
+            name = image.as_posix()
+    else:
+        name = image.as_posix()
+    key = _photo_key(name)
+    entry = photometric.get(key)
+    if entry is None:
+        return (np.eye(3, dtype='<f4').ravel(),
+                np.zeros((4, 3, 3, 3), dtype='<f4').ravel())
+    if not isinstance(entry, dict):
+        raise ValueError(f'Invalid photometric coefficients for {key}')
+    h = np.asarray(entry.get('ppisp_h', np.eye(3).ravel()), dtype=np.float64)
+    grid = np.asarray(entry.get('bilateral_grid', np.zeros((4, 3, 3, 3))),
+                      dtype=np.float64)
+    if (h.shape != (9,) or not np.isfinite(h).all() or np.max(np.abs(h)) > 4 or
+            abs(h[8] - 1) > 1e-5 or
+            abs(np.linalg.det(h.reshape(3, 3))) < 1e-5):
+        raise ValueError(f'Invalid PPISP homography for {key}')
+    if (grid.shape != (4, 3, 3, 3) or not np.isfinite(grid).all() or
+            np.max(np.abs(grid)) > .350001):
+        raise ValueError(f'Invalid bilateral grid for {key}')
+    return h.astype('<f4'), grid.astype('<f4').ravel()
+
+
 def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images_dir=None,
                    photometric=None):
     """Return RGB8, or None on native failure so callers can run the CPU fallback.
@@ -75,7 +105,8 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
     a UTF-8 path prefixed by uint32 length followed by 24 float32 values
     (row-major Rcw, Cworld, COLMAP's 12 intrinsic parameters). RVC3 adds six
     photometric values per view; RVC4 combines those values with person masks.
-    The six values are three log gains and three achromatic log-vignette coefficients.
+    RVC5/RVC6 append a row-major 3x3 PPISP homography and a [4,3,3,RGB]
+    bilateral grid (flattened C-order), with RVC6 also carrying masks.
     """
     if masks_dir is not None and images_dir is None:
         raise ValueError('images_dir is required for person masks')
@@ -86,10 +117,17 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
     try:
         photo_values = ([_view_photometric(view[0], photometric, images_dir)
                          for view in views] if photometric is not None else None)
+        advanced = bool(photometric is not None and any(
+            isinstance(entry, dict) and ('ppisp_h' in entry or 'bilateral_grid' in entry)
+            for entry in photometric.values()))
+        advanced_values = ([_view_advanced(view[0], photometric, images_dir)
+                            for view in views] if advanced else None)
         with tempfile.TemporaryDirectory(prefix='vulkan-', dir=work_dir) as tmp:
             job, out = Path(tmp) / 'job.bin', Path(tmp) / 'rgb.bin'
             with job.open('wb') as stream:
-                magic = (b'RVC4' if photometric is not None and masks_dir is not None else
+                magic = (b'RVC6' if advanced and masks_dir is not None else
+                         b'RVC5' if advanced else
+                         b'RVC4' if photometric is not None and masks_dir is not None else
                          b'RVC3' if photometric is not None else
                          b'RVC2' if masks_dir is not None else b'RVC1')
                 stream.write(struct.pack('<4sII', magic, len(points), len(views)))
@@ -117,6 +155,10 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
                         stream.write(struct.pack('<I', len(encoded)) + encoded)
                     if photo_values is not None:
                         photo_values[view_i].tofile(stream)
+                    if advanced_values is not None:
+                        h, grid = advanced_values[view_i]
+                        h.tofile(stream)
+                        grid.tofile(stream)
             code = run_hidden_stream([str(get_vulkan_bin()), '--job', str(job), '--out', str(out),
                                       '--device', str(device_id)])
             if code != 0 or not out.is_file() or out.stat().st_size != len(points)*4:

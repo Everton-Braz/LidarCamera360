@@ -3,7 +3,11 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-from raven_app.timelapse_calibration import fit_timed_poses
+from raven_app.timelapse_calibration import (
+    estimate_lever_arm,
+    fit_timed_poses,
+    validate_lever_refinement,
+)
 
 
 class TimelapseCalibrationTests(unittest.TestCase):
@@ -68,6 +72,56 @@ class TimelapseCalibrationTests(unittest.TestCase):
         self.assertLess(rmse, .01)
         self.assertEqual(accepted.sum(), len(tc))
         np.testing.assert_allclose(found_arm, arm)
+
+    def _lever_dataset(self, count=120):
+        ts = np.linspace(0, 120, 1201)
+        positions = np.column_stack((
+            10*np.sin(ts/19), 7*np.cos(ts/23), .3*np.sin(ts/8)))
+        rotations = Rotation.from_euler(
+            'zyx', np.column_stack((
+                .75*np.sin(ts/8), .18*np.sin(ts/13), .13*np.cos(ts/11))))
+        tc = np.linspace(7, 113, count)
+        dt = 3.2
+        query = tc-dt
+        body_rotation = Slerp(ts, rotations)(query)
+        prior = rotations[0].inv().apply([0., 0., .185])
+        true_arm = Rotation.from_euler('xyz', [.10, -.08, .03]).apply(prior)
+        target = np.column_stack([
+            np.interp(query, ts, positions[:, axis]) for axis in range(3)
+        ]) + body_rotation.apply(true_arm)
+        world_alignment = Rotation.from_euler('xyz', [.04, -.03, .65])
+        offset = np.array([8., -5., 1.5])
+        scale = 4.8
+        centers = world_alignment.inv().apply(target-offset)/scale
+        rig = Rotation.from_euler('xyz', [.15, -.3, .8])
+        rcw = (world_alignment.inv()*body_rotation*rig).inv().as_matrix()
+        return centers, rcw, tc, ts, positions, rotations, prior, true_arm, dt
+
+    def test_refines_lever_direction_with_fixed_physical_length(self):
+        (centers, rcw, tc, ts, positions, rotations,
+         prior, true_arm, dt) = self._lever_dataset()
+        fit, found_dt, accepted, rmse, found_arm, details = estimate_lever_arm(
+            centers, rcw, tc, ts, positions, rotations,
+            dt_hint=dt+.2, initial_arm=prior)
+        self.assertTrue(details['optimizer_success'])
+        self.assertAlmostEqual(np.linalg.norm(found_arm), .185, places=8)
+        self.assertAlmostEqual(found_dt, dt, delta=.02)
+        self.assertLess(np.linalg.norm(found_arm-true_arm), .01)
+        self.assertLess(rmse, .01)
+        self.assertEqual(accepted.sum(), len(tc))
+
+    def test_blocked_validation_scores_all_shared_valid_test_poses(self):
+        (centers, rcw, tc, ts, positions, rotations,
+         prior, _, _) = self._lever_dataset(count=160)
+        result = validate_lever_refinement(
+            centers, rcw, tc, ts, positions, rotations,
+            initial_arm=prior, folds=5, purge_frames=2, dt_hint=3.2)
+        self.assertEqual(result['fold_count'], 5)
+        self.assertTrue(result['shared_test_domain'])
+        self.assertEqual(result['test_policy'],
+                         'all valid held-out camera poses; no residual trimming')
+        self.assertEqual(sum(fold['baseline']['count'] for fold in result['folds']),
+                         sum(fold['candidate']['count'] for fold in result['folds']))
 
 
 if __name__ == '__main__':

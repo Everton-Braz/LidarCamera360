@@ -160,6 +160,43 @@ class TestThirdCamera(unittest.TestCase):
             self.assertIn("cam2/frame_000001.jpg", img_content)
             self.assertIn("3 cam2/frame_000001.jpg", img_content)
 
+    def test_cli_parsing_third_camera(self):
+        from raven_app.cli import parse
+        wf_args = parse([
+            "workflow", "--bag", "scan.bag", "--insv", "video.insv", "--output", "out_dir",
+            "--third-camera", "configs/third_camera.json"
+        ])
+        self.assertEqual(wf_args.third_camera, Path("configs/third_camera.json"))
+
+        color_args = parse([
+            "colorize", "--dataset", "my_dataset",
+            "--third-camera", "configs/third_camera.json"
+        ])
+        self.assertEqual(color_args.third_camera, Path("configs/third_camera.json"))
+
+    def test_add_source_dialog_initialization(self):
+        try:
+            from PyQt6.QtWidgets import QApplication
+            from raven_app.views.add_source_dialog import AddSourceDialog
+
+            app = QApplication.instance() or QApplication([])
+            cfg = ThirdCameraConfig(
+                camera_name="cam2",
+                source_path="test_phone.mp4",
+                source_type="video",
+                fps=3.0,
+                time_offset_s=0.25,
+            )
+            dialog = AddSourceDialog(config=cfg)
+            res_cfg = dialog.get_config()
+            self.assertEqual(res_cfg.camera_name, "cam2")
+            self.assertEqual(res_cfg.source_path, "test_phone.mp4")
+            self.assertEqual(res_cfg.fps, 3.0)
+            self.assertEqual(res_cfg.time_offset_s, 0.25)
+            dialog.close()
+        except ImportError:
+            pass
+
 
 if __name__ == "__main__":
     unittest.main()

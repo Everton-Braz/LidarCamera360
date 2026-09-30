@@ -28,10 +28,14 @@ class PhotometricCliTests(unittest.TestCase):
                                  else view.photometric_caption.text(), "Compensação fotométrica:")
                 self.assertEqual(view.photometric_combo.itemText(0), "Desativada")
                 self.assertEqual(view.photometric_combo.itemText(1), "Log-linear")
+                self.assertEqual(view.photometric_combo.itemText(2), "PPISP + grade bilateral")
                 self.assertFalse(view.photometric_params_input.isEnabled())
                 view.photometric_combo.setCurrentIndex(1)
                 self.assertTrue(view.photometric_params_input.isEnabled())
                 self.assertEqual(view.photometric_combo.currentData(), "loglinear")
+                view.photometric_combo.setCurrentIndex(2)
+                self.assertTrue(view.photometric_params_input.isEnabled())
+                self.assertEqual(view.photometric_combo.currentData(), "ppisp-bilateral")
 
             set_language("en")
             app.processEvents()
@@ -56,6 +60,12 @@ class PhotometricCliTests(unittest.TestCase):
             ])
             self.assertEqual(args.photometric, "loglinear")
             self.assertEqual(args.photometric_params, Path("fit.json"))
+            advanced = parse([
+                command, *base, "--photometric", "ppisp-bilateral",
+                "--photometric-params", "fit.json",
+            ])
+            self.assertEqual(advanced.photometric, "ppisp-bilateral")
+            self.assertEqual(advanced.photometric_params, Path("fit.json"))
 
     def test_photometric_cli_validation(self):
         with self.assertRaises(SystemExit) as invalid_mode:
@@ -70,6 +80,7 @@ class PhotometricCliTests(unittest.TestCase):
         args = parse(["--headless", "photometric-fit", "--dataset", "dataset"])
         self.assertEqual(args.sample_points, 50000)
         self.assertEqual(args.max_observations, 500000)
+        self.assertEqual(args.mode, "loglinear")
         self.assertIsNone(args.output)
         self.assertIsNone(args.masks_dir)
 
@@ -81,7 +92,7 @@ class PhotometricCliTests(unittest.TestCase):
             self.assertEqual(run(args), 0)
         fit.assert_called_once_with(
             Path("dataset"), output=None, masks_dir=None,
-            sample_points=50000, max_observations=500000,
+            sample_points=50000, max_observations=500000, mode="loglinear",
         )
         self.assertEqual(json.loads(output.getvalue()), {"status": "fitted"})
 
@@ -92,12 +103,13 @@ class PhotometricCliTests(unittest.TestCase):
                 "--output", str(base / "fit.json"),
                 "--masks-dir", str(base / "masks"),
                 "--sample-points", "1200", "--max-observations", "9000",
+                "--mode", "ppisp-bilateral",
             ])
             with patch.dict(sys.modules, {"raven_app.photometric": fake_module}):
                 self.assertEqual(run(explicit), 0)
         fit.assert_called_with(
             base, output=base / "fit.json", masks_dir=base / "masks",
-            sample_points=1200, max_observations=9000,
+            sample_points=1200, max_observations=9000, mode="ppisp-bilateral",
         )
 
     def test_colorize_passes_photometric_settings_to_both_methods(self):
@@ -116,7 +128,7 @@ class PhotometricCliTests(unittest.TestCase):
 
             args = parse([
                 "colorize", "--dataset", str(dataset), "--method", "all",
-                "--photometric", "loglinear", "--photometric-params", "fit.json",
+                "--photometric", "ppisp-bilateral", "--photometric-params", "fit.json",
             ])
             with patch.object(pipeline, "get_slam_trajectory_path", return_value=trajectory), \
                  patch.object(pipeline, "colorize_via_spirula_sfm") as sfm, \
@@ -124,18 +136,18 @@ class PhotometricCliTests(unittest.TestCase):
                 self.assertEqual(run(args), 0)
 
             for method in (sfm, direct):
-                self.assertEqual(method.call_args.kwargs["photometric"], "loglinear")
+                self.assertEqual(method.call_args.kwargs["photometric"], "ppisp-bilateral")
                 self.assertEqual(method.call_args.kwargs["photometric_params"], Path("fit.json"))
 
     def test_workflow_passes_photometric_settings(self):
         args = parse([
             "workflow", "--bag", "bag", "--insv", "video.insv", "--output", "out",
-            "--scanner", "raven", "--photometric", "loglinear",
+            "--scanner", "raven", "--photometric", "ppisp-bilateral",
             "--photometric-params", "fit.json",
         ])
         with patch("raven_app.workflow.execute_unified_workflow", return_value=0) as execute:
             self.assertEqual(run(args), 0)
-        self.assertEqual(execute.call_args.kwargs["photometric"], "loglinear")
+        self.assertEqual(execute.call_args.kwargs["photometric"], "ppisp-bilateral")
         self.assertEqual(execute.call_args.kwargs["photometric_params"], Path("fit.json"))
 
 
