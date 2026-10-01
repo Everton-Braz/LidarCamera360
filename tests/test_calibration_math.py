@@ -43,8 +43,8 @@ class CalibrationMathTests(unittest.TestCase):
                 {"name": "cam1/frame_000001.jpg", "C": np.array([9., 0., 0.]), "R_cw": np.eye(3), "cam_id": 2},
             ]
             cameras = {
-                1: {"params": tuple(np.arange(12, dtype=float) + 100), "width": 3840, "height": 3840},
-                2: {"params": tuple(np.arange(12, dtype=float) + 200), "width": 3840, "height": 3840},
+                1: {"model_id": 10, "params": tuple(np.arange(12, dtype=float) + 100), "width": 3840, "height": 3840},
+                2: {"model_id": 10, "params": tuple(np.arange(12, dtype=float) + 200), "width": 3840, "height": 3840},
             }
             with patch.object(pipeline, "load_trajectory", return_value=(np.array([0., 1.]), np.array([[10., 0., 0.], [20., 0., 0.]]), Rot.from_euler("xyz", [[0, 0, 0], [0, 0, 0]], degrees=True))), \
                  patch.object(pipeline, "load_colmap_images", return_value=images), \
