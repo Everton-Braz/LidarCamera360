@@ -21,7 +21,7 @@ time_offset:
 
 preprocess:
   point_filter_num: 1
-  filter_size_surf: 0.03 # Finer indoor surface constraints; validated on a 913 s Raven walk.
+  filter_size_surf: 0.05 # Finer indoor surface constraints; validated on a 913 s Raven walk.
   lidar_type: 5 # XT32 compatible point format (x, y, z, intensity, ring, timestamp in seconds)
   scan_line: 16
   blind: 0.7
@@ -58,9 +58,9 @@ lio:
   layer_init_num: [5, 5, 5, 5, 5]
 
 local_map:  
-  map_sliding_en: false
-  half_map_size: 100
-  sliding_thresh: 8
+  map_sliding_en: true
+  half_map_size: 500
+  sliding_thresh: 10
 
 uav:
   imu_rate_odom: false
@@ -81,7 +81,7 @@ pcd_save:
   pcd_save_en: true
   type: 0 # 0: World Frame, 1: Body Frame;
   colmap_output_en: true
-  filter_size_pcd: 0.02
+  filter_size_pcd: 0.05
   interval: -1
 
 image_save:

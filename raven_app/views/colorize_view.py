@@ -26,7 +26,8 @@ class ColorizeView(QWidget):
         self.runner = runner
         self._mask_downloader = None
         self.mask_config = None
-        self.third_camera_config = None
+        self.third_camera_configs = []
+        self._next_aux_camera_index = 2
         self._current_log_path = None
         self._init_ui()
         self._connect_signals()
@@ -83,22 +84,29 @@ class ColorizeView(QWidget):
         calib_row.addWidget(self.calib_browse)
         paths_layout.addLayout(calib_row)
 
-        # Auxiliary Camera (Third Camera / Smartphone)
+        # Auxiliary image/video cameras
         aux_row = QHBoxLayout()
         self.aux_label = BodyLabel(tr("Auxiliary Camera:"))
         self.aux_label.setFixedWidth(140)
         self.aux_input = LineEdit()
-        self.aux_input.setPlaceholderText(tr("Optional: Smartphone video or image folder for 3DGS..."))
+        self.aux_input.setPlaceholderText(tr("No auxiliary cameras configured."))
         self.aux_input.setReadOnly(True)
-        self.btn_add_source = PushButton(tr("Add Source Image/Video..."), icon=FluentIcon.ADD)
+        self.btn_add_source = PushButton(tr("Add Camera Source..."), icon=FluentIcon.ADD)
         self.btn_add_source.clicked.connect(self._open_add_source_dialog)
-        self.btn_clear_source = PushButton(tr("Clear"), icon=FluentIcon.DELETE)
+        self.btn_clear_source = PushButton(tr("Clear All"), icon=FluentIcon.DELETE)
         self.btn_clear_source.clicked.connect(self._clear_aux_source)
         aux_row.addWidget(self.aux_label)
         aux_row.addWidget(self.aux_input)
         aux_row.addWidget(self.btn_add_source)
         aux_row.addWidget(self.btn_clear_source)
         paths_layout.addLayout(aux_row)
+
+        self.aux_sources_widget = QWidget(paths_card)
+        self.aux_sources_layout = QVBoxLayout(self.aux_sources_widget)
+        self.aux_sources_layout.setContentsMargins(140, 0, 0, 0)
+        self.aux_sources_layout.setSpacing(6)
+        paths_layout.addWidget(self.aux_sources_widget)
+        self._refresh_aux_sources_ui()
 
         layout.addWidget(paths_card)
 
@@ -297,24 +305,103 @@ class ColorizeView(QWidget):
 
     def _open_add_source_dialog(self):
         from raven_app.views.add_source_dialog import AddSourceDialog
-        dialog = AddSourceDialog(parent=self, config=self.third_camera_config)
+        from raven_app.third_camera import ThirdCameraConfig
+        camera_name = self._next_aux_camera_name()
+        dialog = AddSourceDialog(
+            parent=self,
+            config=ThirdCameraConfig(camera_name=camera_name),
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.third_camera_config = dialog.get_config()
-            if (
-                self.third_camera_config
-                and self.third_camera_config.enabled
-                and self.third_camera_config.source_path
-            ):
-                src_name = Path(self.third_camera_config.source_path).name
-                self.aux_input.setText(
-                    f"{self.third_camera_config.camera_name}: {src_name} ({self.third_camera_config.camera_model})"
-                )
-            else:
-                self.aux_input.clear()
+            config = dialog.get_config()
+            if not config.source_path:
+                return
+            config.camera_name = camera_name
+            self.third_camera_configs.append(config)
+            self._refresh_aux_sources_ui()
+
+    def _edit_aux_source(self, index):
+        from raven_app.views.add_source_dialog import AddSourceDialog
+        if not 0 <= index < len(self.third_camera_configs):
+            return
+        current = self.third_camera_configs[index]
+        dialog = AddSourceDialog(parent=self, config=current)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            config = dialog.get_config()
+            config.camera_name = current.camera_name
+            self.third_camera_configs[index] = config
+            self._refresh_aux_sources_ui()
+
+    def _remove_aux_source(self, index):
+        if 0 <= index < len(self.third_camera_configs):
+            del self.third_camera_configs[index]
+            self._refresh_aux_sources_ui()
+
+    def _next_aux_camera_name(self):
+        used = {str(config.camera_name).casefold() for config in self.third_camera_configs}
+        while f"cam{self._next_aux_camera_index}".casefold() in used:
+            self._next_aux_camera_index += 1
+        name = f"cam{self._next_aux_camera_index}"
+        self._next_aux_camera_index += 1
+        return name
+
+    def _refresh_aux_sources_ui(self):
+        while self.aux_sources_layout.count():
+            item = self.aux_sources_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        if not self.third_camera_configs:
+            self.aux_input.clear()
+            self.aux_input.setPlaceholderText(tr("No auxiliary cameras configured."))
+            self.btn_clear_source.setEnabled(False)
+            empty = CaptionLabel(tr("Add one or more image or video sources to include additional camera views."))
+            empty.setWordWrap(True)
+            self.aux_sources_layout.addWidget(empty)
+            return
+
+        self.aux_input.setText(
+            tr("{n} auxiliary camera(s) configured").format(n=len(self.third_camera_configs))
+        )
+        self.btn_clear_source.setEnabled(True)
+        for index, config in enumerate(self.third_camera_configs):
+            row = QWidget(self.aux_sources_widget)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            source_name = Path(config.source_path).name if config.source_path else tr("No source selected")
+            details = BodyLabel(
+                f"{config.camera_name}: {source_name} ({config.camera_model}, {config.fps:g} fps)"
+            )
+            details.setToolTip(str(config.source_path))
+            row_layout.addWidget(details, 1)
+            edit = PushButton(tr("Configure"))
+            edit.clicked.connect(lambda _checked=False, row_index=index: self._edit_aux_source(row_index))
+            row_layout.addWidget(edit)
+            remove = PushButton(tr("Remove"), icon=FluentIcon.DELETE)
+            remove.clicked.connect(lambda _checked=False, row_index=index: self._remove_aux_source(row_index))
+            row_layout.addWidget(remove)
+            self.aux_sources_layout.addWidget(row)
 
     def _clear_aux_source(self):
-        self.third_camera_config = None
-        self.aux_input.clear()
+        self.third_camera_configs.clear()
+        self._refresh_aux_sources_ui()
+
+    def _active_aux_camera_configs(self):
+        return [config for config in self.third_camera_configs
+                if config.enabled and str(config.source_path).strip()]
+
+    def _configured_aux_camera_names(self):
+        return [config.camera_name for config in self.third_camera_configs
+                if str(config.source_path).strip()]
+
+    def _save_aux_camera_bundle(self, path):
+        cameras = [config.to_dict() for config in self._active_aux_camera_configs()]
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps({"cameras": cameras}, indent=2), encoding="utf-8")
+        temporary.replace(path)
 
     def _browse_photometric_params(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -438,7 +525,9 @@ class ColorizeView(QWidget):
                               position=InfoBarPosition.TOP, parent=self)
                 return
         dialog = MaskSettingsDialog(dataset, config, self,
-                                    backend=self.mask_backend_combo.currentData())
+                                    backend=self.mask_backend_combo.currentData(),
+                                    camera_names=self._configured_aux_camera_names(),
+                                    auxiliary_sources=self.third_camera_configs)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.mask_config = dialog.settings()
             self.chk_mask_persons.setChecked(True)
@@ -490,15 +579,10 @@ class ColorizeView(QWidget):
         if photometric_params and self.photometric_combo.currentData() != "off":
             args.extend(['--photometric-params', photometric_params])
 
-        if (
-            self.third_camera_config
-            and self.third_camera_config.enabled
-            and self.third_camera_config.source_path
-        ):
+        if self._active_aux_camera_configs():
             ds_p = Path(ds)
             cfg_path = ds_p / "third_camera.json"
-            from raven_app.third_camera import save_third_camera_config
-            save_third_camera_config(self.third_camera_config, cfg_path)
+            self._save_aux_camera_bundle(cfg_path)
             args.extend(['--third-camera', str(cfg_path)])
 
         calib = self.calib_input.text().strip()
@@ -600,9 +684,10 @@ class ColorizeView(QWidget):
         self.calib_input.setPlaceholderText(tr("Leave empty to use default Raven rigid calibration..."))
         self.calib_browse.setText(tr("Browse"))
         self.aux_label.setText(tr("Auxiliary Camera:"))
-        self.aux_input.setPlaceholderText(tr("Optional: Smartphone video or image folder for 3DGS..."))
-        self.btn_add_source.setText(tr("Add Source Image/Video..."))
-        self.btn_clear_source.setText(tr("Clear"))
+        self.aux_input.setPlaceholderText(tr("No auxiliary cameras configured."))
+        self.btn_add_source.setText(tr("Add Camera Source..."))
+        self.btn_clear_source.setText(tr("Clear All"))
+        self._refresh_aux_sources_ui()
 
         self.params_title.setText(tr("Method & Synchronization"))
         self.method_label.setText(tr("Colorization Method:"))

@@ -85,4 +85,24 @@ python lidarcamera360.py --headless photometric-fit --dataset scratch/Home3 --ma
 python lidarcamera360.py --headless colorize --dataset scratch/Home3 --method sfm --masks-dir scratch/Home3/masks --photometric ppisp-bilateral
 ```
 
+## Rodada de ablação reproduzível — 30/09/2026
+
+`tools/fit_photometric_ablation.py` refaz a seleção a partir do mesmo NPZ de observações e do mesmo modelo log-linear. A execução em `scratch/photometric_home3/run_20260930/repro/` selecionou `ppisp-bilateral-grid` com `grid_smoothness=2.0`. A partição foi fixa: 60% treino, 20% validação e 20% teste por ponto SfM; o teste não participa da seleção.
+
+No teste reservado, RMSE linear/ΔE76 médio/P90 foram:
+
+| Modo | RMSE linear | ΔE76 médio | ΔE76 P90 |
+|---|---:|---:|---:|
+| Sem correção | 0,059133 | 5,0069 | 10,6090 |
+| Log-linear | 0,047462 | 4,1072 | 8,1663 |
+| Log-linear + PPISP | 0,047159 | 4,0378 | 8,0342 |
+| Log-linear + grade bilateral | 0,045749 | 4,0394 | 8,0390 |
+| Log-linear + PPISP + grade | 0,045480 | 3,9712 | 7,9024 |
+
+O ganho do modo completo contra sem correção foi de 23,1% no RMSE linear e 20,7% no ΔE76 médio; contra log-linear, 4,2% e 3,3%. Os números são qualidade fotométrica em correspondências SfM, não precisão geométrica.
+
+O ensaio de nuvem completa em `scratch/photometric_home3/run_20260930/full_cloud_ablation/` usou 30.318.123 pontos e as mesmas poses. `before.ply` e `after.ply` têm XYZ exatamente iguais; 26.073.749 pontos mudaram RGB. A aplicação levou 168,76 s sem o modelo avançado e 193,94 s com ele nessa execução, com outros ensaios de SLAM usando a máquina ao mesmo tempo. A verificação está em `full_cloud_verification.json`; as imagens `facade_zoom16.png` e `facade_same_xyz.png` são recortes de inspeção com a mesma projeção e ordem de pontos.
+
+O cache automático agora refaz o modo PPISP/grade quando `advanced_model_revision` está desatualizado; um caminho `--photometric-params` explícito continua permitindo reusar um modelo para comparação controlada. Os testes verificam a seleção independente de PPISP e grade, o cache, a validação do JSON e a preservação dos mesmos pares de avaliação.
+
 PPISP não corrige poses erradas, oclusões nem canais saturados. O refinamento de alinhamento muda as poses das câmeras; não reconstrói o SLAM nem altera o XYZ exportado. Os resultados quantitativos da nova execução são registrados junto aos arquivos de comparação.

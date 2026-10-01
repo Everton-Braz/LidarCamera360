@@ -21,6 +21,30 @@ def write_report(model, path):
         for metric in ('linear_rmse', 'delta_e76_mean', 'delta_e76_p90'):
             rows.append(f'<tr><td>{split}</td><td>{metric}</td><td>{before[metric]:.5f}</td>'
                         f'<td>{after[metric]:.5f}</td></tr>')
+    ablation_rows = []
+    variants = (('off', 'Sem correção'), ('loglinear', 'Log-linear'),
+                ('homography', 'Log-linear + PPISP'),
+                ('grid_only', 'Log-linear + grade bilateral'),
+                ('bilateral', 'Log-linear + PPISP + grade'))
+    for split in ('validation', 'test'):
+        for key, label in variants:
+            metrics = model['metrics'].get(f'{split}_{key}')
+            if metrics is None:
+                continue
+            ablation_rows.append(
+                f'<tr><td>{split}</td><td>{label}</td>'
+                f'<td>{metrics["linear_rmse"]:.5f}</td>'
+                f'<td>{metrics["delta_e76_mean"]:.5f}</td>'
+                f'<td>{metrics["delta_e76_p90"]:.5f}</td></tr>')
+    ablation_html = ''
+    if ablation_rows:
+        ablation_html = (
+            '<h2>Ablation no mesmo hold-out</h2>'
+            '<p>Todos os modos usam os mesmos pontos de treino, validação e teste. '
+            '“Sem correção” parte do RGB linear original.</p>'
+            '<table><tr><th>Partição</th><th>Modo</th><th>RMSE linear</th>'
+            '<th>ΔE76 médio</th><th>ΔE76 P90</th></tr>'
+            f'{"".join(ablation_rows)}</table>')
     curves = []
     lenses = {}
     for name, entry in views:
@@ -37,6 +61,7 @@ def write_report(model, path):
 <h1>Compensação fotométrica: {html.escape(model['selected'])}</h1>
 <p>60% dos pontos para ajuste, 20% para seleção e 20% para teste final. Métricas de correspondências SfM; não representam precisão geométrica ou inspeção visual da nuvem.</p>
 <table><tr><th>Partição</th><th>Métrica</th><th>Antes</th><th>Depois</th></tr>{''.join(rows)}</table>
+{ablation_html}
 <h2>Log-ganhos RGB por imagem</h2><p>Ordenação por nome; linha central = identidade. Imagens sem suporte mantêm identidade.</p>
 <svg viewBox="0 0 {width} {height}"><path d="M20 130H980" stroke="#bbb"/>{''.join(lines)}</svg>
 <h2>Vinheta por lente</h2><p>Raio normalizado: 0 a 1; eixo vertical: log da resposta estimada, com zero na linha central.</p>

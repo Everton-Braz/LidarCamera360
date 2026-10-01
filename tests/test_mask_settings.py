@@ -14,6 +14,7 @@ class MaskSettingsTests(unittest.TestCase):
         self.assertEqual(normalize_mask_config(None), {
             'schema': 1,
             'fisheye_border_percent': 0.0,
+            'fisheye_border_percent_by_camera': {},
             'rectangles': {},
             'ellipses': {},
             'polygons': {},
@@ -21,12 +22,14 @@ class MaskSettingsTests(unittest.TestCase):
         self.assertEqual(normalize_mask_config({
             'schema': 1,
             'fisheye_border_percent': 7,
+            'fisheye_border_percent_by_camera': {'cam2': 3},
             'rectangles': {'cam0': [[0.1, 0.2, 0.3, 0.4]]},
             'ellipses': {},
             'polygons': {},
         }), {
             'schema': 1,
             'fisheye_border_percent': 7.0,
+            'fisheye_border_percent_by_camera': {'cam2': 3.0},
             'rectangles': {'cam0': [[0.1, 0.2, 0.3, 0.4]]},
             'ellipses': {},
             'polygons': {},
@@ -37,6 +40,8 @@ class MaskSettingsTests(unittest.TestCase):
             {'fisheye_border_percent': -0.1},
             {'fisheye_border_percent': 25.1},
             {'fisheye_border_percent': float('nan')},
+            {'fisheye_border_percent_by_camera': {'cam2': 25.1}},
+            {'fisheye_border_percent_by_camera': {'cam/2': 1}},
             {'rectangles': {'cam/2': [[0.1, 0.1, 0.2, 0.2]]}},
             {'rectangles': {'cam0': [[-0.1, 0.1, 0.2, 0.2]]}},
             {'rectangles': {'cam0': [[0.4, 0.1, 0.2, 0.2]]}},
@@ -55,6 +60,16 @@ class MaskSettingsTests(unittest.TestCase):
             self.assertAlmostEqual(excluded, percent, delta=0.12)
             self.assertEqual(int(result[500, 500]), 255)
             self.assertEqual(set(np.unique(result)), {255} if percent == 0 else {0, 255})
+
+    def test_fisheye_border_is_camera_specific_with_legacy_fallback(self):
+        source = np.full((1000, 1000), 255, dtype=np.uint8)
+        config = {
+            'fisheye_border_percent': 0,
+            'fisheye_border_percent_by_camera': {'cam2': 10},
+        }
+        self.assertEqual(np.count_nonzero(apply_mask_exclusions(source, 'cam0', config) == 0), 0)
+        excluded_aux = np.count_nonzero(apply_mask_exclusions(source, 'cam2', config) == 0)
+        self.assertAlmostEqual(excluded_aux / source.size * 100, 10, delta=0.12)
 
     def test_camera_rectangles_apply_to_every_frame_of_that_camera(self):
         config = normalize_mask_config({

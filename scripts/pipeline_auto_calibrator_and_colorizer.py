@@ -19,6 +19,7 @@ import sys
 import time
 import struct
 import json
+import math
 import argparse
 import shutil
 import subprocess
@@ -117,21 +118,19 @@ def load_trajectory(path):
 
 
 def load_colmap_cameras(cameras_bin):
-    cameras = {}
-    with open(cameras_bin, "rb") as f:
-        num = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(num):
-            cid, model_id, width, height = struct.unpack("<iiQQ", f.read(24))
-            if model_id != 10:
-                raise ValueError(f"Expected THIN_PRISM_FISHEYE camera (10), got {model_id}")
-            params = struct.unpack("<12d", f.read(12 * 8))
-            cameras[cid] = {
-                "model_id": model_id,
-                "width": width,
-                "height": height,
-                "params": params
-            }
-    return cameras
+    from raven_app.third_camera import _read_colmap_cameras
+    return _read_colmap_cameras(cameras_bin)
+
+
+def _colorization_camera_params(camera):
+    """Pack mixed COLMAP models into the native/CPU projection protocol."""
+    if camera['model_id'] == 10:
+        return camera['params']
+    from raven_app.third_camera import _third_camera_intrinsics_from_colmap
+    model, intr = _third_camera_intrinsics_from_colmap(camera)
+    marker = -999.0 if model == 'PINHOLE' else -998.0 if model == 'OPENCV' else 0.0
+    return tuple(float(intr.get(key, 0.0)) for key in
+                 ('fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2', 'k3', 'k4')) + (0.0, marker)
 
 
 def load_colmap_images(images_bin):
@@ -212,15 +211,25 @@ def solve_umeyama_sim3(X, Y):
 def project_thin_prism(P_v, params):
     """Projeção de pontos 3D da câmera no modelo fisheye Thin Prism de 12 parâmetros"""
     fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, sx1, sy1 = params
-    r = np.hypot(P_v[:, 0], P_v[:, 1])
-    theta = np.arctan2(r, P_v[:, 2])
-    scale = np.divide(theta, r, out=np.zeros_like(theta), where=r > 1e-12)
-    xd, yd = P_v[:, 0] * scale, P_v[:, 1] * scale
-    rd2 = theta**2
-    radial = 1 + rd2 * (k1 + rd2 * (k2 + rd2 * (k3 + rd2 * k4)))
-    du = 2*p1*xd*yd + p2*(rd2 + 2*xd**2) + sx1*rd2
-    dv = p1*(rd2 + 2*yd**2) + 2*p2*xd*yd + sy1*rd2
-    u, v = fx*(xd*radial + du) + cx, fy*(yd*radial + dv) + cy
+    x = P_v[:, 0] / np.maximum(P_v[:, 2], 1e-12)
+    y = P_v[:, 1] / np.maximum(P_v[:, 2], 1e-12)
+    if sy1 < -997.0:  # Auxiliary pinhole / OpenCV model marker for native RVC views.
+        rd2 = x*x + y*y
+        radial = 1 + rd2 * (k1 + rd2 * (k2 + rd2 * (k3 + rd2 * k4)))
+        xd = x*radial + 2*p1*x*y + p2*(rd2 + 2*x*x)
+        yd = y*radial + p1*(rd2 + 2*y*y) + 2*p2*x*y
+        u, v = fx*xd + cx, fy*yd + cy
+        r = np.hypot(u-cx, v-cy)
+    else:
+        r = np.hypot(P_v[:, 0], P_v[:, 1])
+        theta = np.arctan2(r, P_v[:, 2])
+        scale = np.divide(theta, r, out=np.zeros_like(theta), where=r > 1e-12)
+        xd, yd = P_v[:, 0] * scale, P_v[:, 1] * scale
+        rd2 = theta**2
+        radial = 1 + rd2 * (k1 + rd2 * (k2 + rd2 * (k3 + rd2 * k4)))
+        du = 2*p1*xd*yd + p2*(rd2 + 2*xd**2) + sx1*rd2
+        dv = p1*(rd2 + 2*yd**2) + 2*p2*xd*yd + sy1*rd2
+        u, v = fx*(xd*radial + du) + cx, fy*(yd*radial + dv) + cy
     return u, v, r
 
 
@@ -432,13 +441,40 @@ def get_best_vulkan_device() -> int:
     return -1
 
 
-def run_spirula_sfm_auto(dataset_dir, quality="medium"):
+def _spirula_auxiliary_flags(dataset_dir, auxiliary_cameras=None):
+    from raven_app.third_camera import load_third_camera_configs
+    if auxiliary_cameras is None:
+        config = Path(dataset_dir) / 'third_camera.json'
+        auxiliary_cameras = load_third_camera_configs(config) if config.is_file() else []
+    flags = []
+    for camera in auxiliary_cameras:
+        if not camera.enabled or not any((Path(dataset_dir) / 'images' / camera.camera_name).glob('*.jpg')):
+            continue
+        model = camera.camera_model.lower().replace('_', '-')
+        if model not in ('pinhole', 'opencv', 'opencv-fisheye'):
+            raise ValueError(f'Unsupported auxiliary camera model: {camera.camera_model}')
+        focal = float(camera.intrinsics['fx'])
+        if not math.isfinite(focal) or focal <= 0:
+            raise ValueError(f'Invalid focal length for {camera.camera_name}')
+        flags.extend(['--camera-model', f'{camera.camera_name}={model}',
+                      '--focal', f'{camera.camera_name}={focal:g}'])
+        if model != 'pinhole':
+            keys = ('k1', 'k2', 'k3', 'k4') if model == 'opencv-fisheye' else ('k1', 'k2', 'p1', 'p2')
+            values = ','.join(f'{float(camera.intrinsics.get(key, 0)):g}' for key in keys)
+            flags.extend(['--distortion', f'{camera.camera_name}={values}'])
+        print(f'[*] SfM camera {camera.camera_name}: {model}, focal prior {focal:g} px')
+    return flags
+
+
+def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None, force_rebuild=False):
     """Executa o Spirula Studio via CLI se a pasta sparse/0 não existir"""
+    dataset_dir = Path(dataset_dir)
+    auxiliary_flags = _spirula_auxiliary_flags(dataset_dir, auxiliary_cameras)
     img_dir = dataset_dir / "images"
     sparse_dir = dataset_dir / "sparse" / "0"
 
-    if all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
-        load_colmap_cameras(sparse_dir / "cameras.bin")
+    if not force_rebuild and all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
+        _validate_sfm_camera_models(sparse_dir, auxiliary_flags)
         print(f"[+] Existing SfM reconstruction found at: {sparse_dir}")
         return True
 
@@ -470,6 +506,9 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
         "--focal", "1080.19",
         "--camera-model", "thin-prism-fisheye"
     ]
+    cmd.extend(auxiliary_flags)
+    if force_rebuild:
+        cmd.append('--no-resume')
     if vulkan_dev >= 0:
         cmd.extend(["--device", str(vulkan_dev)])
 
@@ -483,16 +522,32 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium"):
     cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
     if not cameras:
         return False
+    _validate_sfm_camera_models(sparse_dir, auxiliary_flags)
     print(f"[+] Spirula SFM completed in {time.time() - t0:.1f}s!")
     return True
 
 
-def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None):
+def _validate_sfm_camera_models(sparse_dir, auxiliary_flags):
+    cameras = load_colmap_cameras(sparse_dir / 'cameras.bin')
+    expected = {'cam0': 10, 'cam1': 10}
+    model_ids = {'pinhole': 1, 'opencv': 4, 'opencv-fisheye': 5}
+    for index, flag in enumerate(auxiliary_flags):
+        if flag == '--camera-model':
+            prefix, model = auxiliary_flags[index + 1].split('=', 1)
+            expected[prefix] = model_ids[model]
+    for image in load_colmap_images(sparse_dir / 'images.bin'):
+        prefix = image['name'].replace('\\', '/').split('/')[0]
+        if prefix in expected and cameras[image['cam_id']]['model_id'] != expected[prefix]:
+            raise ValueError(f'SfM camera model mismatch for {prefix}; rebuild SfM with the selected camera models')
+
+
+def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
+                          trajectory_path=None, use_icp=True):
     """Executa o alinhamento de alta precisão Sim(3) + ICP entre COLMAP e LiDAR"""
     manifest = dataset_dir / 'images/frames.json'
     if manifest.is_file() and json.loads(manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse':
         from raven_app.timelapse_calibration import align_dataset
-        return align_dataset(dataset_dir, dt_hint)
+        return align_dataset(dataset_dir, dt_hint, trajectory_path=trajectory_path)
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
     slam_trj = get_slam_trajectory_path(dataset_dir)
@@ -503,8 +558,8 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None):
     print("=" * 80)
 
     pts_colmap, rgb_colmap = load_colmap_points(sparse_dir / "points3D.bin")
-    pts_lidar = load_pcd(slam_pcd)
-    t_slam, pos_slam, rot_slam = load_trajectory(slam_trj)
+    pts_lidar = load_pcd(slam_pcd) if use_icp else None
+    t_slam, pos_slam, rot_slam = load_trajectory(trajectory_path or slam_trj)
     col_imgs = load_colmap_images(sparse_dir / "images.bin")
 
     # Filtrar cam0 para busca temporal
@@ -589,37 +644,35 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None):
     s_init, R_init, t_init = best_sim3
     print(f"    Optimal synchronization: Δt = {best_dt:.4f}s | Trajectory RMSE: {best_rmse*100:.2f} cm (Scale s = {s_init:.4f})")
 
-    # Refinamento Trimmed ICP nos tie-points 3D
-    step_lidar = max(1, len(pts_lidar) // 200000)
-    sub_lidar = pts_lidar[::step_lidar]
-    tree = cKDTree(sub_lidar)
-
-    step_col = max(1, len(pts_colmap) // 50000)
-    raw_sub_col = pts_colmap[::step_col].copy()
-    current_pts = s_init * (R_init @ raw_sub_col.T).T + t_init
-
-    print(f"[*] Running Trimmed ICP refinement ({len(raw_sub_col):,} tie-points)...")
     s_comp, R_comp, t_comp = s_init, R_init.copy(), t_init.copy()
     rmse_icp = best_rmse
-
-    for it in range(1, 11):
-        dists, idxs = tree.query(current_pts, k=1)
-        thresh = min(0.35, float(np.percentile(dists, 70)))
-        mask = dists < thresh
-        if np.sum(mask) < 20:
-            break
-        match_c = raw_sub_col[mask]
-        match_l = sub_lidar[idxs[mask]]
-
-        try:
-            s_cand, R_cand, t_cand, r_cand = solve_umeyama_sim3(match_c, match_l)
-            if not np.isnan(r_cand) and not np.isinf(r_cand):
-                s_comp, R_comp, t_comp, rmse_icp = s_cand, R_cand, t_cand, r_cand
-                current_pts = s_comp * (R_comp @ raw_sub_col.T).T + t_comp
-        except Exception:
-            break
-
-    print(f"[+] ICP converged: RMSE = {rmse_icp*100:.2f} cm, Scale s = {s_comp:.6f}")
+    if use_icp:
+        # Refinamento Trimmed ICP nos tie-points 3D
+        step_lidar = max(1, len(pts_lidar) // 200000)
+        sub_lidar = pts_lidar[::step_lidar]
+        tree = cKDTree(sub_lidar)
+        step_col = max(1, len(pts_colmap) // 50000)
+        raw_sub_col = pts_colmap[::step_col].copy()
+        current_pts = s_init * (R_init @ raw_sub_col.T).T + t_init
+        print(f"[*] Running Trimmed ICP refinement ({len(raw_sub_col):,} tie-points)...")
+        for _ in range(10):
+            dists, idxs = tree.query(current_pts, k=1)
+            thresh = min(0.35, float(np.percentile(dists, 70)))
+            mask = dists < thresh
+            if np.sum(mask) < 20:
+                break
+            try:
+                s_cand, R_cand, t_cand, r_cand = solve_umeyama_sim3(
+                    raw_sub_col[mask], sub_lidar[idxs[mask]])
+                if np.isfinite(r_cand):
+                    s_comp, R_comp, t_comp, rmse_icp = s_cand, R_cand, t_cand, r_cand
+                    current_pts = s_comp * (R_comp @ raw_sub_col.T).T + t_comp
+            except Exception:
+                break
+        print(f"[+] ICP converged: RMSE = {rmse_icp*100:.2f} cm, Scale s = {s_comp:.6f}")
+    else:
+        print(f"[+] Sample-SfM trajectory alignment accepted without cloud ICP: "
+              f"RMSE = {best_rmse*100:.2f} cm, Scale s = {s_comp:.6f}")
 
     align_data = {
         "calibration_version": CALIBRATION_VERSION,
@@ -630,7 +683,8 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None):
         "R": R_comp.tolist(),
         "t": t_comp.tolist(),
         "rmse_cm": float(rmse_icp * 100),
-        "dt_sync_seconds": float(best_dt)
+        "dt_sync_seconds": float(best_dt),
+        "alignment_method": "trajectory_only_sample_sfm" if not use_icp else "trajectory_and_cloud_icp",
     }
     with open(align_json, "w", encoding="utf-8") as f:
         json.dump(align_data, f, indent=2)
@@ -957,10 +1011,11 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
         return None
 
 
-def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=True):
+def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=True,
+                         trajectory_path=None):
     """Recalibrate with high precision os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
     sparse_dir = dataset_dir / "sparse" / "0"
-    slam_trj = get_slam_trajectory_path(dataset_dir)
+    slam_trj = trajectory_path or get_slam_trajectory_path(dataset_dir)
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
     al = alignment if alignment is not None else current_alignment(dataset_dir, fps)
@@ -1065,6 +1120,8 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
         if len(ids) != 1:
             raise ValueError(f"Expected one calibrated camera for {prefix}, got {ids}")
         camera = cameras[ids.pop()]
+        if camera['model_id'] != 10:
+            raise ValueError(f'Expected THIN_PRISM_FISHEYE for {prefix}')
         calib_dict[field] = dict(zip(keys, camera['params']))
         calib_dict[field].update(width=camera['width'], height=camera['height'])
     calib_dict['transform_convention'] = 'camera_to_trajectory_body'
@@ -1129,7 +1186,8 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         if not img_path.exists():
             continue
 
-        params = cameras[im["cam_id"]]["params"]
+        camera = cameras[im["cam_id"]]
+        params = _colorization_camera_params(camera)
 
         # Posição e orientação da câmera no referencial LiDAR
         C_lidar = s_sim * (R_sim @ im["C"]) + t_sim
@@ -1158,7 +1216,11 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         u, v, r = project_thin_prism(P_v, params)
 
         r_px = np.hypot(u - cx, v - cy)
-        mask_circle = (r_px < 1620.0) & (u >= 0.0) & (u < 3839.0) & (v >= 0.0) & (v < 3839.0)
+        radius = (1620.0 * min(camera['width'], camera['height']) / 3840.0
+                  if camera['model_id'] in (5, 10) else
+                  np.hypot(camera['width'], camera['height']) / 2)
+        mask_circle = ((r_px < radius) & (u >= 0.0) & (u < camera['width'] - 1)
+                       & (v >= 0.0) & (v < camera['height'] - 1))
         if not np.any(mask_circle):
             continue
 
@@ -1169,8 +1231,8 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         idx_c = idx_valid[mask_circle]
 
         # Z-Buffer raster de oclusão
-        ug = np.clip(np.floor(u_c / scale_factor_zbuf).astype(np.int32), 0, zbuf_w - 1)
-        vg = np.clip(np.floor(v_c / scale_factor_zbuf).astype(np.int32), 0, zbuf_h - 1)
+        ug = np.clip(np.floor(u_c * zbuf_w / camera['width']).astype(np.int32), 0, zbuf_w - 1)
+        vg = np.clip(np.floor(v_c * zbuf_h / camera['height']).astype(np.int32), 0, zbuf_h - 1)
         flat_idx = vg * zbuf_w + ug
 
         vis_mask = visible_depths(d_c, flat_idx, zbuf_w, zbuf_h)
@@ -1189,7 +1251,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         r_vis = r_c[vis_mask]
         idx_vis = idx_c[vis_mask]
 
-        scores = (1.0 - 0.5 * (r_vis / 1620.0)**2) / (np.maximum(d_vis, 0.5)**1.5)
+        scores = (1.0 - 0.5 * (r_vis / radius)**2) / (np.maximum(d_vis, 0.5)**1.5)
 
         min_top = np.min(top_scores[idx_vis], axis=1)
         can_insert = scores > min_top
@@ -1292,11 +1354,29 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
 # PIPELINE MÉTODO 2: DIRETO RÍGIDO (SEM SFM)
 # ==============================================================================
 
+def _prepare_direct_photometric(dataset_dir, mode, params, masks_dir):
+    """Use photometric fitting only when this dataset has the required SfM tracks."""
+    if mode == 'off':
+        return None
+    dataset_dir = Path(dataset_dir)
+    sparse = dataset_dir / 'sparse' / '0'
+    has_sfm_tracks = all((sparse / name).is_file()
+                         for name in ('cameras.bin', 'images.bin', 'points3D.bin'))
+    if mode not in ('loglinear', 'ppisp-bilateral'):
+        raise ValueError('Unsupported photometric mode')
+    if not has_sfm_tracks:
+        print(f'[!] {mode} needs COLMAP SfM tracks, which direct/trajectory mode does not create. '
+              'Skipping photometric correction and continuing; select Reconstruction to fit it.')
+        return None
+    from raven_app.photometric import prepare
+    return prepare(dataset_dir, mode, params, masks_dir)
+
 def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_override=None, use_vulkan=True, masks_dir=None, operator_radius=0.0,
-                            photometric='off', photometric_params=None):
+                            photometric='off', photometric_params=None, third_camera=None):
     """Executa a coloração direta rápida usando matriz rígida e tempo calibrado"""
-    from raven_app.photometric import prepare, apply_rgb
-    photo_views = prepare(dataset_dir, photometric, photometric_params, masks_dir)
+    from raven_app.photometric import apply_rgb
+    photo_views = _prepare_direct_photometric(
+        dataset_dir, photometric, photometric_params, masks_dir)
     if operator_radius > 0 and masks_dir is None:
         raise ValueError('Operator removal requires person masks (--mask-persons or --masks-dir); a trajectory radius alone can erase doors and walls')
     if calib_json_path is None:
@@ -1402,7 +1482,6 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     top_colors = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS, 3), dtype=np.uint8)
 
     zbuf_w, zbuf_h = 960, 960
-    scale_factor_zbuf = 3840.0 / zbuf_w
 
     t0 = time.time()
     num_frames = min(len(cam0_files), len(cam1_files))
@@ -1465,117 +1544,124 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
         except Exception as e:
             print(f"[!] Warning: Could not load SfM drift correction: {e}")
 
+    events = []
     for k in range(num_frames):
-        fn_digits = "".join(filter(str.isdigit, cam0_files[k].stem))
-        fn = int(fn_digits) if fn_digits else (k + 1)
         t_vid = frame_time(dataset_dir, "cam0/" + cam0_files[k].name, fps)
-        t_query = t_slam_start + (t_vid - dt_sync)
+        events.extend((
+            (t_vid, 0.0, "cam0", cam0_files[k], params0, R_LC0, t_LC0, "THIN_PRISM_FISHEYE"),
+            (t_vid, 0.0, "cam1", cam1_files[k], params1, R_LC1, t_LC1, "THIN_PRISM_FISHEYE"),
+        ))
 
+    auxiliary_cameras = (third_camera if isinstance(third_camera, (list, tuple))
+                         else [third_camera] if third_camera else [])
+    for camera in auxiliary_cameras:
+        if not getattr(camera, 'enabled', True):
+            continue
+        report = getattr(camera, 'calibration_report', {}) or {}
+        intrinsic_status = report.get('intrinsics', {}).get('status')
+        extrinsic_status = report.get('extrinsics', {}).get('status')
+        if extrinsic_status != 'calibrated' or intrinsic_status != 'sfm_calibrated':
+            reason = report.get('extrinsics', {}).get('reason') or report.get('intrinsics', {}).get('reason') or 'SfM calibration is incomplete'
+            print(f"[!] Direct colorization skipping {camera.camera_name}: {reason}")
+            continue
+        intr = camera.intrinsics
+        model = camera.camera_model.upper()
+        marker = -999.0 if model == 'PINHOLE' else -998.0 if model == 'OPENCV' else 0.0
+        params = (
+            float(intr['fx']), float(intr['fy']), float(intr['cx']), float(intr['cy']),
+            float(intr.get('k1', 0.0)), float(intr.get('k2', 0.0)),
+            float(intr.get('p1', 0.0)), float(intr.get('p2', 0.0)),
+            float(intr.get('k3', 0.0)), float(intr.get('k4', 0.0)),
+            0.0, marker,
+        )
+        transform = np.asarray(camera.T_lidar_to_cam2_rigid_4x4, dtype=np.float64)
+        camera_dir = dataset_dir / 'images' / camera.camera_name
+        for image_path in sorted(camera_dir.glob('*.jpg')) if camera_dir.is_dir() else ():
+            try:
+                capture_time = frame_time(
+                    dataset_dir, f'{camera.camera_name}/{image_path.name}', camera.fps or fps)
+            except (KeyError, OSError, ValueError) as exc:
+                print(f"[!] {camera.camera_name} frame has no capture time ({image_path.name}): {exc}")
+                continue
+            events.append((capture_time, float(camera.time_offset_s), camera.camera_name,
+                           image_path, params, transform[:3, :3], transform[:3, 3], model))
+        print(f"[*] Direct colorization calibrated views: {camera.camera_name} "
+              f"({len([e for e in events if e[2] == camera.camera_name])} frames, {model})")
+
+    events.sort(key=lambda event: (event[0], event[2], event[3].name))
+    for event_index, (video_time, camera_offset, cam_name, img_path, params, R_LC, t_LC, _model) in enumerate(events):
+        t_query = t_slam_start + (video_time - dt_sync - camera_offset)
         if not (t_slam_start <= t_query <= t_slam_end):
             continue
-
-        idx = np.searchsorted(t_slam, t_query)
-        idx = np.clip(idx, 1, len(t_slam) - 1)
+        idx = np.clip(np.searchsorted(t_slam, t_query), 1, len(t_slam) - 1)
         w = (t_query - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
-        p_L_raw = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
-        R_L_raw = slerp(t_query).as_matrix()
-
-        if use_drift_correction and (sample_times[0] <= t_query <= sample_times[-1]):
+        p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
+        R_L = slerp(t_query).as_matrix()
+        if use_drift_correction and sample_times[0] <= t_query <= sample_times[-1]:
             dp = np.array([np.interp(t_query, sample_times, delta_p_arr[:, ax]) for ax in range(3)])
-            dR = slerp_delta_R(t_query).as_matrix()
-            p_L = p_L_raw + dp
-            R_L = dR @ R_L_raw
-        else:
-            p_L = p_L_raw
-            R_L = R_L_raw
+            p_L += dp
+            R_L = slerp_delta_R(t_query).as_matrix() @ R_L
+        p_cam = p_L + R_L @ t_LC
+        R_cw = (R_L @ R_LC).T
+        if operator_radius and masks_dir is not None:
+            operator_views.append((img_path, R_cw, p_cam, params))
+        if gpu_views is not None:
+            gpu_views.append((img_path, R_cw, p_cam, params))
+            continue
 
-        lens_configs = [
-            ("cam0", cam0_files[k], params0, R_LC0, t_LC0),
-            ("cam1", cam1_files[k], params1, R_LC1, t_LC1)
-        ]
+        img_bgr = cv2.imread(str(img_path))
+        if img_bgr is None:
+            continue
+        height, width = img_bgr.shape[:2]
+        camera_radius = (0.5 * np.hypot(width, height) if params[11] < -997.0
+                         else 1620.0 * min(width, height) / 3840.0)
+        P_cam = (R_cw @ (pts_lidar - p_cam).T).T
+        idx_valid = np.flatnonzero(P_cam[:, 2] > 0.15)
+        if not len(idx_valid):
+            continue
+        P_v = P_cam[idx_valid]
+        distances = np.linalg.norm(P_v, axis=1)
+        u, v, _ = project_thin_prism(P_v, params)
+        r_px = np.hypot(u - params[2], v - params[3])
+        valid = ((r_px < camera_radius) & (u >= 0) & (u < width - 1)
+                 & (v >= 0) & (v < height - 1))
+        if not np.any(valid):
+            continue
+        u, v, distances = u[valid], v[valid], distances[valid]
+        r_px, point_indices = r_px[valid], idx_valid[valid]
+        scale_x, scale_y = width / zbuf_w, height / zbuf_h
+        ug = np.clip(np.floor(u / scale_x).astype(np.int32), 0, zbuf_w - 1)
+        vg = np.clip(np.floor(v / scale_y).astype(np.int32), 0, zbuf_h - 1)
+        visible = visible_depths(distances, vg * zbuf_w + ug, zbuf_w, zbuf_h)
+        if masks_dir is not None:
+            keep_mask = load_keep_mask(img_path, dataset_dir / 'images', masks_dir)
+            if keep_mask.shape != img_bgr.shape[:2]:
+                raise ValueError(f'Person mask dimensions do not match {img_path}')
+            visible &= keep_samples(keep_mask, u, v)
+        if not np.any(visible):
+            continue
+        u_vis, v_vis = u[visible], v[visible]
+        scores = (1.0 - 0.5 * (r_px[visible] / camera_radius) ** 2) / np.maximum(distances[visible], 0.5) ** 1.5
+        idx_vis = point_indices[visible]
+        can_insert = scores > np.min(top_scores[idx_vis], axis=1)
+        if not np.any(can_insert):
+            continue
+        idx_insert = idx_vis[can_insert]
+        colors_insert = sample_bilinear(
+            cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), u_vis[can_insert], v_vis[can_insert])
+        if photo_views is not None:
+            photo_key = img_path.relative_to(dataset_dir / 'images').as_posix()
+            colors_insert = apply_rgb(
+                colors_insert, u_vis[can_insert], v_vis[can_insert], params,
+                photo_views.get(photo_key))
+        score_insert = scores[can_insert]
+        worst_slot = np.argmin(top_scores[idx_insert], axis=1)
+        top_scores[idx_insert, worst_slot] = score_insert
+        top_colors[idx_insert, worst_slot] = colors_insert
 
-        for cam_name, img_path, params, R_LC, t_LC in lens_configs:
-            p_cam = p_L + R_L @ t_LC
-            R_world_cam = R_L @ R_LC
-            R_cw = R_world_cam.T
-
-            if operator_radius and masks_dir is not None:
-                operator_views.append((img_path, R_cw, p_cam, params))
-            if gpu_views is not None:
-                gpu_views.append((img_path, R_cw, p_cam, params))
-                continue
-
-            P_cam = (R_cw @ (pts_lidar - p_cam).T).T
-            z_mask = P_cam[:, 2] > 0.15
-            idx_valid = np.where(z_mask)[0]
-            if len(idx_valid) == 0:
-                continue
-
-            P_v = P_cam[idx_valid]
-            d = np.linalg.norm(P_v, axis=1)
-
-            cx, cy = params[2], params[3]
-            u, v, r = project_thin_prism(P_v, params)
-
-            r_px = np.hypot(u - cx, v - cy)
-            mask_circle = (r_px < 1620.0) & (u >= 0.0) & (u < 3839.0) & (v >= 0.0) & (v < 3839.0)
-            if not np.any(mask_circle):
-                continue
-
-            u_c = u[mask_circle]
-            v_c = v[mask_circle]
-            d_c = d[mask_circle]
-            r_c = r_px[mask_circle]
-            idx_c = idx_valid[mask_circle]
-
-            ug = np.clip(np.floor(u_c / scale_factor_zbuf).astype(np.int32), 0, zbuf_w - 1)
-            vg = np.clip(np.floor(v_c / scale_factor_zbuf).astype(np.int32), 0, zbuf_h - 1)
-            flat_idx = vg * zbuf_w + ug
-
-            vis_mask = visible_depths(d_c, flat_idx, zbuf_w, zbuf_h)
-            if masks_dir is not None:
-                keep_mask = load_keep_mask(img_path, dataset_dir / "images", masks_dir)
-                source = cv2.imread(str(img_path))
-                if source is None or keep_mask.shape != source.shape[:2]:
-                    raise ValueError(f"Person mask dimensions do not match {img_path}")
-                vis_mask &= keep_samples(keep_mask, u_c, v_c)
-            if not np.any(vis_mask):
-                continue
-
-            u_vis = u_c[vis_mask]
-            v_vis = v_c[vis_mask]
-            d_vis = d_c[vis_mask]
-            r_vis = r_c[vis_mask]
-            idx_vis = idx_c[vis_mask]
-
-            scores = (1.0 - 0.5 * (r_vis / 1620.0)**2) / (np.maximum(d_vis, 0.5)**1.5)
-
-            min_top = np.min(top_scores[idx_vis], axis=1)
-            can_insert = scores > min_top
-            if not np.any(can_insert):
-                continue
-
-            idx_ins = idx_vis[can_insert]
-            scores_ins = scores[can_insert]
-            u_ins = u_vis[can_insert]
-            v_ins = v_vis[can_insert]
-
-            img_bgr = cv2.imread(str(img_path))
-            if img_bgr is None:
-                continue
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            rgb_ins = sample_bilinear(img_rgb, u_ins, v_ins)
-            if photo_views is not None:
-                rgb_ins = apply_rgb(rgb_ins, u_ins, v_ins, params,
-                                    photo_views.get(img_path.relative_to(dataset_dir / 'images').as_posix()))
-
-            worst_slot = np.argmin(top_scores[idx_ins], axis=1)
-            top_scores[idx_ins, worst_slot] = scores_ins
-            top_colors[idx_ins, worst_slot] = rgb_ins
-
-        if gpu_views is None and ((k + 1) % 25 == 0 or (k + 1) == num_frames):
-            cov = np.count_nonzero(np.any(top_scores > 0, axis=1)) / n_pts * 100
-            print(f"    [{k+1:3d}/{num_frames}] Accumulated frame pairs | Coverage: {cov:.1f}%")
+        if gpu_views is None and (event_index + 1) % 50 == 0:
+            coverage = np.count_nonzero(np.any(top_scores > 0, axis=1)) / n_pts * 100
+            print(f"    [{event_index + 1:3d}/{len(events)}] Accumulated camera views | Coverage: {coverage:.1f}%")
 
     print("[*] Solving statistical consensus and removing projection outliers...")
     if gpu_views is not None:
@@ -1584,7 +1670,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
         if colors is None:
             return colorize_via_direct_rigid(dataset_dir, calib_json_path, fps=fps, dt_override=dt_sync, use_vulkan=False,
                                              masks_dir=masks_dir, operator_radius=operator_radius,
-                                             photometric=photometric, photometric_params=photometric_params)
+                                             photometric=photometric, photometric_params=photometric_params,
+                                             third_camera=third_camera)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)

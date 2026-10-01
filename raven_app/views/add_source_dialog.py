@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
+    QSizePolicy,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -56,8 +57,8 @@ class AddSourceDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(tr("Add Source Image/Video"))
-        self.resize(720, 780)
-        self.setMinimumWidth(640)
+        self.resize(720, 760)
+        self.setMinimumWidth(520)
 
         # Parse or default config
         if config is None:
@@ -101,7 +102,12 @@ class AddSourceDialog(QDialog):
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_content = QWidget()
+        scroll_content.setMinimumWidth(0)
+        scroll_content.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         layout = QVBoxLayout(scroll_content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
@@ -111,28 +117,34 @@ class AddSourceDialog(QDialog):
         # ----------------------------------------------------------------------
         source_card = CardWidget(scroll_content)
         source_layout = QVBoxLayout(source_card)
-        source_layout.setContentsMargins(16, 14, 16, 14)
+        source_layout.setContentsMargins(12, 10, 12, 10)
         source_layout.setSpacing(10)
 
         source_title = SubtitleLabel(tr("1. Media Source (Video or Image Folder)"))
+        source_title.setWordWrap(True)
         source_layout.addWidget(source_title)
 
-        path_row = QHBoxLayout()
+        path_layout = QVBoxLayout()
+        path_layout.setSpacing(8)
         self.source_input = LineEdit()
         self.source_input.setPlaceholderText(
             tr("Select video file (.mp4, .mov) or folder containing extracted images...")
         )
+        path_layout.addWidget(self.source_input)
+
+        browse_buttons = QVBoxLayout()
+        browse_buttons.setSpacing(8)
         self.btn_browse_video = PushButton(tr("Browse Video"), icon=FluentIcon.VIDEO)
         self.btn_browse_video.clicked.connect(self._browse_video)
         self.btn_browse_folder = PushButton(tr("Browse Folder"), icon=FluentIcon.FOLDER)
         self.btn_browse_folder.clicked.connect(self._browse_folder)
-
-        path_row.addWidget(self.source_input)
-        path_row.addWidget(self.btn_browse_video)
-        path_row.addWidget(self.btn_browse_folder)
-        source_layout.addLayout(path_row)
+        browse_buttons.addWidget(self.btn_browse_video, 0, Qt.AlignmentFlag.AlignLeft)
+        browse_buttons.addWidget(self.btn_browse_folder, 0, Qt.AlignmentFlag.AlignLeft)
+        path_layout.addLayout(browse_buttons)
+        source_layout.addLayout(path_layout)
 
         self.meta_label = CaptionLabel(tr("No source selected."))
+        self.meta_label.setWordWrap(True)
         self.meta_label.setStyleSheet("color: #0078D4; font-weight: bold;")
         source_layout.addWidget(self.meta_label)
 
@@ -150,43 +162,51 @@ class AddSourceDialog(QDialog):
         # ----------------------------------------------------------------------
         sync_card = CardWidget(scroll_content)
         sync_layout = QVBoxLayout(sync_card)
-        sync_layout.setContentsMargins(16, 14, 16, 14)
+        sync_layout.setContentsMargins(12, 10, 12, 10)
         sync_layout.setSpacing(10)
 
         sync_title = SubtitleLabel(tr("2. Timing & Frame Rate"))
+        sync_title.setWordWrap(True)
         sync_layout.addWidget(sync_title)
 
         sync_grid = QGridLayout()
-        sync_grid.setHorizontalSpacing(16)
+        sync_grid.setHorizontalSpacing(8)
         sync_grid.setVerticalSpacing(8)
 
-        sync_grid.addWidget(BodyLabel(tr("Camera Identifier:")), 0, 0)
+        camera_label = BodyLabel(tr("Camera Identifier:"))
+        camera_label.setWordWrap(True)
+        sync_grid.addWidget(camera_label, 0, 0)
+        fps_label = BodyLabel(tr("Extraction FPS:"))
+        fps_label.setWordWrap(True)
+        sync_grid.addWidget(fps_label, 0, 1)
         self.cam_name_input = LineEdit()
         self.cam_name_input.setText("cam2")
-        self.cam_name_input.setFixedWidth(140)
-        sync_grid.addWidget(self.cam_name_input, 0, 1)
+        self.cam_name_input.setMaximumWidth(180)
+        sync_grid.addWidget(self.cam_name_input, 1, 0)
 
-        sync_grid.addWidget(BodyLabel(tr("Extraction FPS:")), 0, 2)
         self.fps_spin = DoubleSpinBox()
         self.fps_spin.setRange(0.1, 60.0)
         self.fps_spin.setValue(2.0)
         self.fps_spin.setSingleStep(0.5)
-        self.fps_spin.setFixedWidth(120)
-        sync_grid.addWidget(self.fps_spin, 0, 3)
+        self.fps_spin.setMaximumWidth(150)
+        sync_grid.addWidget(self.fps_spin, 1, 1)
 
-        sync_grid.addWidget(BodyLabel(tr("Time Offset Δt (s):")), 1, 0)
+        offset_label = BodyLabel(tr("Time Offset Δt (s):"))
+        offset_label.setWordWrap(True)
+        sync_grid.addWidget(offset_label, 2, 0, 1, 2)
         self.time_offset_spin = DoubleSpinBox()
         self.time_offset_spin.setRange(-3600.0, 3600.0)
         self.time_offset_spin.setValue(0.0)
         self.time_offset_spin.setSingleStep(0.05)
         self.time_offset_spin.setDecimals(4)
-        self.time_offset_spin.setFixedWidth(140)
-        sync_grid.addWidget(self.time_offset_spin, 1, 1)
+        self.time_offset_spin.setMaximumWidth(170)
+        sync_grid.addWidget(self.time_offset_spin, 3, 0)
 
         sync_desc = CaptionLabel(
             tr("Offset shifts auxiliary timestamps relative to the primary rig clock.")
         )
-        sync_grid.addWidget(sync_desc, 1, 2, 1, 2)
+        sync_desc.setWordWrap(True)
+        sync_grid.addWidget(sync_desc, 3, 1)
 
         sync_layout.addLayout(sync_grid)
         layout.addWidget(sync_card)
@@ -196,69 +216,82 @@ class AddSourceDialog(QDialog):
         # ----------------------------------------------------------------------
         opt_card = CardWidget(scroll_content)
         opt_layout = QVBoxLayout(opt_card)
-        opt_layout.setContentsMargins(16, 14, 16, 14)
+        opt_layout.setContentsMargins(12, 10, 12, 10)
         opt_layout.setSpacing(10)
 
         opt_title = SubtitleLabel(tr("3. Optical Intrinsics"))
+        opt_title.setWordWrap(True)
         opt_layout.addWidget(opt_title)
 
         model_row = QHBoxLayout()
         model_row.addWidget(BodyLabel(tr("Camera Model:")))
         self.model_combo = ComboBox()
         self.model_combo.addItems(["PINHOLE", "OPENCV", "OPENCV_FISHEYE"])
+        self.model_combo.setMaximumWidth(190)
         model_row.addWidget(self.model_combo)
         model_row.addStretch()
 
         self.btn_reset_intrinsics = PushButton(
-            tr("Auto-Calculate from Resolution"), icon=FluentIcon.SYNC
+            tr("Auto-Calculate"), icon=FluentIcon.SYNC
+        )
+        self.btn_reset_intrinsics.setToolTip(
+            tr("Auto-calculate intrinsics from the image resolution.")
         )
         self.btn_reset_intrinsics.clicked.connect(self._auto_calculate_intrinsics)
-        model_row.addWidget(self.btn_reset_intrinsics)
         opt_layout.addLayout(model_row)
+        opt_layout.addWidget(
+            self.btn_reset_intrinsics, 0, Qt.AlignmentFlag.AlignRight
+        )
 
         intrin_grid = QGridLayout()
-        intrin_grid.setHorizontalSpacing(16)
+        intrin_grid.setHorizontalSpacing(8)
         intrin_grid.setVerticalSpacing(8)
 
         intrin_grid.addWidget(BodyLabel(tr("Width (px):")), 0, 0)
+        intrin_grid.addWidget(BodyLabel(tr("Height (px):")), 0, 1)
         self.width_spin = SpinBox()
         self.width_spin.setRange(100, 16384)
         self.width_spin.setValue(1920)
-        intrin_grid.addWidget(self.width_spin, 0, 1)
+        self.width_spin.setMaximumWidth(160)
+        intrin_grid.addWidget(self.width_spin, 1, 0)
 
-        intrin_grid.addWidget(BodyLabel(tr("Height (px):")), 0, 2)
         self.height_spin = SpinBox()
         self.height_spin.setRange(100, 16384)
         self.height_spin.setValue(1080)
-        intrin_grid.addWidget(self.height_spin, 0, 3)
+        self.height_spin.setMaximumWidth(160)
+        intrin_grid.addWidget(self.height_spin, 1, 1)
 
-        intrin_grid.addWidget(BodyLabel(tr("fx:")), 1, 0)
+        intrin_grid.addWidget(BodyLabel(tr("fx:")), 2, 0)
+        intrin_grid.addWidget(BodyLabel(tr("fy:")), 2, 1)
         self.fx_spin = DoubleSpinBox()
         self.fx_spin.setRange(1.0, 50000.0)
         self.fx_spin.setValue(1536.0)
         self.fx_spin.setDecimals(2)
-        intrin_grid.addWidget(self.fx_spin, 1, 1)
+        self.fx_spin.setMaximumWidth(160)
+        intrin_grid.addWidget(self.fx_spin, 3, 0)
 
-        intrin_grid.addWidget(BodyLabel(tr("fy:")), 1, 2)
         self.fy_spin = DoubleSpinBox()
         self.fy_spin.setRange(1.0, 50000.0)
         self.fy_spin.setValue(1536.0)
         self.fy_spin.setDecimals(2)
-        intrin_grid.addWidget(self.fy_spin, 1, 3)
+        self.fy_spin.setMaximumWidth(160)
+        intrin_grid.addWidget(self.fy_spin, 3, 1)
 
-        intrin_grid.addWidget(BodyLabel(tr("cx:")), 2, 0)
+        intrin_grid.addWidget(BodyLabel(tr("cx:")), 4, 0)
+        intrin_grid.addWidget(BodyLabel(tr("cy:")), 4, 1)
         self.cx_spin = DoubleSpinBox()
         self.cx_spin.setRange(0.0, 16384.0)
         self.cx_spin.setValue(960.0)
         self.cx_spin.setDecimals(2)
-        intrin_grid.addWidget(self.cx_spin, 2, 1)
+        self.cx_spin.setMaximumWidth(160)
+        intrin_grid.addWidget(self.cx_spin, 5, 0)
 
-        intrin_grid.addWidget(BodyLabel(tr("cy:")), 2, 2)
         self.cy_spin = DoubleSpinBox()
         self.cy_spin.setRange(0.0, 16384.0)
         self.cy_spin.setValue(540.0)
         self.cy_spin.setDecimals(2)
-        intrin_grid.addWidget(self.cy_spin, 2, 3)
+        self.cy_spin.setMaximumWidth(160)
+        intrin_grid.addWidget(self.cy_spin, 5, 1)
 
         opt_layout.addLayout(intrin_grid)
         layout.addWidget(opt_card)
@@ -268,10 +301,11 @@ class AddSourceDialog(QDialog):
         # ----------------------------------------------------------------------
         rig_card = CardWidget(scroll_content)
         rig_layout = QVBoxLayout(rig_card)
-        rig_layout.setContentsMargins(16, 14, 16, 14)
+        rig_layout.setContentsMargins(12, 10, 12, 10)
         rig_layout.setSpacing(10)
 
         rig_title = SubtitleLabel(tr("4. Nominal Lever Arm & Extrinsics"))
+        rig_title.setWordWrap(True)
         rig_layout.addWidget(rig_title)
 
         rig_hint = CaptionLabel(
@@ -284,7 +318,7 @@ class AddSourceDialog(QDialog):
         rig_layout.addWidget(rig_hint)
 
         extrin_grid = QGridLayout()
-        extrin_grid.setHorizontalSpacing(16)
+        extrin_grid.setHorizontalSpacing(8)
         extrin_grid.setVerticalSpacing(8)
 
         extrin_grid.addWidget(BodyLabel(tr("Translation X (m):")), 0, 0)
@@ -293,42 +327,50 @@ class AddSourceDialog(QDialog):
         self.tx_spin.setValue(0.0)
         self.tx_spin.setSingleStep(0.01)
         self.tx_spin.setDecimals(3)
+        self.tx_spin.setMaximumWidth(160)
         extrin_grid.addWidget(self.tx_spin, 0, 1)
 
-        extrin_grid.addWidget(BodyLabel(tr("Translation Y (m):")), 0, 2)
+        extrin_grid.addWidget(BodyLabel(tr("Translation Y (m):")), 1, 0)
         self.ty_spin = DoubleSpinBox()
         self.ty_spin.setRange(-5.0, 5.0)
         self.ty_spin.setValue(0.15)
         self.ty_spin.setSingleStep(0.01)
         self.ty_spin.setDecimals(3)
-        extrin_grid.addWidget(self.ty_spin, 0, 3)
+        self.ty_spin.setMaximumWidth(160)
+        extrin_grid.addWidget(self.ty_spin, 1, 1)
 
-        extrin_grid.addWidget(BodyLabel(tr("Translation Z (m):")), 1, 0)
+        extrin_grid.addWidget(BodyLabel(tr("Translation Z (m):")), 2, 0)
         self.tz_spin = DoubleSpinBox()
         self.tz_spin.setRange(-5.0, 5.0)
         self.tz_spin.setValue(0.20)
         self.tz_spin.setSingleStep(0.01)
         self.tz_spin.setDecimals(3)
-        extrin_grid.addWidget(self.tz_spin, 1, 1)
+        self.tz_spin.setMaximumWidth(160)
+        extrin_grid.addWidget(self.tz_spin, 2, 1)
 
-        extrin_grid.addWidget(BodyLabel(tr("Euler Roll / Pitch / Yaw (°):")), 1, 2)
-        rpy_box = QHBoxLayout()
+        extrin_grid.addWidget(
+            BodyLabel(tr("Euler Roll / Pitch / Yaw (°):")), 3, 0, 1, 2
+        )
         self.roll_spin = DoubleSpinBox()
         self.roll_spin.setRange(-180.0, 180.0)
         self.roll_spin.setValue(0.0)
+        self.roll_spin.setMaximumWidth(160)
         self.roll_spin.setToolTip(tr("Roll (deg)"))
         self.pitch_spin = DoubleSpinBox()
         self.pitch_spin.setRange(-180.0, 180.0)
         self.pitch_spin.setValue(0.0)
+        self.pitch_spin.setMaximumWidth(160)
         self.pitch_spin.setToolTip(tr("Pitch (deg)"))
         self.yaw_spin = DoubleSpinBox()
         self.yaw_spin.setRange(-180.0, 180.0)
         self.yaw_spin.setValue(0.0)
+        self.yaw_spin.setMaximumWidth(160)
         self.yaw_spin.setToolTip(tr("Yaw (deg)"))
-        rpy_box.addWidget(self.roll_spin)
-        rpy_box.addWidget(self.pitch_spin)
-        rpy_box.addWidget(self.yaw_spin)
-        extrin_grid.addLayout(rpy_box, 1, 3)
+        # Two controls per row keep each spin box wide enough to read without
+        # forcing a third column beyond the visible card width.
+        extrin_grid.addWidget(self.roll_spin, 4, 0)
+        extrin_grid.addWidget(self.pitch_spin, 4, 1)
+        extrin_grid.addWidget(self.yaw_spin, 5, 0)
 
         rig_layout.addLayout(extrin_grid)
         layout.addWidget(rig_card)
@@ -339,22 +381,28 @@ class AddSourceDialog(QDialog):
         # ----------------------------------------------------------------------
         # Footer Action Buttons
         # ----------------------------------------------------------------------
-        footer = QHBoxLayout()
+        footer = QVBoxLayout()
+        footer.setSpacing(8)
+        config_buttons = QHBoxLayout()
+        config_buttons.setSpacing(8)
         self.btn_load_json = PushButton(tr("Load JSON..."), icon=FluentIcon.FOLDER)
         self.btn_load_json.clicked.connect(self._load_json)
         self.btn_save_json = PushButton(tr("Save JSON..."), icon=FluentIcon.SAVE)
         self.btn_save_json.clicked.connect(self._save_json)
-        footer.addWidget(self.btn_load_json)
-        footer.addWidget(self.btn_save_json)
+        config_buttons.addWidget(self.btn_load_json)
+        config_buttons.addWidget(self.btn_save_json)
+        config_buttons.addStretch(1)
+        footer.addLayout(config_buttons)
 
-        footer.addStretch()
-
+        action_buttons = QHBoxLayout()
+        action_buttons.addStretch(1)
         self.btn_cancel = PushButton(tr("Cancel"), icon=FluentIcon.CANCEL)
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_confirm = PrimaryPushButton(tr("Confirm"), icon=FluentIcon.ACCEPT)
         self.btn_confirm.clicked.connect(self._on_confirm)
-        footer.addWidget(self.btn_cancel)
-        footer.addWidget(self.btn_confirm)
+        action_buttons.addWidget(self.btn_cancel)
+        action_buttons.addWidget(self.btn_confirm)
+        footer.addLayout(action_buttons)
 
         main_layout.addLayout(footer)
 

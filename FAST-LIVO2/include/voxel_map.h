@@ -243,7 +243,7 @@ public:
   void pubVoxelMap();
 
   void mapSliding();
-  void clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min );
+  void clearMemOutOfMap(const int64_t& x_max,const int64_t& x_min,const int64_t& y_max,const int64_t& y_min,const int64_t& z_max,const int64_t& z_min );
 
 private:
   void GetUpdatePlane(const VoxelOctoTree *current_octo, const int pub_max_voxel_layer, std::vector<VoxelPlane> &plane_list);

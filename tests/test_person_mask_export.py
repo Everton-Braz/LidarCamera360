@@ -2,11 +2,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
-from raven_app.workflow import _copy_person_masks
+from raven_app.third_camera import ThirdCameraConfig
+from raven_app.workflow import _copy_person_masks, export_colmap_3dgs
 
 
 class PersonMaskExportTests(unittest.TestCase):
@@ -66,6 +68,51 @@ class PersonMaskExportTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 _copy_person_masks(root / "dataset", masks, root / "out", [image_path])
+
+    def test_3dgs_export_preserves_masks_for_all_cameras_and_removes_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            masks = dataset / "masks"
+            image_files = []
+            for camera in ("cam0", "cam1", "cam2", "cam3"):
+                image_dir = dataset / "images" / camera
+                image_dir.mkdir(parents=True)
+                image = image_dir / "frame.jpg"
+                cv2.imwrite(str(image), np.full((12, 16, 3), 90, np.uint8))
+                image_files.append(image)
+                mask = masks / camera / "frame.jpg.png"
+                mask.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(mask), np.full((12, 16), 255, np.uint8))
+
+            calib = root / "rig.json"
+            identity = np.eye(4).tolist()
+            intrinsics = {key: 1.0 for key in ("fx", "fy", "cx", "cy", "k1", "k2", "k3", "k4")}
+            calib.write_text(json.dumps({
+                "cam0_front_intrinsics": intrinsics,
+                "cam1_rear_intrinsics": intrinsics,
+                "T_lidar_to_cam0_rigid_4x4": identity,
+                "T_lidar_to_cam1_rigid_4x4": identity,
+            }), encoding="utf-8")
+            cameras = [
+                ThirdCameraConfig(camera_name=name, calibration_report={
+                    "extrinsics": {"status": "calibrated"},
+                })
+                for name in ("cam2", "cam3")
+            ]
+            output = dataset / "colmap_3dgs"
+            stale = output / "masks" / "cam4" / "old.jpg.png"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale")
+            with (
+                patch("raven_app.workflow.load_lidar_seed_points", return_value=(None, None)),
+                patch("raven_app.workflow._postprocess_3dgs_dataset"),
+            ):
+                export_colmap_3dgs(dataset, calib, masks_dir=masks, third_camera=cameras)
+
+            self.assertFalse(stale.exists())
+            for camera in ("cam0", "cam1", "cam2", "cam3"):
+                self.assertTrue((output / "masks" / camera / "frame.jpg.png").is_file())
 
 
 if __name__ == "__main__":

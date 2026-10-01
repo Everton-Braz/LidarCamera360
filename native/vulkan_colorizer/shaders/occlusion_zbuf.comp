@@ -44,20 +44,29 @@ void main() {
     float r = sqrt(x * x + y * y);
     if (r < 1e-8) r = 1e-8;
 
-    float th = atan(r);
-    float th2 = th * th;
-    float th4 = th2 * th2;
-    float th6 = th4 * th2;
-    float th8 = th4 * th4;
-    float thd = th * (1.0 + dist_radial.x * th2 + dist_radial.y * th4 + dist_radial.z * th6 + dist_radial.w * th8);
-
-    float scale = th / r;
-    float xd = x * scale;
-    float yd = y * scale;
-    float rd2 = xd * xd + yd * yd;
-
-    float x_pp = xd * (th > 1e-8 ? thd / th : 1.0) + 2.0 * dist_prism.x * xd * yd + dist_prism.y * (rd2 + 2.0 * xd * xd) + dist_prism.z * rd2;
-    float y_pp = yd * (th > 1e-8 ? thd / th : 1.0) + dist_prism.x * (rd2 + 2.0 * yd * yd) + 2.0 * dist_prism.y * xd * yd + dist_prism.w * rd2;
+    bool perspective_model = dist_prism.w < -997.0;
+    float rd2;
+    float x_pp;
+    float y_pp;
+    if (perspective_model) {
+        rd2 = x * x + y * y;
+        float radial = 1.0 + rd2 * (dist_radial.x + rd2 * (dist_radial.y + rd2 * (dist_radial.z + rd2 * dist_radial.w)));
+        x_pp = x * radial + 2.0 * dist_prism.x * x * y + dist_prism.y * (rd2 + 2.0 * x * x);
+        y_pp = y * radial + dist_prism.x * (rd2 + 2.0 * y * y) + 2.0 * dist_prism.y * x * y;
+    } else {
+        float th = atan(r);
+        float th2 = th * th;
+        float th4 = th2 * th2;
+        float th6 = th4 * th2;
+        float th8 = th4 * th4;
+        float thd = th * (1.0 + dist_radial.x * th2 + dist_radial.y * th4 + dist_radial.z * th6 + dist_radial.w * th8);
+        float scale = th / r;
+        float xd = x * scale;
+        float yd = y * scale;
+        rd2 = xd * xd + yd * yd;
+        x_pp = xd * (th > 1e-8 ? thd / th : 1.0) + 2.0 * dist_prism.x * xd * yd + dist_prism.y * (rd2 + 2.0 * xd * xd) + dist_prism.z * rd2;
+        y_pp = yd * (th > 1e-8 ? thd / th : 1.0) + dist_prism.x * (rd2 + 2.0 * yd * yd) + 2.0 * dist_prism.y * xd * yd + dist_prism.w * rd2;
+    }
 
     float u = intrinsics1.x * x_pp + intrinsics1.z;
     float v = intrinsics1.y * y_pp + intrinsics1.w;

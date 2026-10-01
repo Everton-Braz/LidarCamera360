@@ -28,6 +28,8 @@ def main():
     parser.add_argument('--before-label', default='ANTES')
     parser.add_argument('--after-label', default='DEPOIS')
     parser.add_argument('--height', type=int, default=650)
+    parser.add_argument('--zoom', type=float, default=1.0,
+                        help='Magnify the selected point crop around its center')
     parser.add_argument('--along', type=float, nargs=2, metavar=('START', 'END'),
                         help='Crop to this fraction of the horizontal principal axis (0..1)')
     args = parser.parse_args()
@@ -57,6 +59,8 @@ def main():
     width, height = 1000, args.height
     if height < 100:
         parser.error('--height must be at least 100')
+    if args.zoom <= 0:
+        parser.error('--zoom must be positive')
     azimuths = args.azimuth or (-.7, 2.4)
     canvas = Image.new('RGB', (width * 2, (height + 35) * len(azimuths)), '#eff2f5')
     draw = ImageDraw.Draw(canvas)
@@ -68,12 +72,15 @@ def main():
         if up[2] < 0:
             up = -up
         projected = np.column_stack((xyz @ right, xyz @ up))
-        scale = min((width-30) / np.ptp(projected[:, 0]), (height-30) / np.ptp(projected[:, 1]))
+        scale = min((width-30) / np.ptp(projected[:, 0]), (height-30) / np.ptp(projected[:, 1])) * args.zoom
         padding = (np.array([width, height]) - np.ptp(projected, axis=0) * scale) / 2
         uv = np.rint((projected-projected.min(0)) * scale + padding).astype(int)
         uv[:, 1] = height - 1 - uv[:, 1]
         pixel = uv[:, 1] * width + uv[:, 0]
+        in_frame = ((uv[:, 0] >= 0) & (uv[:, 0] < width) &
+                    (uv[:, 1] >= 0) & (uv[:, 1] < height))
         order = np.argsort(xyz @ forward, kind='stable')
+        order = order[in_frame[order]]
         _, first = np.unique(pixel[order], return_index=True)
         visible = order[first]
         for column, cloud in enumerate((before, after)):

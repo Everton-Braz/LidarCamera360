@@ -8,6 +8,7 @@ from raven_app.video import (extract_insv_frames_pyav, frame_time,
                              has_cached_frame_extraction, _timelapse_times,
                              video_preview_timeline, extract_video_preview_frame)
 from raven_app.vulkan_engine import colorize_views, get_vulkan_bin
+from raven_app import vulkan_engine
 from raven_app.photometric.model import apply_rgb
 from scripts.pipeline_auto_calibrator_and_colorizer import project_thin_prism
 
@@ -92,6 +93,30 @@ class VideoTests(unittest.TestCase):
 
 @unittest.skipUnless(get_vulkan_bin().is_file(),'Native Vulkan build unavailable')
 class VulkanTests(unittest.TestCase):
+    def test_gpu_colorizes_mixed_image_dimensions_without_cpu_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            points = np.array([[0.0, 0.0, 1.0]])
+            views = []
+            for index, (width, height) in enumerate(((64, 64), (96, 72))):
+                path = root / f'mixed_{index}.png'
+                rgb = np.full((height, width, 3), [40, 140, 210], np.uint8)
+                cv2.imwrite(str(path), rgb[:, :, ::-1])
+                params = [width * .28, height * .28, width / 2, height / 2] + [0] * 8
+                views.append((path, np.eye(3), np.zeros(3), params))
+
+            native_codes = []
+            run_native = vulkan_engine.run_hidden_stream
+            def capture_native(*args, **kwargs):
+                code = run_native(*args, **kwargs)
+                native_codes.append(code)
+                return code
+
+            with patch.object(vulkan_engine, 'run_hidden_stream', side_effect=capture_native):
+                colors = colorize_views(points, views, root)
+            self.assertEqual(native_codes, [0], 'mixed sizes must succeed on Vulkan, not CPU fallback')
+            np.testing.assert_allclose(colors[0], [40, 140, 210], atol=1)
+
     def test_photometric_rvc3_matches_cpu_and_identity(self):
         """RVC3 corrects each observation in linear sRGB and keeps zero-model bytes exact."""
         with tempfile.TemporaryDirectory() as tmp:

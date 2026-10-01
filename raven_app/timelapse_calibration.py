@@ -48,10 +48,58 @@ def fit_timed_poses(centers, world_to_camera, capture_times, slam_times,
         scale, rotation, translation = fit
         return np.linalg.norm(scale * c @ rotation.T + translation - target, axis=1)
 
-    hint = float(dt_hint) if dt_hint is not None else 0.
+    # Compare consensus to poses that can actually overlap in time. A camera
+    # clip may be longer than the SLAM path because recording started/stopped
+    # at different moments; out-of-range images cannot be calibration inliers.
+    sorted_capture = np.sort(tc)
+    slam_span = float(ts[-1] - ts[0])
+    right = 0
+    maximum_overlap = 0
+    for left in range(len(sorted_capture)):
+        right = max(right, left)
+        while (right < len(sorted_capture)
+               and sorted_capture[right] - sorted_capture[left] <= slam_span + 1e-9):
+            right += 1
+        maximum_overlap = max(maximum_overlap, right - left)
+    minimum_consensus = int(np.ceil(max(20., maximum_overlap * .5)))
+
     rng = np.random.default_rng(42)
-    best_mask, best_dt = np.zeros(len(c), dtype=bool), hint
-    for dt in (hint, hint - 4., hint + 4., 0.):
+    best_mask = np.zeros(len(c), dtype=bool)
+    best_dt = float(dt_hint) if dt_hint is not None else 0.
+    candidate_dts = [best_dt, best_dt - 4., best_dt + 4., 0.] if dt_hint is not None else []
+    coarse_support = []
+    if dt_hint is None:
+        # Search every placement that can cover a majority of camera poses.
+        # Using the whole-clip-inside-SLAM interval makes the range empty when
+        # the camera recording is slightly longer than the LiDAR recording.
+        dt_min = float(sorted_capture[minimum_consensus - 1] - ts[-1])
+        dt_max = float(sorted_capture[len(c) - minimum_consensus] - ts[0])
+        if dt_min > dt_max:
+            raise ValueError(
+                'Camera and SLAM recordings have no time offset with majority overlap')
+        step = max(0.25, min(1.0, (dt_max - dt_min) / 1200.0))
+        grid = np.arange(dt_min, dt_max + step * 0.5, step)
+        for dt in grid:
+            valid = (tc-dt >= ts[0]) & (tc-dt <= ts[-1])
+            if valid.sum() < minimum_consensus:
+                continue
+            target = targets(dt)
+            try:
+                fit = similarity(c[valid], target[valid])
+            except ValueError:
+                continue
+            errors = residual(fit, target)[valid]
+            coarse_support.append((int(np.sum(errors < 1.2)),
+                                   float(np.quantile(errors, 0.60)), float(dt)))
+        # Keep several separated peaks: repeated geometry can create local
+        # minima, so a single coarse winner is not sufficient for RANSAC.
+        for support, _, dt in sorted(coarse_support, key=lambda item: (-item[0], item[1])):
+            if all(abs(dt - existing) >= 2.0 for existing in candidate_dts):
+                candidate_dts.append(dt)
+            if len(candidate_dts) >= 8:
+                break
+
+    for dt in candidate_dts:
         target = targets(dt)
         valid = (tc-dt >= ts[0]) & (tc-dt <= ts[-1])
         indices = np.flatnonzero(valid)
@@ -66,23 +114,43 @@ def fit_timed_poses(centers, world_to_camera, capture_times, slam_times,
             mask = valid & (residual(fit, target) < 1.2)
             if mask.sum() > best_mask.sum():
                 best_mask, best_dt = mask, dt
-    if best_mask.sum() < max(20, len(c) * .5):
-        raise ValueError('No majority pose consensus: timelapse reconstruction is unreliable')
+    if best_mask.sum() < minimum_consensus:
+        support = int(best_mask.sum())
+        total = int(len(c))
+        detail = (f'Best full-path time-shift candidate Δt={best_dt:.2f}s '
+                  f'matched {support}/{total} camera poses within 1.2 m.')
+        if coarse_support:
+            detail += ' Gyro synchronization was unavailable or low confidence.'
+        raise ValueError('No majority pose consensus: timelapse reconstruction is unreliable. '
+                         + detail)
 
     mask = best_mask
     for _ in range(3):
         def cost(dt):
+            valid = (tc-dt >= ts[0]) & (tc-dt <= ts[-1])
+            use = mask & valid
+            if use.sum() < minimum_consensus:
+                return 1e6
             target = targets(dt)
-            fit = similarity(c[mask], target[mask])
-            return float(np.mean(residual(fit, target)[mask] ** 2))
+            fit = similarity(c[use], target[use])
+            return float(np.mean(residual(fit, target)[use] ** 2))
         grid = np.linspace(best_dt - 8., best_dt + 8., 81)
-        coarse = grid[np.argmin([cost(dt) for dt in grid])]
+        grid_costs = np.asarray([cost(dt) for dt in grid])
+        if np.all(grid_costs >= 1e6):
+            raise ValueError('Time refinement lost majority overlap with the SLAM trajectory')
+        coarse = grid[np.argmin(grid_costs)]
         best_dt = minimize_scalar(cost, bounds=(coarse-.3, coarse+.3), method='bounded').x
         target = targets(best_dt)
-        fit = similarity(c[mask], target[mask])
-        mask = (residual(fit, target) < .5) & (tc-best_dt >= 0) & (tc-best_dt <= ts[-1])
-        if mask.sum() < max(20, len(c) * .5):
-            raise ValueError('Insufficient consistent timelapse poses after refinement')
+        valid = (tc-best_dt >= ts[0]) & (tc-best_dt <= ts[-1])
+        use = mask & valid
+        fit = similarity(c[use], target[use])
+        mask = valid & (residual(fit, target) < .5)
+        if mask.sum() < minimum_consensus:
+            raise ValueError(
+                f'Insufficient consistent timelapse poses after refinement: '
+                f'{int(mask.sum())}/{len(c)} poses are within 0.50 m '
+                f'(need {minimum_consensus}); the initial 1.20 m consensus was '
+                f'{int(best_mask.sum())}/{len(c)} at Δt={best_dt:.2f}s')
 
     # Frame timing is most observable during turns. Translation alone confounds
     # clock offset with the camera lever arm while walking at constant speed.
@@ -338,12 +406,14 @@ def refined_rig_sidecar(calibration, alignment):
     return result
 
 
-def align_dataset(dataset_dir, dt_hint=None, output_path=None, validate_refinement=True):
+def align_dataset(dataset_dir, dt_hint=None, output_path=None, validate_refinement=True,
+                  trajectory_path=None):
     from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
     root = Path(dataset_dir)
     images = pipeline.load_colmap_images(root/'sparse/0/images.bin')
     front = sorted([im for im in images if im['name'].startswith('cam0/')], key=lambda im: im['name'])
-    ts, positions, rotations = pipeline.load_trajectory(pipeline.get_slam_trajectory_path(root))
+    trajectory_path = trajectory_path or pipeline.get_slam_trajectory_path(root)
+    ts, positions, rotations = pipeline.load_trajectory(trajectory_path)
     times = np.array([pipeline.frame_time(root, im['name']) for im in front])
     centers = np.array([im['C'] for im in front])
     rcw = np.array([im['R_cw'] for im in front])
@@ -379,13 +449,23 @@ def align_dataset(dataset_dir, dt_hint=None, output_path=None, validate_refineme
         transformed = scale*np.array([im['C'] for im in group])@rotation.T + translation
         errors = np.linalg.norm(transformed-body-body_rotations.apply(arm), axis=1)
         local = body_rotations.inv()*Rotation.from_matrix(np.einsum('ij,nkj->nik', rotation, np.array([im['R_cw'] for im in group])))
+        minimum_valid = int(np.ceil(max(20., int(valid.sum()) * .5)))
         good = valid & (errors < .5)
-        if good.sum() < 20:
-            raise ValueError(f'Too few consistent timelapse poses for {lens}')
-        angle = (local[good].mean().inv()*local).magnitude()*180/np.pi
-        good &= angle < 3.
-        if good.sum() < max(20, len(group)*.5):
-            raise ValueError(f'Timelapse calibration rejected: no majority rotation consensus for {lens}')
+        if good.sum() < minimum_valid:
+            raise ValueError(
+                f'Too few consistent timelapse poses for {lens}: '
+                f'{int(good.sum())}/{int(valid.sum())} overlapping poses are within 0.50 m '
+                f'(need {minimum_valid})')
+        position_inliers = good.copy()
+        minimum_rotation = int(np.ceil(max(20., int(position_inliers.sum()) * .5)))
+        angle = (local[position_inliers].mean().inv()*local).magnitude()*180/np.pi
+        rotation_inliers = position_inliers & (angle < 3.)
+        if rotation_inliers.sum() < minimum_rotation:
+            raise ValueError(
+                f'Timelapse calibration rejected: rotation consensus for {lens} is '
+                f'{int(rotation_inliers.sum())}/{int(position_inliers.sum())} position-inlier '
+                f'poses within 3 degrees (need {minimum_rotation})')
+        good = rotation_inliers
         angular_errors.extend(angle[good].tolist())
         accepted.extend(im['name'] for im, ok in zip(group, good) if ok)
         rejected.extend(im['name'] for im, ok in zip(group, good) if not ok)

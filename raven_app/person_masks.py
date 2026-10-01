@@ -51,13 +51,16 @@ def keep_samples(mask, u, v):
 
 
 DEFAULT_MASK_CONFIG = {'schema': 1, 'fisheye_border_percent': 0.0,
+                       'fisheye_border_percent_by_camera': {},
                        'rectangles': {}, 'ellipses': {}, 'polygons': {}}
 
 
 def normalize_mask_config(config=None):
     """Validate portable, normalized per-camera mask settings."""
     config = DEFAULT_MASK_CONFIG if config is None else config
-    if not isinstance(config, dict) or set(config) - {'schema', 'fisheye_border_percent', 'rectangles', 'ellipses', 'polygons'}:
+    if not isinstance(config, dict) or set(config) - {
+            'schema', 'fisheye_border_percent', 'fisheye_border_percent_by_camera',
+            'rectangles', 'ellipses', 'polygons'}:
         raise ValueError('Mask settings must contain only schema, border percentage and per-camera shapes')
     if config.get('schema', 1) != 1:
         raise ValueError('Unsupported mask settings schema')
@@ -65,6 +68,16 @@ def normalize_mask_config(config=None):
     if not isinstance(border, (int, float)) or not math.isfinite(border) or not 0 <= border <= 25:
         raise ValueError('Fisheye border cutoff must be between 0 and 25 percent')
     result = {'schema': 1, 'fisheye_border_percent': float(border)}
+    camera_borders = config.get('fisheye_border_percent_by_camera', {})
+    if not isinstance(camera_borders, dict):
+        raise ValueError('Fisheye border percentages must be grouped by camera')
+    result['fisheye_border_percent_by_camera'] = {}
+    for camera, value in camera_borders.items():
+        if not isinstance(camera, str) or not camera or '/' in camera or '\\' in camera:
+            raise ValueError('Fisheye border camera must be a camera folder name')
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 25:
+            raise ValueError('Fisheye border cutoff must be between 0 and 25 percent')
+        result['fisheye_border_percent_by_camera'][camera] = float(value)
     for shape in ('rectangles', 'ellipses'):
         groups = config.get(shape, {})
         if not isinstance(groups, dict):
@@ -150,12 +163,19 @@ def fisheye_cutoff_radius(shape, percent):
     return (low + high) * .5
 
 
+def fisheye_border_percent(config, camera):
+    """Return this camera's border cutoff, falling back to the legacy default."""
+    config = normalize_mask_config(config)
+    return config['fisheye_border_percent_by_camera'].get(
+        camera, config['fisheye_border_percent'])
+
+
 def static_keep_mask(shape, camera, config):
     """255 outside user-defined fixed exclusions, 0 inside them."""
     config = normalize_mask_config(config)
     height, width = shape[:2]
     keep = np.full((height, width), 255, np.uint8)
-    radius = fisheye_cutoff_radius(shape, config['fisheye_border_percent'])
+    radius = fisheye_cutoff_radius(shape, fisheye_border_percent(config, camera))
     if radius is not None:
         yy, xx = np.ogrid[:height, :width]
         keep[(xx - (width - 1) * .5) ** 2 + (yy - (height - 1) * .5) ** 2 > radius ** 2] = 0
@@ -189,7 +209,7 @@ def fixed_keep_samples(shape, u, v, camera, config):
     height, width = shape[:2]
     x, y = np.floor(u).astype(np.int64), np.floor(v).astype(np.int64)
     keep = (x >= 0) & (y >= 0) & (x + 1 < width) & (y + 1 < height)
-    radius = fisheye_cutoff_radius(shape, config['fisheye_border_percent'])
+    radius = fisheye_cutoff_radius(shape, fisheye_border_percent(config, camera))
     if radius is not None:
         dx = np.maximum(abs(x - (width - 1) * .5), abs(x + 1 - (width - 1) * .5))
         dy = np.maximum(abs(y - (height - 1) * .5), abs(y + 1 - (height - 1) * .5))
@@ -252,8 +272,9 @@ def masked_operator_keep(points, views, images_dir, masks_dir, radius, project):
             continue
         mask = load_keep_mask(image, images_dir, evidence_dir)
         u, v, _ = project(camera, params)
-        valid = ((u >= 0) & (v >= 0) & (u < mask.shape[1] - 1) & (v < mask.shape[0] - 1)
-                 & (np.hypot(u - params[2], v - params[3]) < 1620.0 * min(mask.shape) / 3840.0))
+        valid = ((u >= 0) & (v >= 0) & (u < mask.shape[1] - 1) & (v < mask.shape[0] - 1))
+        if params[-1] >= -997.0:
+            valid &= np.hypot(u - params[2], v - params[3]) < 1620.0 * min(mask.shape) / 3840.0
         if config is not None:
             camera_name = Path(image).resolve().relative_to(Path(images_dir).resolve()).parts[0]
             valid &= fixed_keep_samples(mask.shape, u, v, camera_name, config)

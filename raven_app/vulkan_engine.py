@@ -103,7 +103,8 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
 
     Protocol RVC1/RVC2: uint32 point/view counts, packed float4 points; each view is
     a UTF-8 path prefixed by uint32 length followed by 24 float32 values
-    (row-major Rcw, Cworld, COLMAP's 12 intrinsic parameters). RVC3 adds six
+    (row-major Rcw, Cworld, 12 camera parameters). Auxiliary pinhole/OpenCV views
+    mark the camera model in the last distortion slot. RVC3 adds six
     photometric values per view; RVC4 combines those values with person masks.
     RVC5/RVC6 append a row-major 3x3 PPISP homography and a [4,3,3,RGB]
     bilateral grid (flattened C-order), with RVC6 also carrying masks.
@@ -139,7 +140,7 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
                 del packed
                 for view_i, (path, rotation, center, params) in enumerate(views):
                     if len(params) != 12:
-                        raise ValueError('Vulkan requires THIN_PRISM_FISHEYE (12 parameters)')
+                        raise ValueError('Vulkan camera views require 12 intrinsic/distortion parameters')
                     name = str(Path(path).resolve()).encode('utf-8')
                     values = np.concatenate((np.asarray(rotation).ravel(), np.asarray(center)-origin, params))
                     if not np.isfinite(values).all():

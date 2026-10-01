@@ -346,11 +346,35 @@ void LIVMapper::handleLIO()
     return;
   }
 
+  // Filter out any non-finite or extreme coordinate outliers before PCL VoxelGrid
+  PointCloudXYZI::Ptr clean_feats(new PointCloudXYZI);
+  clean_feats->reserve(feats_undistort->size());
+  for (const auto& pt : feats_undistort->points) {
+    if (std::isfinite(pt.x) && std::isfinite(pt.y) && std::isfinite(pt.z)) {
+      float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+      if (r2 >= 0.04f && r2 <= 1024.0f && std::fabs(pt.z) <= 25.0f) { // 0.2m to 32m sensor range, |z| <= 25m
+        clean_feats->push_back(pt);
+      }
+    }
+  }
+  if (clean_feats->empty()) {
+    std::cout << "[ LIO ]: No valid points within sensor range!" << std::endl;
+    return;
+  }
+
   double t0 = omp_get_wtime();
 
-  downSizeFilterSurf.setInputCloud(feats_undistort);
+  downSizeFilterSurf.setInputCloud(clean_feats);
   downSizeFilterSurf.filter(*feats_down_body);
   
+  if (feats_down_body->empty() && !clean_feats->empty()) {
+    std::cout << "[ LIO Warning ]: VoxelGrid returned empty cloud (bounding overflow); falling back to decimation." << std::endl;
+    size_t step = std::max<size_t>(1, clean_feats->size() / 1500);
+    for (size_t i = 0; i < clean_feats->size(); i += step) {
+      feats_down_body->push_back(clean_feats->points[i]);
+    }
+  }
+
   double t_down = omp_get_wtime();
 
   feats_down_size = feats_down_body->points.size();
@@ -432,7 +456,7 @@ void LIVMapper::handleLIO()
     voxelmap_manager->mapSliding();
   }
   
-  PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
+  PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? clean_feats : feats_down_body);
   int size = laserCloudFullRes->points.size();
   PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
 
@@ -500,6 +524,10 @@ void LIVMapper::savePCD()
       voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
       std::cout << "[FAST-LIVO2] Downsampling point cloud..." << std::endl;
       voxel_filter.filter(*downsampled_cloud);
+      if (downsampled_cloud->empty() && !pcl_wait_save->empty()) {
+        std::cout << "[FAST-LIVO2 Warning] VoxelGrid for savePCD returned empty; using raw cloud fallback." << std::endl;
+        *downsampled_cloud = *pcl_wait_save;
+      }
   
       std::cout << "[FAST-LIVO2] Saving downsampled point cloud to: " << downsampled_points_dir << " (" << downsampled_cloud->points.size() << " points)" << std::endl;
       pcd_writer.writeBinary(downsampled_points_dir, *downsampled_cloud);

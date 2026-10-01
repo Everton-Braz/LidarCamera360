@@ -1,11 +1,12 @@
 """Unified processing workflow view."""
 import json
+import re
 import time
 from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QFrame, QDialog,
-    QMessageBox
+    QMessageBox, QSlider
 )
 from qfluentwidgets import (
     CardWidget, ElevatedCardWidget, TitleLabel, SubtitleLabel, BodyLabel,
@@ -22,6 +23,7 @@ from raven_app.workflow_progress import (
 from raven_app.mask_download import MaskResourceDownload
 from raven_app.mask_resources import resource_status, resources_ready
 from raven_app.bag_io import detect_bag_topics
+from raven_app.seed_export import dataset_seed_point_count, seed_point_count
 from raven_app.i18n import tr
 
 
@@ -39,7 +41,8 @@ class UnifiedWorkflowView(QWidget):
         self.runner = runner
         self._mask_downloader = None
         self.mask_config = None
-        self.third_camera_config = None
+        self.third_camera_configs = []
+        self._next_aux_camera_index = 2
         self._current_log_path = None
         self._workflow_started_at = None
         self._stage_started_at = None
@@ -48,6 +51,9 @@ class UnifiedWorkflowView(QWidget):
         self._current_stage_skipped = False
         self._stage_fraction = 0.0
         self._stage_fraction_from_log = False
+        self._seed_full_point_count = None
+        self._seed_actual_export_count = None
+        self._seed_actual_export_percent = None
         self._stage_history = [[] for _ in STAGE_NAMES]
         self._stage_estimates = [60.0] * len(STAGE_NAMES)
         self._progress_timer = QTimer(self)
@@ -122,22 +128,29 @@ class UnifiedWorkflowView(QWidget):
         insv_row.addWidget(self.btn_browse_insv)
         inputs_layout.addLayout(insv_row)
 
-        # Row 2.5: Auxiliary Image/Video Source (Third Camera / Smartphone)
+        # Row 2.5: Auxiliary image/video cameras
         aux_row = QHBoxLayout()
         self.aux_label = BodyLabel(tr("Auxiliary Camera:"))
         self.aux_label.setFixedWidth(170)
         self.aux_input = LineEdit()
-        self.aux_input.setPlaceholderText(tr("Optional: Smartphone video or image folder for 3DGS..."))
+        self.aux_input.setPlaceholderText(tr("No auxiliary cameras configured."))
         self.aux_input.setReadOnly(True)
-        self.btn_add_source = PushButton(tr("Add Source Image/Video..."), icon=FluentIcon.ADD)
+        self.btn_add_source = PushButton(tr("Add Camera Source..."), icon=FluentIcon.ADD)
         self.btn_add_source.clicked.connect(self._open_add_source_dialog)
-        self.btn_clear_source = PushButton(tr("Clear"), icon=FluentIcon.DELETE)
+        self.btn_clear_source = PushButton(tr("Clear All"), icon=FluentIcon.DELETE)
         self.btn_clear_source.clicked.connect(self._clear_aux_source)
         aux_row.addWidget(self.aux_label)
         aux_row.addWidget(self.aux_input)
         aux_row.addWidget(self.btn_add_source)
         aux_row.addWidget(self.btn_clear_source)
         inputs_layout.addLayout(aux_row)
+
+        self.aux_sources_widget = QWidget(inputs_card)
+        self.aux_sources_layout = QVBoxLayout(self.aux_sources_widget)
+        self.aux_sources_layout.setContentsMargins(170, 0, 0, 0)
+        self.aux_sources_layout.setSpacing(6)
+        inputs_layout.addWidget(self.aux_sources_widget)
+        self._refresh_aux_sources_ui()
 
         # Row 3: Output Folder
         out_row = QHBoxLayout()
@@ -368,6 +381,29 @@ class UnifiedWorkflowView(QWidget):
         self.chk_colmap.setChecked(True)
         output_layout.addWidget(self.chk_colmap)
 
+        seed_layout = QGridLayout()
+        seed_layout.setColumnStretch(1, 1)
+        self.seed_percent_label = BodyLabel(tr("3DGS LiDAR seed export:"))
+        self.seed_percent_slider = QSlider(Qt.Orientation.Horizontal, output_card)
+        self.seed_percent_slider.setObjectName("seedPercentSlider")
+        self.seed_percent_slider.setRange(1, 100)
+        self.seed_percent_slider.setValue(100)
+        self.seed_percent_slider.setToolTip(tr("Choose the percentage of LiDAR points to include in the 3DGS seed."))
+        self.seed_percent_spin = SpinBox(output_card)
+        self.seed_percent_spin.setObjectName("seedPercentSpin")
+        self.seed_percent_spin.setRange(1, 100)
+        self.seed_percent_spin.setValue(100)
+        self.seed_percent_spin.setSuffix("%")
+        self.seed_percent_spin.setToolTip(tr("Type the percentage of LiDAR points to include in the 3DGS seed."))
+        seed_layout.addWidget(self.seed_percent_label, 0, 0)
+        seed_layout.addWidget(self.seed_percent_slider, 0, 1)
+        seed_layout.addWidget(self.seed_percent_spin, 0, 2)
+        output_layout.addLayout(seed_layout)
+
+        self.seed_point_count_label = CaptionLabel("")
+        self.seed_point_count_label.setWordWrap(True)
+        output_layout.addWidget(self.seed_point_count_label)
+
         self.georef_formats_label = CaptionLabel(tr("Automatic georeferenced cloud formats:"))
         output_layout.addWidget(self.georef_formats_label)
         georef_formats_layout = QHBoxLayout()
@@ -502,6 +538,49 @@ class UnifiedWorkflowView(QWidget):
         self.runner.finished.connect(self._on_job_finished)
         self.runner.log_received.connect(self._on_log_received)
         self.runner.error_occurred.connect(self._on_error_occurred)
+        self.seed_percent_slider.valueChanged.connect(self.seed_percent_spin.setValue)
+        self.seed_percent_spin.valueChanged.connect(self.seed_percent_slider.setValue)
+        self.seed_percent_spin.valueChanged.connect(self._update_seed_point_estimate)
+        self.out_input.textChanged.connect(self._refresh_seed_point_estimate)
+        self.chk_colmap.stateChanged.connect(self._toggle_seed_export_controls)
+        self._toggle_seed_export_controls()
+        self._refresh_seed_point_estimate()
+
+    def _toggle_seed_export_controls(self, state=None):
+        enabled = self.chk_colmap.isChecked()
+        self.seed_percent_label.setEnabled(enabled)
+        self.seed_percent_slider.setEnabled(enabled)
+        self.seed_percent_spin.setEnabled(enabled)
+        self._update_seed_point_estimate()
+
+    def _refresh_seed_point_estimate(self, text=None):
+        output = self.out_input.text().strip()
+        self._seed_full_point_count = dataset_seed_point_count(output) if output else None
+        self._seed_actual_export_count = None
+        self._seed_actual_export_percent = None
+        self._update_seed_point_estimate()
+
+    def _update_seed_point_estimate(self, value=None):
+        if not self.chk_colmap.isChecked():
+            self.seed_point_count_label.setText(tr("3DGS seed export is disabled."))
+            return
+
+        percent = self.seed_percent_spin.value()
+        total = self._seed_full_point_count
+        if total is None:
+            self.seed_point_count_label.setText(
+                tr("3DGS seed point count is pending until the LiDAR cloud is available ({percent}% selected).")
+                .format(percent=percent)
+            )
+            return
+
+        if self._seed_actual_export_count is not None and self._seed_actual_export_percent == percent:
+            count = self._seed_actual_export_count
+            text = tr("3DGS seed exported: {count:,} of {total:,} points ({percent}% requested).")
+        else:
+            count = seed_point_count(total, percent)
+            text = tr("Estimated 3DGS seed: {count:,} of {total:,} points ({percent}% selected).")
+        self.seed_point_count_label.setText(text.format(count=count, total=total, percent=percent))
 
     def _on_preset_changed(self, index: int):
         if index == 1:  # Eagle
@@ -565,24 +644,103 @@ class UnifiedWorkflowView(QWidget):
 
     def _open_add_source_dialog(self):
         from raven_app.views.add_source_dialog import AddSourceDialog
-        dialog = AddSourceDialog(parent=self, config=self.third_camera_config)
+        from raven_app.third_camera import ThirdCameraConfig
+        camera_name = self._next_aux_camera_name()
+        dialog = AddSourceDialog(
+            parent=self,
+            config=ThirdCameraConfig(camera_name=camera_name),
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.third_camera_config = dialog.get_config()
-            if (
-                self.third_camera_config
-                and self.third_camera_config.enabled
-                and self.third_camera_config.source_path
-            ):
-                src_name = Path(self.third_camera_config.source_path).name
-                self.aux_input.setText(
-                    f"{self.third_camera_config.camera_name}: {src_name} ({self.third_camera_config.camera_model})"
-                )
-            else:
-                self.aux_input.clear()
+            config = dialog.get_config()
+            if not config.source_path:
+                return
+            config.camera_name = camera_name
+            self.third_camera_configs.append(config)
+            self._refresh_aux_sources_ui()
+
+    def _edit_aux_source(self, index):
+        from raven_app.views.add_source_dialog import AddSourceDialog
+        if not 0 <= index < len(self.third_camera_configs):
+            return
+        current = self.third_camera_configs[index]
+        dialog = AddSourceDialog(parent=self, config=current)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            config = dialog.get_config()
+            config.camera_name = current.camera_name
+            self.third_camera_configs[index] = config
+            self._refresh_aux_sources_ui()
+
+    def _remove_aux_source(self, index):
+        if 0 <= index < len(self.third_camera_configs):
+            del self.third_camera_configs[index]
+            self._refresh_aux_sources_ui()
+
+    def _next_aux_camera_name(self):
+        used = {str(config.camera_name).casefold() for config in self.third_camera_configs}
+        while f"cam{self._next_aux_camera_index}".casefold() in used:
+            self._next_aux_camera_index += 1
+        name = f"cam{self._next_aux_camera_index}"
+        self._next_aux_camera_index += 1
+        return name
+
+    def _refresh_aux_sources_ui(self):
+        while self.aux_sources_layout.count():
+            item = self.aux_sources_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        if not self.third_camera_configs:
+            self.aux_input.clear()
+            self.aux_input.setPlaceholderText(tr("No auxiliary cameras configured."))
+            self.btn_clear_source.setEnabled(False)
+            empty = CaptionLabel(tr("Add one or more image or video sources to include additional camera views."))
+            empty.setWordWrap(True)
+            self.aux_sources_layout.addWidget(empty)
+            return
+
+        self.aux_input.setText(
+            tr("{n} auxiliary camera(s) configured").format(n=len(self.third_camera_configs))
+        )
+        self.btn_clear_source.setEnabled(True)
+        for index, config in enumerate(self.third_camera_configs):
+            row = QWidget(self.aux_sources_widget)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            source_name = Path(config.source_path).name if config.source_path else tr("No source selected")
+            details = BodyLabel(
+                f"{config.camera_name}: {source_name} ({config.camera_model}, {config.fps:g} fps)"
+            )
+            details.setToolTip(str(config.source_path))
+            row_layout.addWidget(details, 1)
+            edit = PushButton(tr("Configure"))
+            edit.clicked.connect(lambda _checked=False, row_index=index: self._edit_aux_source(row_index))
+            row_layout.addWidget(edit)
+            remove = PushButton(tr("Remove"), icon=FluentIcon.DELETE)
+            remove.clicked.connect(lambda _checked=False, row_index=index: self._remove_aux_source(row_index))
+            row_layout.addWidget(remove)
+            self.aux_sources_layout.addWidget(row)
 
     def _clear_aux_source(self):
-        self.third_camera_config = None
-        self.aux_input.clear()
+        self.third_camera_configs.clear()
+        self._refresh_aux_sources_ui()
+
+    def _active_aux_camera_configs(self):
+        return [config for config in self.third_camera_configs
+                if config.enabled and str(config.source_path).strip()]
+
+    def _configured_aux_camera_names(self):
+        return [config.camera_name for config in self.third_camera_configs
+                if str(config.source_path).strip()]
+
+    def _save_aux_camera_bundle(self, path):
+        cameras = [config.to_dict() for config in self._active_aux_camera_configs()]
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps({"cameras": cameras}, indent=2), encoding="utf-8")
+        temporary.replace(path)
 
     def _browse_photometric_params(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -708,7 +866,9 @@ class UnifiedWorkflowView(QWidget):
         dialog = MaskSettingsDialog(output, config, self,
                                     backend=self.mask_backend_combo.currentData(),
                                     insv_path=self.insv_input.text().strip() or None,
-                                    fps=self.fps_spin.value())
+                                    fps=self.fps_spin.value(),
+                                    camera_names=self._configured_aux_camera_names(),
+                                    auxiliary_sources=self.third_camera_configs)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.mask_config = dialog.settings()
             self.mask_persons_chk.setChecked(True)
@@ -777,6 +937,8 @@ class UnifiedWorkflowView(QWidget):
             )
             return
 
+        self._refresh_seed_point_estimate()
+
         if self.process_gps_chk.isChecked() and not any(
             checkbox.isChecked() for checkbox in (
                 self.chk_gps_geojson, self.chk_gps_gpx, self.chk_gps_csv
@@ -829,16 +991,11 @@ class UnifiedWorkflowView(QWidget):
         if photometric_params and self.photometric_combo.currentData() != "off":
             args.extend(["--photometric-params", photometric_params])
 
-        if (
-            self.third_camera_config
-            and self.third_camera_config.enabled
-            and self.third_camera_config.source_path
-        ):
+        if self._active_aux_camera_configs():
             out_p = Path(out)
             out_p.mkdir(parents=True, exist_ok=True)
             cfg_path = out_p / "third_camera.json"
-            from raven_app.third_camera import save_third_camera_config
-            save_third_camera_config(self.third_camera_config, cfg_path)
+            self._save_aux_camera_bundle(cfg_path)
             args.extend(["--third-camera", str(cfg_path)])
 
         if self.recalibrate_chk.isChecked():
@@ -886,6 +1043,7 @@ class UnifiedWorkflowView(QWidget):
             args.append("--export-pcd")
         if self.chk_colmap.isChecked():
             args.append("--export-colmap")
+            args.extend(["--seed-percent", str(self.seed_percent_spin.value())])
 
         if self.process_gps_chk.isChecked():
             args.append("--process-gps")
@@ -982,6 +1140,16 @@ class UnifiedWorkflowView(QWidget):
         self.log_console.ensureCursorVisible()
         for item in line.splitlines():
             self._update_workflow_progress_from_line(item)
+            match = re.search(
+                r"3DGS seed export:\s*([\d,]+)\s*/\s*([\d,]+)\s*points\s*\(requested\s*([\d.]+)%",
+                item,
+                re.IGNORECASE,
+            )
+            if match:
+                self._seed_actual_export_count = int(match.group(1).replace(",", ""))
+                self._seed_full_point_count = int(match.group(2).replace(",", ""))
+                self._seed_actual_export_percent = float(match.group(3))
+                self._update_seed_point_estimate()
 
     def _prepare_workflow_progress(self, output_dir, bag_path, insv_path, method):
         self._stage_root = Path(output_dir)
@@ -1126,9 +1294,10 @@ class UnifiedWorkflowView(QWidget):
         self.insv_input.setPlaceholderText(tr("Select Insta360 X4 / X6 video (.insv or .mp4)..."))
         self.btn_browse_insv.setText(tr("Browse"))
         self.aux_label.setText(tr("Auxiliary Camera:"))
-        self.aux_input.setPlaceholderText(tr("Optional: Smartphone video or image folder for 3DGS..."))
-        self.btn_add_source.setText(tr("Add Source Image/Video..."))
-        self.btn_clear_source.setText(tr("Clear"))
+        self.aux_input.setPlaceholderText(tr("No auxiliary cameras configured."))
+        self.btn_add_source.setText(tr("Add Camera Source..."))
+        self.btn_clear_source.setText(tr("Clear All"))
+        self._refresh_aux_sources_ui()
         self.out_label.setText(tr("Output Directory:"))
         self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
         self.btn_browse_out.setText(tr("Browse"))
@@ -1193,6 +1362,10 @@ class UnifiedWorkflowView(QWidget):
         self.chk_ply.setText(tr("Export Colored Point Cloud (.PLY)"))
         self.chk_pcd.setText(tr("Export Colored Point Cloud (.PCD)"))
         self.chk_colmap.setText(tr("Metric-Scaled 3DGS COLMAP Dataset"))
+        self.seed_percent_label.setText(tr("3DGS LiDAR seed export:"))
+        self.seed_percent_slider.setToolTip(tr("Choose the percentage of LiDAR points to include in the 3DGS seed."))
+        self.seed_percent_spin.setToolTip(tr("Type the percentage of LiDAR points to include in the 3DGS seed."))
+        self._update_seed_point_estimate()
         self.georef_formats_label.setText(tr("Automatic georeferenced cloud formats:"))
         self.gps_formats_label.setText(tr("GPS metadata formats (select one or more):"))
         self.chk_gps_geojson.setText(tr("GeoJSON"))

@@ -72,7 +72,8 @@ def collect_observations(dataset, masks_dir=None, sample_points=50000, max_obser
     if sample_points < 30 or max_observations < 90:
         raise ValueError('Need at least 30 sample points and 90 observations')
     root = Path(dataset)
-    from scripts.pipeline_auto_calibrator_and_colorizer import load_colmap_cameras, project_thin_prism
+    from scripts.pipeline_auto_calibrator_and_colorizer import (
+        load_colmap_cameras, project_thin_prism, _colorization_camera_params)
     from scipy.spatial.transform import Rotation
     from raven_app.person_masks import load_keep_mask, keep_samples
     cameras = load_colmap_cameras(root / 'sparse/0/cameras.bin')
@@ -120,7 +121,8 @@ def collect_observations(dataset, masks_dir=None, sample_points=50000, max_obser
             points = np.array([xyz_by_id[int(pid)] for pid in pids])
             rotation = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
             camera_points = points @ rotation.T + [tx, ty, tz]
-            params = cameras[camera_id]['params']
+            camera = cameras[camera_id]
+            params = _colorization_camera_params(camera)
             pu, pv, _ = project_thin_prism(camera_points, params)
             uv = np.column_stack((features['u'][indices], features['v'][indices]))
             radius = np.hypot(uv[:, 0] - params[2], uv[:, 1] - params[3]) / 1620.0
@@ -217,7 +219,11 @@ def prepare_model(dataset, params=None, masks_dir=None, mode=None):
         model = load_model(path)
         if mode is not None and model.get('mode', 'loglinear') != mode:
             raise ValueError('Photometric parameter mode does not match the requested correction')
-        if model.get('fingerprint') == signature:
+        revision_current = True
+        if mode == 'ppisp-bilateral' and params is None:
+            from .advanced import ADVANCED_MODEL_REVISION
+            revision_current = model.get('advanced_model_revision') == ADVANCED_MODEL_REVISION
+        if model.get('fingerprint') == signature and revision_current:
             print(f'[photometric] reusing validated parameters: {path}', flush=True)
             return model
         if params is not None:

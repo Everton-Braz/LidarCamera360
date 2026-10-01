@@ -207,6 +207,9 @@ def parse(argv=None):
     wf.add_argument('--export-ply',action='store_true',default=False)
     wf.add_argument('--export-pcd',action='store_true',default=False)
     wf.add_argument('--export-colmap',action='store_true',default=False)
+    from raven_app.seed_export import validate_seed_percent
+    wf.add_argument('--seed-percent', type=validate_seed_percent, default=100.0,
+                    help='Percentage of LiDAR points exported as the 3DGS seed (default: 100)')
     wf.add_argument('--process-gps', action='store_true', help='Extract GPS metadata automatically; does not infer cloud placement')
     wf.add_argument('--gps-formats', nargs='+', choices=('geojson', 'gpx', 'csv'),
                     default=('geojson', 'gpx', 'csv'), help='Selected GPS deliverables')
@@ -475,6 +478,7 @@ def run(a):
             export_ply=a.export_ply,
             export_pcd=a.export_pcd,
             export_colmap=a.export_colmap,
+            seed_percent=a.seed_percent,
             process_gps=a.process_gps,
             gps_formats=a.gps_formats,
             geo_formats=a.geo_formats,

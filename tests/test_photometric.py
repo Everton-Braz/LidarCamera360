@@ -1,7 +1,10 @@
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -9,6 +12,18 @@ from raven_app.photometric.model import fit_observations, to_srgb, apply_rgb, lo
 
 
 class PhotometricTests(unittest.TestCase):
+    def test_direct_mode_skips_photometric_fit_without_sfm_or_cached_model(self):
+        from scripts.pipeline_auto_calibrator_and_colorizer import _prepare_direct_photometric
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('raven_app.photometric.prepare') as prepare:
+                output = StringIO()
+                with redirect_stdout(output):
+                    result = _prepare_direct_photometric(
+                        Path(tmp), 'ppisp-bilateral', None, None)
+            self.assertIsNone(result)
+            prepare.assert_not_called()
+            self.assertIn('direct/trajectory mode', output.getvalue())
+
     def synthetic(self, identity=False, vignette=False):
         rng = np.random.default_rng(15)
         n, frames = 700, 12
@@ -55,6 +70,42 @@ class PhotometricTests(unittest.TestCase):
         self.assertEqual(model['selected'], 'gains+vignette')
         self.assertLess(model['metrics']['test_after']['linear_rmse'],
                         .25 * model['metrics']['test_before']['linear_rmse'])
+
+    def test_advanced_reports_independent_component_ablations(self):
+        from raven_app.photometric.advanced import fit_advanced
+
+        obs, names, _ = self.synthetic()
+        rng = np.random.default_rng(4)
+        obs['u'] = rng.uniform(0, 3840, len(obs['point_id']))
+        obs['v'] = rng.uniform(0, 3840, len(obs['point_id']))
+        baseline = fit_observations(obs, names, ['0', '1'])
+        model = fit_advanced(obs, names, ['0', '1'], baseline)
+        metrics = model['metrics']
+        variants = ('off', 'loglinear', 'homography', 'grid_only', 'bilateral')
+        validation_pairs = [metrics[f'validation_{name}']['pairs'] for name in variants]
+        test_pairs = [metrics[f'test_{name}']['pairs'] for name in variants]
+        self.assertEqual(len(set(validation_pairs)), 1)
+        self.assertEqual(len(set(test_pairs)), 1)
+        self.assertEqual(metrics['validation_off']['pairs'],
+                         baseline['metrics']['validation_before']['pairs'])
+        self.assertEqual(metrics['test_grid_only']['pairs'],
+                         baseline['metrics']['test_before']['pairs'])
+
+    def test_grid_only_can_win_validation_selection(self):
+        from raven_app.photometric.advanced import _choose_candidate
+
+        baseline = {'linear_rmse': .1, 'delta_e76_mean': 10.0}
+        candidates = (
+            ('ppisp-homography', {'linear_rmse': .098, 'delta_e76_mean': 9.8},
+             'h', 'h-model', None),
+            ('bilateral-grid-only', {'linear_rmse': .090, 'delta_e76_mean': 9.0},
+             'grid', None, 'grid-model'),
+            ('ppisp-bilateral-grid', {'linear_rmse': .089, 'delta_e76_mean': 9.1},
+             'full', 'full-model', 'full-grid'),
+        )
+        chosen = _choose_candidate(baseline, candidates)
+        self.assertEqual(chosen[0], 'bilateral-grid-only')
+        self.assertEqual(chosen[2:], ('grid', None, 'grid-model'))
 
     def test_inverse_and_identity(self):
         rgb = np.array([[70, 120, 180]], dtype=np.uint8)
@@ -103,6 +154,33 @@ class PhotometricTests(unittest.TestCase):
                                         'views': {}, 'fingerprint': 'stale'}))
             with self.assertRaisesRegex(ValueError, 'refit'):
                 prepare_model(root, path)
+
+    def test_advanced_cache_revision_refits_automatic_but_keeps_explicit_model(self):
+        from raven_app.photometric.dataset import fingerprint, prepare_model
+        from raven_app.photometric.advanced import ADVANCED_MODEL_REVISION
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'photometric' / 'ppisp_bilateral_params.json'
+            path.parent.mkdir(parents=True)
+            legacy = {'schema': 2, 'color_space': 'srgb',
+                      'mode': 'ppisp-bilateral', 'views': {},
+                      'fingerprint': fingerprint(root)}
+            path.write_text(json.dumps(legacy), encoding='utf-8')
+            with patch('raven_app.photometric.dataset.fit_dataset',
+                       return_value={'refit': True}) as refit:
+                self.assertEqual(prepare_model(root, mode='ppisp-bilateral'),
+                                 {'refit': True})
+                refit.assert_called_once()
+            with patch('raven_app.photometric.dataset.fit_dataset') as refit:
+                self.assertEqual(prepare_model(root, path,
+                                               mode='ppisp-bilateral'), legacy)
+                refit.assert_not_called()
+            current = dict(legacy, advanced_model_revision=ADVANCED_MODEL_REVISION)
+            path.write_text(json.dumps(current), encoding='utf-8')
+            with patch('raven_app.photometric.dataset.fit_dataset') as refit:
+                self.assertEqual(prepare_model(root, mode='ppisp-bilateral'), current)
+                refit.assert_not_called()
 
     def test_advanced_model_rejects_invalid_grid_homography_and_mode(self):
         from raven_app.photometric.dataset import prepare_model, fingerprint

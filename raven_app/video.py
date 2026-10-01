@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 
 import cv2
 import numpy as np
@@ -314,6 +315,7 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
         print('[*] Reusing completed video extraction.')
         return True
     output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
     capture_times = _timelapse_times(insv_path) if insv_path.suffix.lower() == '.insv' else None
     backend = _select_decoder(insv_path, decoder, threads)
     attempts = [backend] + (['cpu'] if decoder == 'auto' and backend != 'cpu' else [])
@@ -382,7 +384,9 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                             best = 0.0, pair, times
                             candidates = 1
                         else:
-                            score = sum(_frame_sharpness(frame) for frame in pair)
+                            score_jobs = [decode_pool.submit(_frame_sharpness, frame)
+                                          for frame in pair]
+                            score = sum(job.result() for job in score_jobs)
                             if best is None or score > best[0]:
                                 best = score, pair, times
                             candidates += 1
@@ -405,7 +409,9 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                 manifest.write_text(json.dumps(dict(signature=signature, timestamps=timestamps,
                                                     time_source='insv_timelapse' if capture_times is not None else 'video_pts',
                                                     decoder=backend), indent=2), encoding='utf-8')
-                print(f'[+] Extracted {count} synchronized sharp frame pairs.')
+                elapsed = max(time.perf_counter() - started, 1e-9)
+                print(f'[+] Extracted {count} synchronized sharp frame pairs in '
+                      f'{elapsed:.1f}s ({count / elapsed:.1f} pairs/s).')
                 return True
         except Exception as exc:
             print(f'[!] {backend} video extraction failed: {exc}', flush=True)

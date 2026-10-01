@@ -11,6 +11,66 @@ from raven_app.timelapse_calibration import (
 
 
 class TimelapseCalibrationTests(unittest.TestCase):
+    def test_searches_full_slam_recording_for_late_camera_clip_without_gyro_hint(self):
+        ts = np.linspace(0, 1000, 5001)
+        positions = np.column_stack((
+            24*np.sin(ts/47), 11*np.cos(ts/29), .8*np.sin(ts/17)))
+        rotations = Rotation.from_euler(
+            'zyx', np.column_stack((
+                .65*np.sin(ts/12), .17*np.sin(ts/21), .1*np.cos(ts/16))))
+        tc = np.linspace(8, 88, 41)
+        dt = -631.25
+        query = tc-dt
+        body_rotation = Slerp(ts, rotations)(query)
+        arm = rotations[0].inv().apply([0, 0, .185])
+        target = np.column_stack([
+            np.interp(query, ts, positions[:, axis]) for axis in range(3)
+        ]) + body_rotation.apply(arm)
+        alignment = Rotation.from_euler('xyz', [.04, -.03, .6])
+        translation = np.array([7., -5., 1.])
+        scale = 4.6
+        centers = alignment.inv().apply(target-translation)/scale
+        rig = Rotation.from_euler('xyz', [.1, -.2, .7])
+        world_to_camera = (alignment.inv()*body_rotation*rig).inv().as_matrix()
+
+        fit, found_dt, accepted, rmse, _ = fit_timed_poses(
+            centers, world_to_camera, tc, ts, positions, rotations)
+
+        self.assertAlmostEqual(found_dt, dt, delta=.03)
+        self.assertAlmostEqual(fit[0], scale, delta=.01)
+        self.assertLess(rmse, .01)
+        self.assertEqual(int(accepted.sum()), len(tc))
+
+    def test_searches_majority_overlap_when_camera_clip_is_longer_than_slam(self):
+        ts = np.linspace(0, 100, 1001)
+        positions = np.column_stack((
+            18*np.sin(ts/15), 9*np.cos(ts/19), .5*np.sin(ts/11)))
+        rotations = Rotation.from_euler(
+            'zyx', np.column_stack((
+                .55*np.sin(ts/10), .16*np.sin(ts/17), .09*np.cos(ts/13))))
+        tc = np.linspace(.1, 104.7, 205)
+        dt = 2.45
+        query = np.clip(tc-dt, ts[0], ts[-1])
+        body_rotation = Slerp(ts, rotations)(query)
+        arm = rotations[0].inv().apply([0, 0, .185])
+        target = np.column_stack([
+            np.interp(query, ts, positions[:, axis]) for axis in range(3)
+        ]) + body_rotation.apply(arm)
+        alignment = Rotation.from_euler('xyz', [.04, -.03, .6])
+        translation = np.array([7., -5., 1.])
+        scale = 4.6
+        centers = alignment.inv().apply(target-translation)/scale
+        rig = Rotation.from_euler('xyz', [.1, -.2, .7])
+        world_to_camera = (alignment.inv()*body_rotation*rig).inv().as_matrix()
+
+        fit, found_dt, accepted, rmse, _ = fit_timed_poses(
+            centers, world_to_camera, tc, ts, positions, rotations)
+
+        self.assertAlmostEqual(found_dt, dt, delta=.03)
+        self.assertAlmostEqual(fit[0], scale, delta=.01)
+        self.assertLess(rmse, .01)
+        self.assertGreaterEqual(int(accepted.sum()), 190)
+
     def test_recovers_clock_and_rig_despite_repeated_facade_matches(self):
         ts = np.linspace(0, 200, 2001)
         positions = np.column_stack((20*np.sin(ts/37), 12*np.cos(ts/23), .2*np.sin(ts/10)))

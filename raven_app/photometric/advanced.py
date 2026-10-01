@@ -22,6 +22,7 @@ GRID_LIMIT = 0.35
 IMAGE_SIZE = 3840.0
 _LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float64)
 _IDENTITY_H = np.eye(3, dtype=np.float64)
+ADVANCED_MODEL_REVISION = 2
 
 
 def _homography(rgb, h):
@@ -202,7 +203,8 @@ def _bilinear_design(obs, rgb, indices, target, lens_for_frame, nlenses):
         target_log.reshape(-1), rows2
 
 
-def _fit_shared_grids(obs, train_ix, source, targets, lens_for_frame, nlenses):
+def _fit_shared_grids(obs, train_ix, source, targets, lens_for_frame, nlenses,
+                      smoothness=2.0):
     keep = np.isfinite(targets[train_ix]).all(axis=1)
     ix = train_ix[keep]
     x, y = source[ix], targets[ix]
@@ -248,7 +250,7 @@ def _fit_shared_grids(obs, train_ix, source, targets, lens_for_frame, nlenses):
             ar += 1
     anchor = sparse.coo_matrix((anchor_vals, (anchor_rows, anchor_cols)),
                                shape=(ar, nlenses * 108)).tocsr()
-    reg = sparse.vstack((smooth * 2.0, sparse.eye(nlenses * 108) * 0.15,
+    reg = sparse.vstack((smooth * float(smoothness), sparse.eye(nlenses * 108) * 0.15,
                          anchor * 16.0), format='csr')
     solution = lsqr(sparse.vstack((weighted, reg), format='csr'),
                     np.r_[rhs, np.zeros(reg.shape[0])], atol=1e-5,
@@ -289,8 +291,44 @@ def _base_correct(obs, views, names):
     return np.clip(corrected, 0, 1)
 
 
-def fit_advanced(observations, names, lens_names, baseline, seed=20260929):
-    """Fit/select PPISP H and shared per-lens grids using a fixed point split."""
+def _apply_shared_grids(obs, source, grids, lens_for_frame, supported_frames):
+    """Apply per-lens grids only to frames with enough training support."""
+    output = np.asarray(source, dtype=np.float64).copy()
+    frame = obs['frame_id']
+    eligible = supported_frames[frame]
+    for lens in range(len(grids)):
+        ix = np.flatnonzero(eligible & (lens_for_frame[frame] == lens))
+        if not len(ix):
+            continue
+        correction = _grid_sample(grids[lens], np.clip(source[ix], 0, 1),
+                                  obs['u'][ix], obs['v'][ix])
+        output[ix] = np.clip(source[ix] * np.exp(
+            np.clip(correction, -GRID_LIMIT, GRID_LIMIT)), 0, 1)
+    return output
+
+
+def _choose_candidate(baseline, candidates):
+    """Choose an advanced model using validation RMSE and Delta E only."""
+    selected = ('gains-only', baseline, None, None, None)
+    for candidate in candidates:
+        name, score, corrected, homographies, grids = candidate
+        incumbent = selected[1]
+        if (score['linear_rmse'] < baseline['linear_rmse'] * .995 and
+                score['delta_e76_mean'] < baseline['delta_e76_mean'] and
+                score['linear_rmse'] < incumbent['linear_rmse'] * .995 and
+                score['delta_e76_mean'] < incumbent['delta_e76_mean']):
+            selected = candidate
+    return selected
+
+
+def fit_advanced(observations, names, lens_names, baseline, seed=20260929,
+                 grid_smoothness=2.0):
+    """Fit/select PPISP H and shared per-lens grids using a fixed point split.
+
+    Metrics include independent PPISP-only and grid-only fits on the same
+    point-level train/validation/test split, so the two components can be
+    compared without allowing either to see held-out points.
+    """
     started = time.perf_counter()
     obs = {k: np.asarray(v) for k, v in observations.items()}
     names = list(map(str, names))
@@ -339,58 +377,60 @@ def fit_advanced(observations, names, lens_names, baseline, seed=20260929):
     after_h = _apply_frame_homographies(x, obs['frame_id'], h_matrices)
     validation_before = _metrics(obs, validation, x)
     validation_h = _metrics(obs, validation, after_h)
-    selected = 'ppisp-homography'
-    best = after_h
     # Fit two camera grids jointly with strong smoothness and zero-mean anchors.
     train_ix = np.flatnonzero(train)
     target_h = _loo_targets(obs['point_id'], after_h, obs['weight'], train)
     grids = _fit_shared_grids(obs, train_ix, after_h, target_h,
-                              lens_for_frame, nlenses)
-    grid_after = after_h.copy()
-    eligible = supported_frames[obs['frame_id']]
-    for lens in range(nlenses):
-        ix = np.flatnonzero(eligible & (lens_for_frame[obs['frame_id']] == lens))
-        if not len(ix):
-            continue
-        correction = _grid_sample(grids[lens], np.clip(after_h[ix], 0, 1),
-                                  obs['u'][ix], obs['v'][ix])
-        grid_after[ix] = np.clip(after_h[ix] *
-                                 np.exp(np.clip(correction, -GRID_LIMIT, GRID_LIMIT)),
-                                 0, 1)
+                              lens_for_frame, nlenses,
+                              smoothness=grid_smoothness)
+    grid_after = _apply_shared_grids(obs, after_h, grids, lens_for_frame,
+                                     supported_frames)
     validation_grid = _metrics(obs, validation, grid_after)
-    if (validation_grid['linear_rmse'] < validation_h['linear_rmse'] * .995 and
-            validation_grid['delta_e76_mean'] < validation_h['delta_e76_mean'] and
-            validation_grid['linear_rmse'] < validation_before['linear_rmse'] * .995 and
-            validation_grid['delta_e76_mean'] < validation_before['delta_e76_mean']):
-        best = grid_after
-        selected = 'ppisp-bilateral-grid'
-        validation_after = validation_grid
-    elif validation_h['linear_rmse'] < validation_before['linear_rmse'] * .995 and \
-            validation_h['delta_e76_mean'] < validation_before['delta_e76_mean']:
-        validation_after = validation_h
-        grids[:] = 0
-    else:
-        selected = 'gains-only'
-        validation_after = validation_before
-        h_matrices[:] = _IDENTITY_H
-        grids[:] = 0
+
+    # Fit a second grid directly on the log-linear output for a true grid-only
+    # ablation. This fit uses the same train points and held-out partitions.
+    target_base = _loo_targets(obs['point_id'], x, obs['weight'], train)
+    grids_only = _fit_shared_grids(obs, train_ix, x, target_base,
+                                   lens_for_frame, nlenses,
+                                   smoothness=grid_smoothness)
+    grid_only_after = _apply_shared_grids(obs, x, grids_only, lens_for_frame,
+                                          supported_frames)
+    validation_grid_only = _metrics(obs, validation, grid_only_after)
+    # Select among independent candidates using validation only. Every
+    # advanced candidate must beat log-linear by at least 0.5% in RMSE and
+    # improve mean Delta E; tie-breaking keeps the incumbent model simpler.
+    candidates = (
+        ('ppisp-homography', validation_h, after_h, h_matrices, np.zeros_like(grids)),
+        ('bilateral-grid-only', validation_grid_only, grid_only_after,
+         np.broadcast_to(_IDENTITY_H, (len(names), 3, 3)).copy(), grids_only),
+        ('ppisp-bilateral-grid', validation_grid, grid_after, h_matrices, grids),
+    )
+    selected, validation_after, best, chosen_h, chosen_grids = _choose_candidate(
+        validation_before, candidates)
+    if selected == 'gains-only':
         best = x
+        chosen_h = np.broadcast_to(_IDENTITY_H, (len(names), 3, 3)).copy()
+        chosen_grids = np.zeros_like(grids)
     views = {}
     for frame, name in enumerate(names):
         base_coeff = dict(baseline['views'].get(name, {}))
         if support[frame] >= 16 and selected != 'gains-only':
-            base_coeff['ppisp_h'] = h_matrices[frame].reshape(-1).tolist()
-            base_coeff['bilateral_grid'] = grids[lens_for_frame[frame]].tolist()
+            if selected in ('ppisp-homography', 'ppisp-bilateral-grid'):
+                base_coeff['ppisp_h'] = chosen_h[frame].reshape(-1).tolist()
+            if selected in ('bilateral-grid-only', 'ppisp-bilateral-grid'):
+                base_coeff['bilateral_grid'] = chosen_grids[lens_for_frame[frame]].tolist()
         views[name] = base_coeff
-        report = dict(baseline)
+    report = dict(baseline)
     report.update({
         'schema': 2,
         'mode': 'ppisp-bilateral',
+        'advanced_model_revision': ADVANCED_MODEL_REVISION,
         'selected': selected,
         'variants': {
             'ppisp': 'no_crf_no_vig: exposure is provided by existing per-view gains; intensity-preserving RGI homography',
             'bilateral_grid': 'diagonal RGB log-gain grid, D4xH3xW3, trilinear XY/Rec.709-luminance sampling; shared per lens',
             'spirula_parity': 'reduced: Spirula default uses 12 affine values per grid cell and Rec.601 guidance',
+            'grid_smoothness': float(grid_smoothness),
         },
         'views': views,
         'metrics': {
@@ -412,5 +452,15 @@ def fit_advanced(observations, names, lens_names, baseline, seed=20260929):
             **baseline.get('timing', {}),
             'advanced_fit_seconds': round(time.perf_counter() - started, 3),
         },
+    })
+    report['metrics'].update({
+        'validation_off': _metrics(obs, validation, to_linear(obs['rgb'])),
+        'test_off': _metrics(obs, test, to_linear(obs['rgb'])),
+        'validation_loglinear': validation_before,
+        'test_loglinear': _metrics(obs, test, x),
+        'validation_grid_only': validation_grid_only,
+        'test_grid_only': _metrics(obs, test, grid_only_after),
+        'test_homography': _metrics(obs, test, after_h),
+        'test_bilateral': _metrics(obs, test, grid_after),
     })
     return report

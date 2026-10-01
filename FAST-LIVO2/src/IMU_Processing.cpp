@@ -518,6 +518,9 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
         /* Transform to the 'end' frame */
         M3D R_i(R_imu * Exp(angvel_avr, dt));
         V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - state_inout.pos_end);
+        if (T_ei.norm() > 0.5) {
+          T_ei = T_ei.normalized() * 0.5;
+        }
 
         V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
         // V3D P_compensate = Lid_rot_to_IMU.transpose() *

@@ -401,6 +401,23 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       total_residual += fabs(ptpl_list_[i].dis_to_plane_);
     }
     effct_feat_num_ = ptpl_list_.size();
+    if (effct_feat_num_ < 10)
+    {
+      // Degenerate scan: LiDAR plane constraints are insufficient.
+      // Damp propagated velocity to prevent runaway integration error.
+      state_.vel_end *= 0.5;
+      if (state_.vel_end.norm() > 3.0) {
+        state_.vel_end = state_.vel_end.normalized() * 3.0;
+      }
+      Eigen::Vector3d dpos = state_propagat.pos_end - state_.pos_end;
+      if (dpos.norm() > 0.3) {
+        state_.pos_end += dpos.normalized() * 0.3;
+      } else {
+        state_.pos_end = state_propagat.pos_end;
+      }
+      state_.rot_end = state_propagat.rot_end;
+      break;
+    }
     cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
          << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / effct_feat_num_ << endl;
 
@@ -472,6 +489,9 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
     int minRow, minCol;
     state_ += solution;
+    if (state_.vel_end.norm() > 4.0) {
+      state_.vel_end = state_.vel_end.normalized() * 4.0;
+    }
     auto rot_add = solution.block<3, 1>(0, 0);
     auto t_add = solution.block<3, 1>(3, 0);
     if ((rot_add.norm() * 57.3 < 0.01) && (t_add.norm() * 100 < 0.015)) { flg_EKF_converged = true; }
@@ -617,6 +637,7 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   for (uint i = 0; i < plsize; i++)
   {
     const pointWithVar p_v = input_points[i];
+    if ((p_v.point_w - state_.pos_end).norm() > 70.0) continue;
     float loc_xyz[3];
     for (int j = 0; j < 3; j++)
     {
@@ -669,13 +690,13 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
     }
     VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    bool is_sucess = false;
+    PointToPlane single_ptpl;
+    double prob = 0;
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
       VoxelOctoTree *current_octo = iter->second;
-      PointToPlane single_ptpl;
-      bool is_sucess = false;
-      double prob = 0;
       build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
       if (!is_sucess)
       {
@@ -689,19 +710,44 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
         auto iter_near = voxel_map_.find(near_position);
         if (iter_near != voxel_map_.end()) { build_single_residual(pv, iter_near->second, 0, is_sucess, prob, single_ptpl); }
       }
-      if (is_sucess)
+    }
+    else
+    {
+      // Sub-voxel neighbor fallback if primary cell is not yet mapped
+      float center_x = ((float)position.x + 0.5f) * voxel_size;
+      float center_y = ((float)position.y + 0.5f) * voxel_size;
+      float center_z = ((float)position.z + 0.5f) * voxel_size;
+      int dx = (pv.point_w[0] > center_x) ? 1 : -1;
+      int dy = (pv.point_w[1] > center_y) ? 1 : -1;
+      int dz = (pv.point_w[2] > center_z) ? 1 : -1;
+
+      const int offsets[7][3] = {
+        {dx, 0, 0}, {0, dy, 0}, {0, 0, dz},
+        {dx, dy, 0}, {dx, 0, dz}, {0, dy, dz},
+        {dx, dy, dz}
+      };
+      for (int k = 0; k < 7 && !is_sucess; ++k)
       {
-        mylock.lock();
-        useful_ptpl[i] = true;
-        all_ptpl_list[i] = single_ptpl;
-        mylock.unlock();
+        VOXEL_LOCATION npos(position.x + offsets[k][0], position.y + offsets[k][1], position.z + offsets[k][2]);
+        auto itn = voxel_map_.find(npos);
+        if (itn != voxel_map_.end())
+        {
+          build_single_residual(pv, itn->second, 0, is_sucess, prob, single_ptpl);
+        }
       }
-      else
-      {
-        mylock.lock();
-        useful_ptpl[i] = false;
-        mylock.unlock();
-      }
+    }
+    if (is_sucess)
+    {
+      mylock.lock();
+      useful_ptpl[i] = true;
+      all_ptpl_list[i] = single_ptpl;
+      mylock.unlock();
+    }
+    else
+    {
+      mylock.lock();
+      useful_ptpl[i] = false;
+      mylock.unlock();
     }
   }
   for (size_t i = 0; i < useful_ptpl.size(); i++)
@@ -947,7 +993,7 @@ void VoxelMapManager::mapSliding()
   return;
 }
 
-void VoxelMapManager::clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min )
+void VoxelMapManager::clearMemOutOfMap(const int64_t& x_max,const int64_t& x_min,const int64_t& y_max,const int64_t& y_min,const int64_t& z_max,const int64_t& z_min )
 {
   int delete_voxel_cout = 0;
   // double delete_time = 0;

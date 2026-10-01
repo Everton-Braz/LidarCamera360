@@ -399,7 +399,8 @@ class MaskSettingsDialog(QDialog):
     """Draw fixed rig exclusions on a preview; apply each to every frame of its lens."""
 
     def __init__(self, dataset_dir, config=None, parent=None, model_path=None,
-                 backend='vulkan', insv_path=None, fps=2.0):
+                 backend='vulkan', insv_path=None, fps=2.0, camera_names=(),
+                 auxiliary_sources=()):
         super().__init__(parent)
         self.insv_path = Path(insv_path) if insv_path else None
         self.fps = float(fps)
@@ -417,6 +418,12 @@ class MaskSettingsDialog(QDialog):
             and not has_cached_frame_extraction(self.insv_path, self.dataset_dir, self.fps)
         )
         self.config = normalize_mask_config(config)
+        self.auxiliary_sources = {}
+        for source in auxiliary_sources or ():
+            camera_name = (source.get('camera_name') if isinstance(source, dict)
+                           else getattr(source, 'camera_name', None))
+            if camera_name:
+                self.auxiliary_sources[str(camera_name)] = source
         self.model_path = model_path
         self.backend = backend
         self.preview_paths = {}
@@ -431,6 +438,9 @@ class MaskSettingsDialog(QDialog):
         self._pending_frame_extraction_index = None
         self._video_preview_timeline = ()
         self._video_preview_paths = {'cam0': {}, 'cam1': {}}
+        self._aux_video_preview_paths = {}
+        self._aux_video_preview_info = {}
+        self._aux_video_preview_temp = None
         self._video_preview_temp = None
         self._video_preview_root = None
         self._frame_extraction_timer = QTimer(self)
@@ -455,8 +465,22 @@ class MaskSettingsDialog(QDialog):
         controls.addWidget(BodyLabel(tr('Camera:')))
         self.camera_combo = ComboBox()
         cameras = ['cam0', 'cam1']
+        discovered_cameras = set()
         if self.dataset_dir and (self.dataset_dir / 'images').is_dir():
-            cameras = sorted(set(cameras) | {p.name for p in (self.dataset_dir / 'images').iterdir() if p.is_dir()})
+            discovered_cameras = {
+                p.name for p in (self.dataset_dir / 'images').iterdir() if p.is_dir()
+            }
+        for camera in camera_names or ():
+            name = str(camera).strip()
+            if name and name not in cameras:
+                cameras.append(name)
+        cameras.extend(sorted(
+            discovered_cameras - set(cameras),
+            key=lambda name: tuple(
+                (0, int(part)) if part.isdigit() else (1, part.lower())
+                for part in re.split(r'(\d+)', name)
+            ),
+        ))
         for camera in cameras:
             self.camera_combo.addItem(camera)
         self.camera_combo.currentTextChanged.connect(self._camera_changed)
@@ -544,7 +568,7 @@ class MaskSettingsDialog(QDialog):
         self.border_spin.valueChanged.connect(self._border_changed)
         self.canvas.border_percent = self.border_spin.value()
         border_row.addWidget(self.border_spin)
-        border_hint = CaptionLabel(tr('0% off; 1% excludes about 1% of image pixels. Applies to every camera.'))
+        border_hint = CaptionLabel(tr('0% off; 1% excludes about 1% of image pixels. Saved separately for each camera.'))
         border_hint.setWordWrap(True)
         border_hint.setMaximumWidth(360)
         border_row.addWidget(border_hint)
@@ -574,7 +598,13 @@ class MaskSettingsDialog(QDialog):
         ellipses = self.config['ellipses'].setdefault(camera, [])
         polygons = self.config['polygons'].setdefault(camera, [])
         self.canvas.set_shapes(boxes, ellipses, polygons)
-        if self._lazy_video_preview:
+        border = self.config['fisheye_border_percent_by_camera'].get(
+            camera, self.config['fisheye_border_percent'])
+        self.border_spin.blockSignals(True)
+        self.border_spin.setValue(border)
+        self.border_spin.blockSignals(False)
+        self.canvas.border_percent = border
+        if self._lazy_video_preview and camera in ('cam0', 'cam1'):
             index = self.frame_slider.value()
             count = len(self._video_preview_timeline)
             self.frame_slider.blockSignals(True)
@@ -600,6 +630,15 @@ class MaskSettingsDialog(QDialog):
             frames = []
         if camera in self.preview_paths:
             frames = [self.preview_paths[camera]]
+        if not frames and camera in self.auxiliary_sources:
+            source_path = Path(self._source_value(camera, 'source_path') or '')
+            if source_path.is_file() and source_path.suffix.lower() in (
+                    '.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'):
+                frames = [source_path]
+            elif source_path.is_dir():
+                frames = sorted((p for p in source_path.iterdir() if p.is_file()
+                                 and p.suffix.lower() in ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp')),
+                                key=self._natural_key)
         self.frames_by_camera[camera] = frames
         self.frame_slider.blockSignals(True)
         self.frame_slider.setRange(0, max(0, len(frames) - 1))
@@ -607,6 +646,8 @@ class MaskSettingsDialog(QDialog):
         self.frame_slider.setEnabled(len(frames) > 1)
         self.frame_slider.blockSignals(False)
         self._load_frame(0)
+        if not frames and camera in self.auxiliary_sources:
+            self._prepare_auxiliary_video_preview(camera)
         self.show_mask_button.setToolTip(tr('Preview mask'))
         self.show_mask_button.setAccessibleName(tr('Preview mask'))
         self.show_mask_button.setIcon(FluentIcon.VIEW)
@@ -617,6 +658,66 @@ class MaskSettingsDialog(QDialog):
             self.preview_status.setText(tr('No extracted frames found. Choose a preview image to see the mask.'))
         else:
             self.preview_status.setText('')
+
+    def _source_value(self, camera, key, default=None):
+        source = self.auxiliary_sources.get(camera)
+        return source.get(key, default) if isinstance(source, dict) else getattr(source, key, default)
+
+    def _prepare_auxiliary_video_preview(self, camera):
+        source_path = Path(self._source_value(camera, 'source_path') or '')
+        capture = cv2.VideoCapture(str(source_path))
+        if not capture.isOpened():
+            capture.release()
+            self.preview_status.setText(tr('Cannot load auxiliary camera preview. Check its source file.'))
+            return
+        native_fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        capture.release()
+        if total <= 0:
+            self.preview_status.setText(tr('Cannot read the auxiliary video timeline.'))
+            return
+        target_fps = float(self._source_value(camera, 'fps', self.fps) or self.fps or 1.0)
+        step = max(1, int(round(native_fps / target_fps)))
+        count = max(1, (total + step - 1) // step)
+        self._aux_video_preview_info[camera] = (source_path, step, count)
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setRange(0, count - 1)
+        self.frame_slider.setValue(0)
+        self.frame_slider.setEnabled(count > 1)
+        self.frame_slider.blockSignals(False)
+        self._load_auxiliary_video_preview(camera, 0)
+
+    def _load_auxiliary_video_preview(self, camera, index):
+        source_path, step, count = self._aux_video_preview_info[camera]
+        cached = self._aux_video_preview_paths.setdefault(camera, {}).get(index)
+        if cached is not None and cached.is_file():
+            self._current_source = cached
+            self.canvas.set_image(cached)
+            self.frame_label.setText(f'{index + 1}/{count}  {cached.name}')
+            self.preview_status.setText('')
+            return
+        capture = cv2.VideoCapture(str(source_path))
+        capture.set(cv2.CAP_PROP_POS_FRAMES, index * step)
+        ok, frame = capture.read()
+        capture.release()
+        if not ok or frame is None:
+            self._current_source = None
+            self.canvas.set_image(None)
+            self.frame_label.setText(tr('Frame unavailable'))
+            self.preview_status.setText(tr('Could not decode this auxiliary video frame.'))
+            return
+        if self._aux_video_preview_temp is None:
+            self._aux_video_preview_temp = tempfile.TemporaryDirectory(prefix='raven-mask-aux-preview-')
+        target = Path(self._aux_video_preview_temp.name) / camera / f'frame_{index + 1:06d}.jpg'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(target), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+            self.preview_status.setText(tr('Could not save the auxiliary camera preview frame.'))
+            return
+        self._aux_video_preview_paths[camera][index] = target
+        self._current_source = target
+        self.canvas.set_image(target)
+        self.frame_label.setText(f'{index + 1}/{count}  {target.name}')
+        self.preview_status.setText('')
 
     def _start_frame_extraction_if_needed(self):
         if self.insv_path is None:
@@ -796,7 +897,8 @@ class MaskSettingsDialog(QDialog):
         self.preview_timer.stop()
         self._stop_detection()
         self._person_masks.clear()
-        if self._lazy_video_preview:
+        camera = self.camera_combo.currentText()
+        if self._lazy_video_preview and camera in ('cam0', 'cam1'):
             self._video_selected_index = index
             if self._frame_extraction_process is not None and self._frame_extraction_index != index:
                 self._stop_frame_extraction()
@@ -820,6 +922,13 @@ class MaskSettingsDialog(QDialog):
                 self.show_mask_button.setToolTip(tr('Preview mask'))
                 self.show_mask_button.setAccessibleName(tr('Preview mask'))
                 self.show_mask_button.setIcon(FluentIcon.VIEW)
+            return
+        if camera in self._aux_video_preview_info:
+            self._load_auxiliary_video_preview(camera, index)
+            self.canvas.show_mask = was_mask
+            if was_mask and self._current_source is not None:
+                self._refresh_mask_preview()
+                self.preview_timer.start()
             return
         self._load_frame(index)
         self.canvas.show_mask = was_mask
@@ -876,6 +985,8 @@ class MaskSettingsDialog(QDialog):
         self.canvas.update()
 
     def _border_changed(self, value):
+        camera = self.camera_combo.currentText()
+        self.config['fisheye_border_percent_by_camera'][camera] = float(value)
         self.canvas.border_percent = value
         self.canvas.update()
         self._refresh_mask_preview()
@@ -1022,6 +1133,9 @@ class MaskSettingsDialog(QDialog):
             self._video_preview_temp.cleanup()
             self._video_preview_temp = None
             self._video_preview_root = None
+        if self._aux_video_preview_temp is not None:
+            self._aux_video_preview_temp.cleanup()
+            self._aux_video_preview_temp = None
         if self._frames_temp is not None:
             self._frames_temp.cleanup()
             self._frames_temp = None
@@ -1034,5 +1148,5 @@ class MaskSettingsDialog(QDialog):
         super().accept()
 
     def settings(self):
-        self.config['fisheye_border_percent'] = self.border_spin.value()
+        self.config['fisheye_border_percent_by_camera'][self.camera_combo.currentText()] = self.border_spin.value()
         return normalize_mask_config(self.config)
