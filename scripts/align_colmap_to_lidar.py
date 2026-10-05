@@ -185,10 +185,12 @@ def main():
 
     dataset_dir = args.dataset.resolve()
     colmap_dir = args.sparse.resolve() if args.sparse else find_sparse_dir(dataset_dir)
+    from raven_app.slam_source import active_slam_dir
+    selected_slam = active_slam_dir(dataset_dir)
     slam_file = args.trajectory.resolve() if args.trajectory else (
-        dataset_dir / "slam_out" / "result" / "trajectory.txt"
-        if (dataset_dir / "slam_out" / "result" / "trajectory.txt").is_file()
-        else dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
+        selected_slam / "result" / "trajectory.txt"
+        if (selected_slam / "result" / "trajectory.txt").is_file()
+        else selected_slam / "result" / "Raven_3DMakerPro_Scan.txt"
     )
     out_dir = args.output.resolve() if args.output else dataset_dir / "deliverables"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -285,7 +287,7 @@ def main():
     write_pcd(out_colmap_pcd, pts_metric, colors_filtered)
 
     # 6. Load Raw LiDAR SLAM Cloud and Export Combined Fusion
-    slam_pcd_path = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
+    slam_pcd_path = selected_slam / "pcd" / "all_raw_points.pcd"
     out_fusion_pcd = None
     if slam_pcd_path.exists():
         print(f"\n[*] Loading raw LiDAR SLAM point cloud for fusion...")

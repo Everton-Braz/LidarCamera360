@@ -90,7 +90,7 @@ class AddSourceDialog(QDialog):
         self.title_label = TitleLabel(tr("Add Source Image/Video"))
         self.desc_label = CaptionLabel(
             tr(
-                "Configure an auxiliary camera source (smartphone video or image sequence) "
+                "Configure an auxiliary camera source (smartphone or INSV video, or image sequence) "
                 "to supplement the dual fisheye cameras for high-resolution 3DGS multi-view coverage."
             )
         )
@@ -120,7 +120,7 @@ class AddSourceDialog(QDialog):
         source_layout.setContentsMargins(12, 10, 12, 10)
         source_layout.setSpacing(10)
 
-        source_title = SubtitleLabel(tr("1. Media Source (Video or Image Folder)"))
+        source_title = SubtitleLabel(tr("1. Media Source (Video, INSV, or Image Folder)"))
         source_title.setWordWrap(True)
         source_layout.addWidget(source_title)
 
@@ -136,9 +136,12 @@ class AddSourceDialog(QDialog):
         browse_buttons.setSpacing(8)
         self.btn_browse_video = PushButton(tr("Browse Video"), icon=FluentIcon.VIDEO)
         self.btn_browse_video.clicked.connect(self._browse_video)
+        self.btn_browse_insv = PushButton(tr("Browse INSV"), icon=FluentIcon.VIDEO)
+        self.btn_browse_insv.clicked.connect(self._browse_insv)
         self.btn_browse_folder = PushButton(tr("Browse Folder"), icon=FluentIcon.FOLDER)
         self.btn_browse_folder.clicked.connect(self._browse_folder)
         browse_buttons.addWidget(self.btn_browse_video, 0, Qt.AlignmentFlag.AlignLeft)
+        browse_buttons.addWidget(self.btn_browse_insv, 0, Qt.AlignmentFlag.AlignLeft)
         browse_buttons.addWidget(self.btn_browse_folder, 0, Qt.AlignmentFlag.AlignLeft)
         path_layout.addLayout(browse_buttons)
         source_layout.addLayout(path_layout)
@@ -209,6 +212,23 @@ class AddSourceDialog(QDialog):
         sync_grid.addWidget(sync_desc, 3, 1)
 
         sync_layout.addLayout(sync_grid)
+
+        self.insv_stream_label = BodyLabel(tr("INSV lens streams:"))
+        self.insv_stream_combo = ComboBox()
+        self.insv_stream_combo.addItems([
+            tr("Both lens streams (recommended)"),
+            tr("Lens stream 0"),
+            tr("Lens stream 1"),
+        ])
+        self.insv_stream_combo.setToolTip(
+            tr("Use both lenses from this INSV source, or select one lens stream.")
+        )
+        self.insv_stream_label.setVisible(False)
+        self.insv_stream_combo.setVisible(False)
+        stream_row = QHBoxLayout()
+        stream_row.addWidget(self.insv_stream_label)
+        stream_row.addWidget(self.insv_stream_combo, 1)
+        sync_layout.addLayout(stream_row)
         layout.addWidget(sync_card)
 
         # ----------------------------------------------------------------------
@@ -226,8 +246,11 @@ class AddSourceDialog(QDialog):
         model_row = QHBoxLayout()
         model_row.addWidget(BodyLabel(tr("Camera Model:")))
         self.model_combo = ComboBox()
-        self.model_combo.addItems(["PINHOLE", "OPENCV", "OPENCV_FISHEYE"])
+        self.model_combo.addItems(
+            ["PINHOLE", "OPENCV", "OPENCV_FISHEYE", "THIN_PRISM_FISHEYE"]
+        )
         self.model_combo.setMaximumWidth(190)
+        self.model_combo.currentTextChanged.connect(self._update_distortion_visibility)
         model_row.addWidget(self.model_combo)
         model_row.addStretch()
 
@@ -294,6 +317,31 @@ class AddSourceDialog(QDialog):
         intrin_grid.addWidget(self.cy_spin, 5, 1)
 
         opt_layout.addLayout(intrin_grid)
+
+        distortion_title = CaptionLabel(tr("Distortion coefficients (used by the selected model):"))
+        distortion_title.setWordWrap(True)
+        opt_layout.addWidget(distortion_title)
+        distortion_grid = QGridLayout()
+        distortion_grid.setHorizontalSpacing(8)
+        distortion_grid.setVerticalSpacing(5)
+        self.distortion_spins = {}
+        self._distortion_labels = {}
+        coefficient_names = ("k1", "k2", "p1", "p2", "k3", "k4", "sx1", "sy1")
+        for index, name in enumerate(coefficient_names):
+            row, pair = divmod(index, 2)
+            label_col = pair * 2
+            label = BodyLabel(f"{name}:")
+            spin = DoubleSpinBox()
+            spin.setRange(-10.0, 10.0)
+            spin.setDecimals(8)
+            spin.setSingleStep(0.001)
+            spin.setMaximumWidth(120)
+            distortion_grid.addWidget(label, row, label_col)
+            distortion_grid.addWidget(spin, row, label_col + 1)
+            self._distortion_labels[name] = label
+            self.distortion_spins[name] = spin
+        opt_layout.addLayout(distortion_grid)
+        self._update_distortion_visibility(self.model_combo.currentText())
         layout.addWidget(opt_card)
 
         # ----------------------------------------------------------------------
@@ -411,7 +459,17 @@ class AddSourceDialog(QDialog):
             self,
             tr("Select Auxiliary Video File"),
             "",
-            "Video files (*.mp4 *.mov *.avi *.mkv *.m4v);;All files (*.*)",
+            "Video files (*.mp4 *.mov *.avi *.mkv *.m4v *.insv);;All files (*.*)",
+        )
+        if file_path:
+            self._set_source(file_path)
+
+    def _browse_insv(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("Select Auxiliary Insta360 INSV File"),
+            "",
+            "Insta360 videos (*.insv);;All files (*.*)",
         )
         if file_path:
             self._set_source(file_path)
@@ -425,11 +483,43 @@ class AddSourceDialog(QDialog):
         if folder_path:
             self._set_source(folder_path)
 
+    def _update_insv_stream_combo(self, lens_count: int, selected_stream: Optional[int] = None):
+        self.insv_stream_combo.blockSignals(True)
+        self.insv_stream_combo.clear()
+        if lens_count <= 1:
+            self.insv_stream_combo.addItem(tr("Lens stream 0"))
+            self.insv_stream_combo.setCurrentIndex(0)
+        else:
+            self.insv_stream_combo.addItems([
+                tr("Both lens streams (recommended)"),
+                tr("Lens stream 0"),
+                tr("Lens stream 1"),
+            ])
+            if selected_stream is None:
+                self.insv_stream_combo.setCurrentIndex(0)
+            elif selected_stream in (0, 1):
+                self.insv_stream_combo.setCurrentIndex(selected_stream + 1)
+            else:
+                self.insv_stream_combo.setCurrentIndex(0)
+        self.insv_stream_combo.blockSignals(False)
+
     def _set_source(self, path: str):
         self.source_input.setText(path)
         try:
             meta = detect_source_metadata(path)
-            if meta["type"] == "video":
+            suffix = Path(path).suffix.lower()
+            is_insv = suffix == ".insv" or str(meta.get("type", "")).lower() == "insv"
+            self.insv_stream_label.setVisible(is_insv)
+            self.insv_stream_combo.setVisible(is_insv)
+            if is_insv:
+                self.model_combo.setCurrentText("THIN_PRISM_FISHEYE")
+                streams = int(meta.get("lens_count", 2) or 2)
+                self._update_insv_stream_combo(streams)
+                info = (
+                    f"INSV: {meta['width']}x{meta['height']}, "
+                    f"{streams} lens streams"
+                )
+            elif meta["type"] == "video":
                 info = (
                     f"Video: {meta['width']}x{meta['height']} @ {meta['fps']:.1f} fps, "
                     f"duration {meta['duration_s']:.1f}s ({meta['frame_count']} frames)"
@@ -441,22 +531,65 @@ class AddSourceDialog(QDialog):
             self.meta_label.setText(info)
             self.width_spin.setValue(meta["width"])
             self.height_spin.setValue(meta["height"])
-            self._auto_calculate_intrinsics()
+            self._auto_calculate_intrinsics(meta=meta, is_insv=is_insv)
         except Exception as e:
             self.meta_label.setText(f"[!] {e}")
 
-    def _auto_calculate_intrinsics(self):
+    def _update_distortion_visibility(self, model: str):
+        model = str(model or "PINHOLE").strip().upper()
+        if model == "THIN_PRISM_FISHEYE":
+            visible = {"k1", "k2", "p1", "p2", "k3", "k4", "sx1", "sy1"}
+        elif model == "OPENCV_FISHEYE":
+            visible = {"k1", "k2", "k3", "k4"}
+        elif model == "OPENCV":
+            visible = {"k1", "k2", "p1", "p2"}
+        else:
+            visible = set()
+        for name, spin in self.distortion_spins.items():
+            spin.setVisible(name in visible)
+            self._distortion_labels[name].setVisible(name in visible)
+
+    def _auto_calculate_intrinsics(self, *, meta=None, is_insv=False):
         w = int(self.width_spin.value())
         h = int(self.height_spin.value())
         intrin = default_smartphone_intrinsics(w, h)
+        supplied = {}
+        if isinstance(meta, dict):
+            candidate = meta.get("intrinsics")
+            if isinstance(candidate, dict):
+                supplied.update(candidate)
+            supplied.update({
+                key: meta[key]
+                for key in ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "k4", "sx1", "sy1")
+                if key in meta
+            })
+        for key in ("fx", "fy", "cx", "cy"):
+            if key in supplied:
+                intrin[key] = float(supplied[key])
         self.fx_spin.setValue(intrin["fx"])
         self.fy_spin.setValue(intrin["fy"])
         self.cx_spin.setValue(intrin["cx"])
         self.cy_spin.setValue(intrin["cy"])
+        for name, spin in self.distortion_spins.items():
+            spin.setValue(float(supplied.get(name, 0.0)))
 
     def _load_from_config(self, cfg: ThirdCameraConfig):
         self.cam_name_input.setText(cfg.camera_name or "cam2")
         self.source_input.setText(cfg.source_path or "")
+        source_is_insv = (
+            str(cfg.source_type or "").lower() == "insv"
+            or Path(cfg.source_path or "").suffix.lower() == ".insv"
+        )
+        self.insv_stream_label.setVisible(source_is_insv)
+        self.insv_stream_combo.setVisible(source_is_insv)
+        stream_index = getattr(cfg, "source_stream_index", None)
+        try:
+            stream_index = None if stream_index is None else int(stream_index)
+        except (TypeError, ValueError):
+            stream_index = None
+        self.insv_stream_combo.setCurrentIndex(
+            0 if stream_index not in (0, 1) else stream_index + 1
+        )
         self.enabled_check.setChecked(cfg.enabled)
         self.fps_spin.setValue(cfg.fps or 2.0)
         self.time_offset_spin.setValue(cfg.time_offset_s or 0.0)
@@ -474,6 +607,9 @@ class AddSourceDialog(QDialog):
         self.fy_spin.setValue(float(intr.get("fy", 1536.0)))
         self.cx_spin.setValue(float(intr.get("cx", 960.0)))
         self.cy_spin.setValue(float(intr.get("cy", 540.0)))
+        for name, spin in self.distortion_spins.items():
+            spin.setValue(float(intr.get(name, 0.0)))
+        self._update_distortion_visibility(self.model_combo.currentText())
 
         # Extrinsics
         T = np.array(cfg.T_lidar_to_cam2_rigid_4x4)
@@ -489,7 +625,17 @@ class AddSourceDialog(QDialog):
         if cfg.source_path and Path(cfg.source_path).exists():
             try:
                 meta = detect_source_metadata(cfg.source_path)
-                if meta["type"] == "video":
+                if (Path(cfg.source_path).suffix.lower() == ".insv"
+                        or str(meta.get("type", "")).lower() == "insv"):
+                    streams = int(meta.get("lens_count", 2) or 2)
+                    self.meta_label.setText(
+                        f"INSV: {meta['width']}x{meta['height']}, "
+                        f"{streams} lens streams"
+                    )
+                    self.insv_stream_label.setVisible(True)
+                    self.insv_stream_combo.setVisible(True)
+                    self._update_insv_stream_combo(streams, stream_index)
+                elif meta["type"] == "video":
                     self.meta_label.setText(
                         f"Video: {meta['width']}x{meta['height']} @ {meta['fps']:.1f} fps, "
                         f"{meta['duration_s']:.1f}s ({meta['frame_count']} frames)"
@@ -507,6 +653,8 @@ class AddSourceDialog(QDialog):
         src_type = "video"
         if src_path and Path(src_path).is_dir():
             src_type = "folder"
+        elif src_path and Path(src_path).suffix.lower() == ".insv":
+            src_type = "insv"
 
         # Build 4x4 rigid transformation
         R = Rot.from_euler(
@@ -532,8 +680,12 @@ class AddSourceDialog(QDialog):
             "p1": 0.0,
             "p2": 0.0,
         }
+        intrinsics.update({
+            name: float(spin.value())
+            for name, spin in self.distortion_spins.items()
+        })
 
-        return ThirdCameraConfig(
+        config = ThirdCameraConfig(
             camera_name=self.cam_name_input.text().strip() or "cam2",
             source_path=src_path,
             source_type=src_type,
@@ -545,6 +697,16 @@ class AddSourceDialog(QDialog):
             T_lidar_to_cam2_rigid_4x4=T.tolist(),
             description=f"Auxiliary source ({self.cam_name_input.text().strip()})",
         )
+        if src_type != "insv":
+            stream_index = None
+        elif self.insv_stream_combo.count() == 1:
+            stream_index = 0
+        elif self.insv_stream_combo.currentIndex() == 0:
+            stream_index = None
+        else:
+            stream_index = self.insv_stream_combo.currentIndex() - 1
+        config.source_stream_index = stream_index
+        return config
 
     def _load_json(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -597,7 +759,7 @@ class AddSourceDialog(QDialog):
         if cfg.enabled and not cfg.source_path:
             InfoBar.warning(
                 title=tr("Missing Media Source"),
-                content=tr("Please select a video file or image folder, or disable auxiliary source."),
+                content=tr("Please select a video, INSV file, or image folder, or disable auxiliary source."),
                 parent=self,
                 position=InfoBarPosition.TOP,
                 duration=3500,

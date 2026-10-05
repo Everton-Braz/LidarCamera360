@@ -388,6 +388,32 @@ class TestThirdCamera(unittest.TestCase):
         self.assertIsNone(estimated)
         self.assertIn("comparable rigid-pose consensus", details["reason"])
 
+    def test_clock_search_keeps_residuals_for_rejected_population(self):
+        rotations = [np.eye(3) for _ in range(39)]
+        translations = [np.array([0.3, float(index - 19), 0.2]) for index in range(39)]
+        rotation, translation, quality = _pose_consensus(rotations, translations)
+        self.assertIsNone(rotation)
+        self.assertIsNone(translation)
+        self.assertEqual(quality['accepted_poses'], 1)
+        self.assertEqual(quality['translation_p90_m'], 0)
+        self.assertGreater(quality['translation_all_p70_m'], 10)
+
+    def test_auxiliary_thin_prism_intrinsics_and_text_export(self):
+        from raven_app.third_camera import _third_camera_intrinsics_from_colmap
+        params = [900, 910, 1000, 1001, .01, .02, .03, .04, .05, .06, .07, .08]
+        model, intrinsics = _third_camera_intrinsics_from_colmap(
+            {'model_id': 10, 'width': 2000, 'height': 2000, 'params': params})
+        self.assertEqual(model, 'THIN_PRISM_FISHEYE')
+        self.assertEqual(intrinsics['sx1'], .07)
+        self.assertEqual(intrinsics['p1'], .03)
+        config = ThirdCameraConfig(camera_model=model, intrinsics=intrinsics, source_stream_index=1)
+        self.assertEqual(ThirdCameraConfig.from_dict(config.to_dict()).source_stream_index, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            inject_third_camera_into_colmap(Path(tmp), config, [], camera_id=3)
+            tokens = (Path(tmp) / 'cameras.txt').read_text().strip().split()
+            self.assertEqual(tokens[1], model)
+            np.testing.assert_allclose([float(value) for value in tokens[4:]], params)
+
     def test_inject_third_camera_into_colmap(self):
         with tempfile.TemporaryDirectory() as tmp:
             sparse_out = Path(tmp) / "sparse" / "0"

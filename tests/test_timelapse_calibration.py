@@ -97,6 +97,32 @@ class TimelapseCalibrationTests(unittest.TestCase):
         self.assertGreater(accepted.sum(),65)
         self.assertAlmostEqual(fit[0],scale,delta=.01)
 
+    def test_refines_gyro_hint_inside_local_window_before_consensus_gate(self):
+        rng = np.random.default_rng(27)
+        ts = np.linspace(0, 100, 10001)
+        positions = np.vstack((
+            np.zeros(3), np.cumsum(rng.normal(0, .018, size=(len(ts)-1, 3)), axis=0)))
+        rotations = Rotation.identity(len(ts))
+        tc = np.arange(10., 90.)
+        dt = 6.25
+        query = tc - dt
+        target = np.column_stack([
+            np.interp(query, ts, positions[:, axis]) for axis in range(3)
+        ]) + np.array([0., 0., .185])
+        alignment = Rotation.from_euler('xyz', [.04, -.03, .6])
+        translation = np.array([7., -5., 1.])
+        scale = 4.6
+        centers = alignment.inv().apply(target-translation)/scale
+
+        fit, found_dt, accepted, rmse, _ = fit_timed_poses(
+            centers, Rotation.identity(len(tc)).as_matrix(), tc,
+            ts, positions, rotations, dt_hint=7.75)
+
+        self.assertAlmostEqual(found_dt, dt, delta=.01)
+        self.assertAlmostEqual(fit[0], scale, delta=.01)
+        self.assertLess(rmse, .01)
+        self.assertEqual(int(accepted.sum()), len(tc))
+
     def test_rejects_unrelated_reconstruction(self):
         rng=np.random.default_rng(5)
         ts=np.linspace(0,100,101)

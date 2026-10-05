@@ -4,9 +4,12 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,6 +29,35 @@ namespace native {
 inline std::string output_root;
 inline int threads=4;
 inline YAML::Node config, camera;
+inline std::ofstream scan_provenance_file;
+inline std::uint64_t scan_provenance_end=0;
+inline double scan_provenance_last_timestamp=-std::numeric_limits<double>::infinity();
+inline void open_scan_provenance(const std::string& path) {
+  if (scan_provenance_file.is_open()) throw std::runtime_error("scan provenance file is already open");
+  scan_provenance_file.open(path, std::ios::out | std::ios::trunc);
+  if (!scan_provenance_file) throw std::runtime_error("cannot create scan provenance sidecar: " + path);
+  scan_provenance_file << "timestamp,point_start,point_count\n";
+}
+inline void append_scan_provenance(double timestamp, std::uint64_t point_start, std::uint64_t point_count) {
+  if (!scan_provenance_file.is_open()) throw std::runtime_error("scan provenance sidecar is not open");
+  if (!std::isfinite(timestamp) || timestamp < scan_provenance_last_timestamp || point_count == 0)
+    throw std::runtime_error("invalid scan provenance timestamp or point count");
+  if (point_start != scan_provenance_end)
+    throw std::runtime_error("scan provenance point range is not contiguous with the raw cloud");
+  scan_provenance_file << std::fixed << std::setprecision(6)
+                       << timestamp << ',' << point_start << ',' << point_count << '\n';
+  scan_provenance_end += point_count;
+  scan_provenance_last_timestamp = timestamp;
+}
+inline void finish_scan_provenance(std::uint64_t expected_points) {
+  if (!scan_provenance_file.is_open()) return;
+  scan_provenance_file.flush();
+  if (!scan_provenance_file) throw std::runtime_error("failed to flush scan provenance sidecar");
+  if (scan_provenance_end != expected_points)
+    throw std::runtime_error("scan provenance ranges do not cover the complete raw cloud");
+  scan_provenance_file.close();
+  if (scan_provenance_file.fail()) throw std::runtime_error("failed to close scan provenance sidecar");
+}
 inline YAML::Node parameter(const std::string& key) {
   YAML::Node n = YAML::Clone(config);
   size_t begin=0;

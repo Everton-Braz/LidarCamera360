@@ -67,7 +67,10 @@ def frame_time(dataset_dir, name, fps=2.0):
         key = str(name).replace('\\', '/')
         if key in data:
             return float(data[key])
-        if json.loads(manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse':
+        metadata = json.loads(manifest.read_text(encoding='utf-8'))
+        camera_name = key.split('/')[0]
+        time_source = metadata.get('time_sources', {}).get(camera_name, metadata.get('time_source'))
+        if time_source == 'insv_timelapse':
             raise KeyError(f'No capture timestamp for {key}')
     digits = ''.join(filter(str.isdigit, Path(name).stem))
     return (int(digits) - 1) / fps

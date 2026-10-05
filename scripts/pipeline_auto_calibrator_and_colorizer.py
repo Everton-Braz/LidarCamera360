@@ -32,6 +32,7 @@ from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
 from scipy.ndimage import minimum_filter
 from raven_app.video import frame_time
+from raven_app.slam_source import active_slam_dir
 from raven_app.person_masks import load_keep_mask, keep_samples, masked_operator_keep
 from raven_app.vulkan_engine import get_vulkan_bin, colorize_views
 
@@ -41,7 +42,33 @@ if hasattr(sys.stdout, 'reconfigure'):
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 SPIRULA_EXE = WORKSPACE_DIR / "spirula" / "spirula.exe"
 DEFAULT_CALIB_JSON = WORKSPACE_DIR / "calibracao_rigida_raven_insta360.json"
-CALIBRATION_VERSION = 2
+CALIBRATION_VERSION = 3
+
+
+def _active_slam_signature(dataset_dir, *, trajectory_path=None, cloud_path=None,
+                           include_cloud=None):
+    """Fingerprint the exact trajectory/cloud used for an alignment.
+
+    Sample-SfM alignments may use the parent dataset's trajectory without
+    copying a multi-gigabyte cloud. In that case the trajectory remains the
+    full source signature and the cloud is deliberately omitted.
+    """
+    trajectory = Path(trajectory_path) if trajectory_path is not None else get_slam_trajectory_path(dataset_dir)
+    signature = {'trajectory': str(trajectory.resolve()),
+                 'trajectory_mtime_ns': trajectory.stat().st_mtime_ns}
+    if include_cloud is None:
+        include_cloud = cloud_path is not None
+        if cloud_path is None:
+            try:
+                candidate = active_slam_dir(dataset_dir) / 'pcd' / 'all_raw_points.pcd'
+                include_cloud = candidate.is_file()
+            except (FileNotFoundError, ValueError):
+                include_cloud = False
+    if include_cloud:
+        cloud = Path(cloud_path) if cloud_path is not None else (
+            active_slam_dir(dataset_dir) / 'pcd' / 'all_raw_points.pcd')
+        signature.update(cloud=str(cloud.resolve()), cloud_mtime_ns=cloud.stat().st_mtime_ns)
+    return signature
 
 
 # ==============================================================================
@@ -88,7 +115,7 @@ def load_pcd(path):
 
 def get_slam_trajectory_path(dataset_dir):
     """Find the SLAM trajectory file dynamically regardless of scanner model."""
-    result_dir = Path(dataset_dir) / "slam_out" / "result"
+    result_dir = active_slam_dir(dataset_dir) / "result"
     for name in ("Eagle_Scan.txt", "Eagle_X6_Scan.txt", "Raven_3DMakerPro_Scan.txt", "trajectory.txt"):
         p = result_dir / name
         if p.is_file():
@@ -131,6 +158,36 @@ def _colorization_camera_params(camera):
     marker = -999.0 if model == 'PINHOLE' else -998.0 if model == 'OPENCV' else 0.0
     return tuple(float(intr.get(key, 0.0)) for key in
                  ('fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2', 'k3', 'k4')) + (0.0, marker)
+
+
+def _auxiliary_colorization_camera_params(camera):
+    """Pack an auxiliary camera's selected model into the shared CPU/Vulkan protocol."""
+    model = str(camera.camera_model or 'PINHOLE').strip().upper()
+    intr = camera.intrinsics
+    supported = {'PINHOLE', 'OPENCV', 'OPENCV_FISHEYE', 'THIN_PRISM_FISHEYE'}
+    if model not in supported:
+        raise ValueError(f'Unsupported auxiliary camera model: {camera.camera_model}')
+
+    base = [float(intr[key]) for key in ('fx', 'fy', 'cx', 'cy')]
+    if not np.isfinite(base).all() or min(base[:2]) <= 0:
+        raise ValueError(f'Invalid auxiliary camera intrinsics for {camera.camera_name}')
+    get = lambda key: float(intr.get(key, 0.0))
+
+    if model == 'PINHOLE':
+        distortion = [0.0] * 7 + [-999.0]
+    elif model == 'OPENCV':
+        distortion = [get('k1'), get('k2'), get('p1'), get('p2'), 0.0, 0.0, 0.0, -998.0]
+    elif model == 'OPENCV_FISHEYE':
+        distortion = [get('k1'), get('k2'), 0.0, 0.0,
+                      get('k3'), get('k4'), 0.0, 0.0]
+    else:
+        distortion = [get(key) for key in
+                      ('k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'sx1', 'sy1')]
+
+    params = tuple(base + distortion)
+    if len(params) != 12 or not np.isfinite(params).all():
+        raise ValueError(f'Invalid auxiliary camera distortion for {camera.camera_name}')
+    return params
 
 
 def load_colmap_images(images_bin):
@@ -451,7 +508,7 @@ def _spirula_auxiliary_flags(dataset_dir, auxiliary_cameras=None):
         if not camera.enabled or not any((Path(dataset_dir) / 'images' / camera.camera_name).glob('*.jpg')):
             continue
         model = camera.camera_model.lower().replace('_', '-')
-        if model not in ('pinhole', 'opencv', 'opencv-fisheye'):
+        if model not in ('pinhole', 'opencv', 'opencv-fisheye', 'thin-prism-fisheye'):
             raise ValueError(f'Unsupported auxiliary camera model: {camera.camera_model}')
         focal = float(camera.intrinsics['fx'])
         if not math.isfinite(focal) or focal <= 0:
@@ -459,14 +516,20 @@ def _spirula_auxiliary_flags(dataset_dir, auxiliary_cameras=None):
         flags.extend(['--camera-model', f'{camera.camera_name}={model}',
                       '--focal', f'{camera.camera_name}={focal:g}'])
         if model != 'pinhole':
-            keys = ('k1', 'k2', 'k3', 'k4') if model == 'opencv-fisheye' else ('k1', 'k2', 'p1', 'p2')
+            keys = {
+                'opencv-fisheye': ('k1', 'k2', 'k3', 'k4'),
+                'opencv': ('k1', 'k2', 'p1', 'p2'),
+                'thin-prism-fisheye': (
+                    'k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'sx1', 'sy1'),
+            }[model]
             values = ','.join(f'{float(camera.intrinsics.get(key, 0)):g}' for key in keys)
             flags.extend(['--distortion', f'{camera.camera_name}={values}'])
         print(f'[*] SfM camera {camera.camera_name}: {model}, focal prior {focal:g} px')
     return flags
 
 
-def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None, force_rebuild=False):
+def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None,
+                         force_rebuild=False, allow_partial_calibration=False):
     """Executa o Spirula Studio via CLI se a pasta sparse/0 não existir"""
     dataset_dir = Path(dataset_dir)
     auxiliary_flags = _spirula_auxiliary_flags(dataset_dir, auxiliary_cameras)
@@ -515,8 +578,23 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None, 
     t0 = time.time()
     from raven_app.subprocess_utils import run_hidden_stream
     code = run_hidden_stream(cmd)
-    if code != 0 or not all((sparse_dir / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin")):
+    model_files_present = all(
+        (sparse_dir / name).is_file()
+        for name in ("cameras.bin", "images.bin", "points3D.bin"))
+    if code != 0:
+        if code == 3 and allow_partial_calibration and model_files_present:
+            cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
+            if not cameras:
+                print("[!] Spirula partial sample has no valid COLMAP cameras")
+                return False
+            _validate_sfm_camera_models(sparse_dir, auxiliary_flags)
+            print("[!] Spirula returned code 3; retaining sparse/0 only as a sample-calibration candidate. "
+                  "Per-camera coverage and SLAM rig-calibration gates are still required.")
+            return True
         print(f"[!] Spirula SFM exited with code {code}")
+        return False
+    if not model_files_present:
+        print("[!] Spirula SFM did not produce a complete sparse/0 model")
         return False
 
     cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
@@ -530,7 +608,12 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None, 
 def _validate_sfm_camera_models(sparse_dir, auxiliary_flags):
     cameras = load_colmap_cameras(sparse_dir / 'cameras.bin')
     expected = {'cam0': 10, 'cam1': 10}
-    model_ids = {'pinhole': 1, 'opencv': 4, 'opencv-fisheye': 5}
+    model_ids = {
+        'pinhole': 1,
+        'opencv': 4,
+        'opencv-fisheye': 5,
+        'thin-prism-fisheye': 10,
+    }
     for index, flag in enumerate(auxiliary_flags):
         if flag == '--camera-model':
             prefix, model = auxiliary_flags[index + 1].split('=', 1)
@@ -547,10 +630,16 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
     manifest = dataset_dir / 'images/frames.json'
     if manifest.is_file() and json.loads(manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse':
         from raven_app.timelapse_calibration import align_dataset
-        return align_dataset(dataset_dir, dt_hint, trajectory_path=trajectory_path)
+        result = align_dataset(dataset_dir, dt_hint, trajectory_path=trajectory_path)
+        source_trajectory = Path(trajectory_path) if trajectory_path is not None else get_slam_trajectory_path(dataset_dir)
+        result['slam_source_signature'] = _active_slam_signature(
+            dataset_dir, trajectory_path=source_trajectory, include_cloud=False)
+        (dataset_dir / 'colmap_to_lidar_alignment.json').write_text(
+            json.dumps(result, indent=2), encoding='utf-8')
+        return result
     sparse_dir = dataset_dir / "sparse" / "0"
-    slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
-    slam_trj = get_slam_trajectory_path(dataset_dir)
+    slam_trj = Path(trajectory_path) if trajectory_path is not None else get_slam_trajectory_path(dataset_dir)
+    slam_pcd = (active_slam_dir(dataset_dir) / "pcd" / "all_raw_points.pcd") if use_icp else None
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
     print("=" * 80)
@@ -559,7 +648,7 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
 
     pts_colmap, rgb_colmap = load_colmap_points(sparse_dir / "points3D.bin")
     pts_lidar = load_pcd(slam_pcd) if use_icp else None
-    t_slam, pos_slam, rot_slam = load_trajectory(trajectory_path or slam_trj)
+    t_slam, pos_slam, rot_slam = load_trajectory(slam_trj)
     col_imgs = load_colmap_images(sparse_dir / "images.bin")
 
     # Filtrar cam0 para busca temporal
@@ -676,6 +765,9 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
 
     align_data = {
         "calibration_version": CALIBRATION_VERSION,
+        "slam_source_signature": _active_slam_signature(
+            dataset_dir, trajectory_path=slam_trj, cloud_path=slam_pcd,
+            include_cloud=use_icp),
         "frame_time_source": json.loads((dataset_dir / "images" / "frames.json").read_text(encoding="utf-8")).get("time_source", "video_pts") if (dataset_dir / "images" / "frames.json").is_file() else "legacy_frame_rate",
         "initial_camera_lever_body_m": c_L_phys.tolist(),
         "trajectory_rmse_cm": float(best_rmse * 100),
@@ -696,204 +788,268 @@ def current_alignment(dataset_dir, fps=2.0):
     """Upgrade alignments made with the old inverted lever initialization."""
     path = dataset_dir / "colmap_to_lidar_alignment.json"
     saved = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+    saved_signature = saved.get('slam_source_signature') or {}
+    trajectory = None
+    cloud = None
+    try:
+        candidate = get_slam_trajectory_path(dataset_dir)
+        if candidate.is_file():
+            trajectory = candidate
+    except (FileNotFoundError, ValueError):
+        pass
+    if trajectory is None and not (dataset_dir / 'active_slam.json').is_file():
+        candidate = Path(saved_signature['trajectory']) if saved_signature.get('trajectory') else None
+        if candidate is not None and candidate.is_file():
+            trajectory = candidate
+
+    uses_cloud = 'cloud' in saved_signature
+    if not saved_signature:
+        try:
+            cloud = active_slam_dir(dataset_dir) / 'pcd' / 'all_raw_points.pcd'
+            uses_cloud = cloud.is_file()
+        except (FileNotFoundError, ValueError):
+            uses_cloud = False
+    if uses_cloud:
+        try:
+            candidate = active_slam_dir(dataset_dir) / 'pcd' / 'all_raw_points.pcd'
+            if candidate.is_file():
+                cloud = candidate
+        except (FileNotFoundError, ValueError):
+            pass
+        if cloud is None and not (dataset_dir / 'active_slam.json').is_file():
+            candidate = Path(saved_signature['cloud'])
+            if candidate.is_file():
+                cloud = candidate
+
+    active_signature = None
+    if trajectory is not None and (not uses_cloud or cloud is not None):
+        active_signature = _active_slam_signature(
+            dataset_dir, trajectory_path=trajectory, cloud_path=cloud,
+            include_cloud=uses_cloud)
+    if saved_signature != active_signature:
+        if trajectory is None:
+            trajectory = get_slam_trajectory_path(dataset_dir)
+        return align_colmap_to_lidar(
+            dataset_dir, fps, saved.get('dt_sync_seconds'),
+            trajectory_path=trajectory, use_icp=uses_cloud)
     manifest = dataset_dir / "images" / "frames.json"
     source = json.loads(manifest.read_text(encoding='utf-8')).get('time_source', 'video_pts') if manifest.is_file() else 'legacy_frame_rate'
     if source == 'insv_timelapse':
         from raven_app.timelapse_calibration import VERSION
         if saved.get('timelapse_calibration_version') != VERSION or saved.get('quality_status') != 'accepted':
-            return align_colmap_to_lidar(dataset_dir, fps, saved.get('dt_sync_seconds'))
+            return align_colmap_to_lidar(
+                dataset_dir, fps, saved.get('dt_sync_seconds'),
+                trajectory_path=trajectory, use_icp=uses_cloud)
     if saved.get('calibration_version') != CALIBRATION_VERSION:
-        return align_colmap_to_lidar(dataset_dir, fps, saved.get('dt_sync_seconds'))
+        return align_colmap_to_lidar(
+            dataset_dir, fps, saved.get('dt_sync_seconds'),
+            trajectory_path=trajectory, use_icp=uses_cloud)
     return saved
 
 
-def transform_colmap_to_metric(src_dir: Path, dst_dir: Path, s_sim: float, R_sim: np.ndarray, t_sim: np.ndarray):
-    """Converte o modelo esparso COLMAP do Spirula para o referencial MÉTRICO do LiDAR"""
+def transform_colmap_to_metric(src_dir: Path, dst_dir: Path, s_sim: float, R_sim: np.ndarray,
+                               t_sim: np.ndarray, include_images=None):
+    """Transform COLMAP into LiDAR metric space, filtering poses without orphaned tracks."""
+    from raven_app.third_camera import _COLMAP_CAMERA_MODEL_NAMES, _COLMAP_CAMERA_PARAM_COUNTS
+
+    src_dir, dst_dir = Path(src_dir), Path(dst_dir)
     dst_dir.mkdir(parents=True, exist_ok=True)
+    scale = float(s_sim)
+    rotation = np.asarray(R_sim, dtype=np.float64)
+    translation = np.asarray(t_sim, dtype=np.float64)
+    if (not np.isfinite(scale) or scale <= 0 or rotation.shape != (3, 3)
+            or translation.shape != (3,) or not np.all(np.isfinite(rotation))
+            or not np.all(np.isfinite(translation))
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-3)
+            or np.linalg.det(rotation) <= 0):
+        raise ValueError('Invalid Sim(3) alignment for COLMAP transform')
+    allowed = None if include_images is None else {str(name).replace('\\', '/') for name in include_images}
 
-    # 1. Cameras
-    cams_bin = src_dir / "cameras.bin"
-    cameras = {}
-    if cams_bin.exists():
-        with open(cams_bin, "rb") as f:
-            num_cams = struct.unpack("<Q", f.read(8))[0]
-            for _ in range(num_cams):
-                cid, mid, w, h = struct.unpack("<iiQQ", f.read(24))
-                n_params = 12 if mid == 10 else (8 if mid == 9 else 4)
-                params = struct.unpack(f"<{n_params}d", f.read(n_params * 8))
-                cameras[cid] = {"model_id": mid, "width": w, "height": h, "params": params}
+    cameras = []
+    with (src_dir / 'cameras.bin').open('rb') as stream:
+        camera_count = struct.unpack('<Q', stream.read(8))[0]
+        for _ in range(camera_count):
+            header = stream.read(24)
+            if len(header) != 24:
+                raise ValueError('Truncated COLMAP cameras.bin')
+            camera_id, model_id, width, height = struct.unpack('<iiQQ', header)
+            param_count = _COLMAP_CAMERA_PARAM_COUNTS.get(model_id)
+            if param_count is None:
+                raise ValueError(f'Unsupported COLMAP camera model id: {model_id}')
+            raw = stream.read(param_count * 8)
+            if len(raw) != param_count * 8:
+                raise ValueError('Truncated COLMAP camera parameters')
+            params = struct.unpack(f'<{param_count}d', raw)
+            cameras.append((camera_id, model_id, width, height, params))
+    with (dst_dir / 'cameras.bin').open('wb') as stream:
+        stream.write(struct.pack('<Q', len(cameras)))
+        for camera_id, model_id, width, height, params in cameras:
+            stream.write(struct.pack('<iiQQ', camera_id, model_id, width, height))
+            stream.write(struct.pack(f'<{len(params)}d', *params))
+    with (dst_dir / 'cameras.txt').open('w', encoding='utf-8') as stream:
+        stream.write('# Camera list with one line of data per camera:\n')
+        stream.write('#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n')
+        for camera_id, model_id, width, height, params in cameras:
+            model = _COLMAP_CAMERA_MODEL_NAMES[model_id]
+            stream.write(f"{camera_id} {model} {width} {height} "
+                         f"{' '.join(format(value, '.17g') for value in params)}\n")
 
-        # Salvar cameras.txt com modelo OPENCV_FISHEYE universal para 3DGS
-        with open(dst_dir / "cameras.txt", "w", encoding="utf-8") as f:
-            f.write("# Camera list with one line of data per camera:\n")
-            f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-            for cid, c in cameras.items():
-                p = c["params"]
-                if c["model_id"] == 10 and len(p) >= 12:
-                    # fx, fy, cx, cy, k1, k2, k3, k4
-                    f.write(f"{cid} OPENCV_FISHEYE {c['width']} {c['height']} {p[0]} {p[1]} {p[2]} {p[3]} {p[4]} {p[5]} {p[8]} {p[9]}\n")
-                elif c["model_id"] == 9 and len(p) >= 8:
-                    f.write(f"{cid} OPENCV_FISHEYE {c['width']} {c['height']} {' '.join(str(x) for x in p[:8])}\n")
-                else:
-                    f.write(f"{cid} PINHOLE {c['width']} {c['height']} {' '.join(str(x) for x in p)}\n")
-
-        shutil.copy2(cams_bin, dst_dir / "cameras.bin")
-
-    # 2. Images (Transformar Câmeras para Referencial Métrico)
-    img_bin = src_dir / "images.bin"
-    metric_images = []
-    if img_bin.exists():
-        with open(img_bin, "rb") as f:
-            num_imgs = struct.unpack("<Q", f.read(8))[0]
-            for _ in range(num_imgs):
-                img_id = struct.unpack("<I", f.read(4))[0]
-                qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
-                tx, ty, tz = struct.unpack("<3d", f.read(24))
-                cam_id = struct.unpack("<I", f.read(4))[0]
-                name = ""
+    images = []
+    image_bin = src_dir / 'images.bin'
+    if image_bin.is_file():
+        with image_bin.open('rb') as stream:
+            image_count = struct.unpack('<Q', stream.read(8))[0]
+            for _ in range(image_count):
+                image_id = struct.unpack('<I', stream.read(4))[0]
+                qw, qx, qy, qz = struct.unpack('<4d', stream.read(32))
+                tx, ty, tz = struct.unpack('<3d', stream.read(24))
+                camera_id = struct.unpack('<I', stream.read(4))[0]
+                name_bytes = bytearray()
                 while True:
-                    c = f.read(1)
-                    if c == b"\x00":
+                    character = stream.read(1)
+                    if not character:
+                        raise ValueError('Truncated COLMAP image name')
+                    if character == b'\x00':
                         break
-                    name += c.decode("ascii")
-                n_pts = struct.unpack("<Q", f.read(8))[0]
-                pts2d = []
-                for _ in range(n_pts):
-                    x, y = struct.unpack("<2d", f.read(16))
-                    pid = struct.unpack("<Q", f.read(8))[0]
-                    pts2d.append((x, y, pid))
-
+                    name_bytes.extend(character)
+                name = name_bytes.decode('ascii').replace('\\', '/')
+                point_count = struct.unpack('<Q', stream.read(8))[0]
+                points2d = []
+                for _ in range(point_count):
+                    x, y = struct.unpack('<2d', stream.read(16))
+                    point_id = struct.unpack('<Q', stream.read(8))[0]
+                    points2d.append([x, y, point_id])
+                if allowed is not None and name not in allowed:
+                    continue
                 R_cw = Rot.from_quat([qx, qy, qz, qw]).as_matrix()
-                tvec = np.array([tx, ty, tz], dtype=np.float64)
-                C = -R_cw.T @ tvec
-
-                # Transformação de similaridade Sim(3)
-                C_metric = s_sim * (R_sim @ C) + t_sim
-                R_cw_metric = R_cw @ R_sim.T
-                t_cw_metric = -R_cw_metric @ C_metric
-                q_cw_metric = Rot.from_matrix(R_cw_metric).as_quat()  # x, y, z, w -> qw, qx, qy, qz
-
-                metric_images.append({
-                    "img_id": img_id,
-                    "qw": q_cw_metric[3], "qx": q_cw_metric[0], "qy": q_cw_metric[1], "qz": q_cw_metric[2],
-                    "tx": t_cw_metric[0], "ty": t_cw_metric[1], "tz": t_cw_metric[2],
-                    "cam_id": cam_id,
-                    "name": name,
-                    "pts2d": pts2d
+                center = -R_cw.T @ np.array([tx, ty, tz], dtype=np.float64)
+                center_metric = scale * (rotation @ center) + translation
+                R_metric = R_cw @ rotation.T
+                t_metric = -R_metric @ center_metric
+                q_metric = Rot.from_matrix(R_metric).as_quat()
+                images.append({
+                    'id': image_id, 'q': (q_metric[3], q_metric[0], q_metric[1], q_metric[2]),
+                    't': tuple(t_metric), 'camera_id': camera_id, 'name': name,
+                    'points2d': points2d,
                 })
 
-        # Escrever images.txt
-        with open(dst_dir / "images.txt", "w", encoding="utf-8") as f:
-            f.write("# Image list with two lines of data per image:\n")
-            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
-            for im in metric_images:
-                f.write(f"{im['img_id']} {im['qw']:.8f} {im['qx']:.8f} {im['qy']:.8f} {im['qz']:.8f} "
-                        f"{im['tx']:.8f} {im['ty']:.8f} {im['tz']:.8f} {im['cam_id']} {im['name']}\n")
-                pts_str = " ".join(f"{pt[0]:.2f} {pt[1]:.2f} {pt[2]}" for pt in im["pts2d"])
-                f.write(pts_str + "\n")
+    used_camera_ids = {image['camera_id'] for image in images}
+    camera_ids = {camera[0] for camera in cameras}
+    if not used_camera_ids <= camera_ids:
+        raise ValueError('COLMAP image references a missing camera record')
+    cameras = [camera for camera in cameras if camera[0] in used_camera_ids]
+    with (dst_dir / 'cameras.bin').open('wb') as stream:
+        stream.write(struct.pack('<Q', len(cameras)))
+        for camera_id, model_id, width, height, params in cameras:
+            stream.write(struct.pack('<iiQQ', camera_id, model_id, width, height))
+            stream.write(struct.pack(f'<{len(params)}d', *params))
+    with (dst_dir / 'cameras.txt').open('w', encoding='utf-8') as stream:
+        stream.write('# Camera list with one line of data per camera:\n')
+        stream.write('#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n')
+        for camera_id, model_id, width, height, params in cameras:
+            model = _COLMAP_CAMERA_MODEL_NAMES[model_id]
+            stream.write(f"{camera_id} {model} {width} {height} "
+                         f"{' '.join(format(value, '.17g') for value in params)}\n")
 
-        # Escrever images.bin
-        with open(dst_dir / "images.bin", "wb") as f:
-            f.write(struct.pack("<Q", len(metric_images)))
-            for im in metric_images:
-                f.write(struct.pack("<I", im["img_id"]))
-                f.write(struct.pack("<4d", im["qw"], im["qx"], im["qy"], im["qz"]))
-                f.write(struct.pack("<3d", im["tx"], im["ty"], im["tz"]))
-                f.write(struct.pack("<I", im["cam_id"]))
-                f.write(im["name"].encode("ascii") + b"\x00")
-                f.write(struct.pack("<Q", len(im["pts2d"])))
-                for pt in im["pts2d"]:
-                    f.write(struct.pack("<2d", pt[0], pt[1]))
-                    f.write(struct.pack("<Q", pt[2]))
-
-    # 3. Points3D (Transformar Coordenadas 3D para Referencial Métrico)
-    pts_bin = src_dir / "points3D.bin"
-    metric_pts = []
-    if pts_bin.exists():
-        with open(pts_bin, "rb") as f:
-            num_pts = struct.unpack("<Q", f.read(8))[0]
-            for _ in range(num_pts):
-                pid = struct.unpack("<Q", f.read(8))[0]
-                xyz = struct.unpack("<3d", f.read(24))
-                rgb = struct.unpack("<3B", f.read(3))
-                err = struct.unpack("<d", f.read(8))[0]
-                track_len = struct.unpack("<Q", f.read(8))[0]
-                tracks = []
-                for _ in range(track_len):
-                    img_id, p2d_idx = struct.unpack("<2I", f.read(8))
-                    tracks.append((img_id, p2d_idx))
-
-                xyz_metric = s_sim * (R_sim @ np.array(xyz)) + t_sim
-                err_metric = s_sim * err
-                metric_pts.append({
-                    "pid": pid,
-                    "xyz": xyz_metric,
-                    "rgb": rgb,
-                    "err": err_metric,
-                    "tracks": tracks
+    image_by_id = {image['id']: image for image in images}
+    retained_image_ids = set(image_by_id)
+    points = []
+    point_bin = src_dir / 'points3D.bin'
+    if point_bin.is_file():
+        with point_bin.open('rb') as stream:
+            point_count = struct.unpack('<Q', stream.read(8))[0]
+            for _ in range(point_count):
+                point_id = struct.unpack('<Q', stream.read(8))[0]
+                xyz = struct.unpack('<3d', stream.read(24))
+                rgb = struct.unpack('<3B', stream.read(3))
+                error = struct.unpack('<d', stream.read(8))[0]
+                track_count = struct.unpack('<Q', stream.read(8))[0]
+                tracks = [struct.unpack('<2I', stream.read(8)) for _ in range(track_count)]
+                valid_tracks = []
+                for image_id, point2d_index in tracks:
+                    if image_id not in retained_image_ids:
+                        continue
+                    image = image_by_id[image_id]
+                    if (point2d_index >= len(image['points2d'])
+                            or image['points2d'][point2d_index][2] != point_id):
+                        continue
+                    valid_tracks.append((image_id, point2d_index))
+                if allowed is not None and not valid_tracks:
+                    continue
+                xyz_metric = scale * (rotation @ np.asarray(xyz, dtype=np.float64)) + translation
+                points.append({
+                    'id': point_id, 'xyz': xyz_metric, 'rgb': rgb,
+                    'error': scale * error, 'tracks': valid_tracks,
                 })
 
-        # Escrever points3D.txt
-        with open(dst_dir / "points3D.txt", "w", encoding="utf-8") as f:
-            f.write("# 3D point list with one line of data per point:\n")
-            f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
-            for p in metric_pts:
-                track_str = " ".join(f"{t[0]} {t[1]}" for t in p["tracks"])
-                f.write(f"{p['pid']} {p['xyz'][0]:.6f} {p['xyz'][1]:.6f} {p['xyz'][2]:.6f} "
-                        f"{p['rgb'][0]} {p['rgb'][1]} {p['rgb'][2]} {p['err']:.4f} {track_str}\n")
+    retained_point_ids = {point['id'] for point in points}
+    invalid_id = (1 << 64) - 1
+    for image in images:
+        for point2d in image['points2d']:
+            if point2d[2] != invalid_id and point2d[2] not in retained_point_ids:
+                point2d[2] = invalid_id
 
-        # Escrever points3D.bin
-        with open(dst_dir / "points3D.bin", "wb") as f:
-            f.write(struct.pack("<Q", len(metric_pts)))
-            for p in metric_pts:
-                f.write(struct.pack("<Q", p["pid"]))
-                f.write(struct.pack("<3d", p["xyz"][0], p["xyz"][1], p["xyz"][2]))
-                f.write(struct.pack("<3B", p["rgb"][0], p["rgb"][1], p["rgb"][2]))
-                f.write(struct.pack("<d", p["err"]))
-                f.write(struct.pack("<Q", len(p["tracks"])))
-                for t in p["tracks"]:
-                    f.write(struct.pack("<2I", t[0], t[1]))
+    with (dst_dir / 'images.bin').open('wb') as stream:
+        stream.write(struct.pack('<Q', len(images)))
+        for image in images:
+            stream.write(struct.pack('<I', image['id']))
+            stream.write(struct.pack('<4d', *image['q']))
+            stream.write(struct.pack('<3d', *image['t']))
+            stream.write(struct.pack('<I', image['camera_id']))
+            stream.write(image['name'].encode('ascii') + b'\x00')
+            stream.write(struct.pack('<Q', len(image['points2d'])))
+            for x, y, point_id in image['points2d']:
+                stream.write(struct.pack('<2dQ', x, y, point_id))
+    with (dst_dir / 'images.txt').open('w', encoding='utf-8') as stream:
+        stream.write('# Image list with two lines of data per image:\n')
+        stream.write('#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n')
+        stream.write('#   POINTS2D[] as (X, Y, POINT3D_ID)\n')
+        for image in images:
+            stream.write(f"{image['id']} {' '.join(format(v, '.17g') for v in image['q'])} "
+                         f"{' '.join(format(v, '.17g') for v in image['t'])} "
+                         f"{image['camera_id']} {image['name']}\n")
+            stream.write(' '.join(
+                f"{format(x, '.17g')} {format(y, '.17g')} {-1 if point_id == invalid_id else point_id}"
+                for x, y, point_id in image['points2d']) + '\n')
 
-        # Escrever points3D.ply binário para 3DGS
-        n = len(metric_pts)
-        header = (
-            "ply\n"
-            "format binary_little_endian 1.0\n"
-            f"element vertex {n}\n"
-            "property float x\n"
-            "property float y\n"
-            "property float z\n"
-            "property uchar red\n"
-            "property uchar green\n"
-            "property uchar blue\n"
-            "end_header\n"
-        ).encode("ascii")
-        dt = [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")]
-        arr = np.empty(n, dtype=dt)
-        for i, p in enumerate(metric_pts):
-            arr["x"][i] = p["xyz"][0]
-            arr["y"][i] = p["xyz"][1]
-            arr["z"][i] = p["xyz"][2]
-            arr["r"][i] = p["rgb"][0]
-            arr["g"][i] = p["rgb"][1]
-            arr["b"][i] = p["rgb"][2]
+    with (dst_dir / 'points3D.bin').open('wb') as stream:
+        stream.write(struct.pack('<Q', len(points)))
+        for point in points:
+            stream.write(struct.pack('<Q3d3BdQ', point['id'], *point['xyz'], *point['rgb'],
+                                     point['error'], len(point['tracks'])))
+            for track in point['tracks']:
+                stream.write(struct.pack('<2I', *track))
+    with (dst_dir / 'points3D.txt').open('w', encoding='utf-8') as stream:
+        stream.write('# 3D point list with one line of data per point:\n')
+        stream.write('#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n')
+        for point in points:
+            tracks = ' '.join(f'{image_id} {point2d_index}' for image_id, point2d_index in point['tracks'])
+            stream.write(f"{point['id']} {' '.join(format(v, '.17g') for v in point['xyz'])} "
+                         f"{' '.join(str(v) for v in point['rgb'])} {format(point['error'], '.17g')} {tracks}\n")
 
-        ply_path = dst_dir / "points3D.ply"
-        with open(ply_path, "wb") as f:
-            f.write(header)
-            f.write(arr.tobytes())
+    header = (
+        'ply\nformat binary_little_endian 1.0\n'
+        f'element vertex {len(points)}\nproperty float x\nproperty float y\nproperty float z\n'
+        'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n'
+    ).encode('ascii')
+    dtype = [('x', '<f4'), ('y', '<f4'), ('z', '<f4'), ('r', 'u1'), ('g', 'u1'), ('b', 'u1')]
+    cloud = np.empty(len(points), dtype=dtype)
+    for index, point in enumerate(points):
+        cloud[index] = (*point['xyz'], *point['rgb'])
+    ply_path = dst_dir / 'points3D.ply'
+    with ply_path.open('wb') as stream:
+        stream.write(header)
+        stream.write(cloud.tobytes())
+    if dst_dir.parent.parent.exists():
+        try:
+            shutil.copy2(ply_path, dst_dir.parent.parent / 'points3D.ply')
+        except OSError:
+            pass
 
-        if dst_dir.parent.parent.exists():
-            try:
-                shutil.copy2(ply_path, dst_dir.parent.parent / "points3D.ply")
-            except Exception:
-                pass
-
-    print(f"[+] Metric COLMAP dataset for 3DGS generated successfully at: {dst_dir}")
-    print(f"    Cameras:  {len(cameras)}")
-    print(f"    Images:   {len(metric_images)}")
-    print(f"    Points3D: {len(metric_pts):,} metric tie-points")
+    print(f'[+] Metric COLMAP dataset for 3DGS generated successfully at: {dst_dir}')
+    print(f'    Cameras:  {len(cameras)}')
+    print(f'    Images:   {len(images)}')
+    print(f'    Points3D: {len(points):,} metric tie-points')
     return dst_dir
 
 
@@ -1148,7 +1304,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
     from raven_app.photometric import prepare, apply_rgb
     photo_views = prepare(dataset_dir, photometric, photometric_params, masks_dir)
     sparse_dir = dataset_dir / "sparse" / "0"
-    slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
+    slam_pcd = active_slam_dir(dataset_dir) / "pcd" / "all_raw_points.pcd"
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
     al = current_alignment(dataset_dir, fps)
@@ -1425,7 +1581,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     R_LC1 = T_LC1[:3, :3]
     t_LC1 = T_LC1[:3, 3]
 
-    slam_pcd = dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd"
+    slam_pcd = active_slam_dir(dataset_dir) / "pcd" / "all_raw_points.pcd"
     slam_trj = get_slam_trajectory_path(dataset_dir)
 
     # Determinar sincronização temporal
@@ -1548,8 +1704,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     for k in range(num_frames):
         t_vid = frame_time(dataset_dir, "cam0/" + cam0_files[k].name, fps)
         events.extend((
-            (t_vid, 0.0, "cam0", cam0_files[k], params0, R_LC0, t_LC0, "THIN_PRISM_FISHEYE"),
-            (t_vid, 0.0, "cam1", cam1_files[k], params1, R_LC1, t_LC1, "THIN_PRISM_FISHEYE"),
+            (t_vid, 0.0, "cam0", cam0_files[k], params0, R_LC0, t_LC0, "THIN_PRISM_FISHEYE", None),
+            (t_vid, 0.0, "cam1", cam1_files[k], params1, R_LC1, t_LC1, "THIN_PRISM_FISHEYE", None),
         ))
 
     auxiliary_cameras = (third_camera if isinstance(third_camera, (list, tuple))
@@ -1560,49 +1716,72 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
         report = getattr(camera, 'calibration_report', {}) or {}
         intrinsic_status = report.get('intrinsics', {}).get('status')
         extrinsic_status = report.get('extrinsics', {}).get('status')
-        if extrinsic_status != 'calibrated' or intrinsic_status != 'sfm_calibrated':
-            reason = report.get('extrinsics', {}).get('reason') or report.get('intrinsics', {}).get('reason') or 'SfM calibration is incomplete'
+        if (extrinsic_status == 'calibrated'
+                and intrinsic_status in ('sfm_calibrated', 'calibrated', 'verified')):
+            model = camera.camera_model.upper()
+            params = _auxiliary_colorization_camera_params(camera)
+            transform = np.asarray(camera.T_lidar_to_cam2_rigid_4x4, dtype=np.float64)
+            camera_dir = dataset_dir / 'images' / camera.camera_name
+            added = 0
+            for image_path in sorted(camera_dir.glob('*.jpg')) if camera_dir.is_dir() else ():
+                try:
+                    capture_time = frame_time(
+                        dataset_dir, f'{camera.camera_name}/{image_path.name}', camera.fps or fps)
+                except (KeyError, OSError, ValueError) as exc:
+                    print(f"[!] {camera.camera_name} frame has no capture time ({image_path.name}): {exc}")
+                    continue
+                events.append((capture_time, float(camera.time_offset_s), camera.camera_name,
+                               image_path, params, transform[:3, :3], transform[:3, 3], model, None))
+                added += 1
+            print(f"[*] Direct colorization calibrated views: {camera.camera_name} "
+                  f"({added} frames, {model})")
+            continue
+
+        from raven_app.auxiliary_pose_support import load_camera_pose_support
+        support = load_camera_pose_support(
+            dataset_dir, camera.camera_name, camera_model=camera.camera_model,
+            intrinsics=camera.intrinsics,
+            trajectory_path=slam_trj)
+        if support is None:
+            reason = (report.get('extrinsics', {}).get('reason')
+                      or report.get('intrinsics', {}).get('reason')
+                      or 'No fresh, accepted per-image SfM pose support is available')
             print(f"[!] Direct colorization skipping {camera.camera_name}: {reason}")
             continue
-        intr = camera.intrinsics
-        model = camera.camera_model.upper()
-        marker = -999.0 if model == 'PINHOLE' else -998.0 if model == 'OPENCV' else 0.0
-        params = (
-            float(intr['fx']), float(intr['fy']), float(intr['cx']), float(intr['cy']),
-            float(intr.get('k1', 0.0)), float(intr.get('k2', 0.0)),
-            float(intr.get('p1', 0.0)), float(intr.get('p2', 0.0)),
-            float(intr.get('k3', 0.0)), float(intr.get('k4', 0.0)),
-            0.0, marker,
-        )
-        transform = np.asarray(camera.T_lidar_to_cam2_rigid_4x4, dtype=np.float64)
-        camera_dir = dataset_dir / 'images' / camera.camera_name
-        for image_path in sorted(camera_dir.glob('*.jpg')) if camera_dir.is_dir() else ():
-            try:
-                capture_time = frame_time(
-                    dataset_dir, f'{camera.camera_name}/{image_path.name}', camera.fps or fps)
-            except (KeyError, OSError, ValueError) as exc:
-                print(f"[!] {camera.camera_name} frame has no capture time ({image_path.name}): {exc}")
-                continue
-            events.append((capture_time, float(camera.time_offset_s), camera.camera_name,
-                           image_path, params, transform[:3, :3], transform[:3, 3], model))
-        print(f"[*] Direct colorization calibrated views: {camera.camera_name} "
-              f"({len([e for e in events if e[2] == camera.camera_name])} frames, {model})")
+        support_camera = type('AuxiliaryPoseSupportCamera', (), {})()
+        support_camera.camera_name = camera.camera_name
+        support_camera.camera_model = support['camera_model']
+        support_camera.intrinsics = support['intrinsics']
+        model = support_camera.camera_model.upper()
+        params = _auxiliary_colorization_camera_params(support_camera)
+        added = 0
+        for pose in support['poses']:
+            events.append((float(pose['video_time']), 0.0, camera.camera_name,
+                           pose['image_path'], params, None, None, model,
+                           (pose['R_cw'], pose['C'])))
+            added += 1
+        print(f"[*] Direct colorization registered sample-SfM views: {camera.camera_name} "
+              f"({added} exact poses, {model}; rigid clock/baseline remain uncalibrated)")
 
     events.sort(key=lambda event: (event[0], event[2], event[3].name))
-    for event_index, (video_time, camera_offset, cam_name, img_path, params, R_LC, t_LC, _model) in enumerate(events):
-        t_query = t_slam_start + (video_time - dt_sync - camera_offset)
-        if not (t_slam_start <= t_query <= t_slam_end):
-            continue
-        idx = np.clip(np.searchsorted(t_slam, t_query), 1, len(t_slam) - 1)
-        w = (t_query - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
-        p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
-        R_L = slerp(t_query).as_matrix()
-        if use_drift_correction and sample_times[0] <= t_query <= sample_times[-1]:
-            dp = np.array([np.interp(t_query, sample_times, delta_p_arr[:, ax]) for ax in range(3)])
-            p_L += dp
-            R_L = slerp_delta_R(t_query).as_matrix() @ R_L
-        p_cam = p_L + R_L @ t_LC
-        R_cw = (R_L @ R_LC).T
+    for event_index, (video_time, camera_offset, cam_name, img_path, params,
+                      R_LC, t_LC, _model, pose_override) in enumerate(events):
+        if pose_override is not None:
+            R_cw, p_cam = pose_override
+        else:
+            t_query = t_slam_start + (video_time - dt_sync - camera_offset)
+            if not (t_slam_start <= t_query <= t_slam_end):
+                continue
+            idx = np.clip(np.searchsorted(t_slam, t_query), 1, len(t_slam) - 1)
+            w = (t_query - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
+            p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
+            R_L = slerp(t_query).as_matrix()
+            if use_drift_correction and sample_times[0] <= t_query <= sample_times[-1]:
+                dp = np.array([np.interp(t_query, sample_times, delta_p_arr[:, ax]) for ax in range(3)])
+                p_L += dp
+                R_L = slerp_delta_R(t_query).as_matrix() @ R_L
+            p_cam = p_L + R_L @ t_LC
+            R_cw = (R_L @ R_LC).T
         if operator_radius and masks_dir is not None:
             operator_views.append((img_path, R_cw, p_cam, params))
         if gpu_views is not None:

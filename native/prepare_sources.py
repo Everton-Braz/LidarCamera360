@@ -20,6 +20,13 @@ def replace_body(text, signature, body):
     return text[:opening] + '{\n' + body + '\n}' + text[end:]
 
 
+def replace_once(text, old, new):
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f'Expected exactly one source match, found {count}: {old!r}')
+    return text.replace(old, new, 1)
+
+
 def main():
     p = argparse.ArgumentParser()
     for key in ('upstream', 'output', 'sophus', 'vikit'):
@@ -43,6 +50,17 @@ def main():
         s = s.replace('omp_set_num_threads(MP_PROC_NUM)', 'omp_set_num_threads(native::threads)')
         s = s.replace('int grid_size, patch_size, grid_n_width, grid_n_height, patch_pyrimid_level;', 'int grid_size=0, patch_size=0, grid_n_width=0, grid_n_height=0, patch_pyrimid_level=0;')
         if f.name == 'LIVMapper.cpp':
+            s = replace_once(
+                s,
+                'nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);',
+                'nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);\n'
+                '  nh.param<bool>("pcd_save/scan_provenance_en", scan_provenance_en, false);')
+            s = replace_once(
+                s,
+                'nh.param<int>("pcd_save/type", pcd_save_type, 0);',
+                'nh.param<int>("pcd_save/type", pcd_save_type, 0);\n'
+                '  if (scan_provenance_en && (pcd_save_interval >= 0 || pcd_save_type != 0 || img_en))\n'
+                '    throw std::runtime_error("scan provenance requires world-frame intensity output with pcd_save/interval < 0");')
             for signature in ('void LIVMapper::initializeSubscribersAndPublishers', 'void LIVMapper::run',
                               'void LIVMapper::standard_pcl_cbk', 'void LIVMapper::livox_pcl_cbk',
                               'void LIVMapper::publish_odometry', 'void LIVMapper::publish_path'):
@@ -53,8 +71,33 @@ def main():
   if(colmap_output_en) fout_points.open(native::output_root + "Log/Colmap/sparse/0/points3D.txt");
   if(pcd_save_en) fout_lidar_pos.open(native::output_root + "Log/pcd/lidar_poses.txt");
   if(img_save_en) fout_visual_pos.open(native::output_root + "Log/image/image_poses.txt");
+  if(scan_provenance_en) native::open_scan_provenance(native::output_root + "scan_ranges.csv");
 ''')
+            s = replace_once(
+                s,
+                '*pcl_wait_save_intensity += *pcl_w_wait_pub;',
+                '''const size_t scan_provenance_start = pcl_wait_save_intensity->size();
+          const size_t scan_provenance_count = pcl_w_wait_pub->size();
+          *pcl_wait_save_intensity += *pcl_w_wait_pub;
+          if (scan_provenance_en)
+          {
+            if (LidarMeasures.lio_vio_flg != LIO && LidarMeasures.lio_vio_flg != LO)
+              throw std::runtime_error("scan provenance row is not associated with an LIO update");
+            native::append_scan_provenance(LidarMeasures.measures.back().lio_time,
+                                           scan_provenance_start, scan_provenance_count);
+          }''')
+            s = replace_once(
+                s,
+                '\n}\n\nvoid LIVMapper::run() \n{',
+                '\n  if (scan_provenance_en)\n'
+                '    native::finish_scan_provenance(pcl_wait_save_intensity->size());\n'
+                '}\n\nvoid LIVMapper::run() \n{')
             s = s.replace('if (!vk::camera_loader::loadFromRosNs("laserMapping", vio_manager->cam))', 'if (!native::load_camera(vio_manager->cam))')
+        if f.name == 'LIVMapper.h':
+            s = replace_once(
+                s,
+                'bool lidar_map_inited = false, pcd_save_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;',
+                'bool lidar_map_inited = false, pcd_save_en = false, scan_provenance_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;')
         if f.name == 'common_lib.h':
             s = '#include "native_runtime.h"\n' + s
         s = s.replace('"Log/', '"')

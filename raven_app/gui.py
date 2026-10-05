@@ -148,15 +148,17 @@ class RavenMainWindow(FluentWindow):
         trajectory = None
         if output:
             out_path = Path(output)
-            for candidate in (out_path / "slam_out" / "result" / "Eagle_Scan.txt",
-                              out_path / "slam_out" / "result" / "Eagle_X6_Scan.txt",
-                              out_path / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt",
+            from raven_app.slam_source import active_slam_dir
+            slam_path = active_slam_dir(out_path)
+            for candidate in (slam_path / "result" / "Eagle_Scan.txt",
+                              slam_path / "result" / "Eagle_X6_Scan.txt",
+                              slam_path / "result" / "Raven_3DMakerPro_Scan.txt",
                               out_path / "slam" / "trajectory.txt", out_path / "trajectory.txt",
                               out_path / "Eagle_Scan.txt", out_path / "Raven_3DMakerPro_Scan.txt"):
                 if candidate.is_file():
                     trajectory = str(candidate); break
-            if not trajectory and (out_path / "slam_out" / "result").is_dir():
-                txts = sorted((out_path / "slam_out" / "result").glob("*.txt"))
+            if not trajectory and (slam_path / "result").is_dir():
+                txts = sorted((slam_path / "result").glob("*.txt"))
                 if txts:
                     trajectory = str(txts[0])
         colmap = None

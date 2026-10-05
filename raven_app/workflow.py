@@ -9,6 +9,7 @@ Orchestrates:
 """
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Tuple, Dict, Any
@@ -29,6 +31,7 @@ from scipy.spatial.transform import Rotation as Rot
 from raven_app import __version__
 from raven_app.cli import engine, resources
 from raven_app.bag_io import export_bags
+from raven_app.slam_source import active_slam_dir
 from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, frame_time
 
 for stream in (sys.stdout, sys.stderr):
@@ -65,6 +68,90 @@ def process_gps_metadata(insv_path, output_dir, formats=('geojson', 'gpx', 'csv'
 
 def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 2.0) -> bool:
     return extract_insv_frames_pyav(insv_path, output_dir, fps=fps)
+
+
+def _workflow_path_snapshot(path):
+    if path is None:
+        return None
+    source = Path(path)
+    result = {'path': str(source.resolve())}
+    try:
+        stat = source.stat()
+        result.update(size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
+    except OSError:
+        pass
+    return result
+
+
+def _persist_workflow_run(output_dir, record):
+    """Append/update the structured settings snapshot for the current workflow run."""
+    path = Path(output_dir) / 'workflow_config.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+    except (OSError, ValueError):
+        data = {}
+    runs = data.get('runs', []) if data.get('schema_version') == 1 else []
+    runs = [item for item in runs if item.get('run_id') != record['run_id']]
+    record['updated_at_utc'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    runs.append(record)
+    data = {'schema_version': 1, 'runs': runs[-20:]}
+    temporary = path.with_name(f'.{path.name}.{record["run_id"]}.tmp')
+    temporary.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + '\n',
+        encoding='utf-8')
+    os.replace(temporary, path)
+
+
+def _workflow_image_extraction_snapshot(output_dir, third_cameras):
+    manifest_path = Path(output_dir) / 'images' / 'frames.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    signatures = {'cam0': manifest.get('signature'), 'cam1': manifest.get('signature')}
+    insv_signatures = manifest.get('auxiliary_insv_signatures', {})
+    if not isinstance(insv_signatures, dict):
+        insv_signatures = {}
+    for camera in third_cameras:
+        is_insv = (str(getattr(camera, 'source_type', '')).lower() == 'insv'
+                   or Path(str(getattr(camera, 'source_path', ''))).suffix.lower() == '.insv')
+        signatures[camera.camera_name] = (
+            insv_signatures.get(camera.camera_name, manifest.get(f'signature_{camera.camera_name}'))
+            if is_insv else manifest.get(f'signature_{camera.camera_name}'))
+    frame_counts = {}
+    for name in manifest.get('timestamps', {}):
+        camera_name = str(name).replace('\\', '/').split('/', 1)[0]
+        frame_counts[camera_name] = frame_counts.get(camera_name, 0) + 1
+    return {
+        'manifest': 'images/frames.json',
+        'camera_signatures': signatures,
+        'frame_counts': frame_counts,
+    }
+
+
+def _workflow_settings_snapshot(bag_path, insv_path, output_dir, *, fps, method,
+                                third_cameras, **settings):
+    camera_settings = [
+        {'camera_name': name, 'source_type': 'insv',
+         'source': _workflow_path_snapshot(insv_path), 'fps': float(fps)}
+        for name in ('cam0', 'cam1')
+    ]
+    for camera in third_cameras:
+        config = camera.to_dict()
+        config['source_snapshot'] = _workflow_path_snapshot(camera.source_path)
+        config['fps'] = float(camera.fps)
+        camera_settings.append(config)
+    return {
+        'paths': {
+            'bag': _workflow_path_snapshot(bag_path),
+            'insv': _workflow_path_snapshot(insv_path),
+            'output': str(Path(output_dir).resolve()),
+        },
+        'settings': {
+            **settings,
+            'method': method,
+            'fps_by_camera': {camera['camera_name']: camera['fps']
+                              for camera in camera_settings},
+        },
+        'cameras': camera_settings,
+    }
 
 
 def extract_insv_gyro(insv_path: Path):
@@ -203,7 +290,8 @@ def auto_sync_imu_gyro(bag_path: Path, insv_path: Path,
 
 
 def load_lidar_seed_points(dataset_dir: Path, max_points: Optional[int] = None,
-                           seed_percent: float = 100.0) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+                           seed_percent: float = 100.0,
+                           preferred_method: Optional[str] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """Load colorized or raw LiDAR points to use as dense geometric 3DGS seed.
 
     Defaults to full sensor density unless a percentage or point cap is selected.
@@ -213,6 +301,13 @@ def load_lidar_seed_points(dataset_dir: Path, max_points: Optional[int] = None,
     ply_candidates = sorted((dataset_dir / "deliverables").glob("lidar_colored_*.ply"))
     if not ply_candidates:
         ply_candidates = sorted(dataset_dir.glob("*.ply"))
+    method = str(preferred_method or '').strip().lower()
+    if method in ('direct', 'sfm'):
+        preferred_tokens = ('direct', 'rigid') if method == 'direct' else ('sfm', 'consensus')
+        preferred = [path for path in ply_candidates
+                     if any(token in path.stem.lower() for token in preferred_tokens)]
+        fallback = [path for path in ply_candidates if path not in preferred]
+        ply_candidates = fallback + preferred
 
     xyz = None
     rgb = None
@@ -252,7 +347,7 @@ def load_lidar_seed_points(dataset_dir: Path, max_points: Optional[int] = None,
     if xyz is None:
         pcd_candidates = sorted((dataset_dir / "deliverables").glob("*.pcd"))
         pcd_candidates += [
-            dataset_dir / "slam_out" / "pcd" / "all_raw_points.pcd",
+            active_slam_dir(dataset_dir) / "pcd" / "all_raw_points.pcd",
             dataset_dir / "all_raw_points.pcd",
         ]
         for pcd_path in pcd_candidates:
@@ -579,10 +674,125 @@ def _copy_person_masks(dataset_dir: Path, masks_dir: Path, out_dir: Path, image_
     return len(validated)
 
 
+def _select_bounded_sfm_frames(timed_frames, frame_limit, source_fps=1.0, center_seconds=None):
+    """Keep a temporally continuous clip for video-mode sequential matching."""
+    if len(timed_frames) <= frame_limit:
+        return timed_frames
+    source_fps = float(source_fps)
+    sample_fps = min(1.0, source_fps) if np.isfinite(source_fps) and source_fps > 0 else 1.0
+    first_time = float(timed_frames[0][0])
+    last_time = float(timed_frames[-1][0])
+    duration = max(0.0, last_time - first_time)
+    selected_count = min(frame_limit, max(1, int(np.floor(duration * sample_fps + 1e-9)) + 1))
+    if selected_count >= len(timed_frames):
+        return timed_frames
+
+    window_duration = selected_count / sample_fps
+    start_time = first_time + max(0.0, duration - window_duration) / 2.0
+    if center_seconds is not None:
+        start_time = max(first_time, min(float(center_seconds) - window_duration / 2, last_time - window_duration))
+    end_time = start_time + window_duration
+    window = [item for item in timed_frames
+              if start_time - 1e-6 <= float(item[0]) <= end_time + 1e-6]
+    if len(window) <= selected_count:
+        return window
+    window_times = np.asarray([item[0] for item in window])
+    targets = window_times[0] + np.arange(selected_count) / sample_fps
+    right = np.clip(np.searchsorted(window_times, targets), 0, len(window) - 1)
+    left = np.maximum(0, right - 1)
+    indices = np.unique(np.where(abs(window_times[left] - targets) <= abs(window_times[right] - targets), left, right))
+    return [window[index] for index in indices]
+
+
+def _preserve_sample_sfm_attempt(dataset_dir, sample_root, sample_images, metadata=None):
+    """Keep every bounded-SfM attempt, including partial models rejected before alignment."""
+    attempt_id = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%fZ')
+    attempt_root = Path(dataset_dir) / 'calibration' / 'sample_sfm_attempt' / attempt_id
+    sparse_source = Path(sample_root) / 'sparse'
+    copied_sparse = []
+    if sparse_source.is_dir():
+        for source in sparse_source.rglob('*'):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(sparse_source)
+            target = attempt_root / 'sparse' / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            copied_sparse.append(relative.as_posix())
+
+    manifest_source = Path(sample_images) / 'frames.json'
+    if manifest_source.is_file():
+        manifest_target = attempt_root / 'images' / 'frames.json'
+        manifest_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(manifest_source, manifest_target)
+    attempt_root.mkdir(parents=True, exist_ok=True)
+    preserved = {
+        'attempt_id': attempt_id,
+        'sparse_files': copied_sparse,
+        'sample_manifest': 'images/frames.json' if manifest_source.is_file() else None,
+    }
+    if isinstance(metadata, dict):
+        preserved.update(metadata)
+    (attempt_root / 'attempt.json').write_text(
+        json.dumps(preserved, indent=2), encoding='utf-8')
+    print(f'[*] Preserved bounded SfM attempt at: {attempt_root}')
+    return attempt_root
+
+
+def _validate_sample_sfm_component_coverage(sparse_dir, selected_files, attempt_root):
+    """Require useful per-camera coverage in COLMAP's connected sparse/0 component."""
+    from scripts.pipeline_auto_calibrator_and_colorizer import load_colmap_images
+
+    images_path = Path(sparse_dir) / 'images.bin'
+    if not images_path.is_file():
+        raise RuntimeError('Sample SfM did not produce sparse/0/images.bin')
+    registered = {}
+    for image in load_colmap_images(images_path):
+        normalized = image['name'].replace('\\', '/')
+        camera_name = normalized.split('/', 1)[0]
+        registered[camera_name] = registered.get(camera_name, 0) + 1
+
+    coverage = {}
+    failures = []
+    for camera_name, selected in selected_files.items():
+        selected_count = len(selected)
+        registered_count = registered.get(camera_name, 0)
+        primary = camera_name in ('cam0', 'cam1')
+        required_ratio = 0.60 if primary else 0.35
+        required_count = max(20, int(np.ceil(selected_count * required_ratio)))
+        coverage[camera_name] = {
+            'registered_frames': registered_count,
+            'selected_frames': selected_count,
+            'required_frames': required_count,
+            'required_fraction': required_ratio,
+            'registered_fraction': (registered_count / selected_count) if selected_count else 0.0,
+            'role': 'primary' if primary else 'auxiliary',
+        }
+        if selected_count < 20 or registered_count < required_count:
+            failures.append(
+                f'{camera_name} registered {registered_count}/{selected_count}; '
+                f'requires at least {required_count} ({required_ratio:.0%}) in the connected component')
+
+    metadata_path = Path(attempt_root) / 'attempt.json'
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        metadata = {}
+    metadata['component_coverage'] = coverage
+    metadata['coverage_status'] = 'rejected' if failures else 'candidate'
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+    if failures:
+        raise RuntimeError('Bounded sample sparse/0 lacks per-camera coverage: ' + '; '.join(failures))
+    print('[+] Sample sparse/0 camera coverage: ' + ', '.join(
+        f'{name} {item["registered_frames"]}/{item["selected_frames"]}'
+        for name, item in coverage.items()))
+    return coverage
+
+
 def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync):
-    """Fit auxiliary intrinsics and metric extrinsics using a bounded SfM sample."""
+    """Calibrate the per-session rig from bounded SfM, then recover with all frames."""
     from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
-    from raven_app.third_camera import align_third_camera_to_rig
+    from raven_app.third_camera import align_third_camera_to_rig, ThirdCameraConfig
 
     dataset_dir = Path(dataset_dir)
     images_root = dataset_dir / 'images'
@@ -590,11 +800,29 @@ def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync):
     manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
     all_times = manifest.get('timestamps', {})
     camera_names = ['cam0', 'cam1'] + [camera.camera_name for camera in cameras]
-    per_camera_limit = max(20, min(80, 320 // max(1, len(camera_names))))
-    selected_timestamps = {}
-    selected_files = {}
-    skipped_aux = {}
-
+    per_camera_limit = max(20, min(40, 320 // max(1, len(camera_names))))
+    camera_fps = {'cam0': float(fps), 'cam1': float(fps)}
+    camera_fps.update({camera.camera_name: float(camera.fps) for camera in cameras})
+    primary_times = [float(t) for name, t in all_times.items() if name.startswith('cam0/')]
+    primary_times.extend(float(t) for name, t in all_times.items() if name.startswith('cam1/'))
+    primary_start_seconds = min(primary_times) if primary_times else None
+    primary_end_seconds = max(primary_times) if primary_times else None
+    def filename_start(path):
+        match = re.search(r'VID_(\d{8})_(\d{6})', Path(path).name, re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return datetime.strptime(''.join(match.groups()), '%Y%m%d%H%M%S')
+        except ValueError:
+            return None
+    extraction = manifest.get('extraction', {})
+    primary_source = manifest.get('signature', {}).get('source', '') or extraction.get('source_path', '')
+    if not primary_source:
+        # Persisted manifests can store the source inside the extraction signature.
+        signature = manifest.get('extraction_signature', {})
+        primary_source = signature.get('source_path', '') if isinstance(signature, dict) else ''
+    primary_start = filename_start(primary_source)
+    timed_by_camera = {}
     for camera_name in camera_names:
         camera_dir = images_root / camera_name
         files = sorted(camera_dir.glob('*.jpg')) if camera_dir.is_dir() else []
@@ -609,121 +837,902 @@ def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync):
                     continue
             timed.append((float(timestamp), path, relative))
         timed.sort(key=lambda item: item[0])
-        if len(timed) > per_camera_limit:
-            indices = np.unique(np.rint(np.linspace(0, len(timed) - 1, per_camera_limit)).astype(int))
-            timed = [timed[index] for index in indices]
-        if len(timed) < 20:
-            if camera_name in ('cam0', 'cam1'):
-                raise RuntimeError(
-                    f'Sample SfM needs at least 20 timestamped frames for {camera_name}; found {len(timed)}')
-            skipped_aux[camera_name] = len(timed)
-            continue
-        selected_files[camera_name] = timed
-        for timestamp, _path, relative in timed:
-            selected_timestamps[relative] = timestamp
+        timed_by_camera[camera_name] = timed
+
+    missing = [name for name in camera_names if len(timed_by_camera.get(name, ())) < 20]
+    if missing:
+        details = ', '.join(
+            f'{name} has {len(timed_by_camera.get(name, ()))} timestamped frames'
+            for name in missing)
+        raise RuntimeError(
+            f'Required sample SfM cannot include every camera: {details}; at least 20 are required per camera')
 
     trajectory_path = pipeline.get_slam_trajectory_path(dataset_dir)
     if not trajectory_path or not Path(trajectory_path).is_file():
         raise FileNotFoundError('FAST-LIVO2 trajectory is missing for sample camera calibration')
 
-    with tempfile.TemporaryDirectory(prefix='raven-aux-sfm-', dir=str(dataset_dir)) as tmp:
-        sample_root = Path(tmp)
-        sample_images = sample_root / 'images'
-        for camera_name, timed in selected_files.items():
-            target_dir = sample_images / camera_name
-            target_dir.mkdir(parents=True)
-            for _timestamp, source, _relative in timed:
-                target = target_dir / source.name
+    auxiliary_by_name = {camera.camera_name: camera for camera in cameras}
+    retry_time_hints = {}
+    failures = []
+    attempts = []
+    last_failed_reports = {}
+    best_attempt = None
+    pose_support_attempts = []
+    fractions = (0.50, 0.25, 0.75, None)
+
+    def primary_center(fraction):
+        if primary_start_seconds is not None and primary_end_seconds is not None:
+            return primary_start_seconds + fraction * (primary_end_seconds - primary_start_seconds)
+        primary = timed_by_camera.get('cam0') or timed_by_camera.get('cam1') or []
+        return float(primary[0][0]) + fraction * (float(primary[-1][0]) - float(primary[0][0]))
+
+    for attempt_index, fraction in enumerate(fractions, start=1):
+        full_frame_recovery = fraction is None
+        sample_method = ('full_frame_sfm_pose_recovery' if full_frame_recovery
+                         else 'bounded_temporal_window')
+        selected_files = {}
+        selected_timestamps = {}
+        windows = {}
+        for camera_name in camera_names:
+            timed = timed_by_camera[camera_name]
+            if full_frame_recovery:
+                center = None
+                selected = list(timed)
+            else:
+                center = primary_center(fraction)
+            if not full_frame_recovery and camera_name not in ('cam0', 'cam1'):
+                camera = auxiliary_by_name[camera_name]
+                if camera_name in retry_time_hints:
+                    center += retry_time_hints[camera_name]
+                else:
+                    time_report = (camera.calibration_report or {}).get('time_offset', {}) or {}
+                    if time_report.get('status') in ('configured', 'calibrated', 'verified'):
+                        center += float(camera.time_offset_s)
+                    else:
+                        auxiliary_start = filename_start(camera.source_path)
+                        if primary_start and auxiliary_start:
+                            center -= (auxiliary_start - primary_start).total_seconds()
+                        else:
+                            center = float(timed[0][0]) + fraction * (float(timed[-1][0]) - float(timed[0][0]))
+            if not full_frame_recovery:
+                selected = _select_bounded_sfm_frames(
+                    timed, per_camera_limit, source_fps=camera_fps[camera_name],
+                    center_seconds=center)
+            selected_files[camera_name] = selected
+            if selected:
+                selected_times = [float(item[0]) for item in selected]
+                gaps = np.diff(selected_times)
+                windows[camera_name] = {
+                    'available_frames': len(timed), 'selected_frames': len(selected),
+                    'source_fps': camera_fps[camera_name],
+                    'center_seconds': float(center) if center is not None else None,
+                    'start_seconds': selected_times[0], 'end_seconds': selected_times[-1],
+                    'median_gap_seconds': float(np.median(gaps)) if len(gaps) else 0.0,
+                    'mode': 'all_available_timestamped_frames' if full_frame_recovery else 'bounded_window',
+                }
+            for timestamp, _source, relative in selected:
+                selected_timestamps[relative] = timestamp
+
+        metadata = {
+            'attempt_index': attempt_index,
+            'window_fraction': fraction,
+            'method': sample_method,
+            'sample_windows': windows,
+            'time_offset_hints_used_seconds': dict(retry_time_hints),
+            'status': 'running',
+        }
+        attempt_error = None
+        attempt_root = None
+        calibrated = []
+        candidate_root = None
+        tempdir = None
+        try:
+            from contextlib import nullcontext
+            tempdir = tempfile.TemporaryDirectory(prefix='raven-aux-sfm-', dir=str(dataset_dir))
+            with nullcontext(tempdir.name) as tmp:
+                sample_root = Path(tmp)
+                candidate_root = sample_root
+                sample_images = sample_root / 'images'
+                for camera_name, selected in selected_files.items():
+                    target_dir = sample_images / camera_name
+                    target_dir.mkdir(parents=True)
+                    for _timestamp, source, _relative in selected:
+                        target = target_dir / source.name
+                        try:
+                            os.link(source, target)
+                        except OSError:
+                            shutil.copy2(source, target)
+                sample_manifest = dict(manifest)
+                sample_manifest['timestamps'] = selected_timestamps
+                sample_manifest['sampled_sfm'] = not full_frame_recovery
+                sample_manifest['full_frame_sfm_pose_recovery'] = full_frame_recovery
+                sample_manifest['sample_windows'] = windows
+                (sample_images / 'frames.json').write_text(
+                    json.dumps(sample_manifest, indent=2), encoding='utf-8')
+                short = [name for name, selected in selected_files.items() if len(selected) < 20]
+                if short:
+                    counts = ', '.join(f'{name} {len(selected_files[name])}/20' for name in short)
+                    raise RuntimeError(f'This window cannot include every camera: {counts}')
+
+                # Every attempt starts from the caller's original config.
+                attempt_cameras = [ThirdCameraConfig.from_dict(camera.to_dict()) for camera in cameras]
+                for camera in attempt_cameras:
+                    if camera.camera_name in retry_time_hints:
+                        report = dict(camera.calibration_report or {})
+                        time_report = dict(report.get('time_offset', {}) or {})
+                        time_report['sample_window_hint_seconds'] = retry_time_hints[camera.camera_name]
+                        report['time_offset'] = time_report
+                        camera.calibration_report = report
+                if full_frame_recovery:
+                    print('[*] Bounded calibration windows failed; starting full-frame SfM pose recovery. '
+                          'This performs extra feature extraction and matching over every available '
+                          f'timestamped frame ({sum(map(len, selected_files.values()))} frames).')
+                else:
+                    print('[*] Running bounded sample SfM for per-session camera calibration '
+                          f'({sum(map(len, selected_files.values()))} frames, window {fraction:.0%}).')
+                candidate = pipeline.run_spirula_sfm_auto(
+                    sample_root, quality='medium', auxiliary_cameras=attempt_cameras,
+                    allow_partial_calibration=True)
+                if not candidate:
+                    raise RuntimeError(
+                        'Spirula did not produce a full-frame recovery candidate'
+                        if full_frame_recovery else
+                        'Spirula did not produce a bounded calibration candidate')
                 try:
-                    os.link(source, target)
-                except OSError:
-                    shutil.copy2(source, target)
-        sample_manifest = dict(manifest)
-        sample_manifest['timestamps'] = selected_timestamps
-        sample_manifest['sampled_sfm'] = True
-        (sample_images / 'frames.json').write_text(
-            json.dumps(sample_manifest, indent=2), encoding='utf-8')
+                    coverage = _validate_sample_sfm_component_coverage(
+                        sample_root / 'sparse' / '0', selected_files, sample_root)
+                except RuntimeError as exc:
+                    if full_frame_recovery:
+                        message = str(exc).replace(
+                            'Bounded sample sparse/0', 'Full-frame recovery sparse/0')
+                        raise RuntimeError(message) from exc
+                    raise
+                metadata.update(coverage_status='accepted', component_coverage=coverage)
+                alignment = pipeline.align_colmap_to_lidar(
+                    sample_root, fps=fps, dt_hint=dt_sync,
+                    trajectory_path=trajectory_path, use_icp=False)
+                if alignment.get('quality_status') not in (None, 'accepted'):
+                    raise RuntimeError(
+                        f"Sample SfM alignment rejected: {alignment.get('quality_status')} "
+                        f"{alignment.get('quality_reason', '')}".strip())
+                try:
+                    scale = float(alignment['scale'])
+                    rotation = np.asarray(alignment['R'], dtype=np.float64)
+                    translation = np.asarray(alignment['t'], dtype=np.float64)
+                    sync = float(alignment['dt_sync_seconds'])
+                    rmse = float(alignment['trajectory_rmse_cm'])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(f'Sample SfM alignment is incomplete: {exc}') from exc
+                if (not np.isfinite(scale) or scale <= 0 or not np.isfinite(sync)
+                        or not np.isfinite(rmse) or rmse < 0
+                        or rotation.shape != (3, 3) or translation.shape != (3,)
+                        or not np.all(np.isfinite(rotation))
+                        or not np.all(np.isfinite(translation))
+                        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-3)
+                        or np.linalg.det(rotation) <= 0):
+                    raise RuntimeError('Sample SfM alignment failed finite Sim(3) validation')
+                support_alignment_accepted = alignment.get('quality_status') == 'accepted'
+                if support_alignment_accepted and alignment.get('frame_time_source') == 'insv_timelapse':
+                    from raven_app.timelapse_calibration import VERSION as TIMELAPSE_VERSION
+                    support_alignment_accepted = (
+                        alignment.get('timelapse_calibration_version') == TIMELAPSE_VERSION)
+                if support_alignment_accepted:
+                    sample_time_source = sample_manifest.get('time_source')
+                    support_alignment_accepted = (
+                        not sample_time_source
+                        or alignment.get('frame_time_source') == sample_time_source)
+                metadata.update(
+                    alignment_status='accepted',
+                    alignment_rmse_cm=alignment.get('trajectory_rmse_cm'),
+                    alignment_method=alignment.get('alignment_method'))
+                rig = pipeline.recalibrate_from_sfm(
+                    sample_root, fps=fps, alignment=alignment, write_outputs=False,
+                    trajectory_path=trajectory_path)
 
-        print('[*] Running bounded auxiliary-camera sample SfM '
-              f'({sum(map(len, selected_files.values()))} frames; '
-              f'{per_camera_limit} max per camera)...')
-        if not pipeline.run_spirula_sfm_auto(sample_root, quality='low', auxiliary_cameras=cameras):
-            raise RuntimeError('Spirula did not produce a valid sparse model for the sample frames')
-        alignment = pipeline.align_colmap_to_lidar(
-            sample_root, fps=fps, dt_hint=dt_sync,
-            trajectory_path=trajectory_path, use_icp=False)
+                camera_failures = []
+                for camera in attempt_cameras:
+                    try:
+                        result = align_third_camera_to_rig(
+                            sample_root, camera, fps=fps, alignment_data=alignment,
+                            trajectory_path=trajectory_path)
+                    except Exception as exc:
+                        result = camera
+                        report = dict(result.calibration_report or {})
+                        report['calibration_attempt'] = {'status': 'failed', 'reason': str(exc)}
+                        report['extrinsics'] = {
+                            'status': 'uncalibrated', 'source': 'sample SfM attempt',
+                            'camera_name': result.camera_name, 'reason': str(exc)}
+                    else:
+                        report = dict(result.calibration_report or {})
+                    report['camera_name'] = result.camera_name
+                    ready = _aux_camera_calibration_ready(result)
+                    extrinsics = report.get('extrinsics', {}) or {}
+                    sample_report = {
+                        'status': 'complete' if ready else 'rejected',
+                        'method': sample_method,
+                        'attempt_index': attempt_index,
+                        'window_fraction': fraction,
+                        'frames_per_camera': {name: len(items) for name, items in selected_files.items()},
+                        'alignment_rmse_cm': alignment.get('trajectory_rmse_cm'),
+                        'alignment_method': alignment.get('alignment_method', 'timelapse_pose_consensus'),
+                    }
+                    if not ready:
+                        sample_report['reason'] = (
+                            extrinsics.get('reason') or
+                            (report.get('time_offset', {}) or {}).get('reason') or
+                            'intrinsics, time offset, or metric extrinsics failed the calibration gates')
+                        camera_failures.append(f'{result.camera_name}: {sample_report["reason"]}')
+                    report['sample_sfm'] = sample_report
+                    result.calibration_report = report
+                    calibrated.append(result)
+                    hint = (report.get('time_offset', {}) or {}).get('best_candidate_seconds')
+                    if hint is not None:
+                        try:
+                            hint = float(hint)
+                            if np.isfinite(hint):
+                                retry_time_hints[result.camera_name] = hint
+                        except (TypeError, ValueError):
+                            pass
 
-        # The sample fit also calibrates the primary rig. Keep its intrinsics,
-        # mounting transforms and clock together after the temporary model closes.
-        rig = pipeline.recalibrate_from_sfm(
-            sample_root, fps=fps, alignment=alignment, write_outputs=False,
-            trajectory_path=trajectory_path)
-        evidence = dataset_dir / 'calibration' / 'sample_sfm'
-        (evidence / 'sparse' / '0').mkdir(parents=True, exist_ok=True)
-        (evidence / 'images').mkdir(parents=True, exist_ok=True)
-        for name in ('cameras.bin', 'images.bin', 'points3D.bin'):
-            shutil.copy2(sample_root / 'sparse' / '0' / name,
-                         evidence / 'sparse' / '0' / name)
-        shutil.copy2(sample_images / 'frames.json', evidence / 'images' / 'frames.json')
-        (evidence / 'colmap_to_lidar_alignment.json').write_text(
-            json.dumps(alignment, indent=2), encoding='utf-8')
-        rig['calibration_source'] = 'sample_sfm'
-        rig['sample_sfm_evidence'] = 'calibration/sample_sfm'
+                if best_attempt is None or rmse < best_attempt['alignment_rmse_cm']:
+                    best_attempt = {
+                        'alignment_rmse_cm': rmse,
+                        'alignment': dict(alignment),
+                        'rig': dict(rig),
+                        'cameras': [ThirdCameraConfig.from_dict(camera.to_dict())
+                                    for camera in calibrated],
+                        'window_fraction': fraction,
+                        'method': sample_method,
+                        'frames_per_camera': {name: len(items)
+                                              for name, items in selected_files.items()},
+                        'attempt_index': attempt_index,
+                    }
+
+                # Keep exact registered poses only when the sample-to-SLAM
+                # transform passed an explicit, current alignment acceptance.
+                # These per-image poses do not claim a fixed camera baseline or
+                # phone clock offset.
+                if support_alignment_accepted and auxiliary_by_name:
+                    selected_names = {
+                        name: {relative for _time, _path, relative in selected_files[name]}
+                        for name in auxiliary_by_name
+                    }
+                    allowed_models = {
+                        'PINHOLE', 'OPENCV', 'OPENCV_FISHEYE', 'THIN_PRISM_FISHEYE'}
+                    attempt_support = {}
+                    for result in calibrated:
+                        report = result.calibration_report or {}
+                        candidate = report.get('sample_sfm_pose_support') or {}
+                        camera_name = result.camera_name
+                        model = str(candidate.get('camera_model', '')).strip().upper()
+                        intrinsics = candidate.get('intrinsics')
+                        if (candidate.get('status') != 'candidate'
+                                or model not in allowed_models
+                                or model != str(result.camera_model).strip().upper()
+                                or not isinstance(intrinsics, dict)):
+                            continue
+                        try:
+                            checked_intrinsics = {
+                                str(key): float(value) for key, value in intrinsics.items()}
+                            if (not all(np.isfinite(value) for value in checked_intrinsics.values())
+                                    or any(checked_intrinsics.get(key, 0.0) <= 0
+                                           for key in ('width', 'height', 'fx', 'fy'))):
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                        normalized = []
+                        for pose in candidate.get('poses', []):
+                            if not isinstance(pose, dict):
+                                continue
+                            name = str(pose.get('name', '')).replace('\\', '/')
+                            if (name not in selected_names.get(camera_name, set())
+                                    or not (dataset_dir / 'images' / name).is_file()):
+                                continue
+                            try:
+                                center = np.asarray(pose['C'], dtype=np.float64)
+                                rotation_cw = np.asarray(pose['R_cw'], dtype=np.float64)
+                                video_time = float(pose['video_time'])
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                            if (center.shape != (3,) or rotation_cw.shape != (3, 3)
+                                    or not np.all(np.isfinite(center))
+                                    or not np.all(np.isfinite(rotation_cw))
+                                    or not np.isfinite(video_time)
+                                    or not np.allclose(rotation_cw.T @ rotation_cw,
+                                                       np.eye(3), atol=1e-3)
+                                    or np.linalg.det(rotation_cw) <= 0):
+                                continue
+                            normalized.append({
+                                'name': name, 'video_time': video_time,
+                                'C': center.tolist(), 'R_cw': rotation_cw.tolist(),
+                                'alignment_rmse_cm': rmse,
+                                'sample_window_fraction': fraction,
+                            })
+                        if len(normalized) < 6:
+                            continue
+                        attempt_support[camera_name] = {
+                            'poses': normalized,
+                            'camera_model': model,
+                            'intrinsics': checked_intrinsics,
+                            'config': ThirdCameraConfig.from_dict(result.to_dict()),
+                        }
+                    support_missing = sorted(set(auxiliary_by_name) - set(attempt_support))
+                    metadata['registered_pose_support'] = {
+                        'status': 'candidate' if not support_missing else 'incomplete',
+                        'registered_views_by_camera': {
+                            name: len(item['poses']) for name, item in attempt_support.items()},
+                        'missing_cameras': support_missing,
+                        'alignment_rmse_cm': rmse,
+                    }
+                    if not support_missing:
+                        accepted_coverage = sum(
+                            int((coverage.get(name) or {}).get('registered_frames', 0))
+                            for name in camera_names)
+                        pose_support_attempts.append({
+                            'attempt_index': attempt_index,
+                            'method': sample_method,
+                            'window_fraction': fraction,
+                            'coverage_total': accepted_coverage,
+                            'coverage': dict(coverage),
+                            'alignment_rmse_cm': rmse,
+                            'alignment': dict(alignment),
+                            'camera_support': attempt_support,
+                        })
+                last_failed_reports = {
+                    camera.camera_name: dict(camera.calibration_report or {})
+                    for camera in calibrated
+                }
+                if camera_failures:
+                    metadata['auxiliary_calibration'] = {
+                        camera.camera_name: camera.calibration_report.get('sample_sfm', {})
+                        for camera in calibrated}
+                    raise RuntimeError('; '.join(camera_failures))
+
+                # Publish the final primary rig and sample evidence only after
+                # every enabled auxiliary camera passed its calibration gates.
+                evidence = dataset_dir / 'calibration' / 'sample_sfm'
+                (evidence / 'sparse' / '0').mkdir(parents=True, exist_ok=True)
+                (evidence / 'images').mkdir(parents=True, exist_ok=True)
+                for name in ('cameras.bin', 'images.bin', 'points3D.bin'):
+                    shutil.copy2(sample_root / 'sparse' / '0' / name,
+                                 evidence / 'sparse' / '0' / name)
+                shutil.copy2(sample_images / 'frames.json', evidence / 'images' / 'frames.json')
+                (evidence / 'colmap_to_lidar_alignment.json').write_text(
+                    json.dumps(alignment, indent=2), encoding='utf-8')
+                rig['calibration_source'] = 'sample_sfm'
+                rig['sample_sfm_evidence'] = 'calibration/sample_sfm'
+                rig['sample_sfm_method'] = sample_method
+                rig['sample_sfm_window_fraction'] = fraction
+                rig['sample_sfm_frames_per_camera'] = {
+                    name: len(items) for name, items in selected_files.items()}
+                metadata.update(
+                    status='passed', coverage_status='accepted',
+                    alignment_status='accepted', component_coverage=coverage,
+                    alignment_rmse_cm=alignment.get('trajectory_rmse_cm'),
+                    auxiliary_calibration={
+                        camera.camera_name: camera.calibration_report.get('sample_sfm', {})
+                        for camera in calibrated})
+                for name in ('rig_calibration.json', 'calibracao_rigida_auto.json'):
+                    (dataset_dir / name).write_text(json.dumps(rig, indent=2), encoding='utf-8')
+        except Exception as exc:
+            attempt_error = exc
+            metadata['status'] = 'failed'
+            metadata['failure'] = str(exc)
+            if calibrated:
+                metadata.setdefault('auxiliary_calibration', {
+                    camera.camera_name: camera.calibration_report.get('sample_sfm', {})
+                    for camera in calibrated})
+        finally:
+            try:
+                if candidate_root is not None:
+                    attempt_root = _preserve_sample_sfm_attempt(
+                        dataset_dir, candidate_root, candidate_root / 'images', metadata)
+                    attempts.append(attempt_root)
+            finally:
+                if tempdir is not None:
+                    tempdir.cleanup()
+
+        if attempt_error is not None:
+            label = ('full-frame recovery' if full_frame_recovery
+                     else f'bounded window {fraction:.0%}')
+            failures.append(f'{label}: {attempt_error}')
+            print(f'[!] Sample SfM {label} failed: {attempt_error}')
+            continue
+
+        rig['sample_sfm_attempt'] = str(attempt_root.relative_to(dataset_dir)) if attempt_root else None
         for name in ('rig_calibration.json', 'calibracao_rigida_auto.json'):
             (dataset_dir / name).write_text(json.dumps(rig, indent=2), encoding='utf-8')
-        print(f"[+] Primary rig calibrated from sample SfM: dt={rig['dt_sync_seconds']:.4f}s")
+        if full_frame_recovery:
+            print(f"[+] Primary and all auxiliary cameras calibrated from full-frame SfM: "
+                  f"dt={rig['dt_sync_seconds']:.4f}s.")
+        else:
+            print(f"[+] Primary and all auxiliary cameras calibrated from sample SfM: "
+                  f"dt={rig['dt_sync_seconds']:.4f}s; window {fraction:.0%}.")
+        return calibrated
 
-        calibrated = []
-        for camera in cameras:
-            if camera.camera_name in skipped_aux:
-                report = dict(camera.calibration_report or {})
-                report['camera_name'] = camera.camera_name
-                report['sample_sfm'] = {
-                    'status': 'skipped',
-                    'reason': f"Only {skipped_aux[camera.camera_name]} timestamped frames are available; need 20.",
-                }
-                camera.calibration_report = report
-                calibrated.append(camera)
+    if best_attempt is not None:
+        best_cameras = {camera.camera_name: camera for camera in best_attempt['cameras']}
+        # Keep poses from one COLMAP reconstruction only. Combining images from
+        # independent bounded models can silently mix camera intrinsics or
+        # incompatible local reconstructions even when each alignment passed.
+        best_support = min(
+            pose_support_attempts,
+            key=lambda item: (-int(item['coverage_total']),
+                              float(item['alignment_rmse_cm']),
+                              int(item['attempt_index'])),
+            default=None)
+        resolved_cameras = []
+        support_records = {}
+        unresolved = []
+        for original in cameras:
+            candidate = best_cameras.get(original.camera_name)
+            if candidate is not None and _aux_camera_calibration_ready(candidate):
+                resolved_cameras.append(candidate)
                 continue
-            result = align_third_camera_to_rig(
-                sample_root, camera, fps=fps, alignment_data=alignment,
-                trajectory_path=trajectory_path)
-            report = dict(result.calibration_report or {})
-            report['camera_name'] = result.camera_name
-            extrinsics_calibrated = report.get('extrinsics', {}).get('status') == 'calibrated'
-            sample_report = {
-                'status': 'complete' if extrinsics_calibrated else 'rejected',
-                'method': 'temporally_uniform_sample',
-                'frames_per_camera': {name: len(items) for name, items in selected_files.items()},
-                'alignment_rmse_cm': alignment.get('trajectory_rmse_cm'),
-                'alignment_method': alignment.get('alignment_method', 'timelapse_pose_consensus'),
+
+            collected = ((best_support or {}).get('camera_support', {})
+                         .get(original.camera_name))
+            support_config = collected.get('config') if collected else None
+            poses = list(collected.get('poses', [])) if collected else []
+            if support_config is None or len(poses) < 6:
+                unresolved.append(original.camera_name)
+                continue
+            alignment = (best_support or {}).get('alignment') or {}
+            existing_report = dict(support_config.calibration_report or {})
+            rigid_reason = (
+                (existing_report.get('extrinsics', {}) or {}).get('reason')
+                or (existing_report.get('time_offset', {}) or {}).get('reason')
+                or 'A rigid time offset or camera-to-LiDAR transform did not pass calibration gates')
+            existing_report.pop('sample_sfm_pose_support', None)
+            existing_report['camera_name'] = original.camera_name
+            existing_report['sample_sfm'] = {
+                **(existing_report.get('sample_sfm', {}) or {}),
+                'status': 'per_image_sfm_pose_support',
+                'method': (best_support or {}).get(
+                    'method', 'full_frame_sfm_pose_recovery'),
+                'pose_source': 'registered_sample_sfm_poses_aligned_to_lidar',
+                'reason': rigid_reason,
+                'registered_views': len(poses),
+                'accepted_registered_coverage': (best_support or {}).get('coverage', {}),
+                'alignment_rmse_cm': (best_support or {}).get('alignment_rmse_cm'),
+                'alignment_quality_status': alignment.get('quality_status'),
+                'attempt_index': (best_support or {}).get('attempt_index'),
+                'window_fraction': (best_support or {}).get('window_fraction'),
+                'pose_support_path': 'calibration/auxiliary_pose_support.json',
+                'attempts': [str(path.relative_to(dataset_dir)) for path in attempts],
             }
-            if not extrinsics_calibrated:
-                sample_report['reason'] = (
-                    report.get('extrinsics', {}).get('reason') or
-                    'sample-SfM did not pass the rigid-pose quality gates'
-                )
-            report['sample_sfm'] = sample_report
-            result.calibration_report = report
-            calibrated.append(result)
-            if report.get('extrinsics', {}).get('status') != 'calibrated':
-                reason = report.get('extrinsics', {}).get('reason', 'pose consensus was rejected')
-                print(f'[!] {result.camera_name} sample-SfM calibration rejected: {reason}')
-    return calibrated
+            support_config.calibration_report = existing_report
+            support_records[original.camera_name] = {
+                'status': 'accepted',
+                'source': 'registered_sample_sfm_poses_aligned_to_lidar',
+                'method': (best_support or {}).get(
+                    'method', 'full_frame_sfm_pose_recovery'),
+                'camera_name': original.camera_name,
+                'camera_model': collected['camera_model'],
+                'intrinsics': collected['intrinsics'],
+                'alignment_quality_status': alignment.get('quality_status'),
+                'alignment_frame_time_source': alignment.get('frame_time_source'),
+                'alignment_calibration_version': alignment.get('calibration_version'),
+                'alignment_rmse_cm': (best_support or {}).get('alignment_rmse_cm'),
+                'sample_window_fraction': (best_support or {}).get('window_fraction'),
+                'accepted_registered_coverage': (best_support or {}).get('coverage', {}),
+                'attempt_index': (best_support or {}).get('attempt_index'),
+                'minimum_poses': 6,
+                'poses': sorted(poses, key=lambda pose: (pose['video_time'], pose['name'])),
+            }
+            resolved_cameras.append(support_config)
+
+        if not unresolved:
+            if support_records:
+                from raven_app.auxiliary_pose_support import write_auxiliary_pose_support
+                support_path = write_auxiliary_pose_support(
+                    dataset_dir, support_records, trajectory_path=trajectory_path)
+                print('[+] Auxiliary camera per-image SfM poses accepted for exact registered views: '
+                      + ', '.join(
+                          f'{name} ({len(record["poses"])} images)'
+                          for name, record in support_records.items()))
+                print(f'    Pose support: {support_path}')
+            rig = dict(best_attempt['rig'])
+            rig['calibration_source'] = 'sample_sfm'
+            rig['sample_sfm_alignment_rmse_cm'] = best_attempt['alignment_rmse_cm']
+            rig['sample_sfm_window_fraction'] = best_attempt['window_fraction']
+            rig['sample_sfm_method'] = best_attempt.get('method', 'bounded_temporal_window')
+            rig['sample_sfm_frames_per_camera'] = best_attempt.get('frames_per_camera', {})
+            if best_support is not None:
+                rig['auxiliary_pose_support_method'] = best_support['method']
+                rig['auxiliary_pose_support_attempt_index'] = best_support['attempt_index']
+                rig['auxiliary_pose_support_registered_coverage'] = best_support['coverage']
+            rig['auxiliary_pose_support_path'] = (
+                'calibration/auxiliary_pose_support.json' if support_records else None)
+            rig['sample_sfm_attempts'] = [str(path.relative_to(dataset_dir)) for path in attempts]
+            for name in ('rig_calibration.json', 'calibracao_rigida_auto.json'):
+                (dataset_dir / name).write_text(json.dumps(rig, indent=2), encoding='utf-8')
+            return resolved_cameras
+
+    for camera in cameras:
+        report = dict(last_failed_reports.get(camera.camera_name, camera.calibration_report or {}))
+        report['camera_name'] = camera.camera_name
+        report['sample_sfm'] = {
+            'status': 'failed',
+            'method': 'full_frame_sfm_pose_recovery',
+            'methods_attempted': ['bounded_temporal_window', 'full_frame_sfm_pose_recovery'],
+            'reason': 'Bounded calibration and full-frame SfM recovery failed: '
+                      + '; '.join(failures),
+            'attempts': [str(path.relative_to(dataset_dir)) for path in attempts],
+            'last_attempt': dict(last_failed_reports.get(camera.camera_name, {})),
+        }
+        camera.calibration_report = report
+    details = []
+    for camera in cameras:
+        report = camera.calibration_report or {}
+        reason = ((report.get('extrinsics', {}) or {}).get('reason')
+                  or (report.get('time_offset', {}) or {}).get('reason'))
+        details.append(f'{camera.camera_name}: {reason or "calibration quality gates failed"}')
+    attempts_text = ', '.join(str(path) for path in attempts)
+    raise RuntimeError(
+        'Required per-session sample SfM calibration failed for enabled cameras: '
+        + '; '.join(details) + '; ' + '; '.join(failures) + f'. Attempts: {attempts_text}')
 
 
 def _aux_camera_calibration_ready(camera):
-    """Only use auxiliary views whose intrinsics and metric rig pose both passed calibration."""
+    """Only use auxiliary views with calibrated intrinsics, time offset, and metric extrinsics."""
     report = getattr(camera, 'calibration_report', {}) or {}
+    time_report = report.get('time_offset', {}) or {}
+    time_status = time_report.get('status')
     return (
-        report.get('intrinsics', {}).get('status') == 'sfm_calibrated'
+        report.get('intrinsics', {}).get('status') in ('sfm_calibrated', 'calibrated', 'verified')
+        and time_status in ('calibrated', 'verified', 'configured')
+        and time_report.get('applied', True) is not False
         and report.get('extrinsics', {}).get('status') == 'calibrated'
     )
 
 
+def _aux_camera_pose_support_ready(
+    dataset_dir, camera, *, require_sfm_source_signature=False
+):
+    """Return true only for fresh per-image poses from an accepted SfM alignment."""
+    from raven_app.auxiliary_pose_support import load_camera_pose_support
+    return load_camera_pose_support(
+        Path(dataset_dir), getattr(camera, 'camera_name', ''),
+        camera_model=getattr(camera, 'camera_model', None),
+        intrinsics=getattr(camera, 'intrinsics', None),
+        require_sfm_source_signature=require_sfm_source_signature) is not None
+
+
+def _full_sfm_aux_pose_support_record(dataset_dir, camera):
+    """Build support only from registered images in the current accepted full-SfM model."""
+    report = getattr(camera, 'calibration_report', {}) or {}
+    candidate = report.get('sample_sfm_pose_support') or {}
+    if candidate.get('status') != 'candidate':
+        return None, 'current SfM calibration did not provide registered per-image poses'
+    if candidate.get('alignment_quality_status') != 'accepted':
+        return None, 'COLMAP-to-LiDAR alignment was not explicitly accepted'
+
+    from raven_app.auxiliary_pose_support import sfm_pose_source_signature
+    from scripts.pipeline_auto_calibrator_and_colorizer import CALIBRATION_VERSION, load_colmap_images
+
+    root = Path(dataset_dir)
+    alignment_path = root / 'colmap_to_lidar_alignment.json'
+    sparse_dir = root / 'sparse' / '0'
+    try:
+        alignment = json.loads(alignment_path.read_text(encoding='utf-8'))
+        if (alignment.get('calibration_version') != CALIBRATION_VERSION
+                or alignment.get('quality_status') != 'accepted'
+                or candidate.get('alignment_calibration_version') != CALIBRATION_VERSION):
+            return None, 'the current COLMAP-to-LiDAR alignment is stale or not accepted'
+        if candidate.get('alignment_quality_status') != alignment.get('quality_status'):
+            return None, 'the registered poses do not match the current alignment quality state'
+        manifest = json.loads((root / 'images' / 'frames.json').read_text(encoding='utf-8'))
+        time_source = manifest.get('time_source', 'video_pts')
+        alignment_time_source = alignment.get('frame_time_source', time_source)
+        if (candidate.get('alignment_frame_time_source') != alignment_time_source
+                or time_source != alignment_time_source):
+            return None, 'the aligned poses use a different frame-time source'
+        if time_source == 'insv_timelapse':
+            from raven_app.timelapse_calibration import VERSION as TIMELAPSE_VERSION
+            if (alignment.get('timelapse_calibration_version') != TIMELAPSE_VERSION
+                    or candidate.get('alignment_timelapse_calibration_version') != TIMELAPSE_VERSION):
+                return None, 'the timelapse alignment calibration is stale'
+        saved_model_signature = candidate.get('sfm_pose_source_signature')
+        if (not isinstance(saved_model_signature, dict)
+                or saved_model_signature != sfm_pose_source_signature(root)):
+            return None, 'the COLMAP model or alignment changed after its poses were generated'
+        if not (sparse_dir / 'images.bin').is_file() or not (sparse_dir / 'cameras.bin').is_file():
+            return None, 'the current COLMAP camera/image model is incomplete'
+        registered = {
+            str(image.get('name', '')).replace('\\', '/')
+            for image in load_colmap_images(sparse_dir / 'images.bin')
+        }
+        timestamps = manifest.get('timestamps', {})
+        model = str(candidate.get('camera_model', '')).strip().upper()
+        if model != str(getattr(camera, 'camera_model', '')).strip().upper():
+            return None, 'SfM poses do not use the selected auxiliary optical model'
+        intrinsics = candidate.get('intrinsics')
+        if not isinstance(intrinsics, dict):
+            return None, 'SfM did not provide auxiliary camera intrinsics'
+        checked_intrinsics = {str(key): float(value) for key, value in intrinsics.items()}
+        if (not all(np.isfinite(value) for value in checked_intrinsics.values())
+                or any(checked_intrinsics.get(key, 0.0) <= 0
+                       for key in ('width', 'height', 'fx', 'fy'))):
+            return None, 'SfM auxiliary camera intrinsics are invalid'
+        if (str((report.get('intrinsics') or {}).get('status', ''))
+                not in ('sfm_calibrated', 'calibrated', 'verified')):
+            return None, 'SfM auxiliary camera intrinsics did not pass calibration'
+        poses = []
+        for pose in candidate.get('poses', []):
+            if not isinstance(pose, dict):
+                continue
+            name = str(pose.get('name', '')).replace('\\', '/')
+            if not name.startswith(f'{camera.camera_name}/') or name not in registered:
+                continue
+            try:
+                video_time = float(pose['video_time'])
+                manifest_time = float(timestamps[name])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not np.isfinite(video_time) or abs(video_time - manifest_time) > 1e-6:
+                continue
+            poses.append({**pose, 'video_time': video_time})
+        if len(poses) < 6:
+            return None, f'only {len(poses)} current registered auxiliary poses are valid; six are required'
+        return {
+            'status': 'accepted',
+            'source': 'registered_full_sfm_poses_aligned_to_lidar',
+            'camera_name': camera.camera_name,
+            'camera_model': model,
+            'intrinsics': checked_intrinsics,
+            'alignment_quality_status': 'accepted',
+            'alignment_calibration_version': CALIBRATION_VERSION,
+            'alignment_timelapse_calibration_version': alignment.get(
+                'timelapse_calibration_version'),
+            'alignment_frame_time_source': alignment_time_source,
+            'alignment_rmse_cm': candidate.get('alignment_rmse_cm'),
+            'minimum_poses': 6,
+            'poses': poses,
+            'sfm_pose_source_signature': saved_model_signature,
+        }, None
+    except (OSError, ValueError, TypeError, KeyError, ImportError, struct.error) as exc:
+        return None, f'could not validate current registered SfM poses: {exc}'
+
+
+_COLMAP_TEXT_MODEL_IDS = {
+    'SIMPLE_PINHOLE': 0, 'PINHOLE': 1, 'SIMPLE_RADIAL': 2, 'RADIAL': 3,
+    'OPENCV': 4, 'OPENCV_FISHEYE': 5, 'FULL_OPENCV': 6, 'FOV': 7,
+    'SIMPLE_RADIAL_FISHEYE': 8, 'RADIAL_FISHEYE': 9, 'THIN_PRISM_FISHEYE': 10,
+}
+
+
+def _sync_colmap_text_binary(sparse_dir: Path) -> None:
+    """Regenerate COLMAP binary camera/image files from their text counterparts."""
+    from raven_app.third_camera import (
+        _COLMAP_CAMERA_MODEL_NAMES,
+        _COLMAP_CAMERA_PARAM_COUNTS,
+    )
+
+    sparse_dir = Path(sparse_dir)
+    camera_txt = sparse_dir / 'cameras.txt'
+    image_txt = sparse_dir / 'images.txt'
+    if camera_txt.is_file():
+        cameras = []
+        for line in camera_txt.read_text(encoding='utf-8').splitlines():
+            row = line.strip()
+            if not row or row.startswith('#'):
+                continue
+            parts = row.split()
+            if len(parts) < 5:
+                raise ValueError(f'Invalid COLMAP camera row: {row}')
+            camera_id, model_name, width, height = int(parts[0]), parts[1], int(parts[2]), int(parts[3])
+            model_id = _COLMAP_TEXT_MODEL_IDS.get(model_name)
+            if model_id is None:
+                raise ValueError(f'Unsupported COLMAP camera model: {model_name}')
+            params = [float(value) for value in parts[4:]]
+            if len(params) != _COLMAP_CAMERA_PARAM_COUNTS[model_id]:
+                raise ValueError(
+                    f'{model_name} camera {camera_id} has {len(params)} parameters; '
+                    f'expected {_COLMAP_CAMERA_PARAM_COUNTS[model_id]}'
+                )
+            cameras.append((camera_id, model_id, width, height, params))
+        with (sparse_dir / 'cameras.bin').open('wb') as stream:
+            stream.write(struct.pack('<Q', len(cameras)))
+            for camera_id, model_id, width, height, params in cameras:
+                stream.write(struct.pack('<iiQQ', camera_id, model_id, width, height))
+                stream.write(struct.pack(f'<{len(params)}d', *params))
+
+    if image_txt.is_file():
+        rows = [line.rstrip('\r\n') for line in image_txt.read_text(encoding='utf-8').splitlines()]
+        images = []
+        index = 0
+        while index < len(rows):
+            row = rows[index].strip()
+            if not row or row.startswith('#'):
+                index += 1
+                continue
+            header = row.split(maxsplit=9)
+            if len(header) != 10:
+                raise ValueError(f'Invalid COLMAP image row: {rows[index]}')
+            if index + 1 >= len(rows):
+                raise ValueError(f'COLMAP images.txt is missing a POINTS2D row for {header[9]}')
+            image_id = int(header[0])
+            qvec = tuple(float(value) for value in header[1:5])
+            tvec = tuple(float(value) for value in header[5:8])
+            camera_id = int(header[8])
+            name = header[9]
+            tokens = rows[index + 1].split()
+            if len(tokens) % 3:
+                raise ValueError(f'Invalid COLMAP POINTS2D row for {name}')
+            points2d = []
+            for point_offset in range(0, len(tokens), 3):
+                x, y = float(tokens[point_offset]), float(tokens[point_offset + 1])
+                point_id = int(tokens[point_offset + 2])
+                if point_id < -1:
+                    raise ValueError(f'Invalid POINT3D_ID {point_id} for {name}')
+                points2d.append((x, y, (1 << 64) - 1 if point_id == -1 else point_id))
+            images.append((image_id, qvec, tvec, camera_id, name, points2d))
+            index += 2
+        camera_ids = {camera[0] for camera in cameras} if camera_txt.is_file() else set()
+        if any(image[3] not in camera_ids for image in images):
+            raise ValueError('COLMAP image references a camera id absent from cameras.txt')
+        with (sparse_dir / 'images.bin').open('wb') as stream:
+            stream.write(struct.pack('<Q', len(images)))
+            for image_id, qvec, tvec, camera_id, name, points2d in images:
+                stream.write(struct.pack('<I', image_id))
+                stream.write(struct.pack('<4d', *qvec))
+                stream.write(struct.pack('<3d', *tvec))
+                stream.write(struct.pack('<I', camera_id))
+                stream.write(name.encode('ascii') + b'\x00')
+                stream.write(struct.pack('<Q', len(points2d)))
+                for x, y, point_id in points2d:
+                    stream.write(struct.pack('<2dQ', x, y, point_id))
+
+
+def _validate_rigid_transform(value, label):
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        raise ValueError(f'{label} must be a finite 4x4 rigid transform')
+    rotation = matrix[:3, :3]
+    if (not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-6)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-3)
+            or np.linalg.det(rotation) <= 0
+            or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-3)):
+        raise ValueError(f'{label} does not contain a proper rigid rotation')
+    return matrix
+
+
+def _colmap_model_parameters(intrinsics, lens_model, camera_id):
+    model = str(intrinsics.get('camera_model') or intrinsics.get('lens_model') or lens_model or 'OPENCV_FISHEYE').upper()
+    width, height = int(intrinsics.get('width', 3840)), int(intrinsics.get('height', 3840))
+    fx, fy, cx, cy = (float(intrinsics[key]) for key in ('fx', 'fy', 'cx', 'cy'))
+    values = {
+        'SIMPLE_PINHOLE': [fx, cx, cy],
+        'PINHOLE': [fx, fy, cx, cy],
+        'SIMPLE_RADIAL': [fx, cx, cy, float(intrinsics.get('k1', 0.0))],
+        'RADIAL': [fx, cx, cy, float(intrinsics.get('k1', 0.0)), float(intrinsics.get('k2', 0.0))],
+        'OPENCV': [fx, fy, cx, cy, *[float(intrinsics.get(key, 0.0)) for key in ('k1', 'k2', 'p1', 'p2')]],
+        'OPENCV_FISHEYE': [fx, fy, cx, cy, *[float(intrinsics.get(key, 0.0)) for key in ('k1', 'k2', 'k3', 'k4')]],
+        'FULL_OPENCV': [fx, fy, cx, cy, *[float(intrinsics.get(key, 0.0)) for key in ('k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'k5', 'k6')]],
+        'FOV': [fx, fy, cx, cy, float(intrinsics.get('omega', 0.0))],
+        'SIMPLE_RADIAL_FISHEYE': [fx, cx, cy, float(intrinsics.get('k1', 0.0))],
+        'RADIAL_FISHEYE': [fx, cx, cy, float(intrinsics.get('k1', 0.0)), float(intrinsics.get('k2', 0.0))],
+        'THIN_PRISM_FISHEYE': [fx, fy, cx, cy, *[float(intrinsics.get(key, 0.0)) for key in
+            ('k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'sx1', 'sy1')]],
+    }
+    if model not in values:
+        raise ValueError(f'Unsupported calibrated COLMAP camera model for camera {camera_id}: {model}')
+    if not np.all(np.isfinite(values[model])):
+        raise ValueError(f'Camera {camera_id} intrinsics contain non-finite values')
+    return model, width, height, values[model]
+
+
+def _valid_pose_window(dataset_dir, name, fps, dt_sync, slam_duration, offset=0.0):
+    try:
+        video_time = frame_time(dataset_dir, name, fps)
+    except (KeyError, OSError, ValueError):
+        return False
+    query = video_time - float(dt_sync) - float(offset)
+    return bool(np.isfinite(query) and 0.0 <= query <= slam_duration)
+
+
+def _link_or_copy(source, target):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, target)
+    except OSError:
+        try:
+            target.symlink_to(source)
+        except OSError:
+            shutil.copy2(source, target)
+
+
+def _auxiliary_camera_model_matches(camera, sparse_dir):
+    from raven_app.third_camera import _COLMAP_CAMERA_MODEL_NAMES, _read_colmap_cameras
+    selected = str(getattr(camera, 'camera_model', 'PINHOLE')).upper()
+    expected = {
+        'PINHOLE': 'PINHOLE', 'OPENCV': 'OPENCV',
+        'OPENCV_FISHEYE': 'OPENCV_FISHEYE',
+        'THIN_PRISM_FISHEYE': 'THIN_PRISM_FISHEYE',
+    }.get(selected)
+    if expected is None:
+        return False
+    images_bin = Path(sparse_dir) / 'images.bin'
+    cameras_bin = Path(sparse_dir) / 'cameras.bin'
+    if not images_bin.is_file() or not cameras_bin.is_file():
+        return False
+    from scripts.pipeline_auto_calibrator_and_colorizer import load_colmap_images
+    prefix = f"{getattr(camera, 'camera_name', 'cam2')}/"
+    records = [item for item in load_colmap_images(images_bin) if item['name'].replace('\\', '/').startswith(prefix)]
+    if not records:
+        return True
+    cameras = _read_colmap_cameras(cameras_bin)
+    names = _COLMAP_CAMERA_MODEL_NAMES
+    return all(names.get(cameras[item['cam_id']]['model_id']) == expected for item in records)
+
+
+def _clear_colmap_image_observations(sparse_dir):
+    """Keep camera poses while clearing feature links after replacing SfM points by LiDAR seed points."""
+    path = Path(sparse_dir) / 'images.txt'
+    if not path.is_file():
+        return
+    rows = path.read_text(encoding='utf-8').splitlines()
+    output = []
+    index = 0
+    while index < len(rows):
+        line = rows[index]
+        output.append(line)
+        if line.strip() and not line.lstrip().startswith('#'):
+            if index + 1 >= len(rows):
+                raise ValueError('COLMAP images.txt is missing a POINTS2D row')
+            points = rows[index + 1].split()
+            if len(points) % 3:
+                raise ValueError(f'Invalid COLMAP POINTS2D row after: {line}')
+            output.append(' '.join(f'{points[i]} {points[i+1]} -1' for i in range(0, len(points), 3)))
+            index += 2
+        else:
+            index += 1
+    path.write_text('\n'.join(output) + '\n', encoding='utf-8')
+
+
 def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0,
                        max_points: Optional[int] = None, masks_dir: Optional[Path] = None,
-                       third_camera: Optional[Any] = None, seed_percent: float = 100.0) -> Path:
+                       third_camera: Optional[Any] = None, seed_percent: float = 100.0,
+                       pose_source: str = 'auto', export_path: Optional[Path] = None) -> Path:
+    """Build a clean COLMAP export, preserving any prior export as a recoverable backup."""
+    dataset_dir = Path(dataset_dir)
+    target_dir = Path(export_path) if export_path is not None else dataset_dir / 'colmap_3dgs'
+    if export_path is not None and target_dir.exists():
+        raise FileExistsError(f'COLMAP export directory already exists: {target_dir}')
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage_dir = Path(tempfile.mkdtemp(prefix=f'.{target_dir.name}.stage-', dir=str(target_dir.parent)))
+    try:
+        _build_colmap_3dgs_dataset(
+            dataset_dir, calib_path, fps, dt_sync, max_points, masks_dir, third_camera,
+            seed_percent, pose_source, stage_dir,
+        )
+        backup_dir = None
+        if target_dir.exists():
+            stamp = time.strftime('%Y%m%d_%H%M%S')
+            backup_dir = target_dir.with_name(f'{target_dir.name}.previous-{stamp}')
+            suffix = 1
+            while backup_dir.exists():
+                backup_dir = target_dir.with_name(f'{target_dir.name}.previous-{stamp}-{suffix}')
+                suffix += 1
+            os.replace(target_dir, backup_dir)
+        try:
+            os.replace(stage_dir, target_dir)
+        except Exception:
+            if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
+                os.replace(backup_dir, target_dir)
+            raise
+        _postprocess_3dgs_dataset(target_dir, dataset_dir)
+    except Exception:
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
+    print(f"[+] COLMAP 3DGS dataset generation complete: {target_dir}")
+    return target_dir
+
+
+def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points,
+                              masks_dir, third_camera, seed_percent, pose_source, out_dir):
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
 
     Transforms camera poses into the LiDAR metric coordinate frame and seeds the model with
@@ -733,186 +1742,279 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
     """
     from raven_app.seed_export import validate_seed_percent
     seed_percent = validate_seed_percent(seed_percent)
-    out_dir = dataset_dir / "colmap_3dgs"
+    dataset_dir = Path(dataset_dir)
+    out_dir = Path(out_dir)
+    pose_source = str(pose_source).strip().lower()
+    if pose_source not in ('auto', 'direct', 'sfm'):
+        raise ValueError("pose_source must be 'auto', 'direct', or 'sfm'")
     images_out = out_dir / "images"
     sparse_out = out_dir / "sparse" / "0"
     images_out.mkdir(parents=True, exist_ok=True)
     sparse_out.mkdir(parents=True, exist_ok=True)
-
     print(f"\n[*] Generating COLMAP Dataset for 3DGS Training under: {out_dir}")
-
-    # Link / copy images into colmap_3dgs/images/cam0 and cam1
-    cam0_files = sorted((dataset_dir / "images" / "cam0").glob("*.jpg"))
-    cam1_files = sorted((dataset_dir / "images" / "cam1").glob("*.jpg"))
-    for cam, files in [("cam0", cam0_files), ("cam1", cam1_files)]:
-        dest_cam = images_out / cam
-        dest_cam.mkdir(parents=True, exist_ok=True)
-        for f in files:
-            target = dest_cam / f.name
-            if not target.exists():
-                try:
-                    os.link(f, target)
-                except Exception:
-                    try:
-                        target.symlink_to(f)
-                    except Exception:
-                        shutil.copy2(f, target)
 
     third_cameras = (third_camera if isinstance(third_camera, (list, tuple))
                      else [third_camera] if third_camera else [])
-    camera_files = [*cam0_files, *cam1_files]
-    for camera in third_cameras:
-        if not getattr(camera, "enabled", True):
-            continue
-        cam_name = getattr(camera, "camera_name", "cam2")
-        cam_src = dataset_dir / "images" / cam_name
-        if cam_src.is_dir():
-            cam_files = sorted(cam_src.glob("*.jpg"))
-            camera_files.extend(cam_files)
-            dest_cam = images_out / cam_name
-            dest_cam.mkdir(parents=True, exist_ok=True)
-            for f in cam_files:
-                target = dest_cam / f.name
-                if not target.exists():
-                    try:
-                        os.link(f, target)
-                    except Exception:
-                        try:
-                            target.symlink_to(f)
-                        except Exception:
-                            shutil.copy2(f, target)
+    camera_cfg_by_name = {
+        str(getattr(camera, 'camera_name', 'cam2')): camera for camera in third_cameras
+        if getattr(camera, 'enabled', True)
+    }
 
-    if masks_dir is not None:
-        _copy_person_masks(dataset_dir, masks_dir, out_dir, camera_files)
-
-    # 1. Check if Spirula SfM output is available to transform to METRIC scale
     sfm_sparse = dataset_dir / "sparse" / "0"
     if not (sfm_sparse / "points3D.bin").is_file():
         alt = dataset_dir / "spirula_out" / "workspace" / "sparse" / "0"
         if (alt / "points3D.bin").is_file():
             sfm_sparse = alt
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
+    has_sfm = (sfm_sparse / 'points3D.bin').is_file() and align_json.is_file()
+    if pose_source == 'auto':
+        pose_source = 'sfm' if has_sfm else 'direct'
+    if pose_source == 'sfm' and not has_sfm:
+        raise FileNotFoundError('SfM pose source was requested, but sparse points or COLMAP-to-LiDAR alignment is missing')
+
+    from scripts.pipeline_auto_calibrator_and_colorizer import get_slam_trajectory_path
+    trj_path = get_slam_trajectory_path(dataset_dir)
+    if not trj_path.is_file():
+        raise FileNotFoundError(f'SLAM trajectory not found: {trj_path}')
+    trajectory = np.loadtxt(trj_path, ndmin=2)
+    if (trajectory.ndim != 2 or trajectory.shape[1] < 8 or len(trajectory) < 2
+            or not np.all(np.isfinite(trajectory[:, :8]))
+            or np.any(np.diff(trajectory[:, 0]) <= 0)):
+        raise ValueError(f'Malformed SLAM trajectory: {trj_path}')
+    t_slam = trajectory[:, 0]
+    pos_slam = trajectory[:, 1:4]
+    rot_slam = Rot.from_quat(trajectory[:, 4:8])
+    from scipy.spatial.transform import Slerp
+    slerp = Slerp(t_slam, rot_slam)
+    slam_duration = float(t_slam[-1] - t_slam[0])
+
+    direct_calib = None
+    alignment = None
+    sync_for_export = float(dt_sync)
+    source_image_records = []
+    allowed_names = set()
+    selected_images = []
+    auxiliary_decisions = {}
+    auxiliary_pose_records = {}
+    if pose_source == 'sfm':
+        alignment = json.loads(align_json.read_text(encoding='utf-8'))
+        if alignment.get('quality_status') not in (None, 'accepted'):
+            raise ValueError(f"SfM alignment is not accepted: {alignment.get('quality_status')}")
+        sync_for_export = float(alignment.get('dt_sync_seconds', dt_sync))
+        scale = float(alignment.get('scale', 0.0))
+        rotation = np.asarray(alignment.get('R'), dtype=np.float64)
+        translation = np.asarray(alignment.get('t'), dtype=np.float64)
+        if (not np.isfinite(sync_for_export) or not np.isfinite(scale) or scale <= 0
+                or rotation.shape != (3, 3) or translation.shape != (3,)
+                or not np.all(np.isfinite(rotation)) or not np.all(np.isfinite(translation))
+                or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-3)
+                or np.linalg.det(rotation) <= 0):
+            raise ValueError('SfM alignment contains invalid scale, rotation, translation, or time offset')
+        if alignment.get('frame_time_source') == 'insv_timelapse':
+            from raven_app.timelapse_calibration import VERSION as TIMELAPSE_VERSION
+            if (alignment.get('quality_status') != 'accepted'
+                    or alignment.get('timelapse_calibration_version') != TIMELAPSE_VERSION):
+                raise ValueError('Timelapse SfM alignment is stale or not accepted')
+        from scripts.pipeline_auto_calibrator_and_colorizer import load_colmap_images
+        image_bin = sfm_sparse / 'images.bin'
+        if not image_bin.is_file() or not (sfm_sparse / 'cameras.bin').is_file():
+            raise FileNotFoundError(f'SfM camera/image model is incomplete: {sfm_sparse}')
+        source_image_records = load_colmap_images(image_bin)
+        accepted_value = alignment.get('accepted_image_names')
+        accepted_names = ({str(name).replace('\\', '/') for name in accepted_value}
+                          if isinstance(accepted_value, list) else None)
+        rejected_names = {str(name).replace('\\', '/')
+                          for name in alignment.get('rejected_image_names', [])}
+        for record in source_image_records:
+            name = str(record['name']).replace('\\', '/')
+            camera_name = name.split('/', 1)[0]
+            if camera_name in ('cam0', 'cam1'):
+                if ((accepted_names is not None and name not in accepted_names)
+                        or (accepted_names is None and name in rejected_names)):
+                    continue
+                offset = 0.0
+            else:
+                camera = camera_cfg_by_name.get(camera_name)
+                if camera is None:
+                    auxiliary_decisions[camera_name] = 'excluded: camera is not enabled'
+                    continue
+                if not _auxiliary_camera_model_matches(camera, sfm_sparse):
+                    auxiliary_decisions[camera_name] = 'excluded: sparse model differs from selected optical model'
+                    continue
+                if _aux_camera_calibration_ready(camera):
+                    auxiliary_decisions[camera_name] = 'accepted: calibrated sparse poses'
+                    offset = float(getattr(camera, 'time_offset_s', 0.0))
+                    if not _valid_pose_window(
+                            dataset_dir, name, fps, sync_for_export, slam_duration, offset):
+                        continue
+                elif alignment.get('quality_status') == 'accepted':
+                    # A registered SfM pose is already in the aligned world frame;
+                    # it does not need a fabricated per-camera clock offset.
+                    auxiliary_decisions[camera_name] = 'accepted: registered aligned SfM pose'
+                    offset = None
+                else:
+                    auxiliary_decisions[camera_name] = 'excluded: no accepted alignment or rigid calibration'
+                    continue
+            if camera_name in ('cam0', 'cam1') and not _valid_pose_window(
+                    dataset_dir, name, fps, sync_for_export, slam_duration, 0.0):
+                continue
+            image_path = dataset_dir / 'images' / Path(name)
+            if not image_path.is_file():
+                continue
+            allowed_names.add(name)
+            selected_images.append((name, image_path))
+        if not any(name.startswith(('cam0/', 'cam1/')) for name in allowed_names):
+            raise ValueError('No accepted cam0/cam1 SfM poses remain inside the SLAM time window')
+        print(f"  [*] SfM pose filter: {len(allowed_names)} accepted/in-window images; "
+              f"{len(source_image_records) - len(allowed_names)} rejected, out-of-window, uncalibrated, or missing")
+    else:
+        direct_calib = json.loads(Path(calib_path).read_text(encoding='utf-8'))
+        for camera_id, camera_key in ((1, 'cam0_front_intrinsics'), (2, 'cam1_rear_intrinsics')):
+            _colmap_model_parameters(direct_calib[camera_key], direct_calib.get('lens_model'), camera_id)
+            _validate_rigid_transform(
+                direct_calib[f'T_lidar_to_cam{camera_id - 1}_rigid_4x4'],
+                f'LiDAR-to-cam{camera_id - 1} calibration',
+            )
+        for camera_name in ('cam0', 'cam1'):
+            source_dir = dataset_dir / 'images' / camera_name
+            for image_path in sorted(source_dir.glob('*.jpg')) if source_dir.is_dir() else []:
+                name = f'{camera_name}/{image_path.name}'
+                if _valid_pose_window(dataset_dir, name, fps, sync_for_export, slam_duration):
+                    allowed_names.add(name)
+                    selected_images.append((name, image_path))
+        for camera_name, camera in camera_cfg_by_name.items():
+            if not _aux_camera_calibration_ready(camera):
+                from raven_app.auxiliary_pose_support import load_camera_pose_support
+                support = load_camera_pose_support(
+                    dataset_dir, camera_name,
+                    camera_model=getattr(camera, 'camera_model', None),
+                    intrinsics=getattr(camera, 'intrinsics', None),
+                    trajectory_path=trj_path)
+                if support is None:
+                    auxiliary_decisions[camera_name] = 'excluded: no rigid calibration or fresh registered SfM poses'
+                    print(f'  [!] Skipping {camera_name}: no rigid calibration or fresh registered SfM poses')
+                    continue
+                try:
+                    _colmap_model_parameters(
+                        support['intrinsics'], support['camera_model'], 3)
+                except (KeyError, TypeError, ValueError) as exc:
+                    auxiliary_decisions[camera_name] = f'excluded: invalid SfM optical model ({exc})'
+                    print(f'  [!] Skipping {camera_name}: invalid SfM optical model ({exc})')
+                    continue
+                auxiliary_pose_records[camera_name] = support
+                auxiliary_decisions[camera_name] = (
+                    f'accepted: {len(support["poses"])} registered sample SfM poses')
+                for pose in support['poses']:
+                    name = pose['name']
+                    image_path = Path(pose['image_path'])
+                    if name not in allowed_names and image_path.is_file():
+                        allowed_names.add(name)
+                        selected_images.append((name, image_path))
+                print(f'  [+] Including {len(support["poses"])} exact registered SfM poses for {camera_name}')
+                continue
+            try:
+                _validate_rigid_transform(
+                    getattr(camera, 'T_lidar_to_cam2_rigid_4x4', None),
+                    f'LiDAR-to-{camera_name} calibration',
+                )
+                _colmap_model_parameters(
+                    getattr(camera, 'intrinsics', {}) or {},
+                    getattr(camera, 'camera_model', 'PINHOLE'), 3,
+                )
+                if str(getattr(camera, 'camera_model', 'PINHOLE')).upper() not in (
+                        'PINHOLE', 'OPENCV', 'OPENCV_FISHEYE', 'THIN_PRISM_FISHEYE'):
+                    raise ValueError(f'Unsupported selected COLMAP model for {camera_name}')
+            except ValueError as exc:
+                auxiliary_decisions[camera_name] = f'excluded: {exc}'
+                print(f'  [!] Skipping {camera_name}: {exc}')
+                continue
+            auxiliary_decisions[camera_name] = 'accepted: SLAM synthesis'
+            source_dir = dataset_dir / 'images' / camera_name
+            for image_path in sorted(source_dir.glob('*.jpg')) if source_dir.is_dir() else []:
+                name = f'{camera_name}/{image_path.name}'
+                if _valid_pose_window(dataset_dir, name, fps, sync_for_export, slam_duration,
+                                      float(getattr(camera, 'time_offset_s', 0.0))):
+                    allowed_names.add(name)
+                    selected_images.append((name, image_path))
+        if not any(name.startswith(('cam0/', 'cam1/')) for name in allowed_names):
+            raise ValueError('No cam0/cam1 images overlap the SLAM trajectory time window')
+
+    camera_files = []
+    for name, source in selected_images:
+        target = images_out / Path(name)
+        _link_or_copy(source, target)
+        camera_files.append(source)
+    if masks_dir is not None:
+        _copy_person_masks(dataset_dir, masks_dir, out_dir, camera_files)
 
     poses_ready = False
-    if (sfm_sparse / "points3D.bin").is_file() and align_json.is_file():
+    if pose_source == 'sfm':
         print("  [*] Transforming Spirula SfM cameras and images into true LiDAR METRIC frame via Sim(3)...")
         from scripts.pipeline_auto_calibrator_and_colorizer import transform_colmap_to_metric
-        with open(align_json, "r", encoding="utf-8") as f:
-            al = json.load(f)
-        s_sim = al["scale"]
-        R_sim = np.array(al["R"])
-        t_sim = np.array(al["t"])
-        transform_colmap_to_metric(sfm_sparse, sparse_out, s_sim, R_sim, t_sim)
+        transform_colmap_to_metric(
+            sfm_sparse, sparse_out, alignment['scale'],
+            np.asarray(alignment['R'], dtype=np.float64),
+            np.asarray(alignment['t'], dtype=np.float64),
+            include_images=allowed_names,
+        )
         poses_ready = True
 
     if not poses_ready:
-        # Fallback: Synthesize from SLAM Trajectory
-        print("  [*] SfM sparse reconstruction not found; synthesizing poses from SLAM trajectory...")
-        calib = json.loads(calib_path.read_text(encoding="utf-8"))
+        print("  [*] Using requested direct pose source: SLAM trajectory + calibrated rig")
+        calib = direct_calib
         c0 = calib["cam0_front_intrinsics"]
         c1 = calib["cam1_rear_intrinsics"]
-        T_LC0 = np.array(calib["T_lidar_to_cam0_rigid_4x4"])
-        T_LC1 = np.array(calib["T_lidar_to_cam1_rigid_4x4"])
+        T_LC0 = _validate_rigid_transform(calib["T_lidar_to_cam0_rigid_4x4"], 'LiDAR-to-cam0 calibration')
+        T_LC1 = _validate_rigid_transform(calib["T_lidar_to_cam1_rigid_4x4"], 'LiDAR-to-cam1 calibration')
         R_LC0, t_LC0 = T_LC0[:3, :3], T_LC0[:3, 3]
         R_LC1, t_LC1 = T_LC1[:3, :3], T_LC1[:3, 3]
 
         cameras_txt = sparse_out / "cameras.txt"
-        # Keep the fallback COLMAP cameras in the same optical model and image
-        # dimensions as the calibration. Older rig profiles predate these
-        # fields and used an 8-parameter OPENCV_FISHEYE camera at 3840x3840.
-        model_parameters = {
-            "THIN_PRISM_FISHEYE": (
-                "fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2",
-                "k3", "k4", "sx1", "sy1",
-            ),
-            "OPENCV_FISHEYE": ("fx", "fy", "cx", "cy", "k1", "k2", "k3", "k4"),
-        }
         with open(cameras_txt, "w", encoding="utf-8") as f:
             f.write("# Camera list with one line of data per camera:\n")
             f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
             for camera_id, intrinsics in ((1, c0), (2, c1)):
-                model = str(
-                    intrinsics.get("camera_model")
-                    or intrinsics.get("lens_model")
-                    or calib.get("lens_model")
-                    or "OPENCV_FISHEYE"
-                ).upper()
-                parameter_names = model_parameters.get(model)
-                if parameter_names is None:
-                    raise ValueError(
-                        f"Unsupported calibrated COLMAP camera model for camera {camera_id}: {model}"
-                    )
-                width = int(intrinsics.get("width", 3840))
-                height = int(intrinsics.get("height", 3840))
-                # Intrinsic/distortion terms are required for their declared
-                # model; omitted distortion terms in legacy profiles mean 0.
-                params = []
-                for name in parameter_names:
-                    if name in ("fx", "fy", "cx", "cy"):
-                        params.append(str(intrinsics[name]))
-                    else:
-                        params.append(str(intrinsics.get(name, 0.0)))
-                f.write(f"{camera_id} {model} {width} {height} {' '.join(params)}\n")
+                model, width, height, params = _colmap_model_parameters(
+                    intrinsics, calib.get('lens_model'), camera_id)
+                f.write(f"{camera_id} {model} {width} {height} "
+                        f"{' '.join(format(value, '.17g') for value in params)}\n")
         print("  [+] Written cameras.txt")
-
-        trj_path = dataset_dir / "slam_out" / "result" / "Raven_3DMakerPro_Scan.txt"
-        if not trj_path.is_file() and (dataset_dir / "slam_out" / "result").is_dir():
-            txts = sorted((dataset_dir / "slam_out" / "result").glob("*.txt"))
-            if txts:
-                trj_path = txts[0]
         images_txt = sparse_out / "images.txt"
-
-        if trj_path.is_file():
-            trj_data = np.loadtxt(trj_path)
-            t_slam = trj_data[:, 0]
-            pos_slam = trj_data[:, 1:4]
-            rot_slam = Rot.from_quat(trj_data[:, 4:8])
-            from scipy.spatial.transform import Slerp
-            slerp = Slerp(t_slam, rot_slam)
-
-            t_slam_start = t_slam[0]
-            t_slam_end = t_slam[-1]
-            img_id = 1
-
-            with open(images_txt, "w", encoding="utf-8") as f:
-                f.write("# Image list with two lines of data per image:\n")
-                f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-                f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
-
-                for k in range(min(len(cam0_files), len(cam1_files))):
-                    fn_digits = "".join(filter(str.isdigit, cam0_files[k].stem))
-                    fn = int(fn_digits) if fn_digits else (k + 1)
-                    t_vid = frame_time(dataset_dir, "cam0/" + cam0_files[k].name, fps)
-                    t_query = t_slam_start + (t_vid - dt_sync)
-
-                    if not (t_slam_start <= t_query <= t_slam_end):
+        with open(images_txt, "w", encoding="utf-8") as f:
+            f.write("# Image list with two lines of data per image:\n")
+            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+            image_id = 1
+            for camera_id, camera_name, rotation_lc, translation_lc in (
+                (1, 'cam0', R_LC0, t_LC0), (2, 'cam1', R_LC1, t_LC1),
+            ):
+                for name, image_path in selected_images:
+                    if not name.startswith(f'{camera_name}/'):
                         continue
-
-                    idx = np.clip(np.searchsorted(t_slam, t_query), 1, len(t_slam) - 1)
-                    w = (t_query - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
-                    p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
-                    R_L = slerp(t_query).as_matrix()
-
-                    for cam_id, cam_name, img_file, R_LC, t_LC in [
-                        (1, "cam0", cam0_files[k], R_LC0, t_LC0),
-                        (2, "cam1", cam1_files[k], R_LC1, t_LC1)
-                    ]:
-                        p_cam = p_L + R_L @ t_LC
-                        R_world_cam = R_L @ R_LC
-                        R_cw = R_world_cam.T
-                        t_cw = -R_cw @ p_cam
-                        q_cw = Rot.from_matrix(R_cw).as_quat()
-                        f.write(
-                            f"{img_id} {q_cw[3]:.8f} {q_cw[0]:.8f} {q_cw[1]:.8f} {q_cw[2]:.8f} "
-                            f"{t_cw[0]:.8f} {t_cw[1]:.8f} {t_cw[2]:.8f} {cam_id} {cam_name}/{img_file.name}\n\n"
-                        )
-                        img_id += 1
-
-            print(f"  [+] Written images.txt with {img_id - 1} camera poses")
+                    video_time = frame_time(dataset_dir, name, fps)
+                    t_query = t_slam[0] + (video_time - sync_for_export)
+                    if not (t_slam[0] <= t_query <= t_slam[-1]):
+                        continue
+                    index = int(np.clip(np.searchsorted(t_slam, t_query), 1, len(t_slam) - 1))
+                    weight = (t_query - t_slam[index - 1]) / (t_slam[index] - t_slam[index - 1])
+                    p_lidar = (1.0 - weight) * pos_slam[index - 1] + weight * pos_slam[index]
+                    R_lidar = slerp(t_query).as_matrix()
+                    p_cam = p_lidar + R_lidar @ translation_lc
+                    R_world_cam = R_lidar @ rotation_lc
+                    R_cw = R_world_cam.T
+                    t_cw = -R_cw @ p_cam
+                    q_cw = Rot.from_matrix(R_cw).as_quat()
+                    f.write(
+                        f"{image_id} {q_cw[3]:.17g} {q_cw[0]:.17g} {q_cw[1]:.17g} {q_cw[2]:.17g} "
+                        f"{t_cw[0]:.17g} {t_cw[1]:.17g} {t_cw[2]:.17g} {camera_id} {name}\n\n"
+                    )
+                    image_id += 1
+        print(f"  [+] Written direct images.txt with {image_id - 1} camera poses")
 
     # Seed 3DGS point cloud exclusively with true metric LiDAR points (full raw points)
     lidar_xyz, lidar_rgb = load_lidar_seed_points(
-        dataset_dir, max_points=max_points, seed_percent=seed_percent)
+        dataset_dir, max_points=max_points, seed_percent=seed_percent,
+        preferred_method=pose_source)
     if lidar_xyz is not None and len(lidar_xyz) > 0:
         # If previous SfM points existed from reconstruction, preserve them as points3D_sfm_sparse
         if (sparse_out / "points3D.bin").is_file() and not (sparse_out / "points3D_sfm_sparse.bin").is_file():
@@ -929,23 +2031,39 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
         print(f"  [*] [{method_tag} 3DGS] Writing {seed_percent:g}% metric LiDAR seed "
               f"({len(lidar_xyz):,} points) to points3D.ply, points3D.bin, points3D.txt...")
         write_colmap_points3d(sparse_out, lidar_xyz, lidar_rgb)
+        _clear_colmap_image_observations(sparse_out)
         print(f"  [+] LiDAR 3DGS seed successfully written to: {sparse_out / 'points3D.ply'}")
     else:
         print("  [*] Using existing sparse points3D as 3DGS seed (no LiDAR cloud available).")
 
-    if third_camera:
+    if pose_source == 'direct' and third_cameras:
         from raven_app.third_camera import synthesize_third_camera_poses, inject_third_camera_into_colmap
-        cameras = third_camera if isinstance(third_camera, (list, tuple)) else [third_camera]
-        for camera_index, camera in enumerate(cameras, start=3):
-            if not getattr(camera, "enabled", True):
-                continue
-            report = getattr(camera, "calibration_report", {}) or {}
+        for camera_index, camera in enumerate(third_cameras, start=3):
             if not _aux_camera_calibration_ready(camera):
-                print(f"  [!] Skipping {camera.camera_name}: auxiliary intrinsics or metric mounting extrinsics are not calibrated.")
+                support = auxiliary_pose_records.get(camera.camera_name)
+                if support is None:
+                    print(f"  [!] Skipping {camera.camera_name}: no rigid or registered SfM poses")
+                    continue
+                poses = []
+                for item in support['poses']:
+                    rotation_cw = np.asarray(item['R_cw'], dtype=np.float64)
+                    center = np.asarray(item['C'], dtype=np.float64)
+                    translation_cw = -rotation_cw @ center
+                    quaternion = Rot.from_matrix(rotation_cw).as_quat()
+                    poses.append({
+                        'name': item['name'], 'R_cw': rotation_cw,
+                        't_cw': translation_cw, 'q_cw': quaternion,
+                        'C': center, 'camera_id': camera_index,
+                    })
+                if poses:
+                    inject_third_camera_into_colmap(
+                        sparse_out, camera, poses, camera_id=camera_index)
+                    print(f"  [+] Injected {len(poses)} registered sample SfM poses "
+                          f"({camera.camera_name}) into 3DGS COLMAP dataset")
                 continue
             try:
                 poses = synthesize_third_camera_poses(
-                    dataset_dir, camera, fps=fps, dt_sync=dt_sync)
+                    dataset_dir, camera, fps=fps, dt_sync=sync_for_export)
                 if poses:
                     inject_third_camera_into_colmap(
                         sparse_out, camera, poses, camera_id=camera_index)
@@ -953,9 +2071,25 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
             except Exception as e:
                 print(f"  [!] Warning: Failed to inject {camera.camera_name} poses: {e}")
 
-    _postprocess_3dgs_dataset(out_dir, dataset_dir)
-    print(f"[+] COLMAP 3DGS dataset generation complete: {out_dir}")
-    return out_dir
+    _sync_colmap_text_binary(sparse_out)
+    from scripts.pipeline_auto_calibrator_and_colorizer import load_colmap_images
+    exported_images = load_colmap_images(sparse_out / 'images.bin')
+    counts_by_camera = {}
+    for image in exported_images:
+        camera_name = image['name'].replace('\\', '/').split('/', 1)[0]
+        counts_by_camera[camera_name] = counts_by_camera.get(camera_name, 0) + 1
+    report = {
+        'pose_source': pose_source,
+        'dt_sync_seconds': sync_for_export,
+        'slam_duration_seconds': slam_duration,
+        'exported_images_by_camera': counts_by_camera,
+        'excluded_sfm_images': (len(source_image_records) - len(allowed_names)
+                                if pose_source == 'sfm' else 0),
+        'auxiliary_cameras': auxiliary_decisions,
+        'lidar_seed_percent': seed_percent,
+    }
+    (out_dir / 'colmap_export_report.json').write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
 
 
 def setup_sparse_compatibility(out_dir: Path):
@@ -1044,6 +2178,7 @@ def execute_unified_workflow(
     photometric: str = "off",
     photometric_params: Path = None,
     third_camera: Optional[Any] = None,
+    colmap_export_dir: Optional[Path] = None,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -1085,6 +2220,40 @@ def execute_unified_workflow(
         elif isinstance(third_camera, dict):
             third_cfgs = load_third_camera_configs(third_camera)
     third_cfgs = [cfg for cfg in third_cfgs if cfg.enabled and cfg.source_path]
+    if third_cfgs:
+        from raven_app.third_camera import expand_auxiliary_camera_configs
+        third_cfgs = expand_auxiliary_camera_configs(third_cfgs)
+
+    run_record = {
+        'run_id': str(time.time_ns()),
+        'started_at_utc': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'status': 'started',
+        'app_version': __version__,
+        **_workflow_settings_snapshot(
+            bag_path, insv_path, output_dir, fps=fps, method=method,
+            third_cameras=third_cfgs,
+            lio=bool(lio), threads=int(threads), lidar_topic=lidar_topic,
+            imu_topic=imu_topic, dt_override_seconds=dt_override,
+            recalibrate=bool(recalibrate), run_spirula=bool(run_spirula),
+            use_vulkan=bool(use_vulkan),
+            deliverables={'ply': bool(export_ply), 'pcd': bool(export_pcd),
+                          'colmap_3dgs': bool(export_colmap)},
+            seed_percent=float(seed_percent), process_gps=bool(process_gps),
+            gps_formats=list(gps_formats), geo_formats=list(geo_formats),
+            masks={'generate_person_masks': bool(mask_persons),
+                   'directory': _workflow_path_snapshot(masks_dir),
+                   'model': _workflow_path_snapshot(mask_model),
+                   'backend': mask_backend, 'threshold': float(mask_threshold),
+                   'margin': float(mask_margin),
+                   'config': _workflow_path_snapshot(mask_config)},
+            operator_radius_m=float(operator_radius),
+            photometric={'mode': photometric,
+                         'parameters': _workflow_path_snapshot(photometric_params)},
+            calibration_file=_workflow_path_snapshot(calib_json),
+        ),
+    }
+    _persist_workflow_run(output_dir, run_record)
+    print(f"[*] Workflow settings saved to {output_dir / 'workflow_config.json'}")
 
     print("=" * 80)
     print(" RAVENCALIBRATOR UNIFIED WORKFLOW STUDIO")
@@ -1117,6 +2286,10 @@ def execute_unified_workflow(
         except Exception as e:
             raise RuntimeError(f"Could not extract auxiliary camera {third_cfg.camera_name}: {e}") from e
 
+    run_record['status'] = 'frames_ready'
+    run_record['image_extraction'] = _workflow_image_extraction_snapshot(output_dir, third_cfgs)
+    _persist_workflow_run(output_dir, run_record)
+
     # Auxiliary orientation/source changes invalidate SfM just like INSV changes.
     frames_changed = previous_frames is not None and frames_manifest.stat().st_mtime_ns != previous_frames
 
@@ -1129,12 +2302,33 @@ def execute_unified_workflow(
         print(f"[*] Using manual time offset Δt = {dt_sync:.4f}s")
     else:
         dt_sync = auto_sync_imu_gyro(bag_path, insv_path, imu_topic=imu_topic)
+    run_record['resolved_dt_sync_seconds'] = float(dt_sync)
+    run_record['synchronization_source'] = 'manual_override' if dt_override is not None else 'imu_gyro_correlation'
+    _persist_workflow_run(output_dir, run_record)
 
     # --------------------------------------------------------------------------
     # STAGE 3: Run Native FAST-LIVO2 SLAM
     # --------------------------------------------------------------------------
     print("\n[STAGE 3/7] Running FAST-LIVO2 Native SLAM...")
     slam_out = output_dir / "slam_out"
+    is_eagle = ('livox' in (lidar_topic or '').lower()) or ('eagle' in str(bag_path).lower()) or (lidar_topic == '/livox/lidar')
+    timelapse_raven_profile = bool(is_timelapse and lio and not is_eagle)
+    base_config = resources() / ('FAST-LIVO2/config/eagle.yaml' if is_eagle else 'FAST-LIVO2/config/raven.yaml')
+    if not base_config.is_file():
+        base_config = resources() / 'FAST-LIVO2/config/raven.yaml'
+    native_engine = engine()
+    slam_inputs = {'bag': str(Path(bag_path).resolve()), 'size': Path(bag_path).stat().st_size,
+                   'mtime_ns': Path(bag_path).stat().st_mtime_ns, 'lio': bool(lio),
+                   'lidar_topic': lidar_topic, 'imu_topic': imu_topic,
+                   'timelapse_profile': timelapse_raven_profile, 'provenance_version': 1,
+                   'config_sha256': hashlib.sha256(base_config.read_bytes()).hexdigest(),
+                   'engine_sha256': hashlib.sha256(native_engine.read_bytes()).hexdigest()
+                   if lio and native_engine.is_file() else 'not-used'}
+    if lio:
+        # A settings-keyed raw cache preserves old datasets and invalidates SLAM
+        # when input, sensor topics, engine or estimator configuration changes.
+        key = hashlib.sha256(json.dumps(slam_inputs, sort_keys=True).encode()).hexdigest()[:20]
+        slam_out = output_dir / f'slam_raw_{key}'
     raw_pcd = slam_out / "pcd" / "all_raw_points.pcd"
     raw_trj = slam_out / "result" / "Raven_3DMakerPro_Scan.txt"
     if not raw_trj.is_file() and (slam_out / "result").is_dir():
@@ -1142,8 +2336,6 @@ def execute_unified_workflow(
         if txts:
             raw_trj = txts[0]
 
-    is_eagle = ('livox' in (lidar_topic or '').lower()) or ('eagle' in str(bag_path).lower()) or (lidar_topic == '/livox/lidar')
-    timelapse_raven_profile = bool(is_timelapse and lio and not is_eagle)
     profile_marker = slam_out / 'workflow_config.json'
     expected_profile = {
         'name': 'raven_timelapse_stable_v1',
@@ -1170,19 +2362,26 @@ def execute_unified_workflow(
         else:
             config_path = resources() / "FAST-LIVO2/config/raven.yaml"
         temporary_config = None
-        if timelapse_raven_profile:
+        if timelapse_raven_profile or lio:
             config_text = config_path.read_text(encoding='utf-8')
-            config_text, n_surf = re.subn(r'filter_size_surf:\s*[\d\.]+', 'filter_size_surf: 0.06', config_text, count=1)
-            config_text, n_vox = re.subn(r'voxel_size:\s*[\d\.]+', 'voxel_size: 0.20', config_text, count=1)
-            if n_surf != 1 or n_vox != 1:
-                raise RuntimeError('Cannot build the validated timelapse Raven profile: missing filter_size_surf or voxel_size')
+            if timelapse_raven_profile:
+                config_text, n_surf = re.subn(r'filter_size_surf:\s*[\d\.]+', 'filter_size_surf: 0.06', config_text, count=1)
+                config_text, n_vox = re.subn(r'voxel_size:\s*[\d\.]+', 'voxel_size: 0.20', config_text, count=1)
+                if n_surf != 1 or n_vox != 1:
+                    raise RuntimeError('Cannot build the validated timelapse Raven profile: missing filter_size_surf or voxel_size')
+            if lio:
+                config_text, count = re.subn(r'(?m)^pcd_save:\s*$',
+                                             'pcd_save:\n  scan_provenance_en: true', config_text, count=1)
+                if count != 1:
+                    raise RuntimeError('SLAM config lacks the required pcd_save section')
             temporary_config = output_dir / f'.raven_timelapse_{time.time_ns()}.yaml'
             temporary_config.write_text(config_text, encoding='utf-8')
             config_path = temporary_config
             profile_marker.unlink(missing_ok=True)
             if raw_pcd.is_file() and raw_trj.is_file():
                 print('[*] Existing SLAM output has no matching timelapse profile; recomputing it.')
-            print('[*] Using tested timelapse LIO settings: surface filter 0.06 m, map voxel 0.20 m.')
+            if timelapse_raven_profile:
+                print('[*] Using tested timelapse LIO settings: surface filter 0.06 m, map voxel 0.20 m.')
         camera_path = resources() / "FAST-LIVO2/config/camera_raven.yaml"
         cmd = [
             str(eng), "--input", "-", "--config", str(config_path),
@@ -1208,6 +2407,7 @@ def execute_unified_workflow(
             if timelapse_raven_profile and raw_pcd.is_file() and raw_trj.is_file():
                 profile_marker.write_text(
                     json.dumps(expected_profile, indent=2) + '\n', encoding='utf-8')
+            (slam_out/'input_config.json').write_text(json.dumps(slam_inputs, indent=2), encoding='utf-8')
         finally:
             if temporary_config is not None:
                 temporary_config.unlink(missing_ok=True)
@@ -1217,15 +2417,49 @@ def execute_unified_workflow(
             if txts:
                 raw_trj = txts[0]
 
+    if lio:
+        from raven_app.slam_refinement import refine, VERSION
+        if not (slam_out / 'scan_ranges.csv').is_file():
+            raise RuntimeError('SLAM output lacks exact scan provenance; recompute the raw SLAM in a fresh output directory')
+        refinement_dir = output_dir / (f'slam_refined_{VERSION}_'
+                                      f'{raw_pcd.stat().st_mtime_ns}_{raw_trj.stat().st_mtime_ns}')
+        refinement = refine(slam_out, refinement_dir, log=lambda message: print(f'[*] {message}', flush=True))
+        run_record['slam_refinement'] = refinement
+        _persist_workflow_run(output_dir, run_record)
+        if refinement['status'] == 'accepted':
+            slam_out = refinement_dir
+            raw_pcd = Path(refinement['output_pcd'])
+            raw_trj = Path(refinement['output_trajectory'])
+            print('[+] Global SLAM correction accepted by independent geometry validation.')
+        elif refinement['status'] == 'no_supported_revisits':
+            print('[*] No validated revisit correction; retaining raw SLAM geometry.')
+        else:
+            raise RuntimeError('Global SLAM correction failed geometry validation; candidate retained separately for diagnosis')
+    else:
+        run_record['slam_refinement'] = {'status': 'unsupported_visual_mode',
+                                          'reason': 'Exact world-frame scan provenance requires LiDAR + IMU mode'}
+        print('[*] Global revisit correction requires LiDAR + IMU mode.')
+    active_manifest = output_dir / 'active_slam.json'
+    active_data = {'relative_directory': str(slam_out.relative_to(output_dir)),
+                   'refinement_status': run_record['slam_refinement']['status']}
+    active_temp = output_dir / '.active_slam.tmp'
+    active_temp.write_text(json.dumps(active_data, indent=2), encoding='utf-8')
+    active_temp.replace(active_manifest)
+
     # --------------------------------------------------------------------------
     # STAGE 4: SfM Alignment & Dynamic Spatial Extrinsics Recalibration
     # --------------------------------------------------------------------------
     sparse_bin = output_dir / "sparse" / "0" / "points3D.bin"
     stage4_sfm = (method in ("sfm", "all") or run_spirula or
                   (frames_changed and sparse_bin.is_file()))
+    direct_sample_calibration_required = (
+        method == 'direct' and (bool(third_cfgs) or (recalibrate and not sparse_bin.is_file())))
+    sample_sfm_required = direct_sample_calibration_required
     stage4_title = ("Multi-View SfM Alignment & Spatial Recalibration"
                     if stage4_sfm else
-                    "Direct Trajectory Preparation (full SfM skipped)")
+                    ("Direct trajectory + sample SfM rig calibration (full SfM skipped)"
+                     if sample_sfm_required else
+                     "Direct Trajectory Preparation (full SfM skipped)"))
     print(f"\n[STAGE 4/7] {stage4_title}...")
     from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
     if third_cfgs:
@@ -1272,7 +2506,7 @@ def execute_unified_workflow(
         save_third_camera_config(
             third_cfgs, output_dir / "third_camera_calibrated.json")
 
-    if sparse_bin.is_file():
+    if sparse_bin.is_file() and not (method == 'direct' and third_cfgs):
         print("[*] Performing Metric Sim(3) Alignment (Spirula COLMAP -> LiDAR Ground Truth)...")
         try:
             align_data = pipeline.align_colmap_to_lidar(output_dir, fps=fps, dt_hint=dt_sync)
@@ -1281,7 +2515,7 @@ def execute_unified_workflow(
             if rmse_cm is not None and rmse_cm > 2.0:
                 print(f"[QUALITY WARNING] SfM-to-FAST-LIVO2 trajectory RMSE is {rmse_cm:.2f} cm; "
                       "this is above the requested 1.5–2 cm wall-thickness precision.")
-                print("[QUALITY WARNING] SfM alignment improves camera poses/colorization, but the exported LiDAR XYZ still comes from FAST-LIVO2; this run does not globally correct SLAM drift.")
+                print("[QUALITY WARNING] SfM alignment calibrates camera poses; geometric correction is independently validated in the SLAM stage.")
         except Exception as e:
             if is_timelapse:
                 raise RuntimeError(f'Timelapse alignment failed: {e}') from e
@@ -1299,37 +2533,60 @@ def execute_unified_workflow(
                     raise RuntimeError(f'Timelapse rig calibration failed: {e}') from e
                 print(f"[!] Extrinsics recalibration notice: {e}")
 
-    if method == 'direct' and not sparse_bin.is_file() and (recalibrate or third_cfgs):
+    if method == 'direct' and (recalibrate or third_cfgs) and (
+            not sparse_bin.is_file() or bool(third_cfgs)):
+        print("[*] Per-session rig calibration requires a bounded SfM sample; "
+              "the full SfM reconstruction remains skipped.")
         try:
             third_cfgs = _calibrate_aux_cameras_from_sample_sfm(
                 output_dir, third_cfgs, fps, dt_sync)
             calib = output_dir / 'rig_calibration.json'
             dt_sync = json.loads(calib.read_text(encoding='utf-8'))['dt_sync_seconds']
         except Exception as e:
-            if recalibrate:
-                raise RuntimeError(f'Sample SfM rig calibration failed: {e}') from e
-            print(f'[!] Auxiliary sample-SfM calibration failed: {e}')
+            run_record.update(
+                status='failed',
+                failure={'stage': 'sample_sfm_rig_calibration', 'reason': str(e)},
+            )
+            _persist_workflow_run(output_dir, run_record)
             for camera in third_cfgs:
                 report = dict(camera.calibration_report or {})
                 report['camera_name'] = camera.camera_name
-                report['sample_sfm'] = {'status': 'failed', 'reason': str(e)}
+                report['sample_sfm'] = {
+                    **(report.get('sample_sfm', {}) or {}),
+                    'status': 'failed', 'reason': str(e),
+                }
                 camera.calibration_report = report
+            if third_cfgs:
+                from raven_app.third_camera import save_third_camera_config
+                save_third_camera_config(third_cfgs, output_dir / 'third_camera_calibrated.json')
+            raise RuntimeError(
+                f'Required per-session sample SfM camera calibration failed: {e}') from e
 
     calibrated_cameras = []
     updated_third_cfgs = []
+    full_sfm_pose_support_records = {}
     for third_cfg in third_cfgs:
         report = third_cfg.calibration_report or {}
         sample_status = report.get('sample_sfm', {}).get('status')
-        if sample_status in {'complete', 'rejected', 'failed', 'skipped'}:
-            if _aux_camera_calibration_ready(third_cfg):
+        if sample_status in {'complete', 'rejected', 'failed', 'skipped',
+                             'per_image_sfm_pose_support'}:
+            pose_support_ready = _aux_camera_pose_support_ready(
+                output_dir, third_cfg, require_sfm_source_signature=stage4_sfm)
+            rigid_ready = _aux_camera_calibration_ready(third_cfg)
+            if rigid_ready or (pose_support_ready and not stage4_sfm):
                 calibrated_cameras.append(third_cfg)
-            else:
+                updated_third_cfgs.append(third_cfg)
+                continue
+            if not stage4_sfm:
                 reason = (report.get('sample_sfm', {}).get('reason') or
                           report.get('extrinsics', {}).get('reason') or
                           'sample-SfM calibration did not pass quality gates')
                 print(f"[!] Skipping {third_cfg.camera_name} in point-cloud colorization: {reason}")
-            updated_third_cfgs.append(third_cfg)
-            continue
+                updated_third_cfgs.append(third_cfg)
+                continue
+            action = ('refreshing' if pose_support_ready else 'replacing stale')
+            print(f"[*] {third_cfg.camera_name} per-image SfM poses are {action} from the "
+                  "current aligned model.")
         print(f"\n[*] Calibrating {third_cfg.camera_name} intrinsics and rig extrinsics...")
         try:
             third_cfg = align_third_camera_to_rig(
@@ -1350,11 +2607,81 @@ def execute_unified_workflow(
         updated_third_cfgs.append(third_cfg)
         if _aux_camera_calibration_ready(third_cfg):
             calibrated_cameras.append(third_cfg)
+        elif stage4_sfm:
+            support_record, support_reason = _full_sfm_aux_pose_support_record(
+                output_dir, third_cfg)
+            if support_record is not None:
+                full_sfm_pose_support_records[third_cfg.camera_name] = support_record
+                print(f"[+] {third_cfg.camera_name}: {len(support_record['poses'])} exact registered "
+                      "SfM poses are valid for this accepted LiDAR alignment; "
+                      "rigid offset/baseline remain uncalibrated.")
+            else:
+                print(f"[!] {third_cfg.camera_name} per-image SfM poses not accepted: {support_reason}")
     third_cfgs = updated_third_cfgs
+    if full_sfm_pose_support_records:
+        try:
+            from raven_app.auxiliary_pose_support import write_auxiliary_pose_support
+
+            source_signatures = {
+                json.dumps(record['sfm_pose_source_signature'], sort_keys=True)
+                for record in full_sfm_pose_support_records.values()
+            }
+            if len(source_signatures) != 1:
+                raise ValueError('Auxiliary cameras were aligned against different COLMAP models')
+            sfm_source_signature = next(iter(full_sfm_pose_support_records.values()))[
+                'sfm_pose_source_signature']
+            support_path = write_auxiliary_pose_support(
+                output_dir, full_sfm_pose_support_records,
+                sfm_source_signature=sfm_source_signature)
+            for camera in third_cfgs:
+                record = full_sfm_pose_support_records.get(camera.camera_name)
+                if record is None:
+                    continue
+                report = dict(camera.calibration_report or {})
+                reason = ((report.get('extrinsics') or {}).get('reason')
+                          or 'a rigid per-camera clock offset and baseline were not established')
+                report['sample_sfm'] = {
+                    **(report.get('sample_sfm') or {}),
+                    'status': 'per_image_sfm_pose_support',
+                    'method': 'registered_full_sfm_poses_aligned_to_lidar',
+                    'reason': reason,
+                    'registered_views': len(record['poses']),
+                    'alignment_quality_status': 'accepted',
+                    'alignment_rmse_cm': record.get('alignment_rmse_cm'),
+                    'pose_support_path': str(support_path.relative_to(output_dir)),
+                }
+                camera.calibration_report = report
+            print(f"[+] Accepted exact registered auxiliary poses from the current full SfM model: "
+                  f"{support_path}")
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"[!] Could not publish full-SfM auxiliary pose support: {exc}")
     if third_cfgs:
-        # Persist rejected/failed camera states too, so the report identifies each
-        # auxiliary source and explains why it was excluded from colorization.
         save_third_camera_config(third_cfgs, output_dir / "third_camera_calibrated.json")
+        support_required_for_run = stage4_sfm
+        calibrated_cameras = [
+            camera for camera in third_cfgs
+            if (_aux_camera_calibration_ready(camera)
+                or _aux_camera_pose_support_ready(
+                    output_dir, camera,
+                    require_sfm_source_signature=support_required_for_run))
+        ]
+        failed_cameras = [camera for camera in third_cfgs
+                          if camera not in calibrated_cameras]
+        if failed_cameras:
+            reasons = []
+            for camera in failed_cameras:
+                report = camera.calibration_report or {}
+                reason = ((report.get('sample_sfm', {}) or {}).get('reason')
+                          or (report.get('extrinsics', {}) or {}).get('reason')
+                          or (report.get('time_offset', {}) or {}).get('reason')
+                          or 'intrinsics, time offset, or metric extrinsics were not calibrated')
+                reasons.append(f'{camera.camera_name}: {reason}')
+            message = ('Enabled auxiliary cameras must all pass calibration or have fresh '
+                       'registered SfM poses before colorization: ' + '; '.join(reasons))
+            run_record.update(status='failed', failure={
+                'stage': 'auxiliary_camera_calibration', 'reason': message})
+            _persist_workflow_run(output_dir, run_record)
+            raise RuntimeError(message)
 
     # --------------------------------------------------------------------------
     # STAGE 5: Person-mask generation
@@ -1454,7 +2781,9 @@ def execute_unified_workflow(
     if export_colmap:
         export_colmap_3dgs(output_dir, calib, fps=fps, dt_sync=dt_sync,
                            masks_dir=active_masks_dir, third_camera=third_cfgs,
-                           seed_percent=seed_percent)
+                           seed_percent=seed_percent,
+                           pose_source='direct' if method == 'direct' else 'sfm',
+                           export_path=colmap_export_dir)
 
     print("\n[+] Deliverables currently in folder:")
     for deliv_item in sorted(deliverables_dir.iterdir()):
@@ -1462,6 +2791,15 @@ def execute_unified_workflow(
             print(f"    - {deliv_item.name} ({deliv_item.stat().st_size / 1e6:.1f} MB)")
 
     elapsed = time.time() - t_start
+    run_record.update(
+        status='complete',
+        completed_at_utc=datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        elapsed_seconds=round(elapsed, 3),
+        resolved_dt_sync_seconds=float(dt_sync),
+        calibration_used=_workflow_path_snapshot(calib),
+        auxiliary_calibration=[camera.to_dict() for camera in third_cfgs],
+    )
+    _persist_workflow_run(output_dir, run_record)
     print("\n" + "=" * 80)
     print(f" [SUCCESS] Unified Workflow Complete in {elapsed:.1f}s!")
     print(f" Deliverables saved in: {deliverables_dir}")

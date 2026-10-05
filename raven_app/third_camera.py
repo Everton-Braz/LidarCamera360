@@ -33,7 +33,8 @@ class ThirdCameraConfig:
 
     camera_name: str = "cam2"
     source_path: str = ""
-    source_type: str = "video"  # "video" or "folder"
+    source_type: str = "video"  # "video", "folder", or "insv"
+    source_stream_index: Optional[int] = None
     enabled: bool = True
     fps: float = 2.0
     time_offset_s: float = 0.0
@@ -52,6 +53,8 @@ class ThirdCameraConfig:
             "k4": 0.0,
             "p1": 0.0,
             "p2": 0.0,
+            "sx1": 0.0,
+            "sy1": 0.0,
         }
     )
     T_lidar_to_cam2_rigid_4x4: List[List[float]] = field(
@@ -96,6 +99,7 @@ class ThirdCameraConfig:
             "camera_name",
             "source_path",
             "source_type",
+            "source_stream_index",
             "enabled",
             "fps",
             "time_offset_s",
@@ -172,7 +176,26 @@ def load_third_camera_configs(
 
     if any(not isinstance(camera, dict) for camera in cameras):
         raise TypeError("Every entry in the camera configuration must be an object")
-    return [ThirdCameraConfig.from_dict(camera) for camera in cameras]
+    return expand_auxiliary_camera_configs([ThirdCameraConfig.from_dict(camera) for camera in cameras])
+
+
+def expand_auxiliary_camera_configs(cameras: Sequence[ThirdCameraConfig]) -> List[ThirdCameraConfig]:
+    """Give each auxiliary INSV lens a stable, independently calibrated camera name."""
+    from raven_app.auxiliary_insv import expand_auxiliary_insv_config
+
+    names = [camera.camera_name for camera in cameras]
+    if len(set(names)) != len(names) or any(name in ('cam0', 'cam1') for name in names):
+        raise ValueError('Auxiliary camera names must be unique and cannot use cam0/cam1')
+    reserved = set(names) | {'cam0', 'cam1'}
+    result = []
+    for camera in cameras:
+        if Path(camera.source_path).suffix.lower() == '.insv':
+            expanded = expand_auxiliary_insv_config(camera, reserved - {camera.camera_name})
+            result.extend(expanded)
+            reserved.update(item.camera_name for item in expanded)
+        else:
+            result.append(camera)
+    return result
 
 
 def save_third_camera_config(
@@ -198,6 +221,10 @@ def detect_source_metadata(source_path: Union[str, Path]) -> Dict[str, Any]:
     p = Path(source_path)
     if not p.exists():
         raise FileNotFoundError(f"Source path does not exist: {p}")
+
+    if p.is_file() and p.suffix.lower() == '.insv':
+        from raven_app.auxiliary_insv import inspect_auxiliary_insv
+        return inspect_auxiliary_insv(p)
 
     if p.is_file():
         cap = cv2.VideoCapture(str(p))
@@ -449,6 +476,11 @@ def extract_third_camera_frames(
         (extracted_paths, timestamp_dict) where timestamp_dict maps relative name
         (e.g. 'cam2/frame_000001.jpg') to video PTS in seconds.
     """
+    if Path(config.source_path).suffix.lower() == '.insv':
+        from raven_app.auxiliary_insv import extract_auxiliary_insv_frames
+        return extract_auxiliary_insv_frames(
+            config, dataset_dir, target_fps=target_fps,
+            sharpness_window=sharpness_window, jpeg_quality=jpeg_quality)
     dataset_dir = Path(dataset_dir)
     images_root = dataset_dir / "images"
     cam_dir = images_root / config.camera_name
@@ -828,8 +860,10 @@ def _third_camera_intrinsics_from_colmap(
         cx, cy = p[1:3]
         model = "OPENCV_FISHEYE"
         common.update(k1=p[3], k2=p[4] if model_id == 9 else 0.0)
-    elif model_id == 10:  # THIN_PRISM_FISHEYE is not an auxiliary camera model.
-        raise ValueError("COLMAP THIN_PRISM_FISHEYE cannot calibrate an auxiliary camera")
+    elif model_id == 10:  # COLMAP's twelve-parameter thin-prism fisheye.
+        fx, fy, cx, cy = p[:4]
+        model = "THIN_PRISM_FISHEYE"
+        common.update(zip(('k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'sx1', 'sy1'), p[4:]))
     else:
         raise ValueError(
             f"COLMAP camera model {model_id} cannot be represented by the auxiliary camera schema"
@@ -859,7 +893,8 @@ def _third_camera_intrinsics_from_colmap(
 
 
 def _pose_consensus(
-    rotations: List[np.ndarray], translations: List[np.ndarray]
+    rotations: List[np.ndarray], translations: List[np.ndarray], *,
+    require_rigid_quality: bool = True,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, float]]:
     """Robustly reject inconsistent per-frame rig poses before accepting calibration."""
     if len(rotations) < 6 or len(translations) != len(rotations):
@@ -900,6 +935,10 @@ def _pose_consensus(
         "translation_gate_m": float(translation_gate),
         "rotation_gate_deg": float(rotation_gate),
         "consensus_fraction": float(inlier_count / len(rotations)),
+        # Search uses the same population at every offset. Inlier-only errors
+        # can make a wrong clock with one surviving pose look nearly perfect.
+        "translation_all_p70_m": float(np.percentile(translation_errors, 70)),
+        "rotation_all_p70_deg": float(np.percentile(rotation_errors_deg, 70)),
     }
     if inlier_count < max(6, int(math.ceil(0.70 * len(rotations)))):
         return None, None, stats
@@ -912,11 +951,13 @@ def _pose_consensus(
     )
     stats["translation_p90_m"] = float(np.percentile(final_translation_error, 90))
     stats["rotation_p90_deg"] = float(np.percentile(final_rotation_error, 90))
-    if stats["translation_p90_m"] > 0.10 or stats["rotation_p90_deg"] > 5.0:
+    if require_rigid_quality and (
+        stats["translation_p90_m"] > 0.10 or stats["rotation_p90_deg"] > 5.0
+    ):
         return None, None, stats
 
     baseline = float(np.linalg.norm(final_translation))
-    if baseline < 0.02 or baseline > 2.0:
+    if require_rigid_quality and (baseline < 0.02 or baseline > 2.0):
         stats["lever_arm_m"] = baseline
         return None, None, stats
     stats["lever_arm_m"] = baseline
@@ -1007,10 +1048,14 @@ def _estimate_auxiliary_time_offset(
         )
         if len(rotations) < minimum_views:
             return
-        rotation, translation, quality = _pose_consensus(rotations, translations)
+        # Clock observability and a rigid extrinsic are separate questions.
+        # A camera with stabilization or noisy SfM orientation can still have
+        # a clear time-profile minimum even though its fixed rig pose fails.
+        rotation, translation, quality = _pose_consensus(
+            rotations, translations, require_rigid_quality=False)
         coverage = len(rotations) / max_overlap
-        translation_p90 = float(quality.get("translation_p90_m", math.inf))
-        rotation_p90 = float(quality.get("rotation_p90_deg", math.inf))
+        translation_p90 = float(quality.get("translation_all_p70_m", math.inf))
+        rotation_p90 = float(quality.get("rotation_all_p70_deg", math.inf))
         consensus_fraction = float(quality.get("consensus_fraction", 0.0))
         if not all(math.isfinite(value) for value in (
             translation_p90, rotation_p90, consensus_fraction, coverage
@@ -1026,7 +1071,12 @@ def _estimate_auxiliary_time_offset(
             "score": float(score),
             "quality": quality,
             "coverage": coverage,
-            "passed": rotation is not None and translation is not None,
+            "rigid_quality_passed": (
+                rotation is not None and translation is not None
+                and quality.get("translation_p90_m", math.inf) <= 0.10
+                and quality.get("rotation_p90_deg", math.inf) <= 5.0
+                and 0.02 <= quality.get("lever_arm_m", 0.0) <= 2.0
+            ),
         }
         if rotation is not None and translation is not None:
             evaluated[key] = scored_candidates[key]
@@ -1035,7 +1085,8 @@ def _estimate_auxiliary_time_offset(
         evaluate(float(value))
     if not scored_candidates:
         return None, {
-            "reason": "No offset candidate passed the rigid-pose quality gates",
+            "reason": "No clock candidate had enough timestamped pose consensus",
+            "time_offset_status": "unknown",
             "maximum_overlapping_poses": max_overlap,
         }
 
@@ -1063,20 +1114,23 @@ def _estimate_auxiliary_time_offset(
 
     if not evaluated:
         best_coarse = scored_candidates[coarse_ranked[0]]
+        best_fine = min(scored_candidates, key=lambda value: scored_candidates[value]['score'])
         return None, {
-            "reason": "No offset candidate passed the rigid-pose quality gates",
+            "reason": "No clock candidate had sufficient cross-frame pose consensus",
+            "time_offset_status": "unknown",
             "maximum_overlapping_poses": max_overlap,
             "best_coarse_candidate_seconds": coarse_ranked[0],
             "best_coarse_score": best_coarse["score"],
-            **best_coarse["quality"],
+            "best_candidate_seconds": best_fine,
+            "best_score": scored_candidates[best_fine]['score'],
+            **scored_candidates[best_fine]["quality"],
         }
 
     ranked = sorted(evaluated, key=lambda value: evaluated[value]["score"])
     best = ranked[0]
-    # Compare against every separated time hypothesis, including candidates
-    # whose fit missed a quality gate. A single narrow, strong minimum can be
-    # observable; a constant-motion trajectory still has equally good scores
-    # at separated offsets and remains ambiguous.
+    # Compare against every separated time hypothesis. The returned offset is
+    # a timing result; the caller independently applies the stricter rigid-rig
+    # gates before publishing an extrinsic transform.
     competitors = [value for value in scored_candidates if abs(value - best) >= 1.0]
     if not competitors:
         return None, {
@@ -1084,6 +1138,7 @@ def _estimate_auxiliary_time_offset(
             "candidate_count": len(evaluated),
             "best_candidate_seconds": best,
             "best_score": evaluated[best]["score"],
+            "rigid_quality_passed": evaluated[best]["rigid_quality_passed"],
         }
     runner_up = min(competitors, key=lambda value: scored_candidates[value]["score"])
     best_score = float(evaluated[best]["score"])
@@ -1091,21 +1146,24 @@ def _estimate_auxiliary_time_offset(
     required_margin = max(0.25, 0.35 * max(best_score, 0.1))
     if runner_up_score - best_score < required_margin:
         return None, {
-            "reason": "Multiple time offsets produce comparable rigid-pose consensus",
+            "reason": "Multiple time offsets produce comparable camera-to-SLAM motion fits",
             "candidate_count": len(evaluated),
             "best_candidate_seconds": best,
             "runner_up_seconds": runner_up,
             "best_score": best_score,
             "runner_up_score": runner_up_score,
-            "runner_up_passed_quality_gates": scored_candidates[runner_up]["passed"],
+            "runner_up_rigid_quality_passed": scored_candidates[runner_up]["rigid_quality_passed"],
+            "time_offset_status": "unknown",
         }
 
     return best, {
         "candidate_count": len(evaluated),
         "score": best_score,
+        "best_candidate_seconds": best,
         "runner_up_seconds": runner_up,
         "runner_up_score": runner_up_score,
-        "runner_up_passed_quality_gates": scored_candidates[runner_up]["passed"],
+        "runner_up_rigid_quality_passed": scored_candidates[runner_up]["rigid_quality_passed"],
+        "rigid_quality_passed": evaluated[best]["rigid_quality_passed"],
         "overlapping_poses": int(overlap_count(best)),
         **evaluated[best]["quality"],
     }
@@ -1154,7 +1212,7 @@ def calibrate_third_camera_intrinsics(
             raise ValueError("Auxiliary SfM images use multiple camera models")
 
         selected_model = str(third_config.camera_model or "PINHOLE").strip().upper()
-        expected_model_ids = {"PINHOLE": 1, "OPENCV": 4, "OPENCV_FISHEYE": 5}
+        expected_model_ids = {"PINHOLE": 1, "OPENCV": 4, "OPENCV_FISHEYE": 5, "THIN_PRISM_FISHEYE": 10}
         camera = _read_colmap_cameras(cameras_bin)[camera_id]
         model_id = int(camera["model_id"])
         expected_model_id = expected_model_ids.get(selected_model)
@@ -1230,6 +1288,10 @@ def align_third_camera_to_rig(
 
     report = copy.deepcopy(updated_config.calibration_report or {})
     report['camera_name'] = updated_config.camera_name
+    # Never allow a candidate from an earlier reconstruction to survive a new
+    # calibration attempt. A candidate below is tied to the current model and
+    # alignment signatures.
+    report.pop("sample_sfm_pose_support", None)
     for section, default in (
         ("intrinsics", {"status": "uncalibrated", "source": "configuration"}),
         ("time_offset", {"status": "unknown", "source": "configuration"}),
@@ -1361,10 +1423,51 @@ def align_third_camera_to_rig(
             center_lidar = scale * (rotation_sim @ np.asarray(image["C"], dtype=np.float64)) + translation_sim
             rotation_cw_lidar = np.asarray(image["R_cw"], dtype=np.float64) @ rotation_sim.T
             camera_samples.append({
+                "name": str(image.get("name", "")).replace("\\", "/"),
                 "video_time": float(video_time),
                 "center_lidar": center_lidar,
                 "rotation_world_cam": rotation_cw_lidar.T,
             })
+
+        # Registered camera poses are useful even when the camera's motion is
+        # not explained by one rigid LiDAR-to-camera transform (for example,
+        # phone stabilization or a moving mount). These poses are already in
+        # the accepted metric LiDAR frame, so downstream stages may use them
+        # for these exact images without inventing a clock offset or baseline.
+        if len(camera_samples) >= 6:
+            from raven_app.auxiliary_pose_support import sfm_pose_source_signature
+
+            alignment_rmse = alignment.get("trajectory_rmse_cm")
+            try:
+                alignment_rmse = float(alignment_rmse)
+                if not math.isfinite(alignment_rmse):
+                    alignment_rmse = None
+            except (TypeError, ValueError):
+                alignment_rmse = None
+            report["sample_sfm_pose_support"] = {
+                "status": "candidate",
+                "source": "registered_sfm_poses",
+                "camera_name": third_config.camera_name,
+                "camera_model": updated_config.camera_model,
+                "intrinsics": copy.deepcopy(updated_config.intrinsics),
+                "registered_views": len(camera_samples),
+                "alignment_rmse_cm": alignment_rmse,
+                "alignment_quality_status": alignment.get("quality_status"),
+                "alignment_calibration_version": alignment.get("calibration_version"),
+                "alignment_timelapse_calibration_version": alignment.get(
+                    "timelapse_calibration_version"),
+                "alignment_frame_time_source": time_source,
+                "sfm_pose_source_signature": sfm_pose_source_signature(dataset_dir),
+                "poses": [
+                    {
+                        "name": sample["name"],
+                        "video_time": sample["video_time"],
+                        "C": sample["center_lidar"].tolist(),
+                        "R_cw": sample["rotation_world_cam"].T.tolist(),
+                    }
+                    for sample in camera_samples if sample["name"]
+                ],
+            }
 
         time_report = report["time_offset"]
         offset_status = time_report.get("status", "unknown")
@@ -1389,16 +1492,19 @@ def align_third_camera_to_rig(
                 }
                 updated_config.calibration_report = report
                 print(
-                    f"[*] {third_config.camera_name} extrinsics remain uncalibrated: "
-                    "phone-video time offset is unknown or ambiguous."
+                    f"[*] {third_config.camera_name} clock remains unknown: "
+                    f"{time_report.get('reason', 'no unique time-profile minimum')}."
                 )
                 return updated_config
             configured_offset = float(estimated_offset)
             updated_config.time_offset_s = configured_offset
             time_report.update(
                 status="calibrated",
-                source="rig-pose consensus search",
+                source="camera-to-SLAM motion-profile search",
+                seconds=configured_offset,
+                applied=True,
                 estimated_seconds=configured_offset,
+                rigid_extrinsics_require_separate_validation=True,
                 **auto_offset_quality,
             )
 
@@ -1420,15 +1526,18 @@ def align_third_camera_to_rig(
             report["extrinsics"] = {
                 "status": "uncalibrated",
                 "source": "SfM poses and current COLMAP-to-LiDAR alignment",
-                "reason": "Per-frame rigid-pose consensus failed",
+                "reason": "Per-frame rigid-pose consensus failed; clock offset calibrated independently",
                 "missing_timestamps": missing_timestamps,
                 **quality,
             }
             updated_config.calibration_report = report
             print(
                 f"[*] {third_config.camera_name} metric extrinsics remain uncalibrated: "
-                f"rig-pose consensus failed ({int(quality.get('accepted_poses', 0))}/"
-                f"{int(quality.get('candidate_poses', 0))} accepted poses)."
+                f"rigid-pose validation failed ({int(quality.get('accepted_poses', 0))}/"
+                f"{int(quality.get('candidate_poses', 0))} consistent poses; "
+                f"translation p90 {quality.get('translation_p90_m', math.nan):.3f} m, "
+                f"rotation p90 {quality.get('rotation_p90_deg', math.nan):.2f} deg). "
+                "Registered per-image SfM poses remain available for this camera."
             )
             return updated_config
 
@@ -1551,8 +1660,12 @@ def inject_third_camera_into_colmap(
         k1, k2 = int2.get("k1", 0.0), int2.get("k2", 0.0)
         k3, k4 = int2.get("k3", 0.0), int2.get("k4", 0.0)
         cam_line = f"{camera_id} OPENCV_FISHEYE {w} {h} {fx} {fy} {cx} {cy} {k1} {k2} {k3} {k4}\n"
+    elif cam_model == "THIN_PRISM_FISHEYE":
+        coefficients = ' '.join(str(int2.get(key, 0.0)) for key in
+                                ('k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'sx1', 'sy1'))
+        cam_line = f"{camera_id} {cam_model} {w} {h} {fx} {fy} {cx} {cy} {coefficients}\n"
     else:
-        cam_line = f"{camera_id} PINHOLE {w} {h} {fx} {fy} {cx} {cy}\n"
+        raise ValueError(f"Unsupported auxiliary camera model: {cam_model}")
 
     existing_cams = cameras_txt.read_text(encoding="utf-8") if cameras_txt.is_file() else "# Camera list\n"
     if f"\n{camera_id} " not in f"\n{existing_cams}":

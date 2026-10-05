@@ -7,7 +7,7 @@ import numpy as np
 from scipy.optimize import least_squares, minimize_scalar
 from scipy.spatial.transform import Rotation, Slerp
 
-VERSION = 2
+VERSION = 3
 CAMERA_LEVER_LENGTH_M = 0.185
 
 
@@ -68,7 +68,19 @@ def fit_timed_poses(centers, world_to_camera, capture_times, slam_times,
     best_dt = float(dt_hint) if dt_hint is not None else 0.
     candidate_dts = [best_dt, best_dt - 4., best_dt + 4., 0.] if dt_hint is not None else []
     coarse_support = []
-    if dt_hint is None:
+    if dt_hint is not None:
+        # The gyro estimate is a strong prior, not a reason to test only its
+        # exact value and two endpoints. A small residual clock error can move
+        # a walking camera by more than the 1.2 m consensus threshold. Search
+        # the local gyro window before deciding that the sample is unreliable.
+        positive_gaps = np.diff(sorted_capture)
+        positive_gaps = positive_gaps[positive_gaps > 1e-6]
+        step = min(.25, float(np.median(positive_gaps)) / 4.) if len(positive_gaps) else .25
+        step = max(.05, step)
+        local_grid = np.arange(best_dt - 4., best_dt + 4. + step * .5, step)
+        candidate_dts.extend(float(dt) for dt in local_grid)
+        candidate_dts = list(dict.fromkeys(round(dt, 6) for dt in candidate_dts))
+    else:
         # Search every placement that can cover a majority of camera poses.
         # Using the whole-clip-inside-SLAM interval makes the range empty when
         # the camera recording is slightly longer than the LiDAR recording.
@@ -117,10 +129,12 @@ def fit_timed_poses(centers, world_to_camera, capture_times, slam_times,
     if best_mask.sum() < minimum_consensus:
         support = int(best_mask.sum())
         total = int(len(c))
-        detail = (f'Best full-path time-shift candidate Δt={best_dt:.2f}s '
+        detail = (f'Best camera-to-SLAM time-shift candidate Δt={best_dt:.2f}s '
                   f'matched {support}/{total} camera poses within 1.2 m.')
-        if coarse_support:
-            detail += ' Gyro synchronization was unavailable or low confidence.'
+        if dt_hint is not None:
+            detail += f' The gyro-guided search covered ±4.00 s around Δt={dt_hint:.2f}s.'
+        else:
+            detail += ' Gyro synchronization was unavailable; the full temporal overlap was searched.'
         raise ValueError('No majority pose consensus: timelapse reconstruction is unreliable. '
                          + detail)
 

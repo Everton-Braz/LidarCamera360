@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -43,6 +44,7 @@ class AuxiliaryCameraViewTests(unittest.TestCase):
         for widget in (
             dialog.source_input,
             dialog.btn_browse_video,
+            dialog.btn_browse_insv,
             dialog.btn_browse_folder,
             dialog.cam_name_input,
             dialog.fps_spin,
@@ -86,6 +88,83 @@ class AuxiliaryCameraViewTests(unittest.TestCase):
         dialog.render(painter)
         painter.end()
         self.assertFalse(image.isNull())
+        dialog.close()
+
+    def test_insv_source_defaults_to_thin_prism_and_both_lens_streams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "auxiliary.insv"
+            source.write_bytes(b"metadata is mocked")
+            metadata = {
+                "type": "insv",
+                "width": 2880,
+                "height": 2880,
+                "lens_count": 2,
+            }
+            dialog = AddSourceDialog()
+            with patch("raven_app.views.add_source_dialog.detect_source_metadata", return_value=metadata):
+                dialog._set_source(str(source))
+
+            self.assertEqual(dialog.model_combo.currentText(), "THIN_PRISM_FISHEYE")
+            self.assertFalse(dialog.insv_stream_combo.isHidden())
+            self.assertEqual(dialog.width_spin.value(), 2880)
+            self.assertEqual(dialog.height_spin.value(), 2880)
+            self.assertEqual(dialog.cx_spin.value(), 1440)
+            self.assertEqual(dialog.cy_spin.value(), 1440)
+            self.assertGreater(dialog.fx_spin.value(), 0)
+            self.assertGreater(dialog.fy_spin.value(), 0)
+
+            config = dialog.get_config()
+            self.assertEqual(config.source_type, "insv")
+            self.assertIsNone(config.source_stream_index)
+            self.assertEqual(config.camera_model, "THIN_PRISM_FISHEYE")
+            self.assertEqual(config.intrinsics["width"], 2880)
+            self.assertEqual(config.intrinsics["sx1"], 0.0)
+            self.assertEqual(config.intrinsics["sy1"], 0.0)
+
+            dialog.insv_stream_combo.setCurrentIndex(1)
+            self.assertEqual(dialog.get_config().source_stream_index, 0)
+            dialog.insv_stream_combo.setCurrentIndex(2)
+            self.assertEqual(dialog.get_config().source_stream_index, 1)
+            dialog.close()
+
+    def test_single_lens_insv_source_configures_single_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "single_lens.insv"
+            source.write_bytes(b"mock insv")
+            metadata = {
+                "type": "insv",
+                "width": 3072,
+                "height": 3072,
+                "lens_count": 1,
+            }
+            dialog = AddSourceDialog()
+            with patch("raven_app.views.add_source_dialog.detect_source_metadata", return_value=metadata):
+                dialog._set_source(str(source))
+
+            self.assertEqual(dialog.insv_stream_combo.count(), 1)
+            self.assertEqual(dialog.insv_stream_combo.currentIndex(), 0)
+            self.assertEqual(dialog.get_config().source_stream_index, 0)
+            dialog.close()
+
+    def test_thin_prism_choice_and_coefficients_survive_config_edit(self):
+        config = ThirdCameraConfig(
+            source_path="phone.mp4",
+            source_type="video",
+            camera_model="THIN_PRISM_FISHEYE",
+            intrinsics={
+                "width": 1920, "height": 1080, "fx": 1500, "fy": 1490,
+                "cx": 960, "cy": 540, "k1": 0.01, "k2": -0.02,
+                "p1": 0.003, "p2": -0.004, "k3": 0.005, "k4": -0.006,
+                "sx1": 0.007, "sy1": -0.008,
+            },
+        )
+        dialog = AddSourceDialog(config=config)
+        self.assertEqual(dialog.model_combo.currentText(), "THIN_PRISM_FISHEYE")
+        self.assertFalse(dialog.distortion_spins["sx1"].isHidden())
+        result = dialog.get_config()
+        self.assertEqual(result.camera_model, "THIN_PRISM_FISHEYE")
+        for name in ("k1", "k2", "p1", "p2", "k3", "k4", "sx1", "sy1"):
+            self.assertAlmostEqual(result.intrinsics[name], config.intrinsics[name])
         dialog.close()
 
     def test_both_views_allocate_stable_camera_names_and_save_bundle(self):
