@@ -221,6 +221,36 @@ def parse(argv=None):
                     help='Optional path to third camera JSON configuration, video file, or image folder')
     add_mask_options(wf)
     add_photometric_options(wf)
+    
+    # MCP Server
+    mcp = sub.add_parser('mcp', help='Run native Model Context Protocol (MCP) server for AI agent automation')
+    mcp.add_argument('--transport', choices=('stdio',), default='stdio', help='Transport protocol (default: stdio)')
+
+    # OTA Remote Updates
+    update = sub.add_parser('update', help='Check, download, or install remote OTA updates from GitHub Releases')
+    update.add_argument('action', choices=('check', 'download', 'install'), default='check', nargs='?',
+                        help='Action to perform (default: check)')
+    update.add_argument('--repo', default=None, help='Optional GitHub owner/repo override')
+    update.add_argument('--output', type=Path, default=None, help='Output path for downloaded archive')
+    update.add_argument('--no-restart', action='store_true', help='Do not restart application after install')
+
+    # Bug Report & Feedback
+    feedback = sub.add_parser('feedback', aliases=['bug-report'], help='Submit bug report or feature feedback with diagnostics')
+    feedback.add_argument('--title', required=True, help='Summary of bug or feature')
+    feedback.add_argument('--description', required=True, help='Detailed explanation')
+    feedback.add_argument('--category', choices=('bug', 'feature', 'question'), default='bug', help='Feedback category')
+    feedback.add_argument('--steps', default='', help='Reproduction steps')
+    feedback.add_argument('--contact', default='', help='Optional email/user handle')
+    feedback.add_argument('--browser', action='store_true', help='Open pre-filled issue in default web browser')
+    feedback.add_argument('--export-bundle', type=Path, default=None, help='Export diagnostic zip bundle to file')
+
+    # Telemetry Management
+    telemetry = sub.add_parser('telemetry', help='Inspect or configure anonymous telemetry and heartbeat')
+    telemetry.add_argument('--status', action='store_true', help='Show telemetry opt-in state and anonymous ID')
+    telemetry.add_argument('--enable', action='store_true', help='Opt in to anonymous telemetry')
+    telemetry.add_argument('--disable', action='store_true', help='Opt out of anonymous telemetry')
+    telemetry.add_argument('--heartbeat', action='store_true', help='Send test heartbeat ping')
+
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
     a=p.parse_args(argv)
@@ -497,6 +527,88 @@ def run(a):
             photometric_params=a.photometric_params,
             third_camera=a.third_camera,
         )
+    if a.command == 'mcp':
+        from raven_app.mcp_server import LidarCameraMcpServer
+        server = LidarCameraMcpServer()
+        server.run_stdio()
+        return 0
+    if a.command == 'update':
+        from raven_app.updater import check_for_updates, download_update, stage_windows_update, launch_staged_update
+        repo = a.repo
+        info = check_for_updates(repo=repo)
+        if a.action == 'check':
+            print(json.dumps(info, indent=2, ensure_ascii=False))
+            return 0 if info.get('status') == 'success' else 2
+        elif a.action == 'download':
+            if not info.get('has_update') and not repo:
+                print(f"Already on latest version ({info.get('current_version')}).")
+            dl_url = info.get('download_url')
+            if not dl_url:
+                print(json.dumps({'error': 'No download asset available for this release'}, indent=2))
+                return 2
+            out_target = a.output or (Path.cwd() / info.get('asset_name', 'update.zip'))
+            def _progress(cur, total):
+                pct = (cur / total * 100) if total > 0 else 0
+                msg = chr(13) + f"[update] {pct:.1f}% ({cur}/{total} bytes)"
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+            print(f"Downloading from {dl_url} -> {out_target}...")
+            download_update(dl_url, out_target, progress_callback=_progress)
+            print(f"\nDownload completed: {out_target}")
+            return 0
+        elif a.action == 'install':
+            dl_url = info.get('download_url')
+            if not dl_url:
+                print(json.dumps({'error': 'No download asset available to install'}, indent=2))
+                return 2
+            import tempfile
+            pkg_path = a.output or (Path(tempfile.gettempdir()) / info.get('asset_name', 'update.zip'))
+            if not pkg_path.is_file():
+                print(f"Fetching release archive {info.get('asset_name')}...")
+                download_update(dl_url, pkg_path)
+            script = stage_windows_update(pkg_path, restart_app=not a.no_restart)
+            launch_staged_update(script)
+            print(f"Updater staged and launched ({script}). Exiting current process.")
+            return 0
+    if a.command in ('feedback', 'bug-report'):
+        from raven_app.feedback import gather_diagnostics, build_github_issue_url, open_github_issue_in_browser, send_feedback_webhook, export_feedback_bundle
+        report = {
+            'title': a.title,
+            'description': a.description,
+            'category': a.category,
+            'steps': a.steps,
+            'contact': a.contact,
+            'diagnostics': gather_diagnostics()
+        }
+        res: Dict[str, Any] = {'status': 'processed'}
+        if a.browser:
+            opened = open_github_issue_in_browser(report)
+            res['browser_opened'] = opened
+        else:
+            res['issue_url'] = build_github_issue_url(report)
+        webhook_res = send_feedback_webhook(report)
+        res['webhook'] = webhook_res
+        if a.export_bundle:
+            bundle_path = export_feedback_bundle(report, a.export_bundle)
+            res['bundle_path'] = str(bundle_path)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    if a.command == 'telemetry':
+        from raven_app.telemetry import is_telemetry_enabled, set_telemetry_enabled, get_anonymous_client_id, get_system_telemetry_payload, send_heartbeat
+        if a.enable:
+            set_telemetry_enabled(True)
+        elif a.disable:
+            set_telemetry_enabled(False)
+        payload = get_system_telemetry_payload()
+        status_info = {
+            'telemetry_enabled': is_telemetry_enabled(),
+            'client_id': get_anonymous_client_id(),
+            'payload': payload
+        }
+        if a.heartbeat:
+            status_info['heartbeat_result'] = send_heartbeat()
+        print(json.dumps(status_info, indent=2, ensure_ascii=False))
+        return 0
     raise ValueError('Unknown command')
 
 
