@@ -20,12 +20,10 @@ DEFAULT_REPO = f"Everton-Braz/{REPOSITORY_NAME}"
 def parse_version_tuple(v_str: str) -> Tuple[int, ...]:
     """Parses a version string into a comparable tuple of integers."""
     clean = re.sub(r"^[vV]\s*", "", v_str.strip())
-    parts = []
-    for token in re.split(r"[-._+]", clean):
-        digits = re.findall(r"\d+", token)
-        if digits:
-            parts.append(int(digits[0]))
-    return tuple(parts) if parts else (0,)
+    # Discard pre-release tags and build metadata (e.g. -rc1, +build)
+    release_part = re.split(r"[-+]", clean)[0]
+    digits = re.findall(r"\d+", release_part)
+    return tuple(map(int, digits)) if digits else (0,)
 
 
 def is_newer_version(candidate: str, current: str = __version__) -> bool:

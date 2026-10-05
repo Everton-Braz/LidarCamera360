@@ -7,6 +7,11 @@ import signal
 import subprocess
 import sys
 
+# Ensure project root is on sys.path for direct CLI script execution
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 from raven_app import __version__
 from raven_app.branding import APP_NAME, APP_DESCRIPTION
 
