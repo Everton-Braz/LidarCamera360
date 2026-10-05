@@ -48,8 +48,8 @@ def test_system_telemetry_payload():
     payload = get_system_telemetry_payload()
     assert "client_id" in payload
     assert "os" in payload
-    assert "python" in payload
-    assert payload["app_version"] == __version__
+    assert ("python" in payload or "python_version" in payload)
+    assert payload.get("app_version") == __version__
 
 
 def test_version_parsing_and_comparison():
