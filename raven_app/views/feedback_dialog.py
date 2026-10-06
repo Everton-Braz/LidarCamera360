@@ -26,6 +26,14 @@ class FeedbackDialog(MessageBoxBase):
     """Dialog for reporting bugs or suggesting features with diagnostics."""
 
     def __init__(self, parent: Optional[QWidget] = None):
+        if parent is None:
+            from PyQt6.QtWidgets import QApplication
+            parent = QApplication.activeWindow()
+            if parent is None:
+                # Fallback to keep MaskDialogBase from raising AttributeError
+                parent = QWidget()
+                parent.resize(800, 700)
+                self._dummy_parent = parent
         super().__init__(parent)
         self.title_label = SubtitleLabel(self.tr("Send Feedback & Bug Report"), self)
         

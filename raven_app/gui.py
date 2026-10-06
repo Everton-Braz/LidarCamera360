@@ -18,6 +18,7 @@ from raven_app.views.inspect_view import InspectView
 from raven_app.views.calibration_view import CalibrationView
 from raven_app.views.doctor_view import DoctorView
 from raven_app.views.settings_view import SettingsView
+from raven_app.views.feedback_dialog import FeedbackDialog
 from raven_app.config import load_config, get_app_root
 from raven_app.i18n import (
     set_language, tr, register_language_listener, unregister_language_listener
@@ -108,6 +109,10 @@ class RavenMainWindow(FluentWindow):
     def _on_language_changed_globally(self, lang_code: str):
         self.retranslate_ui()
 
+    def _open_feedback_dialog(self):
+        dlg = FeedbackDialog(self)
+        dlg.exec()
+
     def retranslate_ui(self):
         """Update window title, navigation rail labels, and child views in real-time."""
         self.setWindowTitle(f"{APP_NAME} • {tr(APP_DESCRIPTION)}")
@@ -143,6 +148,11 @@ class RavenMainWindow(FluentWindow):
         if imu:
             self.workflow_view.imu_topic.setText(imu)
         self.switchTo(self.workflow_view)
+
+    def _open_feedback_dialog(self):
+        from raven_app.views.feedback_dialog import FeedbackDialog
+        dlg = FeedbackDialog(self)
+        dlg.exec()
 
     def _open_viewer(self):
         from raven_app.viewer_window import PointCloudViewerWindow
