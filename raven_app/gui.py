@@ -87,6 +87,14 @@ class RavenMainWindow(FluentWindow):
         )
 
         # Bottom navigation item
+        self.navigationInterface.addItem(
+            "FeedbackAction",
+            FluentIcon.FEEDBACK,
+            tr("Feedback"),
+            onClick=self._open_feedback_dialog,
+            position=NavigationItemPosition.BOTTOM,
+            selectable=False,
+        )
         self.addSubInterface(
             self.settings_view,
             FluentIcon.SETTING,

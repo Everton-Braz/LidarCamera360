@@ -1,11 +1,15 @@
 """Settings and personalization view."""
-from PyQt6.QtCore import Qt
+from pathlib import Path
+from typing import Optional
+import threading
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout
 )
 from qfluentwidgets import (
     CardWidget, TitleLabel, SubtitleLabel, BodyLabel,
     CaptionLabel, StrongBodyLabel, ComboBox,
+    PushButton, PrimaryPushButton, SwitchButton, ProgressBar,
     InfoBar, InfoBarPosition, FluentIcon,
     setTheme, Theme, isDarkTheme
 )
@@ -13,6 +17,11 @@ from raven_app import __version__
 from raven_app.branding import APP_NAME, APP_DESCRIPTION
 from raven_app.config import load_config, save_config
 from raven_app.i18n import available_languages, get_language, set_language, tr
+from raven_app.updater import check_for_updates, download_update, stage_windows_update
+from raven_app.telemetry import (
+    is_telemetry_enabled, set_telemetry_enabled, get_anonymous_client_id
+)
+from raven_app.views.feedback_dialog import FeedbackDialog
 
 
 class SettingsView(QWidget):
@@ -155,7 +164,93 @@ class SettingsView(QWidget):
         engines_layout.addLayout(engines_grid)
         layout.addWidget(self.engines_card)
 
-        # 4. About Card
+        # 4. Updates & Maintenance Card
+        self.updates_card = CardWidget(self)
+        updates_layout = QVBoxLayout(self.updates_card)
+        updates_layout.setContentsMargins(20, 16, 20, 16)
+        updates_layout.setSpacing(10)
+
+        self.updates_title = SubtitleLabel(tr("Software Updates"))
+        updates_layout.addWidget(self.updates_title)
+
+        up_row = QHBoxLayout()
+        self.updates_ver_label = BodyLabel(f"{tr('Current Version:')} v{__version__}")
+        self.check_update_btn = PushButton(tr("Check for Updates"))
+        self.check_update_btn.setIcon(FluentIcon.SYNC)
+        self.check_update_btn.clicked.connect(self._check_for_updates)
+        up_row.addWidget(self.updates_ver_label)
+        up_row.addWidget(self.check_update_btn)
+        up_row.addStretch()
+        updates_layout.addLayout(up_row)
+
+        self.updates_status = CaptionLabel(tr("Click 'Check for Updates' to verify the latest release on GitHub."))
+        updates_layout.addWidget(self.updates_status)
+
+        self.download_row = QHBoxLayout()
+        self.download_btn = PrimaryPushButton(tr("Download & Install Update"))
+        self.download_btn.setIcon(FluentIcon.DOWNLOAD)
+        self.download_btn.setVisible(False)
+        self.download_btn.clicked.connect(self._download_and_install_update)
+        self.download_progress = ProgressBar()
+        self.download_progress.setVisible(False)
+        self.download_row.addWidget(self.download_btn)
+        self.download_row.addWidget(self.download_progress)
+        self.download_row.addStretch()
+        updates_layout.addLayout(self.download_row)
+        layout.addWidget(self.updates_card)
+
+        # 5. Anonymous Telemetry & Diagnostics Card
+        self.telemetry_card = CardWidget(self)
+        telem_layout = QVBoxLayout(self.telemetry_card)
+        telem_layout.setContentsMargins(20, 16, 20, 16)
+        telem_layout.setSpacing(10)
+
+        self.telemetry_title = SubtitleLabel(tr("Anonymous Telemetry & Diagnostics"))
+        telem_layout.addWidget(self.telemetry_title)
+
+        telem_row = QHBoxLayout()
+        self.telemetry_switch = SwitchButton()
+        self.telemetry_switch.setChecked(is_telemetry_enabled())
+        self.telemetry_switch.checkedChanged.connect(self._on_telemetry_changed)
+        self.telemetry_switch_label = BodyLabel(tr("Enable anonymous telemetry and diagnostic reporting"))
+        telem_row.addWidget(self.telemetry_switch)
+        telem_row.addWidget(self.telemetry_switch_label)
+        telem_row.addStretch()
+        telem_layout.addLayout(telem_row)
+
+        anon_id = get_anonymous_client_id()
+        self.telemetry_desc = CaptionLabel(
+            f"{tr('Helps improve LiDAR driver support, sensor synchronization, and SLAM accuracy.')} "
+            f"{tr('No video frames, points, paths, or personal info are ever sent.')}\n"
+            f"{tr('Anonymous Installation ID:')} {anon_id[:8]}...{anon_id[-4:]}"
+        )
+        telem_layout.addWidget(self.telemetry_desc)
+        layout.addWidget(self.telemetry_card)
+
+        # 6. Feedback & Bug Report Card
+        self.feedback_card = CardWidget(self)
+        feedback_layout = QVBoxLayout(self.feedback_card)
+        feedback_layout.setContentsMargins(20, 16, 20, 16)
+        feedback_layout.setSpacing(10)
+
+        self.feedback_title = SubtitleLabel(tr("Feedback & Bug Reporting"))
+        feedback_layout.addWidget(self.feedback_title)
+
+        self.feedback_desc = CaptionLabel(
+            tr("Encountered an issue, timestamp offset, or have a suggestion? Send your report directly to the development team on GitHub.")
+        )
+        feedback_layout.addWidget(self.feedback_desc)
+
+        fb_row = QHBoxLayout()
+        self.feedback_btn = PushButton(tr("Open Feedback Dialog"))
+        self.feedback_btn.setIcon(FluentIcon.FEEDBACK)
+        self.feedback_btn.clicked.connect(self._open_feedback_dialog)
+        fb_row.addWidget(self.feedback_btn)
+        fb_row.addStretch()
+        feedback_layout.addLayout(fb_row)
+        layout.addWidget(self.feedback_card)
+
+        # 7. About Card
         self.about_card = CardWidget(self)
         about_layout = QVBoxLayout(self.about_card)
         about_layout.setContentsMargins(20, 16, 20, 16)
@@ -209,6 +304,67 @@ class SettingsView(QWidget):
             setTheme(Theme.AUTO)
         save_config(self.cfg)
 
+    def _on_telemetry_changed(self, enabled: bool):
+        set_telemetry_enabled(enabled)
+        self.cfg["telemetry_enabled"] = enabled
+        save_config(self.cfg)
+        msg = tr("Telemetry enabled. Thank you for supporting open-source development!") if enabled else tr("Telemetry disabled.")
+        InfoBar.info(title=tr("Telemetry"), content=msg, parent=self, position=InfoBarPosition.TOP_RIGHT, duration=2500)
+
+    def _check_for_updates(self):
+        self.check_update_btn.setEnabled(False)
+        self.updates_status.setText(tr("Checking for updates on GitHub..."))
+        def _worker():
+            res = check_for_updates()
+            QTimer.singleShot(0, lambda: self._on_check_update_finished(res))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_check_update_finished(self, res: dict):
+        self.check_update_btn.setEnabled(True)
+        if res.get("status") != "success":
+            self.updates_status.setText(f"{tr('Check failed:')} {res.get('message')}")
+            InfoBar.warning(title=tr("Update Check"), content=res.get("message", "Error"), parent=self, position=InfoBarPosition.TOP_RIGHT, duration=4000)
+            return
+        if res.get("has_update"):
+            tag = res.get("tag_name")
+            self.updates_status.setText(f"{tr('New release available:')} {tag} ({res.get('asset_name', '')})")
+            self._latest_update_res = res
+            self.download_btn.setVisible(True)
+            InfoBar.success(title=tr("Update Available"), content=f"{tr('Version')} {tag} {tr('is ready for download.')}", parent=self, position=InfoBarPosition.TOP_RIGHT, duration=5000)
+        else:
+            self.updates_status.setText(tr("You are using the latest version (v{ver}).", ver=__version__))
+            InfoBar.info(title=tr("Up to Date"), content=tr("LidarCamera360 is up to date."), parent=self, position=InfoBarPosition.TOP_RIGHT, duration=3000)
+
+    def _download_and_install_update(self):
+        res = getattr(self, "_latest_update_res", None)
+        if not res or not res.get("download_url"):
+            return
+        self.download_btn.setEnabled(False)
+        self.download_progress.setVisible(True)
+        self.download_progress.setValue(0)
+        self.updates_status.setText(tr("Downloading update package..."))
+        def _worker():
+            def _cb(cur, total):
+                pct = int((cur / max(1, total)) * 100)
+                QTimer.singleShot(0, lambda: self.download_progress.setValue(pct))
+            zip_path = download_update(res["download_url"], progress_callback=_cb)
+            QTimer.singleShot(0, lambda: self._on_download_finished(zip_path))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_download_finished(self, zip_path: Optional[Path]):
+        self.download_btn.setEnabled(True)
+        self.download_progress.setVisible(False)
+        if not zip_path or not zip_path.is_file():
+            self.updates_status.setText(tr("Failed to download update."))
+            InfoBar.error(title=tr("Update Failed"), content=tr("Download was unsuccessful."), parent=self, position=InfoBarPosition.TOP_RIGHT, duration=4000)
+            return
+        self.updates_status.setText(tr("Update downloaded. Restarting application to apply..."))
+        stage_windows_update(zip_path)
+
+    def _open_feedback_dialog(self):
+        dlg = FeedbackDialog(parent=self.window() or self)
+        dlg.exec()
+
     def retranslate_ui(self):
         """Update all text elements when the language changes at runtime."""
         self.title_label.setText(tr("Settings & Personalization"))
@@ -254,3 +410,17 @@ class SettingsView(QWidget):
             f"{tr('UI Framework:')} PyQt6 with Fluent Widgets\n"
             f"{tr('License:')} Dual MIT / GPLv3 Open-Source Architecture"
         )
+
+        # Updates card
+        self.updates_title.setText(tr("Software Updates"))
+        self.updates_ver_label.setText(f"{tr('Current Version:')} v{__version__}")
+        self.check_update_btn.setText(tr("Check for Updates"))
+        self.download_btn.setText(tr("Download & Install Update"))
+
+        # Telemetry card
+        self.telemetry_title.setText(tr("Anonymous Telemetry & Diagnostics"))
+        self.telemetry_switch_label.setText(tr("Enable anonymous telemetry and diagnostic reporting"))
+
+        # Feedback card
+        self.feedback_title.setText(tr("Feedback & Bug Reporting"))
+        self.feedback_btn.setText(tr("Open Feedback Dialog"))

@@ -60,8 +60,16 @@ class FeedbackDialog(MessageBoxBase):
 
         self.yesButton.setText(self.tr("Submit to GitHub"))
         self.cancelButton.setText(self.tr("Cancel"))
+        self.yesButton.clicked.connect(self._on_submit_clicked)
 
         self.widget.setMinimumWidth(480)
+
+    def _on_submit_clicked(self):
+        report = self.get_report()
+        if not report["title"]:
+            return
+        send_feedback_webhook(report)
+        open_github_issue_in_browser(report)
 
     def get_report(self) -> dict:
         category = self.category_combo.currentData() or "bug"
