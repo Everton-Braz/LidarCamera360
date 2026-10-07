@@ -90,7 +90,7 @@ class ViewerGpsIntegrationTests(unittest.TestCase):
                 main.workflow_view.insv_input.setText('capture.insv')
                 main._open_viewer()
                 self.assertFalse(hasattr(main, 'georeference_view'))
-                self.assertEqual(main.viewer_window._dataset_context['trajectory'], str(trajectory))
+                self.assertEqual(Path(main.viewer_window._dataset_context['trajectory']).resolve(), trajectory.resolve())
             finally:
                 if main.viewer_window:
                     main.viewer_window.close()

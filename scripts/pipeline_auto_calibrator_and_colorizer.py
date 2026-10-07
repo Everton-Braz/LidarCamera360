@@ -826,7 +826,7 @@ def current_alignment(dataset_dir, fps=2.0):
         active_signature = _active_slam_signature(
             dataset_dir, trajectory_path=trajectory, cloud_path=cloud,
             include_cloud=uses_cloud)
-    if saved_signature != active_signature:
+    if saved_signature and active_signature is not None and saved_signature != active_signature:
         if trajectory is None:
             trajectory = get_slam_trajectory_path(dataset_dir)
         return align_colmap_to_lidar(
@@ -836,14 +836,24 @@ def current_alignment(dataset_dir, fps=2.0):
     source = json.loads(manifest.read_text(encoding='utf-8')).get('time_source', 'video_pts') if manifest.is_file() else 'legacy_frame_rate'
     if source == 'insv_timelapse':
         from raven_app.timelapse_calibration import VERSION
+        kwargs = {}
+        if trajectory is not None:
+            kwargs['trajectory_path'] = trajectory
+        if uses_cloud:
+            kwargs['use_icp'] = uses_cloud
         if saved.get('timelapse_calibration_version') != VERSION or saved.get('quality_status') != 'accepted':
             return align_colmap_to_lidar(
                 dataset_dir, fps, saved.get('dt_sync_seconds'),
-                trajectory_path=trajectory, use_icp=uses_cloud)
+                **kwargs)
     if saved.get('calibration_version') != CALIBRATION_VERSION:
+        kwargs = {}
+        if trajectory is not None:
+            kwargs['trajectory_path'] = trajectory
+        if uses_cloud:
+            kwargs['use_icp'] = uses_cloud
         return align_colmap_to_lidar(
             dataset_dir, fps, saved.get('dt_sync_seconds'),
-            trajectory_path=trajectory, use_icp=uses_cloud)
+            **kwargs)
     return saved
 
 

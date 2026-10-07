@@ -136,13 +136,13 @@ def test_bounded_sample_sfm_preserves_three_rejected_windows_without_final_rig(
         workflow._calibrate_aux_cameras_from_sample_sfm(
             output, [camera], fps=2.0, dt_sync=0.0)
 
-    assert len(calls) == 3
+    assert len(calls) == 4
     attempts = list((output / "calibration" / "sample_sfm_attempt").iterdir())
-    assert len(attempts) == 3
+    assert len(attempts) == 4
     assert not (output / "rig_calibration.json").exists()
     assert not (output / "calibration" / "sample_sfm").exists()
     assert camera.calibration_report["sample_sfm"]["status"] == "failed"
-    assert len(camera.calibration_report["sample_sfm"]["attempts"]) == 3
+    assert len(camera.calibration_report["sample_sfm"]["attempts"]) == 4
 
 
 def _dataset(tmp_path, monkeypatch):
