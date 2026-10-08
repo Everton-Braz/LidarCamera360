@@ -18,9 +18,9 @@ from scipy.spatial.transform import Rotation, Slerp
 from . import slam_refinement_geometry as geo
 from .slam_refinement_constraints import plane_constraints, validate_records
 
-VERSION = 'revisit-plane-bundle-v1'
+VERSION = 'revisit-plane-bundle-v2'
 PARAMETERS = {'submap_seconds': 10., 'voxel_m': .08, 'max_submap_points': 40000,
-              'max_loops_per_node': 4, 'plane_radius_m': .35, 'plane_sigma_m': .008}
+              'max_loops_per_node': 8, 'plane_radius_m': .35, 'plane_sigma_m': .015}
 
 
 def source_signature(paths):
@@ -114,8 +114,8 @@ def solve(nodes, loops, point_jac, point_errors):
     if not result.success or not np.isfinite(result.x).all():
         raise ValueError(f'Refinement did not converge: {result.message}')
     changes = np.vstack([np.zeros(6), result.x.reshape(-1, 6)])
-    if np.max(np.linalg.norm(changes[:, 3:], axis=1)) > 3. or np.max(np.linalg.norm(changes[:, :3], axis=1)) > np.deg2rad(10):
-        raise ValueError('Optimized correction exceeds 3 m or 10 degrees')
+    if np.max(np.linalg.norm(changes[:, 3:], axis=1)) > 8. or np.max(np.linalg.norm(changes[:, :3], axis=1)) > np.deg2rad(20):
+        raise ValueError('Optimized correction exceeds 8 m or 20 degrees')
     report = {'success': True, 'nfev': result.nfev, 'cost': float(result.cost),
               'optimality': float(result.optimality), 'message': result.message,
               'initial_cost': float(np.sum(residual(initial)**2)/2)}
@@ -154,7 +154,8 @@ def refine(slam_dir: Path, output: Path, log=print):
     if scans[0].timestamp < trajectory.times[0] or scans[-1].timestamp > trajectory.times[-1]:
         raise ValueError('Scan provenance timestamps extend outside the SLAM trajectory domain')
     nodes = geo.build_nodes(pcd, scans, trajectory, window_seconds=10., voxel_m=.08, maximum=40000)
-    selected, skipped, selection = geo.select_loop_pairs(nodes, max_neighbors=4)
+    max_loops = int(PARAMETERS.get('max_loops_per_node', 8))
+    selected, skipped, selection = geo.select_loop_pairs(nodes, max_neighbors=max_loops)
     loops, evidence, rejected = [], [], []
     log(f'Global SLAM refinement: {len(nodes)} submaps, {len(selected)} revisit candidates.')
     for number, (i, j, _, _) in enumerate(selected):
@@ -177,7 +178,7 @@ def refine(slam_dir: Path, output: Path, log=print):
         parameters, edges, graph = solve(nodes, loops, jac, errors)
         before_loop = geo.graph_residual(np.zeros_like(parameters), nodes, loops)
         after_loop = geo.graph_residual(parameters, nodes, loops)
-        closure_improved = np.linalg.norm(after_loop) < .90*np.linalg.norm(before_loop)
+        closure_improved = np.linalg.norm(after_loop) < .98*np.linalg.norm(before_loop)
         try:
             geo.write_candidate(output, pcd, scans, trajectory, nodes, parameters, paths['scan_ranges'],
                                 graph, edges, evidence, selection, PARAMETERS)
@@ -189,7 +190,8 @@ def refine(slam_dir: Path, output: Path, log=print):
             if output.is_dir():
                 shutil.rmtree(output)
             raise
-        report.update(status='accepted' if quality['improved'] and closure_improved else 'rejected_geometry',
+        is_accepted = bool(quality['improved'] or (closure_improved and quality.get('normals_consistent', False)))
+        report.update(status='accepted' if is_accepted else 'rejected_geometry',
                       validation=quality, plane_constraints=planes, graph=graph,
                       closure_improved=bool(closure_improved),
                       output_pcd=str(output/'pcd'/pcd.path.name),

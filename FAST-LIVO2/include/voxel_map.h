@@ -49,6 +49,10 @@ typedef struct VoxelMapConfig
   double sliding_thresh;
   bool map_sliding_en;
   int half_map_size;
+
+  // degeneracy and velocity limits
+  double max_velocity_;
+  double min_trans_eval_;
 } VoxelMapConfig;
 
 typedef struct PointToPlane

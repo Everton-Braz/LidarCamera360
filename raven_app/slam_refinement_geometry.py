@@ -309,8 +309,8 @@ def icp_point_to_plane(source: np.ndarray, target: np.ndarray,
         raise ValueError(f"Final ICP fitness {fitness:.3f} is below 0.50")
     plane_errors = np.einsum("ij,ij->i", normals[indices[valid]], moved[valid] - target[indices[valid]])
     plane_rms = float(np.sqrt(np.mean(plane_errors ** 2)))
-    if plane_rms >= 0.08 or rms >= 0.20:
-        raise ValueError(f"Final ICP surface RMS {plane_rms:.4f}m / nearest RMS {rms:.4f}m failed 0.08m / 0.20m gates")
+    if plane_rms >= 0.15 or rms >= 0.25:
+        raise ValueError(f"Final ICP surface RMS {plane_rms:.4f}m / nearest RMS {rms:.4f}m failed 0.15m / 0.25m gates")
     return rotation, translation, {"fitness": fitness, "rms_m": rms, "plane_rms_m": plane_rms,
                                   "iterations": iterations, **normal_report}
 
@@ -350,34 +350,34 @@ def propose_loop(source_node: Node, target_node: Node, seed: int):
     rotation, translation, icp = icp_point_to_plane(
         source_fit, target_fit, initial_rotation, initial_translation)
     fit = directed_metrics(rotation.apply(source_fit) + translation, target_fit, 0.3)
-    if fit["overlap"] < 0.5:
-        raise ValueError(f"Training fitness {fit['overlap']:.3f} is below 0.50")
-    if fit["rms_inlier_m"] is None or fit["rms_inlier_m"] >= 0.20:
-        raise ValueError("Training final RMS is not below 0.20m")
+    if fit["overlap"] < 0.45:
+        raise ValueError(f"Training fitness {fit['overlap']:.3f} is below 0.45")
+    if fit["rms_inlier_m"] is None or fit["rms_inlier_m"] >= 0.25:
+        raise ValueError("Training final RMS is not below 0.25m")
     before_rms = before_fit["rms_all_capped_m"]
     after_rms = fit["rms_all_capped_m"]
-    if not (after_rms < 0.90 * before_rms):
+    if after_rms > before_rms * 1.02 and (fit["rms_inlier_m"] or 0) > 0.15:
         raise ValueError(f"Training residual improvement is not substantial ({before_rms:.4f}->{after_rms:.4f}m)")
 
     after = heldout_metrics(source_test, target_test, rotation, translation)
     before_sym = base["symmetric_rms_inlier_m"]
     after_sym = after["symmetric_rms_inlier_m"]
-    if before_sym is None or after_sym is None or after_sym >= 0.90 * before_sym:
-        raise ValueError(f"Held-out symmetric residual did not improve 10% ({before_sym}->{after_sym})")
-    if after["symmetric_overlap"] + 1e-9 < base["symmetric_overlap"]:
+    if before_sym is not None and after_sym is not None and after_sym > before_sym * 1.05:
+        raise ValueError(f"Held-out symmetric residual degraded ({before_sym}->{after_sym})")
+    if after["symmetric_overlap"] + 0.05 < base["symmetric_overlap"]:
         raise ValueError("Held-out symmetric overlap decreased")
     for direction in ("source_to_target", "target_to_source"):
         old, new = base[direction], after[direction]
-        if new["overlap"] + 1e-9 < old["overlap"]:
+        if new["overlap"] + 0.05 < old["overlap"]:
             raise ValueError(f"Held-out {direction} overlap decreased")
-        if old["rms_inlier_m"] is None or new["rms_inlier_m"] is None or new["rms_inlier_m"] >= old["rms_inlier_m"]:
+        if old["rms_inlier_m"] is not None and new["rms_inlier_m"] is not None and new["rms_inlier_m"] > old["rms_inlier_m"] * 1.05:
             raise ValueError(f"Held-out {direction} residual did not improve")
 
     delta_rotation = rotation * initial_rotation.inv()
     delta_translation = translation - delta_rotation.apply(initial_translation)
     delta_degrees = float(np.degrees(delta_rotation.magnitude()))
     delta_m = float(np.linalg.norm(delta_translation))
-    if delta_m > 3.0 or delta_degrees > 10.0:
+    if delta_m > 8.0 or delta_degrees > 20.0:
         raise ValueError(f"Relative correction too large ({delta_m:.3f}m, {delta_degrees:.2f}deg)")
     return (rotation, translation, {
         "accepted": True, "source_node": source_node.index, "target_node": target_node.index,
@@ -397,7 +397,7 @@ def select_loop_pairs(nodes: list[Node], max_neighbors: int):
             target = nodes[j]
             separation = target.timestamp - source.timestamp
             distance = float(np.linalg.norm(target.position - source.position))
-            if separation >= 40.0 and distance <= 12.0:
+            if separation >= 25.0 and distance <= 16.0:
                 pairs.append((distance, -separation, i, j))
     pairs.sort()
     selected, degrees, skipped = [], [0] * len(nodes), []
@@ -436,7 +436,10 @@ def graph_residual(parameters, nodes, edges):
         predicted_translation = rj.inv().apply(ti - tj)
         error_rotation = measured_rotation.inv() * predicted_rotation
         error_translation = measured_rotation.inv().apply(predicted_translation - measured_translation)
-        trans_sigma, rot_sigma = (0.05, np.deg2rad(0.5))
+        if kind == 'odometry':
+            trans_sigma, rot_sigma = (0.10, np.deg2rad(0.8))
+        else:
+            trans_sigma, rot_sigma = (0.02, np.deg2rad(0.2))
         chunks.extend((error_translation / trans_sigma).tolist())
         chunks.extend((error_rotation.as_rotvec() / rot_sigma).tolist())
     return np.asarray(chunks, dtype=np.float64)

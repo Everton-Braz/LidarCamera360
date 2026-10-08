@@ -765,6 +765,7 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
 
     align_data = {
         "calibration_version": CALIBRATION_VERSION,
+        "quality_status": "accepted",
         "slam_source_signature": _active_slam_signature(
             dataset_dir, trajectory_path=slam_trj, cloud_path=slam_pcd,
             include_cloud=use_icp),

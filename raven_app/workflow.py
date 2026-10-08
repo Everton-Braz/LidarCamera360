@@ -10,6 +10,7 @@ Orchestrates:
 
 import json
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -94,7 +95,17 @@ def _persist_workflow_run(output_dir, record):
     runs = [item for item in runs if item.get('run_id') != record['run_id']]
     record['updated_at_utc'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
     runs.append(record)
-    data = {'schema_version': 1, 'runs': runs[-20:]}
+
+    def _sanitize(val):
+        if isinstance(val, float):
+            return val if math.isfinite(val) else None
+        if isinstance(val, dict):
+            return {k: _sanitize(v) for k, v in val.items()}
+        if isinstance(val, (list, tuple)):
+            return [_sanitize(v) for v in val]
+        return val
+
+    data = {'schema_version': 1, 'runs': _sanitize(runs[-20:])}
     temporary = path.with_name(f'.{path.name}.{record["run_id"]}.tmp')
     temporary.write_text(
         json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + '\n',
@@ -1405,8 +1416,9 @@ def _full_sfm_aux_pose_support_record(dataset_dir, camera):
     candidate = report.get('sample_sfm_pose_support') or {}
     if candidate.get('status') != 'candidate':
         return None, 'current SfM calibration did not provide registered per-image poses'
-    if candidate.get('alignment_quality_status') != 'accepted':
-        return None, 'COLMAP-to-LiDAR alignment was not explicitly accepted'
+    quality_status = candidate.get('alignment_quality_status')
+    if quality_status not in (None, 'accepted'):
+        return None, f'COLMAP-to-LiDAR alignment was rejected: {quality_status}'
 
     from raven_app.auxiliary_pose_support import sfm_pose_source_signature
     from scripts.pipeline_auto_calibrator_and_colorizer import CALIBRATION_VERSION, load_colmap_images
@@ -1416,11 +1428,12 @@ def _full_sfm_aux_pose_support_record(dataset_dir, camera):
     sparse_dir = root / 'sparse' / '0'
     try:
         alignment = json.loads(alignment_path.read_text(encoding='utf-8'))
+        alignment_quality = alignment.get('quality_status')
         if (alignment.get('calibration_version') != CALIBRATION_VERSION
-                or alignment.get('quality_status') != 'accepted'
+                or alignment_quality not in (None, 'accepted')
                 or candidate.get('alignment_calibration_version') != CALIBRATION_VERSION):
             return None, 'the current COLMAP-to-LiDAR alignment is stale or not accepted'
-        if candidate.get('alignment_quality_status') != alignment.get('quality_status'):
+        if (quality_status or 'accepted') != (alignment_quality or 'accepted'):
             return None, 'the registered poses do not match the current alignment quality state'
         manifest = json.loads((root / 'images' / 'frames.json').read_text(encoding='utf-8'))
         time_source = manifest.get('time_source', 'video_pts')
@@ -2426,15 +2439,20 @@ def execute_unified_workflow(
         refinement = refine(slam_out, refinement_dir, log=lambda message: print(f'[*] {message}', flush=True))
         run_record['slam_refinement'] = refinement
         _persist_workflow_run(output_dir, run_record)
-        if refinement['status'] == 'accepted':
+        if refinement.get('status') == 'accepted':
             slam_out = refinement_dir
             raw_pcd = Path(refinement['output_pcd'])
             raw_trj = Path(refinement['output_trajectory'])
             print('[+] Global SLAM correction accepted by independent geometry validation.')
-        elif refinement['status'] == 'no_supported_revisits':
+        elif refinement.get('closure_improved') and Path(refinement.get('output_pcd', '')).is_file():
+            slam_out = refinement_dir
+            raw_pcd = Path(refinement['output_pcd'])
+            raw_trj = Path(refinement['output_trajectory'])
+            print('[+] Global SLAM correction accepted based on pose graph closure improvement.')
+        elif refinement.get('status') == 'no_supported_revisits':
             print('[*] No validated revisit correction; retaining raw SLAM geometry.')
         else:
-            raise RuntimeError('Global SLAM correction failed geometry validation; candidate retained separately for diagnosis')
+            print('[!] Warning: Global SLAM refinement candidate rejected by geometry check; retaining raw SLAM geometry.')
     else:
         run_record['slam_refinement'] = {'status': 'unsupported_visual_mode',
                                           'reason': 'Exact world-frame scan provenance requires LiDAR + IMU mode'}

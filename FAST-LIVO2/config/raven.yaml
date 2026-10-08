@@ -42,9 +42,9 @@ vio:
 imu:
   imu_en: true
   imu_int_frame: 30
-  acc_cov: 0.5
+  acc_cov: 1.5
   gyr_cov: 0.1
-  b_acc_cov: 0.0001
+  b_acc_cov: 0.001
   b_gyr_cov: 0.0001
 
 lio:
@@ -56,6 +56,8 @@ lio:
   max_layer: 3
   max_points_num: 100
   layer_init_num: [5, 5, 5, 5, 5]
+  max_velocity: 2.0
+  min_trans_eval: 20.0
 
 local_map:  
   map_sliding_en: true
