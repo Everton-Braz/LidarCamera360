@@ -27,6 +27,7 @@ def main():
                    help='Destination root for the packaged app (default: dist)')
     a = p.parse_args()
     dist_root = a.dist_root.resolve()
+    vcpkg = a.vcpkg_root or (Path(os.environ['VCPKG_ROOT']) if 'VCPKG_ROOT' in os.environ else None)
 
     # Validate required runtime modules are installed
     for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets',
@@ -207,6 +208,12 @@ def main():
                 add_binary(binary, 'bin')
         cmd += ['--add-data', f'{model};models']
 
+    if vcpkg and (vcpkg / 'installed/x64-windows/bin').is_dir():
+        vcpkg_bin = vcpkg / 'installed/x64-windows/bin'
+        for dll in vcpkg_bin.glob('*.dll'):
+            add_binary(dll, 'bin')
+            add_binary(dll, '.')
+
     entry = ROOT / 'lidarcamera360.py' if (ROOT / 'lidarcamera360.py').is_file() else ROOT / 'raven.py'
     cmd.append(str(entry))
     print(f"[*] Running PyInstaller packaging ({'ONEFILE' if a.onefile else 'ONEDIR'})...")
@@ -243,8 +250,8 @@ def main():
                 for f in internal.glob(pattern):
                     shutil.copy2(f, bin_dir / f.name)
         # Copy vcpkg runtime DLLs if available so native executables run standalone
-        vcpkg_bin = vcpkg / 'installed/x64-windows/bin'
-        if vcpkg_bin.is_dir():
+        if vcpkg and (vcpkg / 'installed/x64-windows/bin').is_dir():
+            vcpkg_bin = vcpkg / 'installed/x64-windows/bin'
             for dll in vcpkg_bin.glob('*.dll'):
                 if not (internal / dll.name).is_file():
                     shutil.copy2(dll, internal / dll.name)
