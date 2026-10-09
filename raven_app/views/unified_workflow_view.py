@@ -305,6 +305,11 @@ class UnifiedWorkflowView(QWidget):
         recalib_row.addStretch()
         config_layout.addLayout(recalib_row)
 
+        self.revisit_refinement_chk = CheckBox(tr("Global Pose Graph SLAM Optimization (MOLA / Loop Closure)"))
+        self.revisit_refinement_chk.setChecked(False)
+        self.revisit_refinement_chk.setToolTip(tr("Eliminates duplicate walls, ghosting, and trajectory drift by optimizing revisit loops with pose-graph SLAM. Optional; adds processing time."))
+        config_layout.addWidget(self.revisit_refinement_chk)
+
         mask_row = QHBoxLayout()
         self.mask_persons_chk = CheckBox(tr("Generate masks"))
         self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
@@ -1030,6 +1035,11 @@ class UnifiedWorkflowView(QWidget):
             args.append("--lio")
         else:
             args.append("--vio")
+
+        if self.revisit_refinement_chk.isChecked():
+            args.append("--revisit-refinement")
+        else:
+            args.append("--no-revisit-refinement")
 
         if not self.auto_sync_chk.isChecked() and self.dt_input.text().strip():
             args.extend(["--dt", self.dt_input.text().strip()])

@@ -2192,6 +2192,7 @@ def execute_unified_workflow(
     photometric_params: Path = None,
     third_camera: Optional[Any] = None,
     colmap_export_dir: Optional[Path] = None,
+    revisit_refinement: bool = False,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -2430,7 +2431,7 @@ def execute_unified_workflow(
             if txts:
                 raw_trj = txts[0]
 
-    if lio:
+    if lio and revisit_refinement:
         from raven_app.slam_refinement import refine, VERSION
         if not (slam_out / 'scan_ranges.csv').is_file():
             raise RuntimeError('SLAM output lacks exact scan provenance; recompute the raw SLAM in a fresh output directory')
@@ -2453,6 +2454,10 @@ def execute_unified_workflow(
             print('[*] No validated revisit correction; retaining raw SLAM geometry.')
         else:
             print('[!] Warning: Global SLAM refinement candidate rejected by geometry check; retaining raw SLAM geometry.')
+    elif lio:
+        run_record['slam_refinement'] = {'status': 'skipped_by_user',
+                                          'reason': 'Fast path selected; global revisit optimization disabled by user'}
+        print('[*] Fast path: Global revisit optimization (MOLA / Loop Closure) skipped by user.')
     else:
         run_record['slam_refinement'] = {'status': 'unsupported_visual_mode',
                                           'reason': 'Exact world-frame scan provenance requires LiDAR + IMU mode'}
