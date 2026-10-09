@@ -175,6 +175,7 @@ def main():
     vulkan_mask_shaders = ('ops.comp.spv', 'matmul.comp.spv', 'reduce.comp.spv')
     for shader in vulkan_mask_shaders:
         candidates = (vulkan_masker.parent / 'shaders' / shader,
+                      vulkan_masker.parent / shader,
                       vulkan_masker.parent.parent / shader,
                       ROOT / 'native/vulkan_rfdetr/shaders' / shader)
         source = next((path for path in candidates if path.is_file()), None)
