@@ -250,6 +250,12 @@ def main():
                     shutil.copy2(dll, internal / dll.name)
                 if bin_dir.is_dir() and not (bin_dir / dll.name).is_file():
                     shutil.copy2(dll, bin_dir / dll.name)
+        # Also mirror any opencv and system dlls into bin_dir
+        if bin_dir.is_dir():
+            for pattern in ('*opencv*.dll', '*boost*.dll', '*pcl*.dll', '*z*.dll', '*yaml*.dll'):
+                for f in internal.glob(pattern):
+                    if not (bin_dir / f.name).is_file():
+                        shutil.copy2(f, bin_dir / f.name)
     print(output / f'{APP_NAME}.exe')
 
 
