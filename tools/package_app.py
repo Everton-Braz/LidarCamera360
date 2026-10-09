@@ -242,6 +242,14 @@ def main():
             for pattern in ('vcruntime*.dll', 'msvcp*.dll', 'vcomp*.dll', 'concrt*.dll'):
                 for f in internal.glob(pattern):
                     shutil.copy2(f, bin_dir / f.name)
+        # Copy vcpkg runtime DLLs if available so native executables run standalone
+        vcpkg_bin = vcpkg / 'installed/x64-windows/bin'
+        if vcpkg_bin.is_dir():
+            for dll in vcpkg_bin.glob('*.dll'):
+                if not (internal / dll.name).is_file():
+                    shutil.copy2(dll, internal / dll.name)
+                if bin_dir.is_dir() and not (bin_dir / dll.name).is_file():
+                    shutil.copy2(dll, bin_dir / dll.name)
     print(output / f'{APP_NAME}.exe')
 
 
