@@ -2193,6 +2193,7 @@ def execute_unified_workflow(
     third_camera: Optional[Any] = None,
     colmap_export_dir: Optional[Path] = None,
     revisit_refinement: bool = False,
+    image_bag_path: Optional[Path] = None,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()

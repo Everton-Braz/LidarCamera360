@@ -204,7 +204,8 @@ def parse(argv=None):
     wf.add_argument('--recalibrate',action='store_true',default=True,help='Auto-recalibrate spatial extrinsics from SfM')
     wf.add_argument('--no-recalibrate',action='store_false',dest='recalibrate')
     wf.add_argument('--revisit-refinement',action='store_true',default=False,help='Enable global pose graph SLAM / revisit optimization (MOLA / Loop Closure)')
-    wf.add_argument('--no-revisit-refinement',action='store_false',dest='revisit_refinement',help='Disable global revisit optimization')
+    wf.add_argument('--no-revisit-refinement',action='store_false',dest='revisit_refinement')
+    wf.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for camera frame extraction')
     wf.add_argument('--run-spirula',action='store_true',default=False,help='Run Spirula SfM if not already built')
     wf.add_argument('--export-ply',action='store_true',default=False)
     wf.add_argument('--export-pcd',action='store_true',default=False)
@@ -499,6 +500,7 @@ def run(a):
             photometric_params=a.photometric_params,
             third_camera=a.third_camera,
             revisit_refinement=getattr(a, 'revisit_refinement', False),
+            image_bag_path=getattr(a, 'image_bag_path', None),
         )
     raise ValueError('Unknown command')
 
