@@ -110,7 +110,7 @@ def solve(nodes, loops, point_jac, point_errors):
 
     result = least_squares(residual, initial, jac=jacobian, tr_solver='lsmr', x_scale='jac',
                            tr_options={'atol': 1e-10, 'btol': 1e-10}, loss='soft_l1',
-                           max_nfev=500, xtol=1e-7, ftol=1e-7, gtol=1e-7)
+                           max_nfev=2500, xtol=1e-5, ftol=1e-5, gtol=1e-5)
     if not result.success or not np.isfinite(result.x).all():
         raise ValueError(f'Refinement did not converge: {result.message}')
     changes = np.vstack([np.zeros(6), result.x.reshape(-1, 6)])
@@ -174,8 +174,15 @@ def refine(slam_dir: Path, output: Path, log=print):
         report['status'] = 'no_supported_revisits'
     else:
         log('Optimizing trajectory with scan-time static-plane constraints.')
-        jac, errors, planes = plane_constraints(pcd, scans, nodes)
-        parameters, edges, graph = solve(nodes, loops, jac, errors)
+        try:
+            jac, errors, planes = plane_constraints(pcd, scans, nodes)
+            parameters, edges, graph = solve(nodes, loops, jac, errors)
+        except Exception as exc:
+            log(f'Global SLAM refinement optimization did not converge ({exc}); retaining raw SLAM geometry.')
+            output.mkdir(parents=True, exist_ok=True)
+            report.update(status='rejected_geometry', failure_reason=str(exc))
+            report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
+            return report
         before_loop = geo.graph_residual(np.zeros_like(parameters), nodes, loops)
         after_loop = geo.graph_residual(parameters, nodes, loops)
         closure_improved = np.linalg.norm(after_loop) < .98*np.linalg.norm(before_loop)

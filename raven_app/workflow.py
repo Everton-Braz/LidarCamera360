@@ -2437,7 +2437,11 @@ def execute_unified_workflow(
             raise RuntimeError('SLAM output lacks exact scan provenance; recompute the raw SLAM in a fresh output directory')
         refinement_dir = output_dir / (f'slam_refined_{VERSION}_'
                                       f'{raw_pcd.stat().st_mtime_ns}_{raw_trj.stat().st_mtime_ns}')
-        refinement = refine(slam_out, refinement_dir, log=lambda message: print(f'[*] {message}', flush=True))
+        try:
+            refinement = refine(slam_out, refinement_dir, log=lambda message: print(f'[*] {message}', flush=True))
+        except Exception as exc:
+            print(f'[!] Warning: Global SLAM refinement failed ({exc}); retaining raw SLAM geometry.', flush=True)
+            refinement = {'status': 'rejected_geometry', 'failure_reason': str(exc)}
         run_record['slam_refinement'] = refinement
         _persist_workflow_run(output_dir, run_record)
         if refinement.get('status') == 'accepted':
