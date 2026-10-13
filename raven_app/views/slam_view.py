@@ -11,7 +11,7 @@ from qfluentwidgets import (
     PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
 )
 from raven_app.process_runner import ProcessRunner
-from raven_app.bag_io import detect_bag_topics
+from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag
 from raven_app.i18n import tr
 
 
@@ -62,6 +62,19 @@ class SlamView(QWidget):
         bag_row.addWidget(self.bag_input)
         bag_row.addWidget(self.bag_browse)
         card_layout.addLayout(bag_row)
+
+        # Front Camera Bag row (optional)
+        image_bag_row = QHBoxLayout()
+        self.image_bag_label = BodyLabel(tr("Front Camera Bag:"))
+        self.image_bag_label.setFixedWidth(140)
+        self.image_bag_input = LineEdit()
+        self.image_bag_input.setPlaceholderText(tr("Optional IMAGE_*.bag for front camera / VIO..."))
+        self.image_bag_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
+        self.image_bag_browse.clicked.connect(self._browse_image_bag)
+        image_bag_row.addWidget(self.image_bag_label)
+        image_bag_row.addWidget(self.image_bag_input)
+        image_bag_row.addWidget(self.image_bag_browse)
+        card_layout.addLayout(image_bag_row)
 
         # Output folder row
         out_row = QHBoxLayout()
@@ -242,6 +255,16 @@ class SlamView(QWidget):
         if path:
             self.bag_input.setText(path)
             self._auto_detect_bag(path)
+            cand = find_adjacent_image_bag(Path(path))
+            if cand and cand.is_file() and not self.image_bag_input.text().strip():
+                self.image_bag_input.setText(str(cand))
+
+    def _browse_image_bag(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Select Front Camera Bag"), "", tr("ROS Bag files (*.bag);;All files (*.*)")
+        )
+        if path:
+            self.image_bag_input.setText(path)
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -299,6 +322,9 @@ class SlamView(QWidget):
             '--imu-topic', self.imu_input.text().strip() or '/vanjee_imu_packets',
             '--threads', str(self.threads_spin.value())
         ]
+        if self.image_bag_input.text().strip():
+            args.extend(['--image-bag', self.image_bag_input.text().strip()])
+
         if self.lio_switch.isChecked():
             args.append('--lio')
         else:
@@ -376,6 +402,9 @@ class SlamView(QWidget):
         self.bag_label.setText(tr("ROS Bag File:"))
         self.bag_input.setPlaceholderText(tr("Select merged or raw ROS1 bag file (.bag)..."))
         self.bag_browse.setText(tr("Browse"))
+        self.image_bag_label.setText(tr("Front Camera Bag:"))
+        self.image_bag_input.setPlaceholderText(tr("Optional IMAGE_*.bag for front camera / VIO..."))
+        self.image_bag_browse.setText(tr("Browse"))
         self.out_label.setText(tr("Output Folder:"))
         self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
         self.out_browse.setText(tr("Browse"))

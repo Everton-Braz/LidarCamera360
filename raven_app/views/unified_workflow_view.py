@@ -22,7 +22,7 @@ from raven_app.workflow_progress import (
 )
 from raven_app.mask_download import MaskResourceDownload
 from raven_app.mask_resources import resource_status, resources_ready
-from raven_app.bag_io import detect_bag_topics
+from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag
 from raven_app.seed_export import dataset_seed_point_count, seed_point_count
 from raven_app.i18n import tr
 
@@ -114,6 +114,19 @@ class UnifiedWorkflowView(QWidget):
         bag_row.addWidget(self.bag_input)
         bag_row.addWidget(self.btn_browse_bag)
         inputs_layout.addLayout(bag_row)
+
+        # Row 1.5: Front Camera Bag
+        image_bag_row = QHBoxLayout()
+        self.image_bag_label = BodyLabel(tr("Front Camera Bag (.bag):"))
+        self.image_bag_label.setFixedWidth(170)
+        self.image_bag_input = LineEdit()
+        self.image_bag_input.setPlaceholderText(tr("Optional IMAGE_*.bag for front camera & VIO..."))
+        self.btn_browse_image_bag = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
+        self.btn_browse_image_bag.clicked.connect(self._browse_image_bag)
+        image_bag_row.addWidget(self.image_bag_label)
+        image_bag_row.addWidget(self.image_bag_input)
+        image_bag_row.addWidget(self.btn_browse_image_bag)
+        inputs_layout.addLayout(image_bag_row)
 
         # Row 2: INSV Video
         insv_row = QHBoxLayout()
@@ -635,10 +648,20 @@ class UnifiedWorkflowView(QWidget):
         if path:
             self.bag_input.setText(path)
             self._auto_detect_bag(path)
+            cand = find_adjacent_image_bag(Path(path))
+            if cand and cand.is_file() and not self.image_bag_input.text().strip():
+                self.image_bag_input.setText(str(cand))
             # Auto-suggest output folder if empty
             if not self.out_input.text().strip():
                 p = Path(path)
                 self.out_input.setText(str(p.parent / f"{p.stem}_studio_output"))
+
+    def _browse_image_bag(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Select Front Camera Bag (.bag)"), "", tr("ROS Bag files (*.bag);;All files (*.*)")
+        )
+        if path:
+            self.image_bag_input.setText(path)
 
     def _browse_insv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -991,6 +1014,9 @@ class UnifiedWorkflowView(QWidget):
             "--method", method_key
         ]
 
+        if self.image_bag_input.text().strip():
+            args.extend(["--image-bag", self.image_bag_input.text().strip()])
+
         args.extend(["--photometric", str(self.photometric_combo.currentData())])
         photometric_params = self.photometric_params_input.text().strip()
         if photometric_params and self.photometric_combo.currentData() != "off":
@@ -1300,6 +1326,9 @@ class UnifiedWorkflowView(QWidget):
         self.bag_label.setText(tr("LiDAR ROS Bag (.bag):"))
         self.bag_input.setPlaceholderText(tr("Select merged or raw ROS1 bag file (.bag)..."))
         self.btn_browse_bag.setText(tr("Browse"))
+        self.image_bag_label.setText(tr("Front Camera Bag (.bag):"))
+        self.image_bag_input.setPlaceholderText(tr("Optional IMAGE_*.bag for front camera & VIO..."))
+        self.btn_browse_image_bag.setText(tr("Browse"))
         self.insv_label.setText(tr("Insta360 Video (.insv):"))
         self.insv_input.setPlaceholderText(tr("Select Insta360 X4 / X6 video (.insv or .mp4)..."))
         self.btn_browse_insv.setText(tr("Browse"))
