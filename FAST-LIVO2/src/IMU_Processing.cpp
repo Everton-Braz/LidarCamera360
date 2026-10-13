@@ -21,6 +21,7 @@ ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
   cov_bias_gyr = V3D(0.1, 0.1, 0.1);
   cov_bias_acc = V3D(0.1, 0.1, 0.1);
   cov_inv_expo = 0.2;
+  max_velocity = 2.5;
   mean_acc = V3D(0, 0, -1.0);
   mean_gyr = V3D(0, 0, 0);
   angvel_last = Zero3d;
@@ -419,6 +420,12 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
 
       /* velocity of IMU */
       vel_imu = vel_imu + acc_imu * dt;
+      if (max_velocity > 0.0) {
+        double v_norm = vel_imu.norm();
+        if (v_norm > max_velocity) {
+          vel_imu *= (max_velocity / v_norm);
+        }
+      }
 
       /* save the poses at each IMU measurements */
       angvel_last = angvel_avr;

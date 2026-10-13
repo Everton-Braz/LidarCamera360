@@ -6,10 +6,12 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 
 **Unified LiDAR-Inertial SLAM, 360° Camera Telemetry, Rig Calibration, and 3D Colorization Suite**
 
+[![Release](https://img.shields.io/badge/Release-v0.2.0-brightgreen.svg)](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.2.0)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![C++17 MSVC](https://img.shields.io/badge/C%2B%2B-17%20MSVC-orange.svg)](https://visualstudio.microsoft.com/)
 [![Vulkan](https://img.shields.io/badge/GPU-Vulkan%20Compute-red.svg)](https://www.vulkan.org/)
 [![PyQt6 Fluent](https://img.shields.io/badge/UI-PyQt6%20Fluent%20Widgets-teal.svg)](https://github.com/zhiyiYo/PyQt-Fluent-Widgets)
+[![Tests](https://img.shields.io/badge/Tests-252%20passed-success.svg)](tests/)
 [![License](https://img.shields.io/badge/License-Dual%20MIT%20%2F%20GPLv3-green.svg)](LICENSE)
 
 <br/>
@@ -43,14 +45,15 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
    - Supports standard point clouds and Livox/Eagle high-rate scan formats.
    - Produces high-accuracy LiDAR odometry, 6-DoF trajectories, and dense point cloud maps directly from raw packets.
 
-3. **High-Throughput INSV Video Frame Extraction**
-   - In-process dual-track decoding via bundled PyAV / FFmpeg with hardware acceleration (`CUDA`, `D3D11VA`, `VideoToolbox`, `VAAPI`).
-   - Fast SIMD-based grayscale Laplacian sharpness selection across configurable window intervals.
-   - Multithreaded concurrent JPEG compression and presentation timestamp (`PTS`) preservation.
+3. **High-Throughput INSV Video Extraction & Multi-Source Auxiliary Ingestion**
+   - In-process dual-track and single-stream INSV decoding via bundled PyAV / FFmpeg with hardware acceleration (`CUDA`, `D3D11VA`, `VideoToolbox`, `VAAPI`).
+   - Native support for single-lens and auxiliary panoramic action cameras (Insta360 Ace Pro, GO 3, and auxiliary camera arrays) with dynamic stream selection in UI/CLI.
+   - Fast SIMD-based grayscale Laplacian sharpness selection across configurable window intervals and GOP keyframe seeking.
 
-4. **Programmatic IMU Gyro Cross-Correlation Time Sync**
-   - Decodes embedded binary telemetry trailers from Insta360 INSV files (Gyro and Exposure records).
+4. **Programmatic IMU Gyro Cross-Correlation & Timelapse Auto-Calibration**
+   - Decodes embedded binary telemetry trailers from Insta360 INSV files (Gyro and Exposure records) for video and timelapse captures.
    - Computes Pearson cross-correlation between camera gyro angular velocity norms and LiDAR IMU gyro streams to achieve sub-millisecond clock synchronization ($\Delta t$).
+   - Automatic temporal sync adaptation for variable-rate timelapses and custom trajectory windows.
 
 5. **Thin Prism Fisheye Optical Modeling & Multi-Modal Calibration**
    - Complete 12-parameter Thin Prism fisheye distortion model ($f_x, f_y, c_x, c_y, k_1..k_4, p_1, p_2, s_{x1}, s_{y1}$).
@@ -66,10 +69,11 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
    - Persistent sliced view: keep cuts active in the viewport while hiding box gizmos for pristine inspection.
    - Sub-volume point cloud cropping and export (PLY, PCD, LAS, XYZ).
 
-8. **Metric LiDAR 3DGS Seed Initialization (Gaussian Splatting)**
-   - Exports metric colorized LiDAR point clouds directly as 3D Gaussian Splatting seeds (`points3D.ply`, `points3D.bin`, `points3D.txt`) into COLMAP workspace.
-   - Out-of-the-box compatibility with Inria 3DGS, Nerfstudio (splatfacto), PostShot, Spirula Studio, and LichtFeld Studio.
-   - Intelligent density subsampling to prevent CUDA VRAM blowouts while providing dense geometric scaffolding.
+8. **Full-Density Metric LiDAR 3DGS Seed Initialization & Instant Hardlink Export**
+   - **Zero Downsampling Cap:** Feed 100% of dense metric LiDAR point clouds (tested up to 28.5M+ points!) directly into modern 3D Gaussian Splatting engines (Spirula Studio, LichtFeld Studio, PostShot, Nerfstudio).
+   - **Faster Training Convergence:** Dense geometric scaffolding accelerates convergence and runs efficiently (~6.5 GiB VRAM on modern GPUs like RTX 5070 Ti) by eliminating iterative densification lag.
+   - **Hybrid SfM + LiDAR Fusion:** Automatically merges SfM camera ray tracks with dense metric LiDAR geometry into a unified COLMAP model.
+   - **Zero Duplicate Disk Storage:** Employs NTFS hardlinks and directory junctions to export COLMAP datasets in seconds with 0 additional disk space consumption.
 
 9. **Automated Georeferencing, GCPs & GeoTIFF Orthophotos**
    - Automated GNSS/INSV trajectory georeferencing & Ground Control Points (GCP) alignment.
@@ -77,9 +81,17 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
    - Native INSV GPS extraction and satellite track quality reporting (DOP, fix type, accuracy metrics).
    - Georeferenced LAZ / LAS 1.4 export with Compound CRS (SIRGAS 2000 / UTM).
 
-10. **Modern Fluent UI & Multilingual Localization (i18n)**
-   - Microsoft WinUI 3 Fluent Design System with Mica and Acrylic materials, dark/light theme switching.
-   - Runtime localization supporting **English**, **Português (Brasil)**, **Español**, **Français**, **Deutsch**, **简体中文**, and **日本語**.
+10. **Multi-Camera SLAM Refinement & Geometric Pose Constraints**
+    - Joint multi-camera bundle adjustment and trajectory refinement (`slam_refinement.py`, `slam_refinement_geometry.py`).
+    - Enforces 6-DoF rigid extrinsic constraints and SLAM pose synthesis across auxiliary perspective and fisheye cameras (cam2, cam3, ...) for complete panoramic coverage.
+
+11. **On-Device Vulkan RF-DETR Dynamic Person Masking**
+    - GPU-accelerated person & operator detection/masking powered by native SPIR-V compute shaders (`native/vulkan_rfdetr/shaders/`).
+    - Fully offline, deterministic, zero-cloud execution eliminating pedestrians and dynamic artifacts from 3D reconstruction and Gaussian splatting.
+
+12. **Modern Fluent UI & Multilingual Localization (i18n)**
+    - Microsoft WinUI 3 Fluent Design System with Mica and Acrylic materials, dark/light theme switching.
+    - Runtime localization supporting **English**, **Português (Brasil)**, **Español**, **Français**, **Deutsch**, **简体中文**, and **日本語**.
 
 ---
 
@@ -118,13 +130,21 @@ python lidarcamera360.py workflow --bag D:\capture\scan.bag --insv D:\capture\vi
 python lidarcamera360.py
 ```
 
-### Running the Standalone Windows Executable
+### Running the Standalone Windows Executable (No Python Required)
 
-When using the pre-compiled portable bundle, keep `LidarCamera360.exe` alongside its `_internal/` directory:
+Pre-compiled standalone packages and portable executables are available on [GitHub Releases](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.2.0):
+- 📥 **Direct Portable Download:** [LidarCamera360_portable.exe (v0.2.0)](https://github.com/Everton-Braz/LidarCamera360/releases/download/v0.2.0/LidarCamera360_portable.exe)
+
+When using the portable executable or directory bundle:
 
 ```powershell
+# Check bundled native SLAM and Vulkan engines
 .\LidarCamera360.exe --headless doctor
+
+# Run automated end-to-end processing directly
 .\LidarCamera360.exe workflow --bag D:\capture\scan.bag --insv D:\capture\video.insv --output D:\dataset --method direct
+
+# Or simply double-click LidarCamera360.exe to launch the GUI
 ```
 
 ---
@@ -188,18 +208,29 @@ LidarCamera360/
 │   ├── zh-CN.json                          # 简体中文
 │   └── ja.json                             # 日本語
 ├── native/                                 # C++17 standalone MSVC offline adapter
+│   ├── vulkan_rfdetr/                      # Headless Vulkan RF-DETR segmentation & shaders
+│   └── native_runtime.h                    # Native runtime bridge
 ├── raven_app/                              # Core Python application package
+│   ├── auxiliary_insv.py                   # Single-stream & auxiliary INSV extraction
+│   ├── auxiliary_pose_support.py           # Auxiliary camera pose estimation & validation
 │   ├── branding.py                         # Application identity & version metadata
 │   ├── cli.py                              # Command-line interface parser
+│   ├── cloud_view.py                       # OpenGL point cloud viewer & 3D gizmos
 │   ├── config.py                           # Settings and tool validation
 │   ├── dataset.py                          # Dataset paths and schema normalization
 │   ├── gui.py                              # Fluent UI main window and navigation
 │   ├── i18n.py                             # Localization runtime translation layer
 │   ├── process_runner.py                   # Async job runner with clean cancellation
-│   ├── video.py                            # Accelerated dual-track INSV video extraction
+│   ├── slam_refinement.py                  # Multi-camera SLAM trajectory refinement
+│   ├── slam_refinement_geometry.py         # 6-DoF rigid transform geometry & interpolation
+│   ├── slam_refinement_constraints.py      # Geometric & temporal optimization constraints
+│   ├── third_camera.py                     # Auxiliary multi-camera config & calibration
+│   ├── timelapse_calibration.py            # Binary INSV timelapse telemetry & time sync
+│   ├── video.py                            # Accelerated dual/single-track INSV extraction
 │   ├── vulkan_engine.py                    # Vulkan GPU compute shader bridge
 │   ├── workflow.py                         # End-to-end pipeline orchestrator
 │   └── views/                              # WinUI Fluent tab views
+│       ├── add_source_dialog.py            # Multi-camera & auxiliary stream selector
 │       ├── calibration_view.py             # Rig calibration editor
 │       ├── colorize_view.py                # Standalone colorization studio
 │       ├── doctor_view.py                  # System diagnostics & engine health

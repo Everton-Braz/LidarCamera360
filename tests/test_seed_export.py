@@ -48,6 +48,17 @@ def test_seed_export_counts_match_all_formats_and_source_is_unchanged(tmp_path):
         'T_lidar_to_cam0_rigid_4x4': np.eye(4).tolist(),
         'T_lidar_to_cam1_rigid_4x4': np.eye(4).tolist(),
     }))
+    slam_res = tmp_path / 'slam_out' / 'result'
+    slam_res.mkdir(parents=True)
+    (slam_res / 'Eagle_Scan.txt').write_text(
+        "0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0\n"
+        "10.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0\n",
+        encoding="utf-8"
+    )
+    for cam in ("cam0", "cam1"):
+        d = tmp_path / "images" / cam
+        d.mkdir(parents=True)
+        (d / "frame_000001.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01")
     output = export_colmap_3dgs(tmp_path, calib, seed_percent=25)
     sparse = output / 'sparse' / '0'
     assert cloud_header_point_count(sparse / 'points3D.ply') == 25

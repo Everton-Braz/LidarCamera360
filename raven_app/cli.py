@@ -178,6 +178,8 @@ def parse(argv=None):
     bag_options(slam)
     slam.add_argument('--config',type=Path,default=None)
     slam.add_argument('--camera',type=Path,default=None)
+    slam.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for VIO')
+    slam.add_argument('--calib','--calib-json',dest='calib_json',type=Path,default=None,help='Optional calibration JSON file')
     slam.add_argument('--output',type=Path,required=True)
     slam.add_argument('--threads',type=int,choices=range(1,257),metavar='1..256',default=min(4,os.cpu_count() or 1))
     color=sub.add_parser('colorize',help='Run the existing calibration and colorization pipeline')
@@ -208,6 +210,9 @@ def parse(argv=None):
     wf.add_argument('--dt',type=finite)
     wf.add_argument('--recalibrate',action='store_true',default=True,help='Auto-recalibrate spatial extrinsics from SfM')
     wf.add_argument('--no-recalibrate',action='store_false',dest='recalibrate')
+    wf.add_argument('--revisit-refinement',action='store_true',default=False,help='Enable global pose graph SLAM / revisit optimization (MOLA / Loop Closure)')
+    wf.add_argument('--no-revisit-refinement',action='store_false',dest='revisit_refinement')
+    wf.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for camera frame extraction')
     wf.add_argument('--run-spirula',action='store_true',default=False,help='Run Spirula SfM if not already built')
     wf.add_argument('--export-ply',action='store_true',default=False)
     wf.add_argument('--export-pcd',action='store_true',default=False)
@@ -412,12 +417,20 @@ def run(a):
         with a.output.open('xb') as f: result=export_bags(a.bag,f,**export_options(a))
         print(json.dumps(result));return 0
     if a.command=='slam':
-        from raven_app.bag_io import export_bags, detect_bag_topics
+        from raven_app.bag_io import export_bags, detect_bag_topics, find_adjacent_image_bag
+        from raven_app.workflow import prepare_fastlivo_config
         if not engine().is_file():raise FileNotFoundError('Native engine missing; run tools/build_windows.ps1')
         detected = detect_bag_topics(a.bag)
         lidar_t = a.lidar_topic or detected['lidar_topic']
         imu_t = a.imu_topic or detected['imu_topic']
         is_eagle = (getattr(a, 'scanner', 'auto') == 'eagle') or ('livox' in lidar_t.lower()) or (detected['scanner_type'] == 'eagle')
+
+        raw_bags = a.bag if isinstance(a.bag, list) else [a.bag]
+        image_bag = getattr(a, 'image_bag_path', None) or (find_adjacent_image_bag(raw_bags[0]) if not a.lio else None)
+        if not a.lio and image_bag and Path(image_bag).is_file() and image_bag not in raw_bags:
+            bags = list(raw_bags) + [image_bag]
+        else:
+            bags = raw_bags
 
         config = a.config
         if not config:
@@ -428,18 +441,39 @@ def run(a):
 
         camera = a.camera or (resources() / 'FAST-LIVO2/config/camera_raven.yaml')
 
+        # Inject calib.json into FAST-LIVO2 and camera configs
+        calib_file = getattr(a, 'calib_json', None)
+        project_dir = Path(raw_bags[0]).parent if raw_bags else None
+        config = prepare_fastlivo_config(
+            config, a.output,
+            project_dir=project_dir,
+            calib_file=calib_file,
+            camera_config=camera
+        )
+        if not a.camera and (a.output / "camera_raven.yaml").is_file():
+            camera = a.output / "camera_raven.yaml"
+
         cmd=[str(engine()),'--input','-','--config',str(config),'--camera',str(camera),
              '--output',str(a.output),'--threads',str(a.threads)]
         if a.lio:cmd.append('--lio')
         opts = export_options(a)
         opts['lidar_topic'] = lidar_t
         opts['imu_topic'] = imu_t
+        if not a.lio and not opts.get('image_topic'):
+            opts['image_topic'] = '/camera_front/image_raw'
         from raven_app.subprocess_utils import hidden_window_options
         with subprocess.Popen(cmd,stdin=subprocess.PIPE,**hidden_window_options()) as child:
             try:
-                export_bags(a.bag,child.stdin,**opts)
+                export_bags(bags,child.stdin,**opts)
                 child.stdin.close()
                 return child.wait()
+            except (BrokenPipeError, OSError):
+                try:child.stdin.close()
+                except OSError:pass
+                code = child.wait()
+                if code != 0:
+                    raise RuntimeError(f'FAST-LIVO2 SLAM failed with exit code {code}')
+                return code
             except BaseException:
                 try:child.stdin.close()
                 except OSError:pass
@@ -531,6 +565,8 @@ def run(a):
             photometric=a.photometric,
             photometric_params=a.photometric_params,
             third_camera=a.third_camera,
+            revisit_refinement=getattr(a, 'revisit_refinement', False),
+            image_bag_path=getattr(a, 'image_bag_path', None),
         )
     if a.command == 'mcp':
         from raven_app.mcp_server import LidarCameraMcpServer

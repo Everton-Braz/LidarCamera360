@@ -76,6 +76,14 @@ class TestLidar3DGSSeed(unittest.TestCase):
                 d.mkdir(parents=True)
                 (d / "frame_000001.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01")
 
+            slam_res = dataset / "slam_out" / "result"
+            slam_res.mkdir(parents=True)
+            (slam_res / "Eagle_Scan.txt").write_text(
+                "0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0\n"
+                "10.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0\n",
+                encoding="utf-8"
+            )
+
             calib_data = {
                 "cam0_front_intrinsics": {"fx": 1000, "fy": 1000, "cx": 1920, "cy": 1920, "k1": 0, "k2": 0, "k3": 0, "k4": 0},
                 "cam1_rear_intrinsics": {"fx": 1000, "fy": 1000, "cx": 1920, "cy": 1920, "k1": 0, "k2": 0, "k3": 0, "k4": 0},

@@ -556,9 +556,14 @@ class CloudView(QOpenGLWidget):
         return camera_matrix(self.target, self.yaw, self.elevation, self.half_height, max(self.width(),1)/max(self.height(),1), self.scene_radius)
 
     def initializeGL(self):
+        ctx = self.context()
+        if ctx is None or not ctx.isValid():
+            return
         try:
             self._gl = QOpenGLFunctions_2_1()
-            if not self._gl.initializeOpenGLFunctions(): raise RuntimeError('OpenGL 2.1 is unavailable on this display.')
+            if not self._gl.initializeOpenGLFunctions():
+                self.error = 'OpenGL 2.1 is unavailable on this display.'
+                return
             self._program = QOpenGLShaderProgram(self)
             vertex = '''#version 120
 attribute vec3 position;
@@ -688,6 +693,9 @@ void main(){
         gl.glDisable(0x0B71)
 
     def paintGL(self):
+        ctx = self.context()
+        if ctx is None or not ctx.isValid():
+            return
         painter = QPainter(self)
         painter.beginNativePainting()
         try:
@@ -1332,41 +1340,52 @@ void main(){
         """Render the 3D point cloud scene to an off-screen QImage at arbitrary resolution."""
         if width <= 0 or height <= 0:
             raise ValueError(f"Invalid render dimensions: {width}x{height}")
-        self.makeCurrent()
-        try:
-            if self._gl is None or self._program is None:
-                self.initializeGL()
-            fbo = QOpenGLFramebufferObject(width, height, QOpenGLFramebufferObject.Attachment.CombinedDepthStencil)
-            if not fbo.isValid():
-                fbo = QOpenGLFramebufferObject(width, height, QOpenGLFramebufferObject.Attachment.Depth)
-            if not fbo.isValid():
-                raise RuntimeError(tr("OpenGL cannot create framebuffer of size {w}x{h} on this hardware.").format(w=width, h=height))
-            fbo.bind()
+        img = None
+        ctx = self.context()
+        if ctx is not None and ctx.isValid():
+            try:
+                self.makeCurrent()
+                if self._gl is None or self._program is None:
+                    self.initializeGL()
+                fbo = QOpenGLFramebufferObject(width, height, QOpenGLFramebufferObject.Attachment.CombinedDepthStencil)
+                if not fbo.isValid():
+                    fbo = QOpenGLFramebufferObject(width, height, QOpenGLFramebufferObject.Attachment.Depth)
+                if fbo.isValid():
+                    fbo.bind()
+                    screen_h = max(self.height(), 1)
+                    scale = max(width / max(self.width(), 1), height / screen_h)
+                    pt_scale = scale * point_size_multiplier
+                    self._render_gl_scene(self._gl, width, height, point_size_scale=pt_scale)
+                    fbo.release()
+                    read_img = fbo.toImage()
+                    if not read_img.isNull():
+                        img = read_img
+            except Exception:
+                img = None
+            finally:
+                self.doneCurrent()
+
+        if img is None:
+            img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(self.bg_color)
+
+        if include_overlays:
+            p = QPainter(img)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
             screen_h = max(self.height(), 1)
             scale = max(width / max(self.width(), 1), height / screen_h)
-            pt_scale = scale * point_size_multiplier
-            self._render_gl_scene(self._gl, width, height, point_size_scale=pt_scale)
-            fbo.release()
-            img = fbo.toImage()
-            if img.isNull():
-                raise RuntimeError(tr("Failed to read image from framebuffer object."))
-            if include_overlays:
-                p = QPainter(img)
-                p.setRenderHint(QPainter.RenderHint.Antialiasing)
-                p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-                self._overlay(
-                    p,
-                    width=width,
-                    height=height,
-                    scale=scale,
-                    show_labels=show_labels,
-                    show_hud=show_hud,
-                    show_measurements=show_measurements,
-                )
-                p.end()
-            return img
-        finally:
-            self.doneCurrent()
+            self._overlay(
+                p,
+                width=width,
+                height=height,
+                scale=scale,
+                show_labels=show_labels,
+                show_hud=show_hud,
+                show_measurements=show_measurements,
+            )
+            p.end()
+        return img
 
     def pick_point(self, x, y):
         loaded=[i for i,c in enumerate(self.clouds) if c is not None]

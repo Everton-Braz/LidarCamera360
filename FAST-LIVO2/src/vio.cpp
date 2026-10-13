@@ -254,9 +254,22 @@ void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
   const float w_ref_br = subpix_u_ref * subpix_v_ref;
   for (int x = 0; x < patch_size; x++)
   {
-    uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i - patch_size_half * scale + x * scale) * width + (u_ref_i - patch_size_half * scale);
+    const int row = v_ref_i - patch_size_half * scale + x * scale;
+    if (row < 0 || row + scale >= height)
+    {
+      for (int y = 0; y < patch_size; y++)
+        patch_tmp[patch_size_total * level + x * patch_size + y] = 0.0f;
+      continue;
+    }
+    uint8_t *img_ptr = (uint8_t *)img.data + row * width + (u_ref_i - patch_size_half * scale);
     for (int y = 0; y < patch_size; y++, img_ptr += scale)
     {
+      const int col = u_ref_i - patch_size_half * scale + y * scale;
+      if (col < 0 || col + scale >= width)
+      {
+        patch_tmp[patch_size_total * level + x * patch_size + y] = 0.0f;
+        continue;
+      }
       patch_tmp[patch_size_total * level + x * patch_size + y] =
           w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * width] + w_ref_br * img_ptr[scale * width + scale];
     }
@@ -655,6 +668,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
       // cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 3, cv::Scalar(0, 0, 255), -1, 8); // Green Sparse Align tracked
 
       V3D pt_cam(new_frame_->w2f(pt->pos_));
+      if (pt_cam[2] <= 0.1 || !std::isfinite(pc[0]) || !std::isfinite(pc[1])) continue;
       bool depth_continous = false;
       for (int u = -patch_size_half; u <= patch_size_half; u++)
       {
@@ -824,6 +838,7 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
 {
   if (total_points == 0) return;
   
+  G.setZero();
   compute_jacobian_time = update_ekf_time = 0.0;
 
   for (int level = patch_pyrimid_level - 1; level >= 0; level--)
@@ -850,7 +865,10 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
     if (pg[i].normal == V3D(0, 0, 0)) continue;
 
     V3D pt = pg[i].point_w;
+    V3D pt_cam(new_frame_->w2f(pt));
+    if (pt_cam[2] <= 0.1) continue;
     V2D pc(new_frame_->w2c(pt));
+    if (!std::isfinite(pc[0]) || !std::isfinite(pc[1])) continue;
 
     if (new_frame_->cam_->isInFrame(pc.cast<int>(), border)) // 20px is the patch size in the matcher
     {
@@ -873,7 +891,10 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
   for (int j = 0; j < visual_submap->add_from_voxel_map.size(); j++)
   {
     V3D pt = visual_submap->add_from_voxel_map[j].point_w;
+    V3D pt_cam(new_frame_->w2f(pt));
+    if (pt_cam[2] <= 0.1) continue;
     V2D pc(new_frame_->w2c(pt));
+    if (!std::isfinite(pc[0]) || !std::isfinite(pc[1])) continue;
 
     if (new_frame_->cam_->isInFrame(pc.cast<int>(), border)) // 20px is the patch size in the matcher
     {
@@ -902,6 +923,8 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
     {
       pointWithVar pt_var = append_voxel_points[i];
       V3D pt = pt_var.point_w;
+      V3D pt_cam(new_frame_->w2f(pt));
+      if (pt_cam[2] <= 0.1) continue;
 
       V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * pt_var.normal);
       V3D dir(new_frame_->T_f_w_ * pt);
@@ -909,6 +932,7 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
       double cos_theta = dir.dot(norm_vec);
       // if(std::fabs(cos_theta)<0.34) continue; // 70 degree
       V2D pc(new_frame_->w2c(pt));
+      if (!std::isfinite(pc[0]) || !std::isfinite(pc[1])) continue;
 
       float *patch = new float[patch_size_total];
       getImagePatch(img, pc, patch, 0);
@@ -960,7 +984,19 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
       continue;
     }
 
+    V3D pt_cam(new_frame_->w2f(pt->pos_));
+    if (pt_cam[2] <= 0.1) continue;
+
     V2D pc(new_frame_->w2c(pt->pos_));
+    if (!std::isfinite(pc[0]) || !std::isfinite(pc[1])) continue;
+
+    const int safe_border = patch_size_half + 2;
+    if (pc[0] < safe_border || pc[0] >= width - safe_border ||
+        pc[1] < safe_border || pc[1] >= height - safe_border)
+    {
+      continue;
+    }
+
     bool add_flag = false;
     
     float *patch_temp = new float[patch_size_total];
@@ -1000,6 +1036,10 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
       ftr_new->id_ = new_frame_->id_;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
       pt->addFrameRef(ftr_new);
+    }
+    else
+    {
+      delete[] patch_temp;
     }
   }
   printf("[ VIO ] Update %d points in visual submap\n", update_num);
@@ -1483,7 +1523,17 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       if (pt == nullptr) continue;
 
       V3D pf = Rcw * pt->pos_ + Pcw;
+      if (pf[2] <= 0.1) continue;
+
       pc = cam->world2cam(pf);
+      if (!std::isfinite(pc[0]) || !std::isfinite(pc[1])) continue;
+
+      const int safe_border = (patch_size_half + 2) * scale;
+      if (pc[0] < safe_border || pc[0] >= width - safe_border ||
+          pc[1] < safe_border || pc[1] >= height - safe_border)
+      {
+        continue;
+      }
 
       const float u_ref = pc[0];
       const float v_ref = pc[1];
@@ -1516,6 +1566,12 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       }
       visual_submap->errors[i] = patch_error;
       error += patch_error;
+    }
+
+    if (n_meas == 0)
+    {
+      (*state) = old_state;
+      break;
     }
 
     error = error / n_meas;
@@ -1610,7 +1666,17 @@ void VIOManager::updateState(cv::Mat img, int level)
       if (pt == nullptr) continue;
 
       V3D pf = Rcw * pt->pos_ + Pcw;
+      if (pf[2] <= 0.1) continue;
+
       V2D pc = cam->world2cam(pf);
+      if (!std::isfinite(pc[0]) || !std::isfinite(pc[1])) continue;
+
+      const int safe_border = (patch_size_half + 2) * scale;
+      if (pc[0] < safe_border || pc[0] >= width - safe_border ||
+          pc[1] < safe_border || pc[1] >= height - safe_border)
+      {
+        continue;
+      }
 
       computeProjectionJacobian(pf, Jdpi);
       M3D p_hat;
@@ -1670,6 +1736,12 @@ void VIOManager::updateState(cv::Mat img, int level)
       }
       visual_submap->errors[i] = patch_error;
       error += patch_error;
+    }
+
+    if (n_meas == 0)
+    {
+      (*state) = old_state;
+      break;
     }
 
     error = error / n_meas;

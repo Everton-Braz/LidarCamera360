@@ -5,8 +5,10 @@ IMU=1: six float64 (gyro XYZ, acceleration XYZ); cloud=2: count * five
 float32 (XYZ, intensity, relative milliseconds); image=3: count encoded bytes.
 All values are little endian. Input starts at the beginning for IMU initialization.
 """
+import re
 from pathlib import Path
 import struct
+from typing import Optional
 import numpy as np
 
 MAGIC = b'FLV2\x01\0\0\0'
@@ -227,4 +229,125 @@ def export_bags(paths, stream, *, lidar_topic=None, imu_topic=None,
             counts[kind] += 1
         stream.flush()
     return {'imu': counts[1], 'scans': counts[2], 'images': counts[3]}
+
+
+def find_adjacent_image_bag(bag_path: Path) -> Optional[Path]:
+    """Find candidate IMAGE_*.bag adjacent to a LiDAR bag."""
+    if not bag_path:
+        return None
+    bag_path = Path(bag_path)
+    parent = bag_path.parent
+    if not parent.is_dir():
+        return None
+    name = bag_path.name
+
+    # 1. Direct prefix replacement: LIDAR_xxx -> IMAGE_xxx, PCL_xxx -> IMAGE_xxx
+    if name.startswith("LIDAR_"):
+        cand = parent / ("IMAGE_" + name[6:])
+        if cand.is_file():
+            return cand
+    elif name.startswith("PCL_"):
+        cand = parent / ("IMAGE_" + name[4:])
+        if cand.is_file():
+            return cand
+    elif "lidar" in name.lower():
+        cand_name = re.sub(r'lidar', 'image', name, flags=re.IGNORECASE)
+        cand = parent / cand_name
+        if cand.is_file():
+            return cand
+
+    # 2. Search parent directory for IMAGE_*.bag
+    image_candidates = sorted(parent.glob("IMAGE_*.bag"))
+    if image_candidates:
+        return image_candidates[0]
+    image_candidates_lower = sorted([p for p in parent.glob("*.bag") if "image" in p.name.lower()])
+    if image_candidates_lower:
+        return image_candidates_lower[0]
+
+    return None
+
+
+def extract_images(bag_path: Path, output_dir: Path, *, image_bag_path: Optional[Path] = None,
+                   image_topic: Optional[str] = None, fps: float = 2.0) -> int:
+    """Extract front camera frames from an IMAGE_*.bag or LiDAR bag into output_dir.
+
+    Creates output_dir/cam0 and output_dir/frames.json for workflow compatibility.
+    """
+    from rosbags.highlevel import AnyReader
+    import json
+    import cv2
+
+    bag_path = Path(bag_path)
+    output_dir = Path(output_dir)
+
+    target_bag = None
+    if image_bag_path is not None and Path(image_bag_path).is_file():
+        target_bag = Path(image_bag_path)
+    else:
+        target_bag = find_adjacent_image_bag(bag_path) or bag_path
+
+    out_images = output_dir / "cam0"
+    out_images.mkdir(parents=True, exist_ok=True)
+
+    extracted_count = 0
+    timestamps = {}
+    last_t = -1e9
+    min_interval = 1.0 / max(0.1, fps) if fps > 0 else 0.0
+
+    with AnyReader([target_bag]) as reader:
+        conn_topics = {c.topic: c for c in reader.connections}
+        target_topic = image_topic
+        if not target_topic or target_topic not in conn_topics:
+            candidates = ["/camera_front/image_raw", "/camera_front/image/compressed"]
+            for cand in candidates:
+                if cand in conn_topics:
+                    target_topic = cand
+                    break
+            if not target_topic:
+                for c in reader.connections:
+                    if 'Image' in c.msgtype or 'image' in c.topic.lower() or 'camera' in c.topic.lower():
+                        target_topic = c.topic
+                        break
+
+        if not target_topic or target_topic not in conn_topics:
+            return 0
+
+        connections = [conn_topics[target_topic]]
+        frame_idx = 1
+        for c, _, raw in reader.messages(connections=connections):
+            msg = reader.deserialize(raw, c.msgtype)
+            t = stamp(msg)
+            if t - last_t < min_interval:
+                continue
+            last_t = t
+
+            if hasattr(msg, 'format'):
+                data = bytes(msg.data)
+                img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            else:
+                enc = msg.encoding.lower()
+                channels = {'bgr8': 3, 'rgb8': 3, 'mono8': 1, 'bgra8': 4, 'rgba8': 4}.get(enc, 3)
+                img = np.ndarray((msg.height, msg.width, channels), dtype=np.uint8, buffer=msg.data,
+                                 strides=(msg.step, channels, 1))
+                if enc == 'rgb8':
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                elif enc == 'rgba8':
+                    img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGRA)
+
+            frame_filename = f"frame_{frame_idx:06d}.jpg"
+            frame_path = out_images / frame_filename
+            cv2.imwrite(str(frame_path), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            rel_name = f"cam0/{frame_filename}"
+            timestamps[rel_name] = t
+            frame_idx += 1
+            extracted_count += 1
+
+    manifest_path = output_dir / "frames.json"
+    manifest = {
+        "signature": f"bag_{target_bag.stem}_{extracted_count}",
+        "time_source": "ros_bag",
+        "timestamps": timestamps
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return extracted_count
 

@@ -47,3 +47,8 @@ option(RAVEN_BUILD_VULKAN_RFDETR_OPS "Build experimental Vulkan RF-DETR inferenc
 if(RAVEN_BUILD_VULKAN_RFDETR_OPS)
   add_subdirectory(vulkan_rfdetr)
 endif()
+
+option(RAVEN_BUILD_MOLA "Build MOLA pose-graph & ICP refinement tool" ON)
+if(RAVEN_BUILD_MOLA)
+  add_subdirectory(mola_tools)
+endif()

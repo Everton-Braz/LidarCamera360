@@ -27,6 +27,7 @@ def main():
                    help='Destination root for the packaged app (default: dist)')
     a = p.parse_args()
     dist_root = a.dist_root.resolve()
+    vcpkg = a.vcpkg_root or (Path(os.environ['VCPKG_ROOT']) if 'VCPKG_ROOT' in os.environ else None)
 
     # Validate required runtime modules are installed
     for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets',
@@ -175,6 +176,7 @@ def main():
     vulkan_mask_shaders = ('ops.comp.spv', 'matmul.comp.spv', 'reduce.comp.spv')
     for shader in vulkan_mask_shaders:
         candidates = (vulkan_masker.parent / 'shaders' / shader,
+                      vulkan_masker.parent / shader,
                       vulkan_masker.parent.parent / shader,
                       ROOT / 'native/vulkan_rfdetr/shaders' / shader)
         source = next((path for path in candidates if path.is_file()), None)
@@ -205,6 +207,12 @@ def main():
             if binary.suffix.lower() == '.dll':
                 add_binary(binary, 'bin')
         cmd += ['--add-data', f'{model};models']
+
+    if vcpkg and (vcpkg / 'installed/x64-windows/bin').is_dir():
+        vcpkg_bin = vcpkg / 'installed/x64-windows/bin'
+        for dll in vcpkg_bin.glob('*.dll'):
+            add_binary(dll, 'bin')
+            add_binary(dll, '.')
 
     entry = ROOT / 'lidarcamera360.py' if (ROOT / 'lidarcamera360.py').is_file() else ROOT / 'raven.py'
     cmd.append(str(entry))
@@ -241,6 +249,20 @@ def main():
             for pattern in ('vcruntime*.dll', 'msvcp*.dll', 'vcomp*.dll', 'concrt*.dll'):
                 for f in internal.glob(pattern):
                     shutil.copy2(f, bin_dir / f.name)
+        # Copy vcpkg runtime DLLs if available so native executables run standalone
+        if vcpkg and (vcpkg / 'installed/x64-windows/bin').is_dir():
+            vcpkg_bin = vcpkg / 'installed/x64-windows/bin'
+            for dll in vcpkg_bin.glob('*.dll'):
+                if not (internal / dll.name).is_file():
+                    shutil.copy2(dll, internal / dll.name)
+                if bin_dir.is_dir() and not (bin_dir / dll.name).is_file():
+                    shutil.copy2(dll, bin_dir / dll.name)
+        # Also mirror any opencv and system dlls into bin_dir
+        if bin_dir.is_dir():
+            for pattern in ('*opencv*.dll', '*boost*.dll', '*pcl*.dll', '*z*.dll', '*yaml*.dll'):
+                for f in internal.glob(pattern):
+                    if not (bin_dir / f.name).is_file():
+                        shutil.copy2(f, bin_dir / f.name)
     print(output / f'{APP_NAME}.exe')
 
 

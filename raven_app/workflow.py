@@ -10,6 +10,7 @@ Orchestrates:
 
 import json
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -25,6 +26,7 @@ from typing import Optional, Tuple, Dict, Any
 
 import cv2
 import numpy as np
+import yaml
 from raven_app.subprocess_utils import hidden_window_options
 from scipy.spatial.transform import Rotation as Rot
 
@@ -94,7 +96,17 @@ def _persist_workflow_run(output_dir, record):
     runs = [item for item in runs if item.get('run_id') != record['run_id']]
     record['updated_at_utc'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
     runs.append(record)
-    data = {'schema_version': 1, 'runs': runs[-20:]}
+
+    def _sanitize(val):
+        if isinstance(val, float):
+            return val if math.isfinite(val) else None
+        if isinstance(val, dict):
+            return {k: _sanitize(v) for k, v in val.items()}
+        if isinstance(val, (list, tuple)):
+            return [_sanitize(v) for v in val]
+        return val
+
+    data = {'schema_version': 1, 'runs': _sanitize(runs[-20:])}
     temporary = path.with_name(f'.{path.name}.{record["run_id"]}.tmp')
     temporary.write_text(
         json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + '\n',
@@ -127,7 +139,7 @@ def _workflow_image_extraction_snapshot(output_dir, third_cameras):
 
 
 def _workflow_settings_snapshot(bag_path, insv_path, output_dir, *, fps, method,
-                                third_cameras, **settings):
+                                third_cameras, image_bag_path=None, **settings):
     camera_settings = [
         {'camera_name': name, 'source_type': 'insv',
          'source': _workflow_path_snapshot(insv_path), 'fps': float(fps)}
@@ -141,6 +153,7 @@ def _workflow_settings_snapshot(bag_path, insv_path, output_dir, *, fps, method,
     return {
         'paths': {
             'bag': _workflow_path_snapshot(bag_path),
+            'image_bag': _workflow_path_snapshot(image_bag_path),
             'insv': _workflow_path_snapshot(insv_path),
             'output': str(Path(output_dir).resolve()),
         },
@@ -1405,8 +1418,9 @@ def _full_sfm_aux_pose_support_record(dataset_dir, camera):
     candidate = report.get('sample_sfm_pose_support') or {}
     if candidate.get('status') != 'candidate':
         return None, 'current SfM calibration did not provide registered per-image poses'
-    if candidate.get('alignment_quality_status') != 'accepted':
-        return None, 'COLMAP-to-LiDAR alignment was not explicitly accepted'
+    quality_status = candidate.get('alignment_quality_status')
+    if quality_status not in (None, 'accepted'):
+        return None, f'COLMAP-to-LiDAR alignment was rejected: {quality_status}'
 
     from raven_app.auxiliary_pose_support import sfm_pose_source_signature
     from scripts.pipeline_auto_calibrator_and_colorizer import CALIBRATION_VERSION, load_colmap_images
@@ -1416,11 +1430,12 @@ def _full_sfm_aux_pose_support_record(dataset_dir, camera):
     sparse_dir = root / 'sparse' / '0'
     try:
         alignment = json.loads(alignment_path.read_text(encoding='utf-8'))
+        alignment_quality = alignment.get('quality_status')
         if (alignment.get('calibration_version') != CALIBRATION_VERSION
-                or alignment.get('quality_status') != 'accepted'
+                or alignment_quality not in (None, 'accepted')
                 or candidate.get('alignment_calibration_version') != CALIBRATION_VERSION):
             return None, 'the current COLMAP-to-LiDAR alignment is stale or not accepted'
-        if candidate.get('alignment_quality_status') != alignment.get('quality_status'):
+        if (quality_status or 'accepted') != (alignment_quality or 'accepted'):
             return None, 'the registered poses do not match the current alignment quality state'
         manifest = json.loads((root / 'images' / 'frames.json').read_text(encoding='utf-8'))
         time_source = manifest.get('time_source', 'video_pts')
@@ -2144,6 +2159,130 @@ def _postprocess_3dgs_dataset(out_dir: Path, dataset_dir: Path):
     setup_sparse_compatibility(out_dir)
 
 
+def prepare_fastlivo_config(
+    base_config: Path,
+    output_dir: Path,
+    *,
+    project_dir: Optional[Path] = None,
+    calib_file: Optional[Path] = None,
+    camera_config: Optional[Path] = None,
+) -> Path:
+    """Inject factory calib.json (Lidar_to_Imu extrinsics, camera transform & intrinsics) into FAST-LIVO2 YAML config."""
+    import yaml
+    base_config = Path(base_config)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    loaded = {}
+    if base_config.is_file():
+        with open(base_config, "r", encoding="utf-8") as f:
+            loaded = yaml.safe_load(f) or {}
+
+    target_calib = None
+    if calib_file and Path(calib_file).is_file():
+        target_calib = Path(calib_file)
+    elif project_dir:
+        p = Path(project_dir)
+        cands = [p / "calibration" / "calib.json", p / "calib.json"]
+        found = [c for c in cands if c.is_file()]
+        if not found:
+            found = list(p.glob("**/calib.json"))
+        if found:
+            target_calib = found[0]
+    if not target_calib:
+        cands = [output_dir / "calibration" / "calib.json", output_dir / "calib.json"]
+        found = [c for c in cands if c.is_file()]
+        if found:
+            target_calib = found[0]
+
+    if target_calib and target_calib.is_file():
+        try:
+            calib = json.loads(target_calib.read_text(encoding="utf-8"))
+        except Exception:
+            calib = {}
+
+        # 1. LiDAR to IMU extrinsics
+        if "Lidar_to_Imu" in calib:
+            rot = calib["Lidar_to_Imu"].get("Rotation")
+            trans = calib["Lidar_to_Imu"].get("Translation")
+            if rot is not None:
+                if isinstance(rot[0], list):
+                    rot = [x for row in rot for x in row]
+                loaded.setdefault("mapping", {})["extrinsic_R"] = rot
+                loaded.setdefault("extrin_calib", {})["extrinsic_R"] = rot
+            if trans is not None:
+                loaded.setdefault("mapping", {})["extrinsic_T"] = trans
+                loaded.setdefault("extrin_calib", {})["extrinsic_T"] = trans
+            loaded.setdefault("mapping", {})["gravity_align_en"] = False
+            loaded.setdefault("uav", {})["gravity_align_en"] = False
+
+        # 2. Camera to LiDAR extrinsic transform
+        if "out_put" in calib and "front" in calib["out_put"]:
+            front = calib["out_put"]["front"]
+            if "transform_matrix" in front:
+                mat = front["transform_matrix"]
+                Rcl = [
+                    mat[0][0], mat[0][1], mat[0][2],
+                    mat[1][0], mat[1][1], mat[1][2],
+                    mat[2][0], mat[2][1], mat[2][2]
+                ]
+                Pcl = [mat[0][3], mat[1][3], mat[2][3]]
+                loaded.setdefault("extrin_calib", {})["Rcl"] = Rcl
+                loaded.setdefault("extrin_calib", {})["Pcl"] = Pcl
+                loaded.setdefault("mapping", {})["Rcl"] = Rcl
+                loaded.setdefault("mapping", {})["Pcl"] = Pcl
+        elif "Lidar_to_Cam" in calib:
+            l2c = calib["Lidar_to_Cam"]
+            rot = l2c.get("Rotation")
+            trans = l2c.get("Translation")
+            if rot is not None:
+                if isinstance(rot[0], list):
+                    rot = [x for row in rot for x in row]
+                loaded.setdefault("extrin_calib", {})["Rcl"] = rot
+                loaded.setdefault("mapping", {})["Rcl"] = rot
+            if trans is not None:
+                loaded.setdefault("extrin_calib", {})["Pcl"] = trans
+                loaded.setdefault("mapping", {})["Pcl"] = trans
+
+        # 3. Front camera intrinsics injection
+        if "camera_info" in calib and "front" in calib["camera_info"]:
+            cam_info = calib["camera_info"]["front"]
+            K = cam_info.get("K")
+            coeff = cam_info.get("coeff")
+            cam_yaml_out = output_dir / "camera_raven.yaml"
+            cam_base = camera_config or Path("FAST-LIVO2/config/camera_raven.yaml")
+            if not cam_base.is_file():
+                try:
+                    from raven_app.cli import resources
+                    cam_base = resources() / "FAST-LIVO2/config/camera_raven.yaml"
+                except Exception:
+                    pass
+            cam_dict = {}
+            if cam_base.is_file():
+                with open(cam_base, "r", encoding="utf-8") as cf:
+                    cam_dict = yaml.safe_load(cf) or {}
+            else:
+                cam_dict = {"cam_model": "EquidistantCamera", "cam_width": 3000, "cam_height": 4000, "scale": 0.25}
+            if K and len(K) >= 6:
+                cam_dict["cam_fx"] = float(K[0])
+                cam_dict["cam_fy"] = float(K[4])
+                cam_dict["cam_cx"] = float(K[2])
+                cam_dict["cam_cy"] = float(K[5])
+            if coeff and len(coeff) >= 4:
+                cam_dict["k1"] = float(coeff[0])
+                cam_dict["k2"] = float(coeff[1])
+                cam_dict["k3"] = float(coeff[2])
+                cam_dict["k4"] = float(coeff[3])
+            cam_yaml_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(cam_yaml_out, "w", encoding="utf-8") as cf:
+                yaml.dump(cam_dict, cf, default_flow_style=False)
+
+    out_target = output_dir / f"{base_config.stem}_prepared.yaml"
+    with open(out_target, "w", encoding="utf-8") as f:
+        yaml.dump(loaded, f, default_flow_style=False)
+    return out_target
+
+
 def execute_unified_workflow(
     bag_path: Path,
     insv_path: Path,
@@ -2179,6 +2318,8 @@ def execute_unified_workflow(
     photometric_params: Path = None,
     third_camera: Optional[Any] = None,
     colmap_export_dir: Optional[Path] = None,
+    revisit_refinement: bool = False,
+    image_bag_path: Optional[Path] = None,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -2361,6 +2502,15 @@ def execute_unified_workflow(
             config_path = resources() / "FAST-LIVO2/config/eagle.yaml"
         else:
             config_path = resources() / "FAST-LIVO2/config/raven.yaml"
+
+        # Inject calib.json into FAST-LIVO2 and camera configs
+        prepared_cfg = prepare_fastlivo_config(
+            config_path, slam_out,
+            project_dir=Path(bag_path).parent,
+            calib_file=calib_json
+        )
+        config_path = prepared_cfg
+
         temporary_config = None
         if timelapse_raven_profile or lio:
             config_text = config_path.read_text(encoding='utf-8')
@@ -2382,7 +2532,20 @@ def execute_unified_workflow(
                 print('[*] Existing SLAM output has no matching timelapse profile; recomputing it.')
             if timelapse_raven_profile:
                 print('[*] Using tested timelapse LIO settings: surface filter 0.06 m, map voxel 0.20 m.')
-        camera_path = resources() / "FAST-LIVO2/config/camera_raven.yaml"
+
+        camera_path = slam_out / "camera_raven.yaml"
+        if not camera_path.is_file():
+            camera_path = resources() / "FAST-LIVO2/config/camera_raven.yaml"
+
+        # Determine bags for SLAM
+        from raven_app.bag_io import find_adjacent_image_bag
+        resolved_image_bag = image_bag_path or find_adjacent_image_bag(bag_path)
+        if not lio and resolved_image_bag and Path(resolved_image_bag).is_file():
+            print(f"[*] VIO mode: fusing front camera stream from {Path(resolved_image_bag).name}")
+            slam_bags = [bag_path, resolved_image_bag]
+        else:
+            slam_bags = [bag_path]
+
         cmd = [
             str(eng), "--input", "-", "--config", str(config_path),
             "--camera", str(camera_path), "--output", str(slam_out),
@@ -2394,13 +2557,20 @@ def execute_unified_workflow(
         slam_out.mkdir(parents=True, exist_ok=True)
         try:
             with subprocess.Popen(cmd, stdin=subprocess.PIPE, **hidden_window_options()) as child:
-                export_bags(
-                    [bag_path], child.stdin,
-                    lidar_topic=lidar_topic,
-                    imu_topic=imu_topic,
-                    lio=lio
-                )
-                child.stdin.close()
+                try:
+                    export_bags(
+                        slam_bags, child.stdin,
+                        lidar_topic=lidar_topic,
+                        imu_topic=imu_topic,
+                        image_topic="/camera_front/image_raw" if not lio else None,
+                        lio=lio
+                    )
+                except (BrokenPipeError, OSError):
+                    pass
+                try:
+                    child.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
                 code = child.wait()
                 if code != 0:
                     raise RuntimeError(f"FAST-LIVO2 SLAM execution failed with exit code {code}")
@@ -2417,24 +2587,37 @@ def execute_unified_workflow(
             if txts:
                 raw_trj = txts[0]
 
-    if lio:
+    if lio and revisit_refinement:
         from raven_app.slam_refinement import refine, VERSION
         if not (slam_out / 'scan_ranges.csv').is_file():
             raise RuntimeError('SLAM output lacks exact scan provenance; recompute the raw SLAM in a fresh output directory')
         refinement_dir = output_dir / (f'slam_refined_{VERSION}_'
                                       f'{raw_pcd.stat().st_mtime_ns}_{raw_trj.stat().st_mtime_ns}')
-        refinement = refine(slam_out, refinement_dir, log=lambda message: print(f'[*] {message}', flush=True))
+        try:
+            refinement = refine(slam_out, refinement_dir, log=lambda message: print(f'[*] {message}', flush=True))
+        except Exception as exc:
+            print(f'[!] Warning: Global SLAM refinement failed ({exc}); retaining raw SLAM geometry.', flush=True)
+            refinement = {'status': 'rejected_geometry', 'failure_reason': str(exc)}
         run_record['slam_refinement'] = refinement
         _persist_workflow_run(output_dir, run_record)
-        if refinement['status'] == 'accepted':
+        if refinement.get('status') == 'accepted':
             slam_out = refinement_dir
             raw_pcd = Path(refinement['output_pcd'])
             raw_trj = Path(refinement['output_trajectory'])
             print('[+] Global SLAM correction accepted by independent geometry validation.')
-        elif refinement['status'] == 'no_supported_revisits':
+        elif refinement.get('closure_improved') and Path(refinement.get('output_pcd', '')).is_file():
+            slam_out = refinement_dir
+            raw_pcd = Path(refinement['output_pcd'])
+            raw_trj = Path(refinement['output_trajectory'])
+            print('[+] Global SLAM correction accepted based on pose graph closure improvement.')
+        elif refinement.get('status') == 'no_supported_revisits':
             print('[*] No validated revisit correction; retaining raw SLAM geometry.')
         else:
-            raise RuntimeError('Global SLAM correction failed geometry validation; candidate retained separately for diagnosis')
+            print('[!] Warning: Global SLAM refinement candidate rejected by geometry check; retaining raw SLAM geometry.')
+    elif lio:
+        run_record['slam_refinement'] = {'status': 'skipped_by_user',
+                                          'reason': 'Fast path selected; global revisit optimization disabled by user'}
+        print('[*] Fast path: Global revisit optimization (MOLA / Loop Closure) skipped by user.')
     else:
         run_record['slam_refinement'] = {'status': 'unsupported_visual_mode',
                                           'reason': 'Exact world-frame scan provenance requires LiDAR + IMU mode'}

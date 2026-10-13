@@ -84,6 +84,8 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(win.workflow_view.lidar_topic.text(), '/custom_lidar')
         self.assertEqual(win.workflow_view.imu_topic.text(), '/custom_imu')
         win.close()
+        win.deleteLater()
+        self.app.processEvents()
 
     def test_workflow_ui_labels_and_defaults(self):
         from raven_app.gui import create_main_window
@@ -115,6 +117,8 @@ class GuiTests(unittest.TestCase):
             self.assertGreaterEqual(checkbox.width(), checkbox.sizeHint().width())
             self.assertGreater(view.btn_export_log.width(), 0)
         win.close()
+        win.deleteLater()
+        self.app.processEvents()
 
     def test_workflow_progress_updates_from_stage_and_vulkan_logs(self):
         import time
@@ -140,6 +144,7 @@ class GuiTests(unittest.TestCase):
             self.assertGreater(view.overall_progress_bar.value(), 0)
             view._progress_timer.stop()
             view.deleteLater()
+            self.app.processEvents()
 
     def test_skipped_mask_stage_is_not_added_to_timing_history(self):
         import time
@@ -158,6 +163,7 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(load_stage_history(tmp)[4], [])
             view._progress_timer.stop()
             view.deleteLater()
+            self.app.processEvents()
 
     def test_mask_settings_extracts_only_selected_video_frames_on_demand(self):
         import time
@@ -213,6 +219,8 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(len(list(dialog._video_preview_root.rglob('*.jpg'))), 4)
             finally:
                 dialog.reject()
+                dialog.deleteLater()
+                self.app.processEvents()
 
 
 class WorkflowTests(unittest.TestCase):
@@ -390,6 +398,14 @@ class WorkflowTests(unittest.TestCase):
                 d = dataset / "images" / cam
                 d.mkdir(parents=True)
                 (d / "frame_000001.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01")
+
+            slam_res = dataset / "slam_out" / "result"
+            slam_res.mkdir(parents=True)
+            (slam_res / "Eagle_Scan.txt").write_text(
+                "0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0\n"
+                "10.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0\n",
+                encoding="utf-8"
+            )
 
             root = Path(__file__).resolve().parents[1]
             calib = root / "calibracao_rigida_raven_insta360.json"

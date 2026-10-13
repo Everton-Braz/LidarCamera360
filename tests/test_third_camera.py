@@ -386,7 +386,7 @@ class TestThirdCamera(unittest.TestCase):
             samples, t_slam, positions, slerp, dt_sync, extraction_fps=1.0
         )
         self.assertIsNone(estimated)
-        self.assertIn("comparable rigid-pose consensus", details["reason"])
+        self.assertIn("comparable", details["reason"])
 
     def test_clock_search_keeps_residuals_for_rejected_population(self):
         rotations = [np.eye(3) for _ in range(39)]

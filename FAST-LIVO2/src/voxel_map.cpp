@@ -50,6 +50,8 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<bool>("local_map/map_sliding_en", voxel_config.map_sliding_en, false);
   nh.param<int>("local_map/half_map_size", voxel_config.half_map_size, 100);
   nh.param<double>("local_map/sliding_thresh", voxel_config.sliding_thresh, 8);
+  nh.param<double>("lio/max_velocity", voxel_config.max_velocity_, 2.5);
+  nh.param<double>("lio/min_trans_eval", voxel_config.min_trans_eval_, 20.0);
 }
 
 void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPlane *plane)
@@ -487,10 +489,26 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     auto vec = state_propagat - state_;
     VD(DIM_STATE)
     solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
-    int minRow, minCol;
+    if (config_setting_.min_trans_eval_ > 0.0)
+    {
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(H_T_H.block<3, 3>(3, 3));
+      Eigen::Vector3d evals_trans = saes.eigenvalues();
+      Eigen::Matrix3d evecs_trans = saes.eigenvectors();
+      for (int d = 0; d < 3; ++d)
+      {
+        if (evals_trans(d) < config_setting_.min_trans_eval_)
+        {
+          double t_proj = solution.block<3, 1>(3, 0).dot(evecs_trans.col(d));
+          solution.block<3, 1>(3, 0) -= t_proj * evecs_trans.col(d);
+          double v_proj = state_.vel_end.dot(evecs_trans.col(d));
+          state_.vel_end -= v_proj * 0.5 * evecs_trans.col(d);
+        }
+      }
+    }
     state_ += solution;
-    if (state_.vel_end.norm() > 4.0) {
-      state_.vel_end = state_.vel_end.normalized() * 4.0;
+    double max_v = config_setting_.max_velocity_ > 0.0 ? config_setting_.max_velocity_ : 2.5;
+    if (state_.vel_end.norm() > max_v) {
+      state_.vel_end = state_.vel_end.normalized() * max_v;
     }
     auto rot_add = solution.block<3, 1>(0, 0);
     auto t_add = solution.block<3, 1>(3, 0);
