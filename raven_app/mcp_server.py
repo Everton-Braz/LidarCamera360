@@ -89,6 +89,46 @@ class LidarCameraMcpServer:
                 }
             },
             {
+                "name": "telemetry_status",
+                "description": "Inspect anonymous telemetry opt-in state, client installation ID, and system telemetry payload.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "configure_telemetry",
+                "description": "Enable or disable anonymous telemetry collection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "True to opt in, False to opt out."
+                        }
+                    },
+                    "required": ["enabled"]
+                }
+            },
+            {
+                "name": "georeference",
+                "description": "Calculate INSV GPS trajectory, georeference point cloud or COLMAP dataset to target CRS, and export GeoJSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "insv_path": {"type": "string", "description": "Path to Insta360 .INSV video."},
+                        "output_dir": {"type": "string", "description": "Output directory for georeferenced deliverables and GeoJSON."},
+                        "cloud_path": {"type": "string", "description": "Optional path to point cloud (PCD/PLY/LAZ/LAS)."},
+                        "colmap_dir": {"type": "string", "description": "Optional COLMAP dataset directory."},
+                        "trajectory_path": {"type": "string", "description": "Optional trajectory file (.txt)."},
+                        "crs": {"type": "string", "description": "Target projected CRS (e.g. EPSG:31984, EPSG:32724)."},
+                        "yaw_deg": {"type": "number", "description": "Optional manual True North yaw angle in degrees."},
+                        "orthophoto": {"type": "boolean", "default": False, "description": "Generate high-resolution georeferenced orthophoto."}
+                    },
+                    "required": ["insv_path", "output_dir"]
+                }
+            },
+            {
                 "name": "submit_feedback",
                 "description": "Submit a bug report or feature request with diagnostics.",
                 "inputSchema": {
@@ -162,6 +202,40 @@ class LidarCameraMcpServer:
             repo = arguments.get("repo")
             return check_for_updates(repo=repo)
 
+        elif name == "telemetry_status":
+            from raven_app.telemetry import is_telemetry_enabled, get_anonymous_client_id, get_system_telemetry_payload
+            return {
+                "telemetry_enabled": is_telemetry_enabled(),
+                "client_id": get_anonymous_client_id(),
+                "payload": get_system_telemetry_payload()
+            }
+
+        elif name == "configure_telemetry":
+            from raven_app.telemetry import set_telemetry_enabled, is_telemetry_enabled
+            enabled = bool(arguments.get("enabled", True))
+            set_telemetry_enabled(enabled)
+            return {"telemetry_enabled": is_telemetry_enabled()}
+
+        elif name == "georeference":
+            from raven_app.georeference import run_georeference
+            insv = Path(arguments["insv_path"])
+            out_dir = Path(arguments["output_dir"])
+            cloud = Path(arguments["cloud_path"]) if arguments.get("cloud_path") else None
+            colmap_dir = Path(arguments["colmap_dir"]) if arguments.get("colmap_dir") else None
+            traj = Path(arguments["trajectory_path"]) if arguments.get("trajectory_path") else None
+            crs = arguments.get("crs")
+            yaw_deg = arguments.get("yaw_deg")
+            ortho = bool(arguments.get("orthophoto", False))
+            return run_georeference(
+                insv, out_dir,
+                cloud=cloud,
+                colmap_dir=colmap_dir,
+                trajectory=traj,
+                crs=crs,
+                yaw_deg=yaw_deg,
+                generate_orthophoto_file=ortho
+            )
+
         elif name == "submit_feedback":
             from raven_app.feedback import gather_diagnostics, build_github_issue_url, send_feedback_webhook
             report = {
@@ -224,6 +298,16 @@ class LidarCameraMcpServer:
                 "id": req_id,
                 "result": {
                     "tools": self.tools
+                }
+            }
+
+        elif method in ("resources/list", "prompts/list"):
+            key = "resources" if method == "resources/list" else "prompts"
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    key: []
                 }
             }
 
