@@ -93,6 +93,14 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
     - Microsoft WinUI 3 Fluent Design System with Mica and Acrylic materials, dark/light theme switching.
     - Runtime localization supporting **English**, **Português (Brasil)**, **Español**, **Français**, **Deutsch**, **简体中文**, and **日本語**.
 
+13. **Native Model Context Protocol (MCP) Server for AI Agents**
+    - Built-in JSON-RPC 2.0 stdio MCP server (`python lidarcamera360.py mcp`) allowing AI assistants (Claude Desktop, Antigravity, Cursor) to autonomously inspect ROS bags, extract GNSS telemetry, extract sharp fisheye frames, execute georeferencing, and monitor engine health.
+
+14. **Over-The-Air (OTA) Updates, Privacy-First Telemetry & Diagnostic Feedback**
+    - Remote release verification and automated staging directly from GitHub Releases (`python lidarcamera360.py update`).
+    - Anonymous diagnostic telemetry with persistent client UUID and user opt-in/opt-out toggle (`python lidarcamera360.py telemetry`).
+    - Integrated Fluent feedback dialog and CLI bug reporting with packaged diagnostic bundles (`python lidarcamera360.py feedback`).
+
 ---
 
 ## 🖥️ Application Screenshots
@@ -122,6 +130,15 @@ python lidarcamera360.py --headless doctor
 
 # Inspect a ROS1 bag's topics and message rates
 python lidarcamera360.py inspect-bag --bag D:\capture\scan.bag
+
+# Run native Model Context Protocol (MCP) Server for AI agent automation
+python lidarcamera360.py mcp
+
+# Check for remote updates from GitHub Releases
+python lidarcamera360.py update check
+
+# Query anonymous telemetry state
+python lidarcamera360.py telemetry --status
 
 # Run automated end-to-end processing (Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables)
 python lidarcamera360.py workflow --bag D:\capture\scan.bag --insv D:\capture\video.insv --output D:\dataset --method direct
