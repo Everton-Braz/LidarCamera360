@@ -138,6 +138,12 @@ def main():
         if f.suffix.lower() in ('.exe', '.dll'):
             add_binary(f, 'bin')
 
+    mola_candidates = (ROOT / 'build/native/mola_tools/Release/mola_optimizer.exe',
+                       ROOT / 'bin/mola_optimizer.exe')
+    mola_exe = next((path for path in mola_candidates if path.is_file()), None)
+    if mola_exe is not None:
+        add_binary(mola_exe, 'bin')
+
     spirula = ROOT / 'spirula/spirula.exe'
     if not spirula.is_file():
         spirula = ROOT / 'bin/spirula.exe'

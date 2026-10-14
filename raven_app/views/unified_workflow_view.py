@@ -70,7 +70,6 @@ class UnifiedWorkflowView(QWidget):
         # Scroll area to comfortably accommodate all cards
         scroll = SmoothScrollArea(self)
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
 
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -549,6 +548,8 @@ class UnifiedWorkflowView(QWidget):
         layout.addWidget(log_card)
 
         scroll.setWidget(content)
+        scroll.enableTransparentBackground()
+        content.setAutoFillBackground(False)
         main_layout.addWidget(scroll)
 
     def _connect_signals(self):

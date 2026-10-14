@@ -633,13 +633,19 @@ class PointCloudViewerWindow(QMainWindow):
             self.status.setText(tr("Could not print view: {error}").format(error=exc))
 
     def _sync_theme(self, *args):
-        palette = self.palette()
-        palette.setColor(QPalette.ColorRole.Window, QColor('#202020' if isDarkTheme() else '#f0f4f9'))
-        palette.setColor(QPalette.ColorRole.WindowText, QColor('#ffffff' if isDarkTheme() else '#1a1a1a'))
-        self.setPalette(palette)
-        self.centralWidget().setAutoFillBackground(True)
-        self.centralWidget().setPalette(palette)
-        self.renderer.update()
+        try:
+            palette = self.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor('#202020' if isDarkTheme() else '#f0f4f9'))
+            palette.setColor(QPalette.ColorRole.WindowText, QColor('#ffffff' if isDarkTheme() else '#1a1a1a'))
+            self.setPalette(palette)
+            cw = self.centralWidget()
+            if cw is not None:
+                cw.setAutoFillBackground(True)
+                cw.setPalette(palette)
+            if hasattr(self, 'renderer') and self.renderer is not None:
+                self.renderer.update()
+        except Exception:
+            pass
 
     def _choose_cloud(self, slot):
         path, _ = QFileDialog.getOpenFileName(self, tr("Open point cloud"), "", tr("Point clouds (*.pcd *.ply *.las *.laz);;All files (*.*)"))
@@ -759,6 +765,10 @@ class PointCloudViewerWindow(QMainWindow):
             event.ignore()
             self.status.setText(tr("Waiting for cloud loading to finish..."))
             return
+        try:
+            qconfig.themeChanged.disconnect(self._sync_theme)
+        except Exception:
+            pass
         super().closeEvent(event)
 
 

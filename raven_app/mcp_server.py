@@ -89,28 +89,6 @@ class LidarCameraMcpServer:
                 }
             },
             {
-                "name": "telemetry_status",
-                "description": "Inspect anonymous telemetry opt-in state, client installation ID, and system telemetry payload.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "configure_telemetry",
-                "description": "Enable or disable anonymous telemetry collection.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "enabled": {
-                            "type": "boolean",
-                            "description": "True to opt in, False to opt out."
-                        }
-                    },
-                    "required": ["enabled"]
-                }
-            },
-            {
                 "name": "georeference",
                 "description": "Calculate INSV GPS trajectory, georeference point cloud or COLMAP dataset to target CRS, and export GeoJSON.",
                 "inputSchema": {
@@ -201,20 +179,6 @@ class LidarCameraMcpServer:
             from raven_app.updater import check_for_updates
             repo = arguments.get("repo")
             return check_for_updates(repo=repo)
-
-        elif name == "telemetry_status":
-            from raven_app.telemetry import is_telemetry_enabled, get_anonymous_client_id, get_system_telemetry_payload
-            return {
-                "telemetry_enabled": is_telemetry_enabled(),
-                "client_id": get_anonymous_client_id(),
-                "payload": get_system_telemetry_payload()
-            }
-
-        elif name == "configure_telemetry":
-            from raven_app.telemetry import set_telemetry_enabled, is_telemetry_enabled
-            enabled = bool(arguments.get("enabled", True))
-            set_telemetry_enabled(enabled)
-            return {"telemetry_enabled": is_telemetry_enabled()}
 
         elif name == "georeference":
             from raven_app.georeference import run_georeference

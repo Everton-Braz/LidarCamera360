@@ -10,7 +10,7 @@ from qfluentwidgets import (
     CardWidget, TitleLabel, SubtitleLabel, BodyLabel,
     CaptionLabel, StrongBodyLabel, ComboBox,
     PushButton, PrimaryPushButton, SwitchButton, ProgressBar,
-    InfoBar, InfoBarPosition, FluentIcon,
+    InfoBar, InfoBarPosition, FluentIcon, SmoothScrollArea,
     setTheme, Theme, isDarkTheme
 )
 from raven_app import __version__
@@ -18,9 +18,6 @@ from raven_app.branding import APP_NAME, APP_DESCRIPTION
 from raven_app.config import load_config, save_config
 from raven_app.i18n import available_languages, get_language, set_language, tr
 from raven_app.updater import check_for_updates, download_update, stage_windows_update
-from raven_app.telemetry import (
-    is_telemetry_enabled, set_telemetry_enabled, get_anonymous_client_id
-)
 from raven_app.views.feedback_dialog import FeedbackDialog
 
 
@@ -35,9 +32,16 @@ class SettingsView(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = SmoothScrollArea(self)
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(36, 24, 36, 24)
-        layout.setSpacing(16)
+        layout.setSpacing(18)
 
         # Header
         header_layout = QVBoxLayout()
@@ -51,10 +55,10 @@ class SettingsView(QWidget):
         layout.addLayout(header_layout)
 
         # 1. Language & Region Card
-        self.language_card = CardWidget(self)
+        self.language_card = CardWidget(content)
         lang_card_layout = QVBoxLayout(self.language_card)
-        lang_card_layout.setContentsMargins(20, 16, 20, 16)
-        lang_card_layout.setSpacing(10)
+        lang_card_layout.setContentsMargins(24, 20, 24, 20)
+        lang_card_layout.setSpacing(12)
 
         self.language_title = SubtitleLabel(tr("Language & Region"))
         lang_card_layout.addWidget(self.language_title)
@@ -62,6 +66,7 @@ class SettingsView(QWidget):
         lang_row = QHBoxLayout()
         self.language_label = BodyLabel(tr("Language:"))
         self.language_combo = ComboBox()
+        self.language_combo.setMinimumWidth(220)
         for code, name in available_languages():
             self.language_combo.addItem(name, userData=code)
 
@@ -83,10 +88,10 @@ class SettingsView(QWidget):
         layout.addWidget(self.language_card)
 
         # 2. Appearance Card
-        self.theme_card = CardWidget(self)
+        self.theme_card = CardWidget(content)
         theme_layout = QVBoxLayout(self.theme_card)
-        theme_layout.setContentsMargins(20, 16, 20, 16)
-        theme_layout.setSpacing(10)
+        theme_layout.setContentsMargins(24, 20, 24, 20)
+        theme_layout.setSpacing(12)
 
         self.appearance_title = SubtitleLabel(tr("Appearance"))
         theme_layout.addWidget(self.appearance_title)
@@ -94,16 +99,19 @@ class SettingsView(QWidget):
         mode_row = QHBoxLayout()
         self.theme_label = BodyLabel(tr("Application Theme:"))
         self.theme_combo = ComboBox()
+        self.theme_combo.setMinimumWidth(220)
         self._theme_options = ["dark", "light", "auto"]
         self.theme_combo.addItems([tr("Dark Theme"), tr("Light Theme"), tr("Follow Windows System")])
 
-        current_theme = self.cfg.get("theme", "dark")
+        current_theme = self.cfg.get("theme", "dark").lower()
+        self.theme_combo.blockSignals(True)
         if current_theme == "light":
             self.theme_combo.setCurrentIndex(1)
         elif current_theme == "auto":
             self.theme_combo.setCurrentIndex(2)
         else:
             self.theme_combo.setCurrentIndex(0)
+        self.theme_combo.blockSignals(False)
 
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
 
@@ -119,10 +127,10 @@ class SettingsView(QWidget):
         layout.addWidget(self.theme_card)
 
         # 3. Embedded Engines & Capabilities Card
-        self.engines_card = CardWidget(self)
+        self.engines_card = CardWidget(content)
         engines_layout = QVBoxLayout(self.engines_card)
-        engines_layout.setContentsMargins(20, 16, 20, 16)
-        engines_layout.setSpacing(10)
+        engines_layout.setContentsMargins(24, 20, 24, 20)
+        engines_layout.setSpacing(12)
 
         self.engines_title = SubtitleLabel(tr("Embedded Processing Engines"))
         engines_layout.addWidget(self.engines_title)
@@ -134,7 +142,7 @@ class SettingsView(QWidget):
 
         engines_grid = QGridLayout()
         engines_grid.setHorizontalSpacing(24)
-        engines_grid.setVerticalSpacing(8)
+        engines_grid.setVerticalSpacing(10)
 
         self.eng_slam_title = StrongBodyLabel("FAST-LIVO2 SLAM:")
         self.eng_slam_status = CaptionLabel("✓ " + tr("Bundled & Ready (Native MSVC C++17)"))
@@ -165,18 +173,20 @@ class SettingsView(QWidget):
         layout.addWidget(self.engines_card)
 
         # 4. Updates & Maintenance Card
-        self.updates_card = CardWidget(self)
+        self.updates_card = CardWidget(content)
         updates_layout = QVBoxLayout(self.updates_card)
-        updates_layout.setContentsMargins(20, 16, 20, 16)
-        updates_layout.setSpacing(10)
+        updates_layout.setContentsMargins(24, 20, 24, 20)
+        updates_layout.setSpacing(12)
 
         self.updates_title = SubtitleLabel(tr("Software Updates"))
         updates_layout.addWidget(self.updates_title)
 
         up_row = QHBoxLayout()
+        up_row.setSpacing(12)
         self.updates_ver_label = BodyLabel(f"{tr('Current Version:')} v{__version__}")
         self.check_update_btn = PushButton(tr("Check for Updates"))
         self.check_update_btn.setIcon(FluentIcon.SYNC)
+        self.check_update_btn.setMinimumHeight(32)
         self.check_update_btn.clicked.connect(self._check_for_updates)
         up_row.addWidget(self.updates_ver_label)
         up_row.addWidget(self.check_update_btn)
@@ -187,8 +197,10 @@ class SettingsView(QWidget):
         updates_layout.addWidget(self.updates_status)
 
         self.download_row = QHBoxLayout()
+        self.download_row.setSpacing(12)
         self.download_btn = PrimaryPushButton(tr("Download & Install Update"))
         self.download_btn.setIcon(FluentIcon.DOWNLOAD)
+        self.download_btn.setMinimumHeight(32)
         self.download_btn.setVisible(False)
         self.download_btn.clicked.connect(self._download_and_install_update)
         self.download_progress = ProgressBar()
@@ -199,39 +211,11 @@ class SettingsView(QWidget):
         updates_layout.addLayout(self.download_row)
         layout.addWidget(self.updates_card)
 
-        # 5. Anonymous Telemetry & Diagnostics Card
-        self.telemetry_card = CardWidget(self)
-        telem_layout = QVBoxLayout(self.telemetry_card)
-        telem_layout.setContentsMargins(20, 16, 20, 16)
-        telem_layout.setSpacing(10)
-
-        self.telemetry_title = SubtitleLabel(tr("Anonymous Telemetry & Diagnostics"))
-        telem_layout.addWidget(self.telemetry_title)
-
-        telem_row = QHBoxLayout()
-        self.telemetry_switch = SwitchButton()
-        self.telemetry_switch.setChecked(is_telemetry_enabled())
-        self.telemetry_switch.checkedChanged.connect(self._on_telemetry_changed)
-        self.telemetry_switch_label = BodyLabel(tr("Enable anonymous telemetry and diagnostic reporting"))
-        telem_row.addWidget(self.telemetry_switch)
-        telem_row.addWidget(self.telemetry_switch_label)
-        telem_row.addStretch()
-        telem_layout.addLayout(telem_row)
-
-        anon_id = get_anonymous_client_id()
-        self.telemetry_desc = CaptionLabel(
-            f"{tr('Helps improve LiDAR driver support, sensor synchronization, and SLAM accuracy.')} "
-            f"{tr('No video frames, points, paths, or personal info are ever sent.')}\n"
-            f"{tr('Anonymous Installation ID:')} {anon_id[:8]}...{anon_id[-4:]}"
-        )
-        telem_layout.addWidget(self.telemetry_desc)
-        layout.addWidget(self.telemetry_card)
-
-        # 6. Feedback & Bug Report Card
-        self.feedback_card = CardWidget(self)
+        # 5. Feedback & Bug Report Card
+        self.feedback_card = CardWidget(content)
         feedback_layout = QVBoxLayout(self.feedback_card)
-        feedback_layout.setContentsMargins(20, 16, 20, 16)
-        feedback_layout.setSpacing(10)
+        feedback_layout.setContentsMargins(24, 20, 24, 20)
+        feedback_layout.setSpacing(12)
 
         self.feedback_title = SubtitleLabel(tr("Feedback & Bug Reporting"))
         feedback_layout.addWidget(self.feedback_title)
@@ -244,6 +228,8 @@ class SettingsView(QWidget):
         fb_row = QHBoxLayout()
         self.feedback_btn = PushButton(tr("Open Feedback Dialog"))
         self.feedback_btn.setIcon(FluentIcon.FEEDBACK)
+        self.feedback_btn.setMinimumHeight(34)
+        self.feedback_btn.setMinimumWidth(190)
         self.feedback_btn.clicked.connect(self._open_feedback_dialog)
         fb_row.addWidget(self.feedback_btn)
         fb_row.addStretch()
@@ -251,10 +237,10 @@ class SettingsView(QWidget):
         layout.addWidget(self.feedback_card)
 
         # 7. About Card
-        self.about_card = CardWidget(self)
+        self.about_card = CardWidget(content)
         about_layout = QVBoxLayout(self.about_card)
-        about_layout.setContentsMargins(20, 16, 20, 16)
-        about_layout.setSpacing(8)
+        about_layout.setContentsMargins(24, 20, 24, 20)
+        about_layout.setSpacing(10)
 
         self.about_title = SubtitleLabel(tr("About {app_name}", app_name=APP_NAME))
         self.about_version = StrongBodyLabel(f"{APP_NAME} v{__version__}")
@@ -270,6 +256,10 @@ class SettingsView(QWidget):
         layout.addWidget(self.about_card)
 
         layout.addStretch()
+        scroll.setWidget(content)
+        scroll.enableTransparentBackground()
+        content.setAutoFillBackground(False)
+        main_layout.addWidget(scroll)
 
     def _on_language_changed(self, idx: int):
         if idx < 0 or idx >= len(self._language_codes):
@@ -295,21 +285,25 @@ class SettingsView(QWidget):
 
     def _on_theme_changed(self, idx: int):
         theme_names = ["dark", "light", "auto"]
-        self.cfg["theme"] = theme_names[idx]
-        if idx == 0:
-            setTheme(Theme.DARK)
-        elif idx == 1:
-            setTheme(Theme.LIGHT)
-        else:
-            setTheme(Theme.AUTO)
+        if idx < 0 or idx >= len(theme_names):
+            return
+
+        theme_name = theme_names[idx]
+        self.cfg["theme"] = theme_name
         save_config(self.cfg)
 
-    def _on_telemetry_changed(self, enabled: bool):
-        set_telemetry_enabled(enabled)
-        self.cfg["telemetry_enabled"] = enabled
-        save_config(self.cfg)
-        msg = tr("Telemetry enabled. Thank you for supporting open-source development!") if enabled else tr("Telemetry disabled.")
-        InfoBar.info(title=tr("Telemetry"), content=msg, parent=self, position=InfoBarPosition.TOP_RIGHT, duration=2500)
+        target_theme = Theme.DARK if idx == 0 else (Theme.LIGHT if idx == 1 else Theme.AUTO)
+
+        def _apply_theme():
+            try:
+                setTheme(target_theme)
+            except Exception as exc:
+                print(f"[!] Error switching theme: {exc}")
+
+        # Defer theme application to next event loop iteration so ComboBoxMenu
+        # can finish dismissing cleanly before stylesheets across the app are recalculated.
+        QTimer.singleShot(0, _apply_theme)
+
 
     def _check_for_updates(self):
         self.check_update_btn.setEnabled(False)
@@ -416,10 +410,6 @@ class SettingsView(QWidget):
         self.updates_ver_label.setText(f"{tr('Current Version:')} v{__version__}")
         self.check_update_btn.setText(tr("Check for Updates"))
         self.download_btn.setText(tr("Download & Install Update"))
-
-        # Telemetry card
-        self.telemetry_title.setText(tr("Anonymous Telemetry & Diagnostics"))
-        self.telemetry_switch_label.setText(tr("Enable anonymous telemetry and diagnostic reporting"))
 
         # Feedback card
         self.feedback_title.setText(tr("Feedback & Bug Reporting"))

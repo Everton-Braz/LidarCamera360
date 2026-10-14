@@ -6,6 +6,43 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [v0.3.0] - 2026-10-14
+
+### 🛡️ 100% Privacy-First Architecture (Telemetry-Free)
+- **Complete Telemetry Removal**: Completely eliminated all anonymous telemetry, heartbeat HTTP calls, and installation UUID tracking from the application, settings interface, and CLI/MCP layers.
+- **Zero Background Network Activity**: The application does not transmit any usage data, telemetry payloads, or identifiers.
+- **Automated Configuration Sanitization**: Automatically purges any legacy telemetry configuration keys and persistent client ID files from user directories.
+
+### 🤖 Native Model Context Protocol (MCP) Server
+- **AI Agent Automation**: Built-in JSON-RPC 2.0 stdio MCP server (`python lidarcamera360.py mcp`) exposing 7 specialized tools to AI assistants (Claude Desktop, Antigravity, Cursor):
+  - `doctor`: Automated diagnostic inspection of native MSVC engines, Vulkan compute devices, and Spirula SfM status.
+  - `inspect_bag`: Fast, zero-ROS ROS1 bag inspection for LiDAR/IMU/Image topics and message frequencies.
+  - `extract_gps`: High-frequency GNSS extraction from Insta360 INSV containers into GeoJSON, GPX, and CSV.
+  - `extract_insv_frames`: Hardware-accelerated dual-fisheye frame extraction via PyAV.
+  - `georeference`: Full georeferencing and CRS reprojection pipeline for point clouds and COLMAP datasets.
+  - `check_updates`: Remote GitHub release checking and changelog inspection.
+  - `submit_feedback`: Manual, voluntary bug reporting with packaged diagnostics.
+
+### 🔄 MOLA Pose-Graph Loop-Closure Refinement
+- **Drift Elimination on Large Trajectories**: Integrated MOLA pose-graph refinement (`--revisit-refinement`) for global loop closure and trajectory optimization.
+- **Convergence Fallback Safety**: Robust error handling and fallback mechanisms to preserve SLAM outputs if loop closures are indeterminate.
+
+### 📷 Auxiliary Front-Facing Camera & Extrinsics Injection
+- **Front Camera Bag Support**: Ingestion of auxiliary camera bags (`IMAGE_*.bag`) with synchronized optical frames.
+- **Custom Extrinsic Injection**: Pass custom calibration transforms and timestamps directly via CLI (`--calib`, `--image-bag`, `--dt`) and UI settings.
+
+### 🚀 Over-The-Air (OTA) Updates & Voluntary Feedback
+- **Release Verification & Self-Update**: Query latest releases, inspect version deltas, and stage automated updates on Windows (`python lidarcamera360.py update`).
+- **Voluntary Feedback Dialog**: Intuitive Fluent UI dialog and CLI runner (`python lidarcamera360.py feedback`) generating packaged diagnostic ZIP bundles with zero personal data.
+
+### 🛡️ Core Engine Stability & Memory Safety
+- **FAST-LIVO2 VIO Out-of-Bounds Fix**: Prevented memory crashes during heavy visual feature tracking by enforcing strict boundary validation on image patch buffers.
+- **Broken Pipe Handling**: Graceful error recovery when native C++ processes terminate or disconnect.
+- **Fluent Theme Switch Stability**: Deferred stylesheet re-evaluation on theme toggle to prevent menu layout dismiss crashes.
+- **Comprehensive Quality Assurance**: 100% passing test suite across 270 unit, integration, and UI tests.
+
+---
+
 ## [v0.2.0] - 2026-09-23
 
 ### 🦅 3DMakerPro Eagle LiDAR & Insta360 X6 Hardware Support

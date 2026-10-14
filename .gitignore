@@ -27,8 +27,8 @@ dataset-test/
 *.ply
 node_modules/
 graphify-out/
-/artifacts/calibration_fix/
-/artifacts/viewer/
+artifacts/
 scratch/
+.agents/skills/release-social-promo/
 
 frame_27s.jpg

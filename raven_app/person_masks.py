@@ -24,6 +24,15 @@ from raven_app.mask_resources import (MODEL_SHA256, download_progress, ensure_re
                                       resolve_vulkan_shaders_dir)
 
 
+def _file_digest_hex(stream):
+    if hasattr(hashlib, 'file_digest'):
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    h = hashlib.sha256()
+    while chunk := stream.read(65536):
+        h.update(chunk)
+    return h.hexdigest()
+
+
 def mask_path(image_path, images_dir, masks_dir):
     relative = Path(image_path).resolve().relative_to(Path(images_dir).resolve())
     return Path(masks_dir) / (relative.as_posix() + '.png')
@@ -355,7 +364,7 @@ def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03,
         fingerprint = MODEL_SHA256
     else:
         with model.open('rb') as stream:
-            fingerprint = hashlib.file_digest(stream, 'sha256').hexdigest()
+            fingerprint = _file_digest_hex(stream)
     masks = dataset / 'masks'
     masks.mkdir(parents=True, exist_ok=True)
     manifest = masks / 'manifest.json'
@@ -377,7 +386,7 @@ def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03,
         download_progress, backend=backend, model_path=model
     )
     with model.open('rb') as stream:
-        settings['model_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        settings['model_sha256'] = _file_digest_hex(stream)
     # Invalidate completion before running: interrupted/failed batches cannot be reused.
     manifest.unlink(missing_ok=True)
     started = time.perf_counter()

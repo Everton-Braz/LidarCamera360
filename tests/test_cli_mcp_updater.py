@@ -1,4 +1,4 @@
-"""Unit and integration tests for telemetry, updater, MCP server, and feedback."""
+"""Unit and integration tests for updater, MCP server, and feedback."""
 import json
 import os
 import sys
@@ -7,12 +7,6 @@ from pathlib import Path
 import pytest
 
 from raven_app import __version__
-from raven_app.telemetry import (
-    get_anonymous_client_id,
-    is_telemetry_enabled,
-    set_telemetry_enabled,
-    get_system_telemetry_payload,
-)
 from raven_app.updater import (
     parse_version_tuple,
     is_newer_version,
@@ -25,31 +19,6 @@ from raven_app.feedback import (
     build_github_issue_url,
     export_feedback_bundle,
 )
-
-
-def test_telemetry_opt_in_toggle():
-    set_telemetry_enabled(True)
-    assert is_telemetry_enabled() is True
-    set_telemetry_enabled(False)
-    assert is_telemetry_enabled() is False
-    set_telemetry_enabled(True)
-    assert is_telemetry_enabled() is True
-
-
-def test_anonymous_client_id():
-    cid = get_anonymous_client_id()
-    assert isinstance(cid, str)
-    assert len(cid) >= 16
-    # Calling again returns stable ID
-    assert get_anonymous_client_id() == cid
-
-
-def test_system_telemetry_payload():
-    payload = get_system_telemetry_payload()
-    assert "client_id" in payload
-    assert "os" in payload
-    assert ("python" in payload or "python_version" in payload)
-    assert payload.get("app_version") == __version__
 
 
 def test_version_parsing_and_comparison():
@@ -131,6 +100,7 @@ def test_mcp_server_protocol():
     assert "extract_insv_frames" in tool_names
     assert "check_updates" in tool_names
     assert "submit_feedback" in tool_names
+    assert "georeference" in tool_names
 
     doc_resp = server.handle_request({
         "jsonrpc": "2.0",
@@ -140,42 +110,6 @@ def test_mcp_server_protocol():
     })
     assert doc_resp is not None
     assert "content" in doc_resp["result"]
-
-    # Extended tools check
-    assert "telemetry_status" in tool_names
-    assert "configure_telemetry" in tool_names
-    assert "georeference" in tool_names
-
-    # Test telemetry_status tool
-    t_stat = server.handle_request({
-        "jsonrpc": "2.0",
-        "id": 4,
-        "method": "tools/call",
-        "params": {"name": "telemetry_status", "arguments": {}}
-    })
-    assert t_stat is not None
-    content = json.loads(t_stat["result"]["content"][0]["text"])
-    assert "telemetry_enabled" in content
-    assert "client_id" in content
-
-    # Test configure_telemetry tool
-    t_cfg = server.handle_request({
-        "jsonrpc": "2.0",
-        "id": 5,
-        "method": "tools/call",
-        "params": {"name": "configure_telemetry", "arguments": {"enabled": False}}
-    })
-    assert t_cfg is not None
-    content_cfg = json.loads(t_cfg["result"]["content"][0]["text"])
-    assert content_cfg["telemetry_enabled"] is False
-
-    # Restore telemetry
-    server.handle_request({
-        "jsonrpc": "2.0",
-        "id": 6,
-        "method": "tools/call",
-        "params": {"name": "configure_telemetry", "arguments": {"enabled": True}}
-    })
 
     # Test resources/list and prompts/list
     res_resp = server.handle_request({
@@ -193,22 +127,6 @@ def test_mcp_server_protocol():
         "params": {}
     })
     assert prompt_resp is not None and "prompts" in prompt_resp["result"]
-
-
-def test_cli_telemetry_commands(capsys):
-    from raven_app.cli import parse, run
-    args = parse(["telemetry", "--enable"])
-    assert args.command == "telemetry"
-    assert args.enable is True
-    ret = run(args)
-    assert ret == 0
-    captured = capsys.readouterr()
-    payload = json.loads(captured.out)
-    assert payload["telemetry_enabled"] is True
-
-    args_stat = parse(["telemetry", "--status"])
-    ret_stat = run(args_stat)
-    assert ret_stat == 0
 
 
 def test_cli_update_check_command(capsys):
@@ -240,4 +158,3 @@ def test_cli_feedback_command(tmp_path, capsys):
     res = json.loads(captured.out)
     assert res["status"] == "processed"
     assert out_bundle.is_file()
-

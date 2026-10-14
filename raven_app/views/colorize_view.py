@@ -9,7 +9,7 @@ from qfluentwidgets import (
     CardWidget, TitleLabel, SubtitleLabel, BodyLabel,
     CaptionLabel, StrongBodyLabel, PrimaryPushButton, PushButton, ToolButton,
     LineEdit, DoubleSpinBox, ComboBox, CheckBox, ProgressBar,
-    PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
+    PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition, SmoothScrollArea
 )
 from raven_app.process_runner import ProcessRunner, make_run_log_path
 from raven_app.mask_download import MaskResourceDownload
@@ -34,9 +34,16 @@ class ColorizeView(QWidget):
         self._refresh_mask_resource_state()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = SmoothScrollArea(self)
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(36, 24, 36, 24)
-        layout.setSpacing(16)
+        layout.setSpacing(18)
 
         # Header
         header_layout = QVBoxLayout()
@@ -50,9 +57,9 @@ class ColorizeView(QWidget):
         layout.addLayout(header_layout)
 
         # Dataset & Paths Card
-        paths_card = CardWidget(self)
+        paths_card = CardWidget(content)
         paths_layout = QVBoxLayout(paths_card)
-        paths_layout.setContentsMargins(20, 18, 20, 18)
+        paths_layout.setContentsMargins(24, 20, 24, 20)
         paths_layout.setSpacing(14)
 
         self.paths_title = SubtitleLabel(tr("Dataset & Calibration Inputs"))
@@ -60,11 +67,13 @@ class ColorizeView(QWidget):
 
         # Dataset folder row
         ds_row = QHBoxLayout()
+        ds_row.setSpacing(12)
         self.ds_label = BodyLabel(tr("Dataset Directory:"))
-        self.ds_label.setFixedWidth(140)
+        self.ds_label.setFixedWidth(160)
         self.ds_input = LineEdit()
         self.ds_input.setPlaceholderText(tr("Select folder containing slam_out/ and images/..."))
         self.ds_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
+        self.ds_browse.setFixedWidth(105)
         self.ds_browse.clicked.connect(self._browse_dataset)
         ds_row.addWidget(self.ds_label)
         ds_row.addWidget(self.ds_input)
@@ -73,11 +82,13 @@ class ColorizeView(QWidget):
 
         # Calib JSON row
         calib_row = QHBoxLayout()
+        calib_row.setSpacing(12)
         self.calib_label = BodyLabel(tr("Calibration JSON:"))
-        self.calib_label.setFixedWidth(140)
+        self.calib_label.setFixedWidth(160)
         self.calib_input = LineEdit()
         self.calib_input.setPlaceholderText(tr("Leave empty to use default Raven rigid calibration..."))
         self.calib_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
+        self.calib_browse.setFixedWidth(105)
         self.calib_browse.clicked.connect(self._browse_calib)
         calib_row.addWidget(self.calib_label)
         calib_row.addWidget(self.calib_input)
@@ -86,14 +97,16 @@ class ColorizeView(QWidget):
 
         # Auxiliary image/video cameras
         aux_row = QHBoxLayout()
+        aux_row.setSpacing(10)
         self.aux_label = BodyLabel(tr("Auxiliary Camera:"))
-        self.aux_label.setFixedWidth(140)
+        self.aux_label.setFixedWidth(160)
         self.aux_input = LineEdit()
         self.aux_input.setPlaceholderText(tr("No auxiliary cameras configured."))
         self.aux_input.setReadOnly(True)
         self.btn_add_source = PushButton(tr("Add Camera Source..."), icon=FluentIcon.ADD)
         self.btn_add_source.clicked.connect(self._open_add_source_dialog)
         self.btn_clear_source = PushButton(tr("Clear All"), icon=FluentIcon.DELETE)
+        self.btn_clear_source.setFixedWidth(105)
         self.btn_clear_source.clicked.connect(self._clear_aux_source)
         aux_row.addWidget(self.aux_label)
         aux_row.addWidget(self.aux_input)
@@ -103,7 +116,7 @@ class ColorizeView(QWidget):
 
         self.aux_sources_widget = QWidget(paths_card)
         self.aux_sources_layout = QVBoxLayout(self.aux_sources_widget)
-        self.aux_sources_layout.setContentsMargins(140, 0, 0, 0)
+        self.aux_sources_layout.setContentsMargins(160, 0, 0, 0)
         self.aux_sources_layout.setSpacing(6)
         paths_layout.addWidget(self.aux_sources_widget)
         self._refresh_aux_sources_ui()
@@ -111,18 +124,21 @@ class ColorizeView(QWidget):
         layout.addWidget(paths_card)
 
         # Method & Parameters Card
-        params_card = CardWidget(self)
+        params_card = CardWidget(content)
         params_layout = QVBoxLayout(params_card)
-        params_layout.setContentsMargins(20, 18, 20, 18)
-        params_layout.setSpacing(14)
+        params_layout.setContentsMargins(24, 20, 24, 20)
+        params_layout.setSpacing(16)
 
         self.params_title = SubtitleLabel(tr("Method & Synchronization"))
         params_layout.addWidget(self.params_title)
 
+        # Colorization Method
         method_row = QHBoxLayout()
+        method_row.setSpacing(12)
         self.method_label = BodyLabel(tr("Colorization Method:"))
-        self.method_label.setFixedWidth(140)
+        self.method_label.setFixedWidth(180)
         self.method_combo = ComboBox()
+        self.method_combo.setMinimumWidth(280)
         self.method_combo.addItems([
             tr("Trajectory-based colorization"),
             tr("Reconstruction-based colorization"),
@@ -131,30 +147,37 @@ class ColorizeView(QWidget):
         self.method_combo.setCurrentIndex(0)
         method_row.addWidget(self.method_label)
         method_row.addWidget(self.method_combo)
+        method_row.addStretch()
         params_layout.addLayout(method_row)
 
-        # Timing row
+        # Timing row (FPS and Manual Delta t)
         timing_row = QHBoxLayout()
+        timing_row.setSpacing(12)
         self.fps_label = BodyLabel(tr("Extraction FPS:"))
+        self.fps_label.setFixedWidth(180)
         self.fps_spin = DoubleSpinBox()
         self.fps_spin.setRange(0.1, 120.0)
         self.fps_spin.setValue(2.0)
         self.fps_spin.setSingleStep(0.5)
+        self.fps_spin.setFixedWidth(110)
         self.fps_spin.setToolTip(tr("Extraction rate is capped by the source video. For a 2 fps timelapse, use 2; a higher value does not create extra frames."))
 
         self.dt_label = BodyLabel(tr("Manual Δt (s):"))
         self.dt_input = LineEdit()
-        self.dt_input.setPlaceholderText("Optional (e.g. -4.2 or 5.7075)")
+        self.dt_input.setPlaceholderText(tr("Optional (e.g. -4.2 or 5.7075)"))
+        self.dt_input.setFixedWidth(240)
 
         timing_row.addWidget(self.fps_label)
         timing_row.addWidget(self.fps_spin)
-        timing_row.addSpacing(20)
+        timing_row.addSpacing(24)
         timing_row.addWidget(self.dt_label)
         timing_row.addWidget(self.dt_input)
         timing_row.addStretch()
         params_layout.addLayout(timing_row)
 
-        photometric_row = QHBoxLayout()
+        # Photometric Compensation Mode
+        photo_mode_row = QHBoxLayout()
+        photo_mode_row.setSpacing(12)
         self.photometric_label = BodyLabel(tr("Photometric compensation:"))
         self.photometric_label.setFixedWidth(180)
         self.photometric_combo = ComboBox()
@@ -162,33 +185,38 @@ class ColorizeView(QWidget):
         self.photometric_combo.addItem(tr("Log-linear"), userData="loglinear")
         self.photometric_combo.addItem(tr("PPISP + bilateral grid"), userData="ppisp-bilateral")
         self.photometric_combo.setCurrentIndex(0)
-        self.photometric_combo.setFixedWidth(190)
+        self.photometric_combo.setMinimumWidth(260)
         self.photometric_combo.currentIndexChanged.connect(self._update_photometric_controls)
+        photo_mode_row.addWidget(self.photometric_label)
+        photo_mode_row.addWidget(self.photometric_combo)
+        photo_mode_row.addStretch()
+        params_layout.addLayout(photo_mode_row)
+
+        # Photometric Parameters Row (conditionally enabled)
+        photo_params_row = QHBoxLayout()
+        photo_params_row.setSpacing(12)
         self.photometric_params_label = BodyLabel(tr("Photometric parameters:"))
         self.photometric_params_label.setFixedWidth(180)
         self.photometric_params_input = LineEdit()
         self.photometric_params_input.setPlaceholderText(tr("Optional fitted JSON file"))
         self.photometric_params_browse = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
+        self.photometric_params_browse.setFixedWidth(105)
         self.photometric_params_browse.clicked.connect(self._browse_photometric_params)
-        photometric_row.addWidget(self.photometric_label)
-        photometric_row.addWidget(self.photometric_combo)
-        photometric_row.addSpacing(12)
-        photometric_row.addWidget(self.photometric_params_label)
-        photometric_row.addWidget(self.photometric_params_input)
-        photometric_row.addWidget(self.photometric_params_browse)
-        params_layout.addLayout(photometric_row)
+        photo_params_row.addWidget(self.photometric_params_label)
+        photo_params_row.addWidget(self.photometric_params_input)
+        photo_params_row.addWidget(self.photometric_params_browse)
+        params_layout.addLayout(photo_params_row)
         self._update_photometric_controls()
 
-        # Checkboxes
-        check_row = QHBoxLayout()
+        # SfM Alignment & Recalibration Checkboxes (stacked vertically for clarity)
         self.chk_spirula = CheckBox(tr("Run Spirula SfM automatically if sparse reconstruction is missing"))
         self.chk_recalib = CheckBox(tr("Recalibrate spatial extrinsics from SfM alignment"))
-        check_row.addWidget(self.chk_spirula)
-        check_row.addWidget(self.chk_recalib)
-        check_row.addStretch()
-        params_layout.addLayout(check_row)
+        params_layout.addWidget(self.chk_spirula)
+        params_layout.addWidget(self.chk_recalib)
 
+        # Person & Scanner Masking (Row 1: Enable & Backend)
         mask_row = QHBoxLayout()
+        mask_row.setSpacing(12)
         self.chk_mask_persons = CheckBox(tr("Generate masks"))
         self.chk_mask_persons.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
         self.mask_backend_label = BodyLabel(tr("Mask backend:"))
@@ -196,32 +224,40 @@ class ColorizeView(QWidget):
         self.mask_backend_combo.addItem(tr("Vulkan"), userData="vulkan")
         self.mask_backend_combo.addItem(tr("TensorRT"), userData="tensorrt")
         self.mask_backend_combo.setCurrentIndex(0)
+        self.mask_backend_combo.setFixedWidth(140)
         self.mask_backend_combo.currentIndexChanged.connect(self._refresh_mask_resource_state)
         self.mask_backend_combo.currentIndexChanged.connect(self._update_mask_backend_tooltip)
         self._update_mask_backend_tooltip()
+
+        mask_row.addWidget(self.chk_mask_persons)
+        mask_row.addSpacing(24)
+        mask_row.addWidget(self.mask_backend_label)
+        mask_row.addWidget(self.mask_backend_combo)
+        mask_row.addStretch()
+        params_layout.addLayout(mask_row)
+
+        # Person & Scanner Masking (Row 2: Action buttons & Operator Radius)
+        mask_controls_row = QHBoxLayout()
+        mask_controls_row.setSpacing(12)
         self.btn_mask_model = PushButton(tr("Download model RF-DETR"), icon=FluentIcon.DOWNLOAD)
         self.btn_mask_model.clicked.connect(self._download_rf_detr)
         self.btn_mask_settings = PushButton(tr("Mask settings..."))
         self.btn_mask_settings.clicked.connect(self._open_mask_settings)
+
         self.operator_radius_label = BodyLabel(tr("Operator removal radius (m):"))
         self.operator_radius_spin = DoubleSpinBox()
         self.operator_radius_spin.setRange(0.0, 5.0)
         self.operator_radius_spin.setDecimals(2)
         self.operator_radius_spin.setSingleStep(0.10)
         self.operator_radius_spin.setValue(0.0)
+        self.operator_radius_spin.setFixedWidth(110)
         self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
         self.operator_radius_spin.valueChanged.connect(lambda value: self.chk_mask_persons.setChecked(True) if value > 0 else None)
         self.chk_mask_persons.toggled.connect(lambda checked: self.operator_radius_spin.setValue(0.0) if not checked else None)
-        mask_row.addWidget(self.chk_mask_persons)
-        mask_row.addWidget(self.mask_backend_label)
-        mask_row.addWidget(self.mask_backend_combo)
-        mask_row.addStretch()
-        params_layout.addLayout(mask_row)
 
-        mask_controls_row = QHBoxLayout()
         mask_controls_row.addWidget(self.btn_mask_model)
         mask_controls_row.addWidget(self.btn_mask_settings)
-        mask_controls_row.addSpacing(12)
+        mask_controls_row.addSpacing(24)
         mask_controls_row.addWidget(self.operator_radius_label)
         mask_controls_row.addWidget(self.operator_radius_spin)
         mask_controls_row.addStretch()
@@ -230,9 +266,9 @@ class ColorizeView(QWidget):
         layout.addWidget(params_card)
 
         # Action & Status Card
-        action_card = CardWidget(self)
+        action_card = CardWidget(content)
         action_layout = QHBoxLayout(action_card)
-        action_layout.setContentsMargins(20, 14, 20, 14)
+        action_layout.setContentsMargins(24, 16, 24, 16)
 
         status_box = QVBoxLayout()
         self.status_title = StrongBodyLabel(tr("Status: Ready"))
@@ -249,8 +285,10 @@ class ColorizeView(QWidget):
         action_layout.addWidget(self.progress_bar)
 
         self.btn_run = PrimaryPushButton(tr("Run Colorization"), icon=FluentIcon.PALETTE)
+        self.btn_run.setMinimumHeight(36)
         self.btn_run.clicked.connect(self._start_colorization)
         self.btn_cancel = PushButton(tr("Cancel"), icon=FluentIcon.CLOSE)
+        self.btn_cancel.setMinimumHeight(36)
         self.btn_cancel.clicked.connect(self._cancel)
         self.btn_cancel.setEnabled(False)
 
@@ -259,10 +297,10 @@ class ColorizeView(QWidget):
         layout.addWidget(action_card)
 
         # Live Console Card
-        log_card = CardWidget(self)
+        log_card = CardWidget(content)
         log_layout = QVBoxLayout(log_card)
-        log_layout.setContentsMargins(16, 12, 16, 12)
-        log_layout.setSpacing(8)
+        log_layout.setContentsMargins(20, 16, 20, 16)
+        log_layout.setSpacing(10)
 
         log_header = QHBoxLayout()
         self.log_title = SubtitleLabel(tr("Colorization Log"))
@@ -280,11 +318,18 @@ class ColorizeView(QWidget):
 
         self.log_console = PlainTextEdit()
         self.log_console.setReadOnly(True)
+        self.log_console.setMinimumHeight(240)
         self.log_console.setStyleSheet(
             "PlainTextEdit { background-color: #0c1219; color: #a9c7df; font-family: 'Consolas', 'Courier New'; font-size: 12px; border-radius: 6px; padding: 8px; }"
         )
         log_layout.addWidget(self.log_console)
-        layout.addWidget(log_card, stretch=1)
+        layout.addWidget(log_card)
+
+        layout.addStretch()
+        scroll.setWidget(content)
+        scroll.enableTransparentBackground()
+        content.setAutoFillBackground(False)
+        main_layout.addWidget(scroll)
 
     def _connect_signals(self):
         self.runner.started.connect(self._on_job_started)

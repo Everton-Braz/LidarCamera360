@@ -6,12 +6,12 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 
 **Unified LiDAR-Inertial SLAM, 360° Camera Telemetry, Rig Calibration, and 3D Colorization Suite**
 
-[![Release](https://img.shields.io/badge/Release-v0.2.0-brightgreen.svg)](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.2.0)
+[![Release](https://img.shields.io/badge/Release-v0.3.0-brightgreen.svg)](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.3.0)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![C++17 MSVC](https://img.shields.io/badge/C%2B%2B-17%20MSVC-orange.svg)](https://visualstudio.microsoft.com/)
 [![Vulkan](https://img.shields.io/badge/GPU-Vulkan%20Compute-red.svg)](https://www.vulkan.org/)
 [![PyQt6 Fluent](https://img.shields.io/badge/UI-PyQt6%20Fluent%20Widgets-teal.svg)](https://github.com/zhiyiYo/PyQt-Fluent-Widgets)
-[![Tests](https://img.shields.io/badge/Tests-252%20passed-success.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-270%20passed-success.svg)](tests/)
 [![License](https://img.shields.io/badge/License-Dual%20MIT%20%2F%20GPLv3-green.svg)](LICENSE)
 
 <br/>
@@ -96,9 +96,8 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 13. **Native Model Context Protocol (MCP) Server for AI Agents**
     - Built-in JSON-RPC 2.0 stdio MCP server (`python lidarcamera360.py mcp`) allowing AI assistants (Claude Desktop, Antigravity, Cursor) to autonomously inspect ROS bags, extract GNSS telemetry, extract sharp fisheye frames, execute georeferencing, and monitor engine health.
 
-14. **Over-The-Air (OTA) Updates, Privacy-First Telemetry & Diagnostic Feedback**
+14. **Over-The-Air (OTA) Updates & Diagnostic Bug Reporting**
     - Remote release verification and automated staging directly from GitHub Releases (`python lidarcamera360.py update`).
-    - Anonymous diagnostic telemetry with persistent client UUID and user opt-in/opt-out toggle (`python lidarcamera360.py telemetry`).
     - Integrated Fluent feedback dialog and CLI bug reporting with packaged diagnostic bundles (`python lidarcamera360.py feedback`).
 
 ---
@@ -137,9 +136,6 @@ python lidarcamera360.py mcp
 # Check for remote updates from GitHub Releases
 python lidarcamera360.py update check
 
-# Query anonymous telemetry state
-python lidarcamera360.py telemetry --status
-
 # Run automated end-to-end processing (Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables)
 python lidarcamera360.py workflow --bag D:\capture\scan.bag --insv D:\capture\video.insv --output D:\dataset --method direct
 
@@ -149,8 +145,8 @@ python lidarcamera360.py
 
 ### Running the Standalone Windows Executable (No Python Required)
 
-Pre-compiled standalone packages and portable executables are available on [GitHub Releases](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.2.0):
-- 📥 **Direct Portable Download:** [LidarCamera360_portable.exe (v0.2.0)](https://github.com/Everton-Braz/LidarCamera360/releases/download/v0.2.0/LidarCamera360_portable.exe)
+Pre-compiled standalone packages and portable executables are available on [GitHub Releases](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.3.0):
+- 📥 **Direct Portable Download:** [LidarCamera360_portable.exe (v0.3.0)](https://github.com/Everton-Braz/LidarCamera360/releases/download/v0.3.0/LidarCamera360_portable.exe)
 
 When using the portable executable or directory bundle:
 

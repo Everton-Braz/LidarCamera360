@@ -14,14 +14,27 @@ from typing import Any, Dict, Optional
 from raven_app import __version__
 from raven_app.branding import APP_NAME, REPOSITORY_NAME
 from raven_app.config import get_config_dir, load_config
-from raven_app.telemetry import get_system_telemetry_payload
 
 DEFAULT_REPO = f"Everton-Braz/{REPOSITORY_NAME}"
 
 
 def gather_diagnostics() -> Dict[str, Any]:
     """Compiles full non-sensitive diagnostic info for bug reporting."""
-    diagnostics = get_system_telemetry_payload()
+    diagnostics: Dict[str, Any] = {
+        "app_name": APP_NAME,
+        "app_version": __version__,
+        "os": platform.system(),
+        "os_release": platform.release(),
+        "os_version": platform.version(),
+        "arch": platform.machine(),
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+    }
+    try:
+        from raven_app.vulkan_engine import vulkan_status
+        diagnostics["vulkan_status"] = vulkan_status()
+    except Exception:
+        diagnostics["vulkan_status"] = {"available": False}
     
     # Gather engine statuses
     try:

@@ -31,9 +31,21 @@ def load_config() -> dict:
         if cfg_path.is_file():
             data = json.loads(cfg_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                # Ensure no lingering telemetry keys exist in settings
+                data.pop("telemetry_enabled", None)
+                data.pop("telemetry_endpoint", None)
                 defaults.update(data)
     except (OSError, ValueError):
         pass
+
+    # Clean up any legacy installation ID file
+    try:
+        cid_file = get_config_dir() / "client_id.txt"
+        if cid_file.is_file():
+            cid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     return defaults
 
 

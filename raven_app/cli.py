@@ -254,13 +254,6 @@ def parse(argv=None):
     feedback.add_argument('--browser', action='store_true', help='Open pre-filled issue in default web browser')
     feedback.add_argument('--export-bundle', type=Path, default=None, help='Export diagnostic zip bundle to file')
 
-    # Telemetry Management
-    telemetry = sub.add_parser('telemetry', help='Inspect or configure anonymous telemetry and heartbeat')
-    telemetry.add_argument('--status', action='store_true', help='Show telemetry opt-in state and anonymous ID')
-    telemetry.add_argument('--enable', action='store_true', help='Opt in to anonymous telemetry')
-    telemetry.add_argument('--disable', action='store_true', help='Opt out of anonymous telemetry')
-    telemetry.add_argument('--heartbeat', action='store_true', help='Send test heartbeat ping')
-
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
     a=p.parse_args(argv)
@@ -633,22 +626,6 @@ def run(a):
             bundle_path = export_feedback_bundle(report, a.export_bundle)
             res['bundle_path'] = str(bundle_path)
         print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0
-    if a.command == 'telemetry':
-        from raven_app.telemetry import is_telemetry_enabled, set_telemetry_enabled, get_anonymous_client_id, get_system_telemetry_payload, send_heartbeat
-        if a.enable:
-            set_telemetry_enabled(True)
-        elif a.disable:
-            set_telemetry_enabled(False)
-        payload = get_system_telemetry_payload()
-        status_info = {
-            'telemetry_enabled': is_telemetry_enabled(),
-            'client_id': get_anonymous_client_id(),
-            'payload': payload
-        }
-        if a.heartbeat:
-            status_info['heartbeat_result'] = send_heartbeat()
-        print(json.dumps(status_info, indent=2, ensure_ascii=False))
         return 0
     raise ValueError('Unknown command')
 

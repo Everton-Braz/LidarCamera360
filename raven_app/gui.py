@@ -46,6 +46,15 @@ class RavenMainWindow(FluentWindow):
         self.resize(1160, 820)
         self.setMinimumSize(960, 660)
 
+        # Apply saved theme from configuration
+        theme_pref = load_config().get("theme", "dark").lower()
+        if theme_pref == "light":
+            setTheme(Theme.LIGHT)
+        elif theme_pref == "auto":
+            setTheme(Theme.AUTO)
+        else:
+            setTheme(Theme.DARK)
+
         # Set application and window icon
         icon = _get_app_icon()
         if not icon.isNull():
@@ -237,11 +246,20 @@ def launch(*, on_ready=None):
         if ctypes.windll.kernel32.GetConsoleProcessList(processes, 2) == 1:
             ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
-    # Enable High-DPI scaling and load saved language
-    set_language(load_config().get("language", "en"))
+    # Enable High-DPI scaling and load saved language and theme
+    cfg = load_config()
+    set_language(cfg.get("language", "en"))
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+
+    theme_pref = cfg.get("theme", "dark").lower()
+    if theme_pref == "light":
+        setTheme(Theme.LIGHT)
+    elif theme_pref == "auto":
+        setTheme(Theme.AUTO)
+    else:
+        setTheme(Theme.DARK)
 
     icon = _get_app_icon()
     if not icon.isNull():
