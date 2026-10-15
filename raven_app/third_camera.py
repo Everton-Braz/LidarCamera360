@@ -781,6 +781,7 @@ _COLMAP_CAMERA_PARAM_COUNTS = {
     8: 4,   # SIMPLE_RADIAL_FISHEYE
     9: 5,   # RADIAL_FISHEYE
     10: 12, # THIN_PRISM_FISHEYE
+    17: 2,  # EQUIRECTANGULAR
 }
 _COLMAP_CAMERA_MODEL_NAMES = {
     0: "SIMPLE_PINHOLE",
@@ -794,6 +795,7 @@ _COLMAP_CAMERA_MODEL_NAMES = {
     8: "SIMPLE_RADIAL_FISHEYE",
     9: "RADIAL_FISHEYE",
     10: "THIN_PRISM_FISHEYE",
+    17: "EQUIRECTANGULAR",
 }
 
 
@@ -864,6 +866,8 @@ def _third_camera_intrinsics_from_colmap(
         fx, fy, cx, cy = p[:4]
         model = "THIN_PRISM_FISHEYE"
         common.update(zip(('k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'sx1', 'sy1'), p[4:]))
+    elif model_id == 17:  # EQUIRECTANGULAR
+        return "EQUIRECTANGULAR", {"width": width, "height": height, "fx": width / (2.0 * math.pi), "fy": height / math.pi, "cx": width / 2.0, "cy": height / 2.0}
     else:
         raise ValueError(
             f"COLMAP camera model {model_id} cannot be represented by the auxiliary camera schema"
