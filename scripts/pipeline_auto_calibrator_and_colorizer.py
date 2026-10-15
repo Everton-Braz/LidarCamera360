@@ -109,6 +109,8 @@ def load_pcd(path):
             raise ValueError('PCD payload size does not match its header')
         data = np.fromfile(f, dtype=dtype, count=n)
         xyz = np.column_stack([data[name] for name in ('x','y','z')]).astype(np.float64)
+        mask = np.isfinite(xyz).all(axis=1)
+        xyz = xyz[mask]
     print(f"    Loaded points: {len(xyz):,}")
     return xyz
 

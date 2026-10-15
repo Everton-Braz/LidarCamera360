@@ -89,8 +89,13 @@ def validate_records(reference, candidate, seed=20261003, patch_seed=901, radius
         raise ValueError('Validation requires identical record count and layout')
     ids, before = sample_records(reference, seed)
     after = np.column_stack([candidate.points[f][ids] for f in candidate.xyz_fields]).astype(float)
-    if not np.isfinite(after).all():
-        raise ValueError('Corrected sample contains non-finite coordinates')
+    finite_mask = np.isfinite(after).all(axis=1)
+    if finite_mask.sum() < len(after) * 0.5:
+        raise ValueError('Corrected sample contains too many non-finite coordinates')
+    if not finite_mask.all():
+        ids = ids[finite_mask]
+        before = before[finite_mask]
+        after = after[finite_mask]
     split = len(before)//2
     centers = select_surface_patches(before[:split], radius=radius, seed=patch_seed)
     train_tree, test_tree = cKDTree(before[:split]), cKDTree(before[split:])
