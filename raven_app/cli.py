@@ -212,6 +212,8 @@ def parse(argv=None):
     wf.add_argument('--no-recalibrate',action='store_false',dest='recalibrate')
     wf.add_argument('--revisit-refinement',action='store_true',default=False,help='Enable global pose graph SLAM / revisit optimization (MOLA / Loop Closure)')
     wf.add_argument('--no-revisit-refinement',action='store_false',dest='revisit_refinement')
+    wf.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from beginning of dataset')
+    wf.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end of dataset')
     wf.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for camera frame extraction')
     wf.add_argument('--run-spirula',action='store_true',default=False,help='Run Spirula SfM if not already built')
     wf.add_argument('--export-ply',action='store_true',default=False)
@@ -253,6 +255,26 @@ def parse(argv=None):
     feedback.add_argument('--contact', default='', help='Optional email/user handle')
     feedback.add_argument('--browser', action='store_true', help='Open pre-filled issue in default web browser')
     feedback.add_argument('--export-bundle', type=Path, default=None, help='Export diagnostic zip bundle to file')
+
+    # Dataset Trim (Temporal Cut)
+    trim = sub.add_parser('trim', help='Trim synchronized ROS bag and 360 video from start and end')
+    trim.add_argument('--bag', type=Path, required=True, help='Path to input ROS bag (.bag)')
+    trim.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to input 360 video (.insv / .mp4)')
+    trim.add_argument('--output', type=Path, required=True, help='Output directory for trimmed dataset')
+    trim.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from start (default: 0.0)')
+    trim.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end (default: 0.0)')
+    trim.add_argument('--dt', dest='dt_sync', type=float, default=None, help='Manual time sync offset (seconds; auto-computed if omitted)')
+
+    # Dataset Chunking (Overlapping Chunks)
+    chunk = sub.add_parser('chunk', help='Divide dataset into overlapping chunks with temporal interpolation')
+    chunk.add_argument('--bag', type=Path, required=True, help='Path to input ROS bag (.bag)')
+    chunk.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to input 360 video (.insv / .mp4)')
+    chunk.add_argument('--output', type=Path, required=True, help='Output directory for chunks')
+    chunk.add_argument('--chunk-duration', type=float, default=300.0, help='Duration of each chunk in seconds (default: 300.0)')
+    chunk.add_argument('--overlap', type=float, default=30.0, help='Overlap duration shared between consecutive chunks in seconds (default: 30.0)')
+    chunk.add_argument('--trim-start', type=float, default=0.0, help='Optional initial seconds to cut before chunking')
+    chunk.add_argument('--trim-end', type=float, default=0.0, help='Optional final seconds to cut before chunking')
+    chunk.add_argument('--dt', dest='dt_sync', type=float, default=None, help='Manual time sync offset (seconds; auto-computed if omitted)')
 
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
@@ -526,6 +548,8 @@ def run(a):
             if not lidar_t: lidar_t = detected['lidar_topic']
             if not imu_t: imu_t = detected['imu_topic']
 
+        calib_file = getattr(a, 'calib', None) or getattr(a, 'calib_json', None)
+        dt_val = getattr(a, 'dt', None)
         return execute_unified_workflow(
             a.bag, a.insv, a.output,
             lio=a.lio,
@@ -534,8 +558,10 @@ def run(a):
             imu_topic=imu_t,
             fps=a.fps,
             method=a.method,
-            calib_json=a.calib,
-            dt_override=a.dt,
+            calib_json=calib_file,
+            dt_override=dt_val,
+            trim_start=getattr(a, 'trim_start', 0.0),
+            trim_end=getattr(a, 'trim_end', 0.0),
             recalibrate=a.recalibrate,
             run_spirula=a.run_spirula,
             use_vulkan=not a.no_vulkan,
@@ -626,6 +652,41 @@ def run(a):
             bundle_path = export_feedback_bundle(report, a.export_bundle)
             res['bundle_path'] = str(bundle_path)
         print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    if a.command == 'trim':
+        from raven_app.dataset_trim import trim_dataset_synchronized
+        print(f"Trimming dataset: start={a.trim_start}s, end={a.trim_end}s")
+        res = trim_dataset_synchronized(
+            bag_path=a.bag,
+            video_path=a.insv,
+            output_dir=a.output,
+            trim_start_sec=a.trim_start,
+            trim_end_sec=a.trim_end,
+            dt_sync=a.dt_sync,
+            progress_callback=lambda stage, p: print(f"[{int(p*100):3d}%] {stage}"),
+        )
+        print(f"\nDataset trimmed successfully:")
+        print(f"  Bag:   {res['bag_path']} ({res['bag_duration']:.2f}s, {res['bag_messages']} msgs)")
+        print(f"  Video: {res['video_path']} ({res['video_duration']:.2f}s)")
+        print(f"  Sync:  dt_sync = {res['dt_sync']:.4f}s")
+        return 0
+    if a.command == 'chunk':
+        from raven_app.dataset_trim import split_dataset_into_chunks
+        print(f"Dividing dataset into chunks: duration={a.chunk_duration}s, overlap={a.overlap}s")
+        chunks = split_dataset_into_chunks(
+            bag_path=a.bag,
+            video_path=a.insv,
+            output_dir=a.output,
+            chunk_duration_sec=a.chunk_duration,
+            overlap_sec=a.overlap,
+            trim_start_sec=a.trim_start,
+            trim_end_sec=a.trim_end,
+            dt_sync=a.dt_sync,
+            progress_callback=lambda stage, p: print(f"[{int(p*100):3d}%] {stage}"),
+        )
+        print(f"\nDivided dataset into {len(chunks)} overlapping chunks in {a.output}:")
+        for c in chunks:
+            print(f"  [{c['name']}] Bag: {c['bag_duration']:.1f}s | Video: {c['video_duration']:.1f}s | Overlap: {c['overlap_sec']:.1f}s")
         return 0
     raise ValueError('Unknown command')
 

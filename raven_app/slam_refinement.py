@@ -71,7 +71,16 @@ def graph_jacobian(parameters, nodes, edges):
     return coo_matrix((values, (rows, cols)), shape=(len(base), len(parameters))).tocsr()
 
 
-def solve(nodes, loops, point_jac, point_errors):
+def solve(nodes, loops, point_jac, point_errors, method='rootslam', config=None):
+    if method == 'rootslam':
+        try:
+            from .rootslam import rootslam_solve, RootSLAMConfig
+            cfg = config or RootSLAMConfig(precision='float32')
+            return rootslam_solve(nodes, loops, point_jac, point_errors, config=cfg)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(f"RootSLAM solver fallback to LSMR: {exc}")
+
     edges = [(i, i+1, *geo.relative_pose(nodes[i], nodes[i+1]), 'odometry')
              for i in range(len(nodes)-1)] + loops
     anchors = []
@@ -153,6 +162,16 @@ def refine(slam_dir: Path, output: Path, log=print):
     scans = geo.read_scan_ranges(paths['scan_ranges'], pcd.count)
     if scans[0].timestamp < trajectory.times[0] or scans[-1].timestamp > trajectory.times[-1]:
         raise ValueError('Scan provenance timestamps extend outside the SLAM trajectory domain')
+
+    all_scans = scans
+    # Detect stationary initialization and exclude stationary warm-up scans universally
+    onset_time = geo.detect_motion_onset(trajectory)
+    if onset_time > scans[0].timestamp:
+        valid_scans = [s for s in scans if s.timestamp >= onset_time]
+        if valid_scans and len(valid_scans) < len(scans):
+            log(f'Stationary warm-up detected ({onset_time - scans[0].timestamp:.2f}s). Filtering pre-mission scans.')
+            scans = valid_scans
+
     nodes = geo.build_nodes(pcd, scans, trajectory, window_seconds=10., voxel_m=.08, maximum=40000)
     max_loops = int(PARAMETERS.get('max_loops_per_node', 8))
     selected, skipped, selection = geo.select_loop_pairs(nodes, max_neighbors=max_loops)
@@ -187,7 +206,7 @@ def refine(slam_dir: Path, output: Path, log=print):
         after_loop = geo.graph_residual(parameters, nodes, loops)
         closure_improved = np.linalg.norm(after_loop) < .98*np.linalg.norm(before_loop)
         try:
-            geo.write_candidate(output, pcd, scans, trajectory, nodes, parameters, paths['scan_ranges'],
+            geo.write_candidate(output, pcd, all_scans, trajectory, nodes, parameters, paths['scan_ranges'],
                                 graph, edges, evidence, selection, PARAMETERS)
             log('Validating corrected geometry on independent reference records.')
             quality = validate_records(pcd, geo.read_pcd(output/'pcd'/pcd.path.name))
