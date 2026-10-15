@@ -84,15 +84,34 @@ def _open_decoder(path, track, backend, threads):
         kwargs['hwaccel'] = HWAccel(backend, allow_software_fallback=False)
     container = av.open(str(path), **kwargs)
     try:
-        if len(container.streams.video) != 2:
-            raise ValueError('Input must contain exactly two video tracks')
+        num_streams = len(container.streams.video)
+        if num_streams < 1:
+            raise ValueError('Input video has no video tracks')
+        if track >= num_streams:
+            raise ValueError(f'Requested track {track} but container only has {num_streams} tracks')
         stream = container.streams.video[track]
         stream.codec_context.thread_count = threads
         stream.thread_type = 'AUTO'
         return container, stream
-    except BaseException:
+    except Exception:
         container.close()
         raise
+
+
+def is_equirectangular_video(path):
+    """Check if video has 1 video stream with 2:1 aspect ratio (or equirectangular projection)."""
+    import av
+    try:
+        with av.open(str(path)) as probe:
+            if len(probe.streams.video) == 1:
+                s = probe.streams.video[0]
+                w = getattr(s, 'width', 0) or 0
+                h = getattr(s, 'height', 0) or 0
+                if w > 0 and h > 0 and abs(float(w) / float(h) - 2.0) < 0.05:
+                    return True
+        return False
+    except Exception:
+        return False
 
 
 def _select_decoder(path, requested, threads):
@@ -171,8 +190,11 @@ def video_preview_timeline(insv_path, fps=2.0):
     path = Path(insv_path)
     capture_times = _timelapse_times(path) if path.suffix.lower() == '.insv' else None
     with av.open(str(path)) as container:
-        if len(container.streams.video) != 2:
+        is_equirect = is_equirectangular_video(path)
+        if not is_equirect and len(container.streams.video) != 2:
             raise ValueError('Input must contain exactly two video tracks')
+        elif is_equirect and len(container.streams.video) < 1:
+            raise ValueError('Input video has no video tracks')
         if capture_times is not None:
             stream = container.streams.video[0]
             frame_count = stream.frames
@@ -224,11 +246,14 @@ def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
     capture_times = _timelapse_times(insv_path) if insv_path.suffix.lower() == '.insv' else None
     backend = _select_decoder(insv_path, decoder, threads)
     attempts = [backend] + (['cpu'] if decoder == 'auto' and backend != 'cpu' else [])
+    is_equirect = is_equirectangular_video(insv_path)
+    lenses = 1 if is_equirect else 2
+    cam_names = ('cam0',) if is_equirect else ('cam0', 'cam1')
     for backend in attempts:
         try:
             with ExitStack() as stack:
                 sources = []
-                for lens in range(2):
+                for lens in range(lenses):
                     container, stream = _open_decoder(insv_path, lens, backend, threads)
                     stack.enter_context(container)
                     sources.append((container, stream))
@@ -252,12 +277,12 @@ def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
                         raise ValueError('Video tracks have different frame counts')
                     times = [float(frame.time) - origin if frame.time is not None else source_index / rate
                              for frame in pair]
-                    if abs(times[0] - times[1]) > 0.5 / rate:
+                    if not is_equirect and abs(times[0] - times[1]) > 0.5 / rate:
                         raise ValueError('Video tracks have mismatched presentation timestamps')
                     if capture_times is not None:
                         if source_index >= len(capture_times):
                             raise ValueError('More video frames than timelapse timestamps')
-                        times = [float(capture_times[source_index])] * 2
+                        times = [float(capture_times[source_index])] * lenses
                     source_index += 1
                     bucket = int(math.floor(max(0.0, times[0]) * fps + 1e-7))
                     if bucket < target_bucket:
@@ -278,17 +303,16 @@ def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
                 output_dir.mkdir(parents=True, exist_ok=True)
                 with tempfile.TemporaryDirectory(prefix='preview-', dir=output_dir) as tmp:
                     stage = Path(tmp)
-                    for lens in range(2):
-                        (stage / f'cam{lens}').mkdir()
+                    for cam in cam_names:
+                        (stage / cam).mkdir()
                     _write_pair(stage, number, pair, jpeg_quality)
                     images = output_dir / 'images'
-                    for lens in range(2):
-                        camera = f'cam{lens}'
-                        target = images / camera
+                    for cam in cam_names:
+                        target = images / cam
                         target.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(stage / camera / f'frame_{number:06d}.jpg'),
+                        shutil.move(str(stage / cam / f'frame_{number:06d}.jpg'),
                                     target / f'frame_{number:06d}.jpg')
-                print(f'[+] Extracted preview pair {number}/{len(buckets)}.')
+                print(f'[+] Extracted preview {cam_names} {number}/{len(buckets)}.')
                 return True
         except Exception as exc:
             print(f'[!] {backend} preview extraction failed: {exc}', flush=True)
@@ -322,19 +346,22 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
     capture_times = _timelapse_times(insv_path) if insv_path.suffix.lower() == '.insv' else None
     backend = _select_decoder(insv_path, decoder, threads)
     attempts = [backend] + (['cpu'] if decoder == 'auto' and backend != 'cpu' else [])
+    is_equirect = is_equirectangular_video(insv_path)
+    lenses = 1 if is_equirect else 2
     for backend in attempts:
-        print(f'[*] Video decoder: {backend}; threads per lens: {threads}', flush=True)
+        print(f'[*] Video decoder: {backend}; lenses: {lenses}; threads per lens: {threads}', flush=True)
         try:
             with tempfile.TemporaryDirectory(prefix='frames-', dir=output_dir) as tmp, ExitStack() as stack:
                 stage = Path(tmp)
-                for cam in ('cam0', 'cam1'):
+                cam_names = ('cam0',) if is_equirect else ('cam0', 'cam1')
+                for cam in cam_names:
                     (stage / cam).mkdir()
                 sources = []
-                for lens in range(2):
+                for lens in range(lenses):
                     container, stream = _open_decoder(insv_path, lens, backend, threads)
                     stack.enter_context(container)
                     sources.append((container, stream))
-                decode_pool = stack.enter_context(ThreadPoolExecutor(max_workers=2, thread_name_prefix='video'))
+                decode_pool = stack.enter_context(ThreadPoolExecutor(max_workers=lenses, thread_name_prefix='video'))
                 encode_workers = max(2, min(os.cpu_count() or 4, 4))
                 encode_pool = stack.enter_context(ThreadPoolExecutor(max_workers=encode_workers, thread_name_prefix='jpeg'))
                 iterators = [container.decode(stream) for container, stream in sources]
@@ -348,7 +375,7 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     future, number = pending.popleft()
                     future.result()
                     if progress_cb:
-                        for lens in range(2):
+                        for lens in range(lenses):
                             progress_cb(lens, number)
 
                 def save(candidate):
@@ -360,7 +387,7 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     count += 1
                     _, pair, times = candidate
                     pending.append((encode_pool.submit(_write_pair, stage, count, pair, jpeg_quality), count))
-                    for lens in range(2):
+                    for lens in range(lenses):
                         timestamps[f'cam{lens}/frame_{count:06d}.jpg'] = times[lens]
 
                 while True:
@@ -374,10 +401,10 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     if capture_times is not None and index >= len(capture_times):
                         raise ValueError('More video frames than timelapse timestamps')
                     index += 1
-                    if abs(times[0] - times[1]) > 0.5 / rate:
+                    if not is_equirect and abs(times[0] - times[1]) > 0.5 / rate:
                         raise ValueError('Video tracks have mismatched presentation timestamps')
                     if capture_times is not None:
-                        times = [float(capture_times[index - 1])] * 2
+                        times = [float(capture_times[index - 1])] * lenses
                     bucket = int(math.floor(max(0.0, times[0]) * fps + 1e-7))
                     if bucket != interval:
                         save(best)
@@ -402,16 +429,20 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     raise ValueError('Timelapse timestamps do not match video frame count')
                 images.mkdir(exist_ok=True)
                 manifest.unlink(missing_ok=True)
-                for cam in ('cam0', 'cam1'):
+                for cam in cam_names:
                     target = images / cam
                     target.mkdir(exist_ok=True)
                     for old in target.glob('frame_*.jpg'):
                         old.unlink()
                     for file in (stage / cam).iterdir():
                         shutil.move(str(file), target / file.name)
-                manifest.write_text(json.dumps(dict(signature=signature, timestamps=timestamps,
-                                                    time_source='insv_timelapse' if capture_times is not None else 'video_pts',
-                                                    decoder=backend), indent=2), encoding='utf-8')
+                manifest_dict = dict(signature=signature, timestamps=timestamps,
+                                     time_source='insv_timelapse' if capture_times is not None else 'video_pts',
+                                     decoder=backend)
+                if is_equirect:
+                    manifest_dict['video_mode'] = 'equirectangular'
+                    manifest_dict['camera_names'] = ['cam0']
+                manifest.write_text(json.dumps(manifest_dict, indent=2), encoding='utf-8')
                 elapsed = max(time.perf_counter() - started, 1e-9)
                 print(f'[+] Extracted {count} synchronized sharp frame pairs in '
                       f'{elapsed:.1f}s ({count / elapsed:.1f} pairs/s).')
@@ -421,5 +452,6 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
     return False
 
 
-# Compatibility alias for existing integrations.
+# Compatibility aliases for existing integrations.
+extract_insv_frames = extract_video_frames
 extract_insv_frames_pyav = extract_video_frames

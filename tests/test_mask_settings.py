@@ -6,6 +6,7 @@ from raven_app.person_masks import (
     apply_mask_exclusions,
     fixed_keep_samples,
     normalize_mask_config,
+    static_keep_mask,
 )
 
 
@@ -113,6 +114,20 @@ class MaskSettingsTests(unittest.TestCase):
         samples = fixed_keep_samples((100, 100), np.array([50., 20.]),
                                      np.array([50., 40.]), 'cam0', config)
         np.testing.assert_array_equal(samples, [False, True])
+
+    def test_equirectangular_frame_ignores_fisheye_border_cutoff(self):
+        config = normalize_mask_config({
+            'fisheye_border_percent': 20,
+            'rectangles': {'cam0': [[0.4, 0.4, 0.6, 0.6]]},
+        })
+        equirect_shape = (1000, 2000)
+        mask = static_keep_mask(equirect_shape, 'cam0', config)
+        # Equirectangular frames (width > 1.8 * height) must not cut corners/borders with fisheye ellipse
+        self.assertEqual(int(mask[0, 0]), 255)
+        self.assertEqual(int(mask[999, 1999]), 255)
+        self.assertEqual(int(mask[0, 1000]), 255)
+        # Fixed shapes (rectangle) still apply properly
+        self.assertEqual(int(mask[500, 1000]), 0)
 
 if __name__ == '__main__':
     unittest.main()

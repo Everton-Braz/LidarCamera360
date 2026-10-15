@@ -1,4 +1,5 @@
 """Visual editor for per-camera fixed-area and fisheye mask settings."""
+import json
 import os
 from pathlib import Path
 import re
@@ -232,12 +233,13 @@ class MaskCanvas(QWidget):
         painter.drawImage(rect, self.mask_image if self.show_mask and not self.mask_image.isNull() else self.image)
         if self.show_mask:
             return
-        if self.border_percent:
+        if self.border_percent and (self.image.height() > 0 and self.image.width() <= 1.8 * self.image.height()):
             radius = (fisheye_cutoff_radius((self.image.height(), self.image.width()), self.border_percent)
                       * rect.width() / self.image.width())
-            center = rect.center()
-            painter.setPen(QPen(QColor(255, 190, 50), 3))
-            painter.drawEllipse(center, radius, radius)
+            if radius is not None:
+                center = rect.center()
+                painter.setPen(QPen(QColor(255, 190, 50), 3))
+                painter.drawEllipse(center, radius, radius)
         preview = None
         if self.drag_start is not None and self.drag_end is not None:
             preview = [min(self.drag_start.x(), self.drag_end.x()),
@@ -412,7 +414,20 @@ class MaskSettingsDialog(QDialog):
             self.dataset_dir = Path(self._frames_temp.name)
         else:
             self.dataset_dir = None
-        from raven_app.video import has_cached_frame_extraction
+        from raven_app.video import has_cached_frame_extraction, is_equirectangular_video
+        self._is_equirectangular = False
+        if self.insv_path is not None:
+            self._is_equirectangular = is_equirectangular_video(self.insv_path)
+        if not self._is_equirectangular and self.dataset_dir:
+            manifest_file = self.dataset_dir / 'images' / 'frames.json'
+            if manifest_file.is_file():
+                try:
+                    meta = json.loads(manifest_file.read_text(encoding='utf-8'))
+                    self._is_equirectangular = (meta.get('video_mode') == 'equirectangular')
+                except Exception:
+                    pass
+            if not self._is_equirectangular and (self.dataset_dir / 'images' / 'cam0').is_dir() and not (self.dataset_dir / 'images' / 'cam1').is_dir():
+                self._is_equirectangular = True
         self._lazy_video_preview = bool(
             self.insv_path is not None
             and not has_cached_frame_extraction(self.insv_path, self.dataset_dir, self.fps)
@@ -437,7 +452,7 @@ class MaskSettingsDialog(QDialog):
         self._frame_extraction_index = None
         self._pending_frame_extraction_index = None
         self._video_preview_timeline = ()
-        self._video_preview_paths = {'cam0': {}, 'cam1': {}}
+        self._video_preview_paths = {'cam0': {}} if self._is_equirectangular else {'cam0': {}, 'cam1': {}}
         self._aux_video_preview_paths = {}
         self._aux_video_preview_info = {}
         self._aux_video_preview_temp = None
@@ -464,7 +479,7 @@ class MaskSettingsDialog(QDialog):
         controls = QHBoxLayout()
         controls.addWidget(BodyLabel(tr('Camera:')))
         self.camera_combo = ComboBox()
-        cameras = ['cam0', 'cam1']
+        cameras = ['cam0'] if self._is_equirectangular else ['cam0', 'cam1']
         discovered_cameras = set()
         if self.dataset_dir and (self.dataset_dir / 'images').is_dir():
             discovered_cameras = {
@@ -591,6 +606,27 @@ class MaskSettingsDialog(QDialog):
         self._camera_changed(self.camera_combo.currentText())
         self._start_frame_extraction_if_needed()
 
+    def _sync_border_spin_state(self):
+        camera = self.camera_combo.currentText()
+        is_equirect = getattr(self, '_is_equirectangular', False)
+        if not is_equirect and not self.canvas.image.isNull():
+            w, h = self.canvas.image.width(), self.canvas.image.height()
+            if h > 0 and w > 1.8 * h:
+                is_equirect = True
+        if is_equirect:
+            self.border_spin.setEnabled(False)
+            self.border_spin.setToolTip(tr('Fisheye border cutoff does not apply to equirectangular frames.'))
+            self.canvas.border_percent = 0.0
+        else:
+            self.border_spin.setEnabled(True)
+            self.border_spin.setToolTip('')
+            border = self.config['fisheye_border_percent_by_camera'].get(
+                camera, self.config['fisheye_border_percent'])
+            self.border_spin.blockSignals(True)
+            self.border_spin.setValue(border)
+            self.border_spin.blockSignals(False)
+            self.canvas.border_percent = border
+
     def _camera_changed(self, camera):
         self._stop_detection()
         self._person_masks.clear()
@@ -598,12 +634,7 @@ class MaskSettingsDialog(QDialog):
         ellipses = self.config['ellipses'].setdefault(camera, [])
         polygons = self.config['polygons'].setdefault(camera, [])
         self.canvas.set_shapes(boxes, ellipses, polygons)
-        border = self.config['fisheye_border_percent_by_camera'].get(
-            camera, self.config['fisheye_border_percent'])
-        self.border_spin.blockSignals(True)
-        self.border_spin.setValue(border)
-        self.border_spin.blockSignals(False)
-        self.canvas.border_percent = border
+        self._sync_border_spin_state()
         if self._lazy_video_preview and camera in ('cam0', 'cam1'):
             index = self.frame_slider.value()
             count = len(self._video_preview_timeline)
@@ -750,11 +781,13 @@ class MaskSettingsDialog(QDialog):
         if path is not None and path.is_file():
             self._current_source = path
             self.canvas.set_image(path)
+            self._sync_border_spin_state()
             self.frame_label.setText(f'{index + 1}/{len(self._video_preview_timeline)}  {path.name}')
             self.preview_status.setText('')
             return
         self._current_source = None
         self.canvas.set_image(None)
+        self._sync_border_spin_state()
         self.frame_label.setText(
             tr('Loading frame {current}/{total}...').format(
                 current=index + 1, total=len(self._video_preview_timeline)))
@@ -841,14 +874,15 @@ class MaskSettingsDialog(QDialog):
         process.deleteLater()
         self.save_button.setEnabled(True)
         paths = {}
+        expected_cameras = ('cam0',) if getattr(self, '_is_equirectangular', False) else ('cam0', 'cam1')
         if index is not None and self._video_preview_root is not None:
-            for camera in ('cam0', 'cam1'):
+            for camera in expected_cameras:
                 path = self._video_preview_root / 'images' / camera / f'frame_{index + 1:06d}.jpg'
                 if path.is_file():
                     paths[camera] = path
-        if code == 0 and len(paths) == 2:
+        if code == 0 and len(paths) == len(expected_cameras):
             for camera, path in paths.items():
-                self._video_preview_paths[camera][index] = path
+                self._video_preview_paths.setdefault(camera, {})[index] = path
             if index == getattr(self, '_video_selected_index', 0):
                 self._load_video_preview_frame(index)
                 self.preview_status.setText(tr('Frame ready. Select Preview mask to inspect the RF-DETR mask.'))
@@ -885,11 +919,13 @@ class MaskSettingsDialog(QDialog):
         if not frames:
             self._current_source = None
             self.canvas.set_image(None)
+            self._sync_border_spin_state()
             self.frame_label.setText(tr('No frames'))
             return
         index = max(0, min(index, len(frames) - 1))
         self._current_source = frames[index]
         self.canvas.set_image(self._current_source)
+        self._sync_border_spin_state()
         self.frame_label.setText(f'{index + 1}/{len(frames)}  {self._current_source.name}')
 
     def _frame_changed(self, index):
@@ -1027,7 +1063,11 @@ class MaskSettingsDialog(QDialog):
             mask = static_keep_mask(shape, camera, self.settings())
         else:
             mask = apply_mask_exclusions(base, camera, self.settings())
-            self.preview_status.setText(tr('Combined preview: RF-DETR people, fixed shapes, and fisheye cutoff. White keeps pixels; black excludes them.'))
+            is_equirect = getattr(self, '_is_equirectangular', False) or (shape[0] > 0 and shape[1] > 1.8 * shape[0])
+            if is_equirect:
+                self.preview_status.setText(tr('Combined preview: RF-DETR people and fixed shapes. White keeps pixels; black excludes them.'))
+            else:
+                self.preview_status.setText(tr('Combined preview: RF-DETR people, fixed shapes, and fisheye cutoff. White keeps pixels; black excludes them.'))
         self.canvas.set_mask(mask)
 
     def _start_detection(self):

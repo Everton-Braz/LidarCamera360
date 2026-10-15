@@ -120,12 +120,12 @@ def parse(argv=None):
                    help='Download and prepare resources for the selected RF-DETR mask backend')
     download_masks.add_argument('--backend', choices=('vulkan', 'tensorrt'), default='vulkan')
     video=sub.add_parser('extract-insv', help='Extract synchronized sharp lens frames using bundled PyAV')
-    video.add_argument('--insv', type=Path, required=True)
+    video.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to .insv or .mp4 360 video')
     video.add_argument('--output', type=Path, required=True)
     video.add_argument('--fps', type=positive, default=2.)
     video_preview = sub.add_parser('extract-insv-frame',
                    help='Extract one synchronized sharp lens pair for a mask preview')
-    video_preview.add_argument('--insv', type=Path, required=True)
+    video_preview.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to .insv or .mp4 360 video')
     video_preview.add_argument('--output', type=Path, required=True)
     video_preview.add_argument('--fps', type=positive, default=2.)
     video_preview.add_argument('--index', type=int, required=True,
@@ -155,7 +155,7 @@ def parse(argv=None):
     photometric_fit.add_argument('--mode', choices=('loglinear', 'ppisp-bilateral'), default='loglinear',
                    help='Photometric model to fit (default: loglinear)')
     geo=sub.add_parser('georeference', help='Calculate INSV GPS, georeference point clouds and COLMAP datasets, and export GeoJSON')
-    geo.add_argument('--insv', type=Path, required=True, help='Path to Insta360 .INSV video')
+    geo.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to Insta360 .INSV or .MP4 video')
     geo.add_argument('--output', type=Path, required=True, help='Output directory for georeferenced deliverables and GeoJSON')
     geo.add_argument('--cloud', type=Path, help='Optional point cloud (PCD/PLY/LAZ/LAS) to georeference')
     geo.add_argument('--colmap-dir', type=Path, help='Optional COLMAP dataset directory containing sparse/ and images/')
@@ -196,7 +196,7 @@ def parse(argv=None):
                        help='Optional path to third camera JSON configuration, video file, or image folder')
     wf=sub.add_parser('workflow',help='Run end-to-end processing: Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables')
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
-    wf.add_argument('--insv',type=Path,required=True,help='Insta360 video file')
+    wf.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Insta360 video file (.insv) or 360 equirectangular video (.mp4)')
     wf.add_argument('--output',type=Path,required=True,help='Output directory for deliverables')
     wf.add_argument('--scanner', '--preset', choices=['auto', 'raven', 'eagle'], default='auto', help='Scanner preset (auto, raven, eagle)')
     wf.add_argument('--lidar-topic', default=None, help='LiDAR topic (default: auto-detected)')

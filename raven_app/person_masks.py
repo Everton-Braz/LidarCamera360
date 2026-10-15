@@ -149,6 +149,8 @@ def fisheye_cutoff_radius(shape, percent):
     if percent <= 0:
         return None
     height, width = shape[:2]
+    if height > 0 and width > 1.8 * height:
+        return None
     half_w, half_h = width * .5, height * .5
 
     def kept_area(radius):
