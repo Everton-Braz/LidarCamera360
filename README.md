@@ -283,6 +283,45 @@ LidarCamera360 embraces an open, transparent licensing architecture:
 
 ---
 
+## 📚 Academic Citations & Acknowledgments
+
+This project builds upon state-of-the-art research in Simultaneous Localization and Mapping (SLAM), Lie-group trajectory optimization, and modular point-cloud processing. We gratefully acknowledge the authors and maintainers of the following foundational works and open-source ecosystems:
+
+### 1. RootSLAM (Square-Root Bundle Adjustment & Pose-Graph Solver)
+Our default trajectory refinement and loop-closure optimization engine (`raven_app/rootslam.py` & `raven_app/slam_refinement.py`) implements the mathematical formulation introduced in **RootSLAM**. By leveraging QR-based nullspace marginalization ($Q_2^\top$ projection), $\text{SE}(3)/\text{SO}(3)$ manifold retractions with right-Jacobian inverses, and square-root conditioning, our pipeline performs joint landmark-and-pose-graph optimization stably in single-precision (`float32`) arithmetic without squaring the condition number of the system.
+
+* **Paper:** *RootSLAM: Square Root Bundle Adjustment for Visual-Inertial SLAM*
+* **Authors:** Tomás Santucci, Mateo de Mayo, Daniel Cremers, and Taihú Pire
+* **Preprint:** [arXiv:2610.15157v1](https://arxiv.org/abs/2610.15157v1)
+
+```bibtex
+@article{santucci2026rootslam,
+  title   = {RootSLAM: Square Root Bundle Adjustment for Visual-Inertial SLAM},
+  author  = {Santucci, Tom{\'a}s and de Mayo, Mateo and Cremers, Daniel and Pire, Taih{\'u}},
+  journal = {arXiv preprint arXiv:2610.15157},
+  year    = {2026}
+}
+```
+
+### 2. MOLA (Modular Optimization Framework for Localization and Mapping)
+Our native C++ optimization tools (`native/mola_tools/`), modular back-end architecture design (`docs/mola_integration_plan.md`), and ICP/factor-graph interoperability patterns are inspired by and integrate concepts from the **MOLA** ecosystem and the Mobile Robot Programming Toolkit (**MRPT**).
+
+* **Project Organization:** [https://github.com/MOLAorg](https://github.com/MOLAorg)
+* **Main Repository:** [https://github.com/MOLAorg/mola](https://github.com/MOLAorg/mola)
+* **Author:** José-Luis Blanco-Claraco et al.
+
+```bibtex
+@inproceedings{blanco2019mola,
+  title     = {A Modular Optimization Framework for Localization and Mapping ({MOLA})},
+  author    = {Blanco-Claraco, Jos{\'e}-Luis},
+  booktitle = {Robotics: Science and Systems (RSS)},
+  year      = {2019},
+  url       = {https://github.com/MOLAorg/mola}
+}
+```
+
+---
+
 ## 🤝 Contributing
 
 Contributions, bug reports, and hardware profile additions are welcome! Please open an issue or submit a pull request on GitHub.

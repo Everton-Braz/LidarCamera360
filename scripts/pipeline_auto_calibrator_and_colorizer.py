@@ -109,6 +109,8 @@ def load_pcd(path):
             raise ValueError('PCD payload size does not match its header')
         data = np.fromfile(f, dtype=dtype, count=n)
         xyz = np.column_stack([data[name] for name in ('x','y','z')]).astype(np.float64)
+        mask = np.isfinite(xyz).all(axis=1)
+        xyz = xyz[mask]
     print(f"    Loaded points: {len(xyz):,}")
     return xyz
 
@@ -287,6 +289,19 @@ def project_thin_prism(P_v, params):
         du = 2*p1*xd*yd + p2*(rd2 + 2*xd**2) + sx1*rd2
         dv = p1*(rd2 + 2*yd**2) + 2*p2*xd*yd + sy1*rd2
         u, v = fx*(xd*radial + du) + cx, fy*(yd*radial + dv) + cy
+    return u, v, r
+
+
+def project_equirectangular(P_v, width, height):
+    """Projeção de pontos 3D da câmera em formato equirretangular (lon/lat 360x180)."""
+    x, y, z = P_v[:, 0], P_v[:, 1], P_v[:, 2]
+    r = np.sqrt(x**2 + y**2 + z**2)
+    r_safe = np.maximum(r, 1e-12)
+    lon = np.arctan2(x, z)
+    sin_lat = np.clip(y / r_safe, -1.0, 1.0)
+    lat = np.arcsin(sin_lat)
+    u = (lon / (2.0 * np.pi) + 0.5) * width
+    v = (lat / np.pi + 0.5) * height
     return u, v, r
 
 
@@ -559,16 +574,42 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None,
     print(f" Quality:    {quality}")
     print("=" * 80)
 
-    cmd = [
-        str(spirula_bin), "sfm", "auto",
-        str(img_dir),
-        "-o", str(dataset_dir),
-        "--data-type", "video",
-        "--quality", quality,
-        "--camera-mode", "folder",
-        "--focal", "1080.19",
-        "--camera-model", "thin-prism-fisheye"
-    ]
+    manifest_file = dataset_dir / "images" / "frames.json"
+    is_equirect = False
+    if manifest_file.is_file():
+        try:
+            is_equirect = json.loads(manifest_file.read_text(encoding='utf-8')).get('video_mode') == 'equirectangular'
+        except Exception:
+            pass
+    if not is_equirect and not (dataset_dir / "images" / "cam1").is_dir() and (dataset_dir / "images" / "cam0").is_dir():
+        first_img = next((dataset_dir / "images" / "cam0").glob("*.jpg"), None)
+        if first_img:
+            from PIL import Image
+            with Image.open(first_img) as im_probe:
+                if im_probe.width == 2 * im_probe.height:
+                    is_equirect = True
+
+    if is_equirect:
+        cmd = [
+            str(spirula_bin), "sfm", "auto",
+            str(img_dir),
+            "-o", str(dataset_dir),
+            "--data-type", "video",
+            "--quality", quality,
+            "--camera-mode", "folder",
+            "--camera-model", "equirectangular"
+        ]
+    else:
+        cmd = [
+            str(spirula_bin), "sfm", "auto",
+            str(img_dir),
+            "-o", str(dataset_dir),
+            "--data-type", "video",
+            "--quality", quality,
+            "--camera-mode", "folder",
+            "--focal", "1080.19",
+            "--camera-model", "thin-prism-fisheye"
+        ]
     cmd.extend(auxiliary_flags)
     if force_rebuild:
         cmd.append('--no-resume')
@@ -606,13 +647,22 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None,
 
 
 def _validate_sfm_camera_models(sparse_dir, auxiliary_flags):
+    dataset_dir = sparse_dir.parents[1]
+    manifest = dataset_dir / 'images' / 'frames.json'
+    is_equirect = False
+    if manifest.is_file():
+        try:
+            is_equirect = json.loads(manifest.read_text(encoding='utf-8')).get('video_mode') == 'equirectangular'
+        except Exception:
+            pass
     cameras = load_colmap_cameras(sparse_dir / 'cameras.bin')
-    expected = {'cam0': 10, 'cam1': 10}
+    expected = {'cam0': 17} if is_equirect else {'cam0': 10, 'cam1': 10}
     model_ids = {
         'pinhole': 1,
         'opencv': 4,
         'opencv-fisheye': 5,
         'thin-prism-fisheye': 10,
+        'equirectangular': 17,
     }
     for index, flag in enumerate(auxiliary_flags):
         if flag == '--camera-model':
@@ -1227,7 +1277,65 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
         median_t = np.median(t_list, axis=0)
         return mean_rot, median_t
 
+    manifest = dataset_dir / 'images' / 'frames.json'
+    is_equirect = False
+    if manifest.is_file():
+        try:
+            is_equirect = json.loads(manifest.read_text(encoding='utf-8')).get('video_mode') == 'equirectangular'
+        except Exception:
+            pass
+
     R0, t0 = solve_lens("cam0/")
+    has_cam1_images = any(im['name'].startswith('cam1/') for im in images)
+    if is_equirect and not has_cam1_images:
+        T_LC0 = np.eye(4)
+        T_LC0[:3, :3] = R0.as_matrix()
+        T_LC0[:3, 3] = t0
+        e0 = R0.as_euler("xyz", degrees=True)
+        print("\n" + "=" * 80)
+        print(" PHYSICAL RIG RE-CALIBRATION FROM SFM/SPIRULA COMPLETE (EQUIRECTANGULAR):")
+        print(f" Cam0: Euler XYZ={e0} | Lever arm={t0*100} cm (norm {np.linalg.norm(t0)*100:.2f} cm)")
+        print("=" * 80)
+        calib_dict = {
+            "calibration_version": CALIBRATION_VERSION,
+            "timelapse_calibration_version": al.get('timelapse_calibration_version'),
+            "scanner": "3DMakerPro_Raven_LiDAR",
+            "camera": "Equirectangular_360",
+            "lens_model": "EQUIRECTANGULAR",
+            "T_lidar_to_cam0_rigid_4x4": T_LC0.tolist(),
+            "lever_arm_cam0_meters": {
+                "dx": float(t0[0]), "dy": float(t0[1]), "dz": float(t0[2]), "norm_distance_cm": float(np.linalg.norm(t0) * 100)
+            },
+            "rotation_euler_xyz_deg_cam0": {
+                "roll": float(e0[0]), "pitch": float(e0[1]), "yaw": float(e0[2])
+            },
+            "dt_sync_seconds": float(dt_sync)
+        }
+        cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
+        ids = {im['cam_id'] for im in images if im['name'].startswith('cam0/')}
+        if len(ids) != 1:
+            raise ValueError(f"Expected one calibrated camera for cam0/, got {ids}")
+        camera = cameras[ids.pop()]
+        calib_dict["cam0_front_intrinsics"] = {
+            "camera_model": "EQUIRECTANGULAR",
+            "width": camera['width'],
+            "height": camera['height'],
+            "params": list(camera['params']),
+        }
+        calib_dict['transform_convention'] = 'camera_to_trajectory_body'
+        if write_outputs:
+            deliv_dir = dataset_dir / "deliverables"
+            deliv_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            with open(dataset_dir / "rig_calibration.json", "w", encoding="utf-8") as f:
+                json.dump(calib_dict, f, indent=2)
+            with open(dataset_dir / "calibracao_rigida_auto.json", "w", encoding="utf-8") as f:
+                json.dump(calib_dict, f, indent=2)
+            with open(deliv_dir / f"rig_calibration_{ts}.json", "w", encoding="utf-8") as f:
+                json.dump(calib_dict, f, indent=2)
+            print(f"  [+] Dynamic calibration saved to: {dataset_dir / 'rig_calibration.json'}")
+        return calib_dict
+
     R1, t1 = solve_lens("cam1/")
     if al.get('frame_time_source') == 'insv_timelapse':
         if any(not .08 <= np.linalg.norm(t) <= .30 for t in (t0, t1)) or np.linalg.norm(t0-t1) > .12:
@@ -1325,6 +1433,13 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
 
     cameras = load_colmap_cameras(sparse_dir / "cameras.bin")
     images = load_colmap_images(sparse_dir / "images.bin")
+    cam0 = cameras.get(1)
+    if isinstance(cam0, dict):
+        is_equirect_cam = (cam0.get('model_id') == 17 or cam0.get('model_name') == 'EQUIRECTANGULAR')
+    elif cam0:
+        is_equirect_cam = (getattr(cam0, 'model_id', None) == 17 or getattr(cam0, 'model_name', None) == 'EQUIRECTANGULAR')
+    else:
+        is_equirect_cam = False
     pose_overrides = {}
     if al.get('frame_time_source') == 'insv_timelapse':
         from raven_app.timelapse_calibration import rejected_pose_overrides
@@ -1333,7 +1448,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
     n_pts = len(pts_lidar)
 
     operator_views = []
-    gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() else None
+    gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() and not is_equirect_cam else None
     K_VIEWS = 3
     top_scores = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS), dtype=np.float32)
     top_colors = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS, 3), dtype=np.uint8)
@@ -1354,7 +1469,8 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
             continue
 
         camera = cameras[im["cam_id"]]
-        params = _colorization_camera_params(camera)
+        is_equirect_cam = (camera['model_id'] == 17)
+        view_params = (float(camera['width']), float(camera['height'])) if is_equirect_cam else _colorization_camera_params(camera)
 
         # Posição e orientação da câmera no referencial LiDAR
         C_lidar = s_sim * (R_sim @ im["C"]) + t_sim
@@ -1365,29 +1481,42 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
             R_cw_lidar, C_lidar = pose_overrides[im['name']]
 
         if operator_radius and masks_dir is not None:
-            operator_views.append((img_path, R_cw_lidar, C_lidar, params))
-        if gpu_views is not None:
-            gpu_views.append((img_path, R_cw_lidar, C_lidar, params))
+            operator_views.append((img_path, R_cw_lidar, C_lidar, view_params))
+        if gpu_views is not None and not is_equirect_cam:
+            gpu_views.append((img_path, R_cw_lidar, C_lidar, view_params))
             continue
 
         P_cam = (R_cw_lidar @ (pts_lidar - C_lidar).T).T
-        z_mask = P_cam[:, 2] > 0.15
-        idx_valid = np.where(z_mask)[0]
-        if len(idx_valid) == 0:
-            continue
+        if is_equirect_cam:
+            d = np.linalg.norm(P_cam, axis=1)
+            idx_valid = np.where(d > 0.15)[0]
+            if len(idx_valid) == 0:
+                continue
+            P_v = P_cam[idx_valid]
+            d = d[idx_valid]
+            u, v, r = project_equirectangular(P_v, camera['width'], camera['height'])
+            radius = np.hypot(camera['width'], camera['height']) / 2.0
+            r_px = np.ones_like(u)
+            mask_circle = (u >= 0.0) & (u < camera['width'] - 1) & (v >= 0.0) & (v < camera['height'] - 1)
+        else:
+            prism_params = _colorization_camera_params(camera)
+            z_mask = P_cam[:, 2] > 0.15
+            idx_valid = np.where(z_mask)[0]
+            if len(idx_valid) == 0:
+                continue
 
-        P_v = P_cam[idx_valid]
-        d = np.linalg.norm(P_v, axis=1)
+            P_v = P_cam[idx_valid]
+            d = np.linalg.norm(P_v, axis=1)
 
-        cx, cy = params[2], params[3]
-        u, v, r = project_thin_prism(P_v, params)
+            cx, cy = prism_params[2], prism_params[3]
+            u, v, r = project_thin_prism(P_v, prism_params)
 
-        r_px = np.hypot(u - cx, v - cy)
-        radius = (1620.0 * min(camera['width'], camera['height']) / 3840.0
-                  if camera['model_id'] in (5, 10) else
-                  np.hypot(camera['width'], camera['height']) / 2)
-        mask_circle = ((r_px < radius) & (u >= 0.0) & (u < camera['width'] - 1)
-                       & (v >= 0.0) & (v < camera['height'] - 1))
+            r_px = np.hypot(u - cx, v - cy)
+            radius = (1620.0 * min(camera['width'], camera['height']) / 3840.0
+                      if camera['model_id'] in (5, 10) else
+                      np.hypot(camera['width'], camera['height']) / 2)
+            mask_circle = ((r_px < radius) & (u >= 0.0) & (u < camera['width'] - 1)
+                           & (v >= 0.0) & (v < camera['height'] - 1))
         if not np.any(mask_circle):
             continue
 
@@ -1436,7 +1565,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         rgb_ins = sample_bilinear(img_rgb, u_ins, v_ins)
         if photo_views is not None:
-            rgb_ins = apply_rgb(rgb_ins, u_ins, v_ins, params,
+            rgb_ins = apply_rgb(rgb_ins, u_ins, v_ins, view_params,
                                 photo_views.get(im['name'].replace('\\', '/')))
 
         worst_slot = np.argmin(top_scores[idx_ins], axis=1)
@@ -1579,16 +1708,20 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
                      or cfg.get('timelapse_calibration_version') != active_alignment.get('timelapse_calibration_version'))):
             cfg = recalibrate_from_sfm(dataset_dir, fps)
 
-    p0 = cfg["cam0_front_intrinsics"]
-    params0 = (p0["fx"], p0["fy"], p0["cx"], p0["cy"], p0["k1"], p0["k2"], p0["p1"], p0["p2"], p0["k3"], p0["k4"], p0["sx1"], p0["sy1"])
-    p1 = cfg["cam1_rear_intrinsics"]
-    params1 = (p1["fx"], p1["fy"], p1["cx"], p1["cy"], p1["k1"], p1["k2"], p1["p1"], p1["p2"], p1["k3"], p1["k4"], p1["sx1"], p1["sy1"])
+    p0 = cfg.get("cam0_front_intrinsics", {})
+    params0 = (p0.get("fx", 0.0), p0.get("fy", 0.0), p0.get("cx", 0.0), p0.get("cy", 0.0),
+               p0.get("k1", 0.0), p0.get("k2", 0.0), p0.get("p1", 0.0), p0.get("p2", 0.0),
+               p0.get("k3", 0.0), p0.get("k4", 0.0), p0.get("sx1", 0.0), p0.get("sy1", 0.0))
+    p1 = cfg.get("cam1_rear_intrinsics", {})
+    params1 = (p1.get("fx", 0.0), p1.get("fy", 0.0), p1.get("cx", 0.0), p1.get("cy", 0.0),
+               p1.get("k1", 0.0), p1.get("k2", 0.0), p1.get("p1", 0.0), p1.get("p2", 0.0),
+               p1.get("k3", 0.0), p1.get("k4", 0.0), p1.get("sx1", 0.0), p1.get("sy1", 0.0))
 
-    T_LC0 = np.array(cfg["T_lidar_to_cam0_rigid_4x4"])
+    T_LC0 = np.array(cfg.get("T_lidar_to_cam0_rigid_4x4", np.eye(4)))
     R_LC0 = T_LC0[:3, :3]
     t_LC0 = T_LC0[:3, 3]
 
-    T_LC1 = np.array(cfg["T_lidar_to_cam1_rigid_4x4"])
+    T_LC1 = np.array(cfg.get("T_lidar_to_cam1_rigid_4x4", np.eye(4)))
     R_LC1 = T_LC1[:3, :3]
     t_LC1 = T_LC1[:3, 3]
 
@@ -1633,17 +1766,35 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
 
     front = {p.name: p for p in (dataset_dir / "images" / "cam0").glob("*.jpg")}
     rear = {p.name: p for p in (dataset_dir / "images" / "cam1").glob("*.jpg")}
-    pairs = sorted(front.keys() & rear.keys(),
-                   key=lambda name: frame_time(dataset_dir, "cam0/" + name, fps))
-    if not pairs:
-        raise ValueError("No synchronized front/rear image pairs found")
-    if front.keys() != rear.keys():
-        print(f"[!] Skipping {len(front.keys() ^ rear.keys())} unpaired lens images")
-    cam0_files = [front[name] for name in pairs]
-    cam1_files = [rear[name] for name in pairs]
+    manifest_path = dataset_dir / "images" / "frames.json"
+    is_equirect = False
+    if manifest_path.is_file():
+        try:
+            m_data = json.loads(manifest_path.read_text(encoding='utf-8'))
+            is_equirect = m_data.get('video_mode') == 'equirectangular'
+        except Exception:
+            pass
+
+    if is_equirect:
+        pairs = sorted(front.keys(), key=lambda name: frame_time(dataset_dir, "cam0/" + name, fps))
+        if not pairs:
+            raise ValueError("No equirectangular cam0 images found")
+        cam0_files = [front[name] for name in pairs]
+        cam1_files = []
+        num_frames = len(cam0_files)
+    else:
+        pairs = sorted(front.keys() & rear.keys(),
+                       key=lambda name: frame_time(dataset_dir, "cam0/" + name, fps))
+        if not pairs:
+            raise ValueError("No synchronized front/rear image pairs found")
+        if front.keys() != rear.keys():
+            print(f"[!] Skipping {len(front.keys() ^ rear.keys())} unpaired lens images")
+        cam0_files = [front[name] for name in pairs]
+        cam1_files = [rear[name] for name in pairs]
+        num_frames = min(len(cam0_files), len(cam1_files))
 
     operator_views = []
-    gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() else None
+    gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() and not is_equirect else None
     K_VIEWS = 3
     top_scores = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS), dtype=np.float32)
     top_colors = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS, 3), dtype=np.uint8)
@@ -1651,7 +1802,6 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     zbuf_w, zbuf_h = 960, 960
 
     t0 = time.time()
-    num_frames = min(len(cam0_files), len(cam1_files))
 
     print("\n" + "=" * 80)
     print(" DIRECT RIGID COLORIZATION (TOP-3 MULTI-VIEW CONSENSUS)")
@@ -1714,10 +1864,15 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     events = []
     for k in range(num_frames):
         t_vid = frame_time(dataset_dir, "cam0/" + cam0_files[k].name, fps)
-        events.extend((
-            (t_vid, 0.0, "cam0", cam0_files[k], params0, R_LC0, t_LC0, "THIN_PRISM_FISHEYE", None),
-            (t_vid, 0.0, "cam1", cam1_files[k], params1, R_LC1, t_LC1, "THIN_PRISM_FISHEYE", None),
-        ))
+        if is_equirect:
+            events.append(
+                (t_vid, 0.0, "cam0", cam0_files[k], params0, R_LC0, t_LC0, "EQUIRECTANGULAR", None)
+            )
+        else:
+            events.extend((
+                (t_vid, 0.0, "cam0", cam0_files[k], params0, R_LC0, t_LC0, "THIN_PRISM_FISHEYE", None),
+                (t_vid, 0.0, "cam1", cam1_files[k], params1, R_LC1, t_LC1, "THIN_PRISM_FISHEYE", None),
+            ))
 
     auxiliary_cameras = (third_camera if isinstance(third_camera, (list, tuple))
                          else [third_camera] if third_camera else [])
@@ -1776,7 +1931,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
 
     events.sort(key=lambda event: (event[0], event[2], event[3].name))
     for event_index, (video_time, camera_offset, cam_name, img_path, params,
-                      R_LC, t_LC, _model, pose_override) in enumerate(events):
+                      R_LC, t_LC, model, pose_override) in enumerate(events):
         if pose_override is not None:
             R_cw, p_cam = pose_override
         else:
@@ -1803,16 +1958,27 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
         if img_bgr is None:
             continue
         height, width = img_bgr.shape[:2]
-        camera_radius = (0.5 * np.hypot(width, height) if params[11] < -997.0
-                         else 1620.0 * min(width, height) / 3840.0)
         P_cam = (R_cw @ (pts_lidar - p_cam).T).T
-        idx_valid = np.flatnonzero(P_cam[:, 2] > 0.15)
-        if not len(idx_valid):
-            continue
-        P_v = P_cam[idx_valid]
-        distances = np.linalg.norm(P_v, axis=1)
-        u, v, _ = project_thin_prism(P_v, params)
-        r_px = np.hypot(u - params[2], v - params[3])
+        if model == "EQUIRECTANGULAR":
+            camera_radius = 0.5 * np.hypot(width, height)
+            distances = np.linalg.norm(P_cam, axis=1)
+            idx_valid = np.flatnonzero(distances > 0.15)
+            if not len(idx_valid):
+                continue
+            P_v = P_cam[idx_valid]
+            distances = distances[idx_valid]
+            u, v, _ = project_equirectangular(P_v, width, height)
+            r_px = np.ones_like(u)
+        else:
+            camera_radius = (0.5 * np.hypot(width, height) if params[11] < -997.0
+                             else 1620.0 * min(width, height) / 3840.0)
+            idx_valid = np.flatnonzero(P_cam[:, 2] > 0.15)
+            if not len(idx_valid):
+                continue
+            P_v = P_cam[idx_valid]
+            distances = np.linalg.norm(P_v, axis=1)
+            u, v, _ = project_thin_prism(P_v, params)
+            r_px = np.hypot(u - params[2], v - params[3])
         valid = ((r_px < camera_radius) & (u >= 0) & (u < width - 1)
                  & (v >= 0) & (v < height - 1))
         if not np.any(valid):

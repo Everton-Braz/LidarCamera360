@@ -117,7 +117,8 @@ def _persist_workflow_run(output_dir, record):
 def _workflow_image_extraction_snapshot(output_dir, third_cameras):
     manifest_path = Path(output_dir) / 'images' / 'frames.json'
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-    signatures = {'cam0': manifest.get('signature'), 'cam1': manifest.get('signature')}
+    is_equirect = manifest.get('video_mode') == 'equirectangular'
+    signatures = {'cam0': manifest.get('signature')} if is_equirect else {'cam0': manifest.get('signature'), 'cam1': manifest.get('signature')}
     insv_signatures = manifest.get('auxiliary_insv_signatures', {})
     if not isinstance(insv_signatures, dict):
         insv_signatures = {}
@@ -812,12 +813,16 @@ def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync):
     manifest_path = images_root / 'frames.json'
     manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
     all_times = manifest.get('timestamps', {})
-    camera_names = ['cam0', 'cam1'] + [camera.camera_name for camera in cameras]
+    is_equirect = manifest.get('video_mode') == 'equirectangular' or not (images_root / 'cam1').is_dir()
+    has_cam1 = not is_equirect and (images_root / 'cam1').is_dir() and any(name.startswith('cam1/') for name in all_times)
+    primary_camera_names = ['cam0', 'cam1'] if has_cam1 else ['cam0']
+    camera_names = primary_camera_names + [camera.camera_name for camera in cameras]
     per_camera_limit = max(20, min(40, 320 // max(1, len(camera_names))))
-    camera_fps = {'cam0': float(fps), 'cam1': float(fps)}
+    camera_fps = {name: float(fps) for name in primary_camera_names}
     camera_fps.update({camera.camera_name: float(camera.fps) for camera in cameras})
     primary_times = [float(t) for name, t in all_times.items() if name.startswith('cam0/')]
-    primary_times.extend(float(t) for name, t in all_times.items() if name.startswith('cam1/'))
+    if has_cam1:
+        primary_times.extend(float(t) for name, t in all_times.items() if name.startswith('cam1/'))
     primary_start_seconds = min(primary_times) if primary_times else None
     primary_end_seconds = max(primary_times) if primary_times else None
     def filename_start(path):
@@ -1514,6 +1519,7 @@ _COLMAP_TEXT_MODEL_IDS = {
     'SIMPLE_PINHOLE': 0, 'PINHOLE': 1, 'SIMPLE_RADIAL': 2, 'RADIAL': 3,
     'OPENCV': 4, 'OPENCV_FISHEYE': 5, 'FULL_OPENCV': 6, 'FOV': 7,
     'SIMPLE_RADIAL_FISHEYE': 8, 'RADIAL_FISHEYE': 9, 'THIN_PRISM_FISHEYE': 10,
+    'EQUIRECTANGULAR': 17,
 }
 
 
@@ -1534,17 +1540,18 @@ def _sync_colmap_text_binary(sparse_dir: Path) -> None:
             if not row or row.startswith('#'):
                 continue
             parts = row.split()
-            if len(parts) < 5:
+            if len(parts) < 4:
                 raise ValueError(f'Invalid COLMAP camera row: {row}')
             camera_id, model_name, width, height = int(parts[0]), parts[1], int(parts[2]), int(parts[3])
             model_id = _COLMAP_TEXT_MODEL_IDS.get(model_name)
             if model_id is None:
                 raise ValueError(f'Unsupported COLMAP camera model: {model_name}')
             params = [float(value) for value in parts[4:]]
-            if len(params) != _COLMAP_CAMERA_PARAM_COUNTS[model_id]:
+            expected_params = _COLMAP_CAMERA_PARAM_COUNTS.get(model_id, 0)
+            if len(params) != expected_params:
                 raise ValueError(
                     f'{model_name} camera {camera_id} has {len(params)} parameters; '
-                    f'expected {_COLMAP_CAMERA_PARAM_COUNTS[model_id]}'
+                    f'expected {expected_params}'
                 )
             cameras.append((camera_id, model_id, width, height, params))
         with (sparse_dir / 'cameras.bin').open('wb') as stream:
@@ -1616,6 +1623,8 @@ def _validate_rigid_transform(value, label):
 def _colmap_model_parameters(intrinsics, lens_model, camera_id):
     model = str(intrinsics.get('camera_model') or intrinsics.get('lens_model') or lens_model or 'OPENCV_FISHEYE').upper()
     width, height = int(intrinsics.get('width', 3840)), int(intrinsics.get('height', 3840))
+    if model == 'EQUIRECTANGULAR':
+        return model, width, height, [float(width), float(height)]
     fx, fy, cx, cy = (float(intrinsics[key]) for key in ('fx', 'fy', 'cx', 'cy'))
     values = {
         'SIMPLE_PINHOLE': [fx, cx, cy],
@@ -1884,13 +1893,29 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
               f"{len(source_image_records) - len(allowed_names)} rejected, out-of-window, uncalibrated, or missing")
     else:
         direct_calib = json.loads(Path(calib_path).read_text(encoding='utf-8'))
-        for camera_id, camera_key in ((1, 'cam0_front_intrinsics'), (2, 'cam1_rear_intrinsics')):
-            _colmap_model_parameters(direct_calib[camera_key], direct_calib.get('lens_model'), camera_id)
+        manifest_path = dataset_dir / 'images' / 'frames.json'
+        is_equirect = False
+        if manifest_path.is_file():
+            try:
+                is_equirect = json.loads(manifest_path.read_text(encoding='utf-8')).get('video_mode') == 'equirectangular'
+            except Exception:
+                pass
+        if not is_equirect and direct_calib.get('lens_model') == 'EQUIRECTANGULAR':
+            is_equirect = True
+        primary_calib_keys = (
+            ((1, 'cam0_front_intrinsics'),)
+            if is_equirect and 'cam1_rear_intrinsics' not in direct_calib
+            else ((1, 'cam0_front_intrinsics'), (2, 'cam1_rear_intrinsics'))
+        )
+        for camera_id, camera_key in primary_calib_keys:
+            intr = direct_calib.get(camera_key, direct_calib.get(f'cam{camera_id - 1}', {}))
+            _colmap_model_parameters(intr, direct_calib.get('lens_model'), camera_id)
             _validate_rigid_transform(
                 direct_calib[f'T_lidar_to_cam{camera_id - 1}_rigid_4x4'],
                 f'LiDAR-to-cam{camera_id - 1} calibration',
             )
-        for camera_name in ('cam0', 'cam1'):
+        primary_camera_names = ('cam0',) if is_equirect else ('cam0', 'cam1')
+        for camera_name in primary_camera_names:
             source_dir = dataset_dir / 'images' / camera_name
             for image_path in sorted(source_dir.glob('*.jpg')) if source_dir.is_dir() else []:
                 name = f'{camera_name}/{image_path.name}'
@@ -1976,19 +2001,36 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
 
     if not poses_ready:
         print("  [*] Using requested direct pose source: SLAM trajectory + calibrated rig")
-        calib = direct_calib
-        c0 = calib["cam0_front_intrinsics"]
-        c1 = calib["cam1_rear_intrinsics"]
+        calib = direct_calib or (json.loads(Path(calib_path).read_text(encoding='utf-8')) if calib_path and Path(calib_path).is_file() else {})
+        manifest_path = dataset_dir / 'images' / 'frames.json'
+        is_equirect = False
+        if manifest_path.is_file():
+            try:
+                is_equirect = json.loads(manifest_path.read_text(encoding='utf-8')).get('video_mode') == 'equirectangular'
+            except Exception:
+                pass
+        if not is_equirect and calib.get('lens_model') == 'EQUIRECTANGULAR':
+            is_equirect = True
+
+        c0 = calib.get("cam0_front_intrinsics", calib.get("cam0", {}))
         T_LC0 = _validate_rigid_transform(calib["T_lidar_to_cam0_rigid_4x4"], 'LiDAR-to-cam0 calibration')
-        T_LC1 = _validate_rigid_transform(calib["T_lidar_to_cam1_rigid_4x4"], 'LiDAR-to-cam1 calibration')
         R_LC0, t_LC0 = T_LC0[:3, :3], T_LC0[:3, 3]
-        R_LC1, t_LC1 = T_LC1[:3, :3], T_LC1[:3, 3]
+
+        if is_equirect and "cam1_rear_intrinsics" not in calib and "T_lidar_to_cam1_rigid_4x4" not in calib:
+            primary_cams_to_write = ((1, c0),)
+            primary_rig_poses = ((1, 'cam0', R_LC0, t_LC0),)
+        else:
+            c1 = calib.get("cam1_rear_intrinsics", calib.get("cam1", {}))
+            T_LC1 = _validate_rigid_transform(calib.get("T_lidar_to_cam1_rigid_4x4", calib["T_lidar_to_cam0_rigid_4x4"]), 'LiDAR-to-cam1 calibration')
+            R_LC1, t_LC1 = T_LC1[:3, :3], T_LC1[:3, 3]
+            primary_cams_to_write = ((1, c0), (2, c1))
+            primary_rig_poses = ((1, 'cam0', R_LC0, t_LC0), (2, 'cam1', R_LC1, t_LC1))
 
         cameras_txt = sparse_out / "cameras.txt"
         with open(cameras_txt, "w", encoding="utf-8") as f:
             f.write("# Camera list with one line of data per camera:\n")
             f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-            for camera_id, intrinsics in ((1, c0), (2, c1)):
+            for camera_id, intrinsics in primary_cams_to_write:
                 model, width, height, params = _colmap_model_parameters(
                     intrinsics, calib.get('lens_model'), camera_id)
                 f.write(f"{camera_id} {model} {width} {height} "
@@ -2000,9 +2042,7 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
             f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
             f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
             image_id = 1
-            for camera_id, camera_name, rotation_lc, translation_lc in (
-                (1, 'cam0', R_LC0, t_LC0), (2, 'cam1', R_LC1, t_LC1),
-            ):
+            for camera_id, camera_name, rotation_lc, translation_lc in primary_rig_poses:
                 for name, image_path in selected_images:
                     if not name.startswith(f'{camera_name}/'):
                         continue
@@ -2294,8 +2334,10 @@ def execute_unified_workflow(
     imu_topic: str = "/vanjee_imu_packets",
     fps: float = 2.0,
     method: str = "sfm",
-    calib_json: Path = None,
-    dt_override: float = None,
+    calib_json: Optional[Path] = None,
+    dt_override: Optional[float] = None,
+    trim_start: float = 0.0,
+    trim_end: float = 0.0,
     recalibrate: bool = True,
     run_spirula: bool = False,
     use_vulkan: bool = True,
@@ -2443,8 +2485,28 @@ def execute_unified_workflow(
         print(f"[*] Using manual time offset Δt = {dt_sync:.4f}s")
     else:
         dt_sync = auto_sync_imu_gyro(bag_path, insv_path, imu_topic=imu_topic)
+        if dt_sync is None:
+            print("[*] Searching for fallback/hint sync in existing calibration or defaulting to 0.0s for initial pose search...")
+            dt_sync = 0.0
+            # Check if reference calibration or existing alignment has a known offset
+            for cand_path in (output_dir / 'rig_calibration.json', output_dir / 'calibracao_rigida_auto.json',
+                              resources() / 'calibracao_rigida_raven_insta360.json'):
+                if cand_path.is_file():
+                    try:
+                        c_data = json.loads(cand_path.read_text(encoding='utf-8'))
+                        if 'dt_sync_seconds' in c_data and c_data['dt_sync_seconds'] is not None:
+                            dt_sync = float(c_data['dt_sync_seconds'])
+                            print(f"[*] Using calibration offset hint Δt = {dt_sync:.4f}s from {cand_path.name}")
+                            break
+                        ref_dt = c_data.get('reference_capture', {}).get('dt_sync_seconds')
+                        if ref_dt is not None:
+                            dt_sync = float(ref_dt)
+                            print(f"[*] Using calibration reference offset hint Δt = {dt_sync:.4f}s from {cand_path.name}")
+                            break
+                    except Exception:
+                        pass
     run_record['resolved_dt_sync_seconds'] = float(dt_sync)
-    run_record['synchronization_source'] = 'manual_override' if dt_override is not None else 'imu_gyro_correlation'
+    run_record['synchronization_source'] = 'manual_override' if dt_override is not None else ('imu_gyro_correlation' if dt_sync != 0.0 else 'fallback_zero')
     _persist_workflow_run(output_dir, run_record)
 
     # --------------------------------------------------------------------------
@@ -2617,7 +2679,7 @@ def execute_unified_workflow(
     elif lio:
         run_record['slam_refinement'] = {'status': 'skipped_by_user',
                                           'reason': 'Fast path selected; global revisit optimization disabled by user'}
-        print('[*] Fast path: Global revisit optimization (MOLA / Loop Closure) skipped by user.')
+        print('[*] Fast path: Global revisit optimization (Loop Closure) skipped by user.')
     else:
         run_record['slam_refinement'] = {'status': 'unsupported_visual_mode',
                                           'reason': 'Exact world-frame scan provenance requires LiDAR + IMU mode'}
@@ -2693,7 +2755,7 @@ def execute_unified_workflow(
         print("[*] Performing Metric Sim(3) Alignment (Spirula COLMAP -> LiDAR Ground Truth)...")
         try:
             align_data = pipeline.align_colmap_to_lidar(output_dir, fps=fps, dt_hint=dt_sync)
-            dt_sync = align_data.get("dt_sync_seconds", dt_sync)
+            dt_sync = float(align_data.get("dt_sync_seconds", dt_sync))
             rmse_cm = align_data.get('trajectory_rmse_cm')
             if rmse_cm is not None and rmse_cm > 2.0:
                 print(f"[QUALITY WARNING] SfM-to-FAST-LIVO2 trajectory RMSE is {rmse_cm:.2f} cm; "
@@ -2724,7 +2786,7 @@ def execute_unified_workflow(
             third_cfgs = _calibrate_aux_cameras_from_sample_sfm(
                 output_dir, third_cfgs, fps, dt_sync)
             calib = output_dir / 'rig_calibration.json'
-            dt_sync = json.loads(calib.read_text(encoding='utf-8'))['dt_sync_seconds']
+            dt_sync = float(json.loads(calib.read_text(encoding='utf-8'))['dt_sync_seconds'])
         except Exception as e:
             run_record.update(
                 status='failed',

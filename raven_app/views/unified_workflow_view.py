@@ -272,6 +272,46 @@ class UnifiedWorkflowView(QWidget):
 
         config_layout.addLayout(sync_row)
 
+        # Dataset Trimming & Chunking Controls
+        trim_row = QHBoxLayout()
+        self.trim_chk = CheckBox(tr("Trim Dataset (Temporal Cut)"))
+        self.trim_chk.setToolTip(tr("Trim seconds from beginning and end of dataset synchronously for both bag and video."))
+        self.trim_chk.stateChanged.connect(self._toggle_trim_controls)
+        trim_row.addWidget(self.trim_chk)
+        trim_row.addSpacing(15)
+
+        self.trim_start_label = CaptionLabel(tr("Trim Start (s):"))
+        self.trim_start_spin = DoubleSpinBox()
+        self.trim_start_spin.setRange(0.0, 7200.0)
+        self.trim_start_spin.setValue(0.0)
+        self.trim_start_spin.setSingleStep(1.0)
+        self.trim_start_spin.setEnabled(False)
+        trim_row.addWidget(self.trim_start_label)
+        trim_row.addWidget(self.trim_start_spin)
+        trim_row.addSpacing(10)
+
+        self.trim_end_label = CaptionLabel(tr("Trim End (s):"))
+        self.trim_end_spin = DoubleSpinBox()
+        self.trim_end_spin.setRange(0.0, 7200.0)
+        self.trim_end_spin.setValue(0.0)
+        self.trim_end_spin.setSingleStep(1.0)
+        self.trim_end_spin.setEnabled(False)
+        trim_row.addWidget(self.trim_end_label)
+        trim_row.addWidget(self.trim_end_spin)
+        trim_row.addSpacing(15)
+
+        self.btn_export_trim = PushButton(tr("Save Trimmed..."), icon=FluentIcon.CUT)
+        self.btn_export_trim.setToolTip(tr("Export the trimmed Bag and Video to a standalone folder."))
+        self.btn_export_trim.clicked.connect(self._action_export_trimmed_dataset)
+        trim_row.addWidget(self.btn_export_trim)
+
+        self.btn_chunk_dataset = PushButton(tr("Divide in Chunks..."), icon=FluentIcon.TILES)
+        self.btn_chunk_dataset.setToolTip(tr("Divide dataset into overlapping chunks with temporal interpolation."))
+        self.btn_chunk_dataset.clicked.connect(self._action_open_chunk_dialog)
+        trim_row.addWidget(self.btn_chunk_dataset)
+        trim_row.addStretch()
+        config_layout.addLayout(trim_row)
+
         # Colorization & Recalibration Method
         method_row = QHBoxLayout()
         self.method_label = BodyLabel(tr("Colorization & Recalibration:"))
@@ -317,7 +357,7 @@ class UnifiedWorkflowView(QWidget):
         recalib_row.addStretch()
         config_layout.addLayout(recalib_row)
 
-        self.revisit_refinement_chk = CheckBox(tr("Global Pose Graph SLAM Optimization (MOLA / Loop Closure)"))
+        self.revisit_refinement_chk = CheckBox(tr("Global Pose Graph SLAM Optimization (Loop Closure)"))
         self.revisit_refinement_chk.setChecked(False)
         self.revisit_refinement_chk.setToolTip(tr("Eliminates duplicate walls, ghosting, and trajectory drift by optimizing revisit loops with pose-graph SLAM. Optional; adds processing time."))
         config_layout.addWidget(self.revisit_refinement_chk)
@@ -634,6 +674,77 @@ class UnifiedWorkflowView(QWidget):
 
     def _toggle_auto_sync(self, state):
         self.dt_input.setEnabled(not self.auto_sync_chk.isChecked())
+
+    def _toggle_trim_controls(self, state):
+        enabled = bool(state)
+        self.trim_start_spin.setEnabled(enabled)
+        self.trim_end_spin.setEnabled(enabled)
+
+    def _action_export_trimmed_dataset(self):
+        """Export trimmed bag and video directly to disk."""
+        bag = self.bag_input.text().strip()
+        insv = self.insv_input.text().strip()
+        if not bag or not Path(bag).is_file():
+            InfoBar.warning(title=tr("Missing LiDAR Bag"), content=tr("Please select a valid ROS bag file first."), parent=self)
+            return
+        if not insv or not Path(insv).is_file():
+            InfoBar.warning(title=tr("Missing 360 Video"), content=tr("Please select a valid INSV/MP4 video first."), parent=self)
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, tr("Select Directory to Save Trimmed Dataset"))
+        if not out_dir:
+            return
+        trim_start = float(self.trim_start_spin.value()) if self.trim_chk.isChecked() else 0.0
+        trim_end = float(self.trim_end_spin.value()) if self.trim_chk.isChecked() else 0.0
+        dt_val = None
+        if self.dt_input.text().strip():
+            try: dt_val = float(self.dt_input.text().strip())
+            except ValueError: pass
+        try:
+            from raven_app.dataset_trim import trim_dataset_synchronized
+            res = trim_dataset_synchronized(
+                bag_path=bag, video_path=insv, output_dir=out_dir,
+                trim_start_sec=trim_start, trim_end_sec=trim_end, dt_sync=dt_val,
+            )
+            InfoBar.success(
+                title=tr("Dataset Trimmed Successfully"),
+                content=tr("Trimmed bag ({b_dur:.1f}s) and video ({v_dur:.1f}s) saved to {path}").format(
+                    b_dur=res['bag_duration'], v_dur=res['video_duration'], path=out_dir
+                ), parent=self, duration=6000
+            )
+        except Exception as e:
+            InfoBar.error(title=tr("Trimming Failed"), content=str(e), parent=self, duration=6000)
+
+    def _action_open_chunk_dialog(self):
+        """Divide dataset into overlapping chunks with temporal interpolation."""
+        bag = self.bag_input.text().strip()
+        insv = self.insv_input.text().strip()
+        if not bag or not Path(bag).is_file() or not insv or not Path(insv).is_file():
+            InfoBar.warning(title=tr("Missing Inputs"), content=tr("Please select both a valid ROS bag and video first."), parent=self)
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, tr("Select Directory to Save Dataset Chunks"))
+        if not out_dir:
+            return
+        trim_start = float(self.trim_start_spin.value()) if self.trim_chk.isChecked() else 0.0
+        trim_end = float(self.trim_end_spin.value()) if self.trim_chk.isChecked() else 0.0
+        dt_val = None
+        if self.dt_input.text().strip():
+            try: dt_val = float(self.dt_input.text().strip())
+            except ValueError: pass
+        try:
+            from raven_app.dataset_trim import split_dataset_into_chunks
+            chunks = split_dataset_into_chunks(
+                bag_path=bag, video_path=insv, output_dir=out_dir,
+                chunk_duration_sec=300.0, overlap_sec=30.0,
+                trim_start_sec=trim_start, trim_end_sec=trim_end, dt_sync=dt_val,
+            )
+            InfoBar.success(
+                title=tr("Chunks Created Successfully"),
+                content=tr("Generated {count} synchronized overlapping chunks in {path}").format(
+                    count=len(chunks), path=out_dir
+                ), parent=self, duration=6000
+            )
+        except Exception as e:
+            InfoBar.error(title=tr("Chunking Failed"), content=str(e), parent=self, duration=6000)
 
     def _toggle_gps_formats(self, state=None):
         enabled = self.process_gps_chk.isChecked()
@@ -1034,6 +1145,12 @@ class UnifiedWorkflowView(QWidget):
             args.append("--recalibrate")
         else:
             args.append("--no-recalibrate")
+
+        if self.trim_chk.isChecked():
+            if self.trim_start_spin.value() > 0:
+                args.extend(["--trim-start", str(float(self.trim_start_spin.value()))])
+            if self.trim_end_spin.value() > 0:
+                args.extend(["--trim-end", str(float(self.trim_end_spin.value()))])
 
         if method_key in ("sfm", "all"):
             args.append("--run-spirula")

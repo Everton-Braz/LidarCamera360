@@ -120,12 +120,12 @@ def parse(argv=None):
                    help='Download and prepare resources for the selected RF-DETR mask backend')
     download_masks.add_argument('--backend', choices=('vulkan', 'tensorrt'), default='vulkan')
     video=sub.add_parser('extract-insv', help='Extract synchronized sharp lens frames using bundled PyAV')
-    video.add_argument('--insv', type=Path, required=True)
+    video.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to .insv or .mp4 360 video')
     video.add_argument('--output', type=Path, required=True)
     video.add_argument('--fps', type=positive, default=2.)
     video_preview = sub.add_parser('extract-insv-frame',
                    help='Extract one synchronized sharp lens pair for a mask preview')
-    video_preview.add_argument('--insv', type=Path, required=True)
+    video_preview.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to .insv or .mp4 360 video')
     video_preview.add_argument('--output', type=Path, required=True)
     video_preview.add_argument('--fps', type=positive, default=2.)
     video_preview.add_argument('--index', type=int, required=True,
@@ -155,7 +155,7 @@ def parse(argv=None):
     photometric_fit.add_argument('--mode', choices=('loglinear', 'ppisp-bilateral'), default='loglinear',
                    help='Photometric model to fit (default: loglinear)')
     geo=sub.add_parser('georeference', help='Calculate INSV GPS, georeference point clouds and COLMAP datasets, and export GeoJSON')
-    geo.add_argument('--insv', type=Path, required=True, help='Path to Insta360 .INSV video')
+    geo.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to Insta360 .INSV or .MP4 video')
     geo.add_argument('--output', type=Path, required=True, help='Output directory for georeferenced deliverables and GeoJSON')
     geo.add_argument('--cloud', type=Path, help='Optional point cloud (PCD/PLY/LAZ/LAS) to georeference')
     geo.add_argument('--colmap-dir', type=Path, help='Optional COLMAP dataset directory containing sparse/ and images/')
@@ -196,7 +196,7 @@ def parse(argv=None):
                        help='Optional path to third camera JSON configuration, video file, or image folder')
     wf=sub.add_parser('workflow',help='Run end-to-end processing: Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables')
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
-    wf.add_argument('--insv',type=Path,required=True,help='Insta360 video file')
+    wf.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Insta360 video file (.insv) or 360 equirectangular video (.mp4)')
     wf.add_argument('--output',type=Path,required=True,help='Output directory for deliverables')
     wf.add_argument('--scanner', '--preset', choices=['auto', 'raven', 'eagle'], default='auto', help='Scanner preset (auto, raven, eagle)')
     wf.add_argument('--lidar-topic', default=None, help='LiDAR topic (default: auto-detected)')
@@ -210,8 +210,10 @@ def parse(argv=None):
     wf.add_argument('--dt',type=finite)
     wf.add_argument('--recalibrate',action='store_true',default=True,help='Auto-recalibrate spatial extrinsics from SfM')
     wf.add_argument('--no-recalibrate',action='store_false',dest='recalibrate')
-    wf.add_argument('--revisit-refinement',action='store_true',default=False,help='Enable global pose graph SLAM / revisit optimization (MOLA / Loop Closure)')
+    wf.add_argument('--revisit-refinement',action='store_true',default=False,help='Enable global pose graph SLAM / revisit optimization (Loop Closure)')
     wf.add_argument('--no-revisit-refinement',action='store_false',dest='revisit_refinement')
+    wf.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from beginning of dataset')
+    wf.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end of dataset')
     wf.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for camera frame extraction')
     wf.add_argument('--run-spirula',action='store_true',default=False,help='Run Spirula SfM if not already built')
     wf.add_argument('--export-ply',action='store_true',default=False)
@@ -253,6 +255,26 @@ def parse(argv=None):
     feedback.add_argument('--contact', default='', help='Optional email/user handle')
     feedback.add_argument('--browser', action='store_true', help='Open pre-filled issue in default web browser')
     feedback.add_argument('--export-bundle', type=Path, default=None, help='Export diagnostic zip bundle to file')
+
+    # Dataset Trim (Temporal Cut)
+    trim = sub.add_parser('trim', help='Trim synchronized ROS bag and 360 video from start and end')
+    trim.add_argument('--bag', type=Path, required=True, help='Path to input ROS bag (.bag)')
+    trim.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to input 360 video (.insv / .mp4)')
+    trim.add_argument('--output', type=Path, required=True, help='Output directory for trimmed dataset')
+    trim.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from start (default: 0.0)')
+    trim.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end (default: 0.0)')
+    trim.add_argument('--dt', dest='dt_sync', type=float, default=None, help='Manual time sync offset (seconds; auto-computed if omitted)')
+
+    # Dataset Chunking (Overlapping Chunks)
+    chunk = sub.add_parser('chunk', help='Divide dataset into overlapping chunks with temporal interpolation')
+    chunk.add_argument('--bag', type=Path, required=True, help='Path to input ROS bag (.bag)')
+    chunk.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to input 360 video (.insv / .mp4)')
+    chunk.add_argument('--output', type=Path, required=True, help='Output directory for chunks')
+    chunk.add_argument('--chunk-duration', type=float, default=300.0, help='Duration of each chunk in seconds (default: 300.0)')
+    chunk.add_argument('--overlap', type=float, default=30.0, help='Overlap duration shared between consecutive chunks in seconds (default: 30.0)')
+    chunk.add_argument('--trim-start', type=float, default=0.0, help='Optional initial seconds to cut before chunking')
+    chunk.add_argument('--trim-end', type=float, default=0.0, help='Optional final seconds to cut before chunking')
+    chunk.add_argument('--dt', dest='dt_sync', type=float, default=None, help='Manual time sync offset (seconds; auto-computed if omitted)')
 
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
@@ -479,11 +501,15 @@ def run(a):
         if a.mask_persons:
             from raven_app.person_masks import read_mask_config
             read_mask_config(a.mask_config)
+        from raven_app.slam_source import active_slam_dir
         dataset=a.dataset.resolve()
+        active_slam = active_slam_dir(dataset)
         trj = pipeline.get_slam_trajectory_path(dataset)
-        if not (dataset/'slam_out/pcd/all_raw_points.pcd').is_file() or not trj.is_file():
+        if not (active_slam/'pcd/all_raw_points.pcd').is_file() or not trj.is_file():
             raise FileNotFoundError(f'Missing dataset inputs: all_raw_points.pcd or SLAM trajectory ({trj.name})')
-        for cam in ('cam0','cam1'):
+        is_equirect = not (dataset/'images'/'cam1').is_dir() or (dataset/'images'/'cam0'/'equirectangular.txt').is_file()
+        check_cams = ('cam0',) if is_equirect else ('cam0', 'cam1')
+        for cam in check_cams:
             if not any((dataset/'images'/cam).glob('*.jpg')):raise ValueError(f'Missing extracted frames in images/{cam}')
         if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset):raise RuntimeError('Spirula reconstruction failed')
         if a.recalibrate_from_sfm:pipeline.recalibrate_from_sfm(dataset,fps=a.fps)
@@ -501,12 +527,20 @@ def run(a):
                 masks_dir=masks_dir, operator_radius=a.operator_radius,
                 photometric=a.photometric, photometric_params=a.photometric_params
             )
+        third_cfgs = None
+        if getattr(a, 'third_camera', None):
+            from raven_app.third_camera import load_third_camera_configs
+            third_cfgs = load_third_camera_configs(a.third_camera)
+        elif (dataset / 'third_camera_calibrated.json').is_file():
+            from raven_app.third_camera import load_third_camera_configs
+            third_cfgs = load_third_camera_configs(dataset / 'third_camera_calibrated.json')
         if a.method in ('direct','all'):
             pipeline.colorize_via_direct_rigid(
                 dataset, a.calib, fps=a.fps, dt_override=a.dt,
                 use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
                 operator_radius=a.operator_radius,
-                photometric=a.photometric, photometric_params=a.photometric_params
+                photometric=a.photometric, photometric_params=a.photometric_params,
+                third_camera=third_cfgs
             )
         return 0
     if a.command=='workflow':
@@ -526,6 +560,8 @@ def run(a):
             if not lidar_t: lidar_t = detected['lidar_topic']
             if not imu_t: imu_t = detected['imu_topic']
 
+        calib_file = getattr(a, 'calib', None) or getattr(a, 'calib_json', None)
+        dt_val = getattr(a, 'dt', None)
         return execute_unified_workflow(
             a.bag, a.insv, a.output,
             lio=a.lio,
@@ -534,8 +570,10 @@ def run(a):
             imu_topic=imu_t,
             fps=a.fps,
             method=a.method,
-            calib_json=a.calib,
-            dt_override=a.dt,
+            calib_json=calib_file,
+            dt_override=dt_val,
+            trim_start=getattr(a, 'trim_start', 0.0),
+            trim_end=getattr(a, 'trim_end', 0.0),
             recalibrate=a.recalibrate,
             run_spirula=a.run_spirula,
             use_vulkan=not a.no_vulkan,
@@ -626,6 +664,41 @@ def run(a):
             bundle_path = export_feedback_bundle(report, a.export_bundle)
             res['bundle_path'] = str(bundle_path)
         print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    if a.command == 'trim':
+        from raven_app.dataset_trim import trim_dataset_synchronized
+        print(f"Trimming dataset: start={a.trim_start}s, end={a.trim_end}s")
+        res = trim_dataset_synchronized(
+            bag_path=a.bag,
+            video_path=a.insv,
+            output_dir=a.output,
+            trim_start_sec=a.trim_start,
+            trim_end_sec=a.trim_end,
+            dt_sync=a.dt_sync,
+            progress_callback=lambda stage, p: print(f"[{int(p*100):3d}%] {stage}"),
+        )
+        print(f"\nDataset trimmed successfully:")
+        print(f"  Bag:   {res['bag_path']} ({res['bag_duration']:.2f}s, {res['bag_messages']} msgs)")
+        print(f"  Video: {res['video_path']} ({res['video_duration']:.2f}s)")
+        print(f"  Sync:  dt_sync = {res['dt_sync']:.4f}s")
+        return 0
+    if a.command == 'chunk':
+        from raven_app.dataset_trim import split_dataset_into_chunks
+        print(f"Dividing dataset into chunks: duration={a.chunk_duration}s, overlap={a.overlap}s")
+        chunks = split_dataset_into_chunks(
+            bag_path=a.bag,
+            video_path=a.insv,
+            output_dir=a.output,
+            chunk_duration_sec=a.chunk_duration,
+            overlap_sec=a.overlap,
+            trim_start_sec=a.trim_start,
+            trim_end_sec=a.trim_end,
+            dt_sync=a.dt_sync,
+            progress_callback=lambda stage, p: print(f"[{int(p*100):3d}%] {stage}"),
+        )
+        print(f"\nDivided dataset into {len(chunks)} overlapping chunks in {a.output}:")
+        for c in chunks:
+            print(f"  [{c['name']}] Bag: {c['bag_duration']:.1f}s | Video: {c['video_duration']:.1f}s | Overlap: {c['overlap_sec']:.1f}s")
         return 0
     raise ValueError('Unknown command')
 

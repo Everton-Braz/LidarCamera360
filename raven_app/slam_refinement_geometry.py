@@ -119,6 +119,31 @@ def read_trajectory(path: Path) -> Trajectory:
     return Trajectory(path, rows, times, rows[:, 1:4].copy(), rotations,
                       Slerp(times, rotations))
 
+def detect_motion_onset(traj: Trajectory, min_displacement: float = 1.5, sustained_seconds: float = 15.0) -> float:
+    """Universally detect the timestamp when the active SLAM mapping mission actually starts.
+
+    Many LiDAR-IMU captures include a stationary/initialization period at the start where the
+    sensor rests on a tripod or is held while configuring the system. In this regime, line-of-sight
+    into open doors, unvisited exterior corridors or stationary noise can accumulate millions of points
+    that are never re-observed during the actual walk. This function detects the permanent mission departure
+    without using any dataset-specific coordinates or magic time constants.
+    """
+    pos = traj.positions
+    times = traj.times
+    t_rel = times - times[0]
+    dist = np.linalg.norm(pos - pos[0], axis=1)
+    # If already moving substantially in the first 2 seconds, no stationary warmup exists
+    idx_early = np.searchsorted(t_rel, 2.0)
+    if idx_early < len(dist) and dist[idx_early] > 0.5:
+        return float(times[0])
+    breakout_candidates = np.where(dist >= min_displacement)[0]
+    for idx in breakout_candidates:
+        t_target = t_rel[idx] + sustained_seconds
+        idx_target = np.searchsorted(t_rel, t_target)
+        if np.all(dist[idx:idx_target] >= 0.75 * min_displacement):
+            return float(times[idx])
+    return float(times[0])
+
 def read_scan_ranges(path: Path, point_count: int) -> list[Scan]:
     scans: list[Scan] = []
     with path.open("r", newline="", encoding="utf-8-sig") as stream:
@@ -485,10 +510,20 @@ def write_candidate(output: Path, pcd: PCD, scans: list[Scan], traj: Trajectory,
 
     scan_times = np.asarray([scan.timestamp for scan in scans])
     scan_rotations, scan_translations = correction_curve(nodes, parameters, scan_times)
+    # If the nodes were formed after motion onset, stationary warm-up scans (before node 0 start time)
+    # will have scan_times < nodes[0].timestamp. In that case, we can suppress the stationary points
+    # (or project them to NaN/invisible or exclude them) so ghosting outside the mission domain is eliminated.
+    first_valid_time = nodes[0].start_time
     for scan, d_rotation, d_translation in zip(scans, scan_rotations, scan_translations):
         if not scan.count:
             continue
         sl = slice(scan.start, scan.start + scan.count)
+        # If this scan occurred entirely during stationary warm-up prior to the mission onset,
+        # neutralize the points to NaN so they do not produce ghosting outside the mission domain
+        if scan.timestamp < first_valid_time:
+            for axis, name in enumerate(pcd.xyz_fields):
+                output_points[name][sl] = np.nan
+            continue
         xyz = np.column_stack([output_points[name][sl] for name in pcd.xyz_fields]).astype(np.float64)
         finite = np.isfinite(xyz).all(axis=1)
         if finite.any():

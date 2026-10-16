@@ -6,7 +6,22 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
-## [v0.3.0] - 2026-10-14
+## [v0.3.0] - 2026-10-15
+
+### 🌐 360° Equirectangular Video Support
+- **Single-Camera 360° Pipeline**: Full native pipeline for stitched equirectangular videos (`.mp4`), enabling single-track 360 camera ingestion alongside dual-fisheye INSV containers.
+- **COLMAP Equirectangular Model (ID 17)**: Complete support for COLMAP camera model 17 (`EQUIRECTANGULAR`), including cameras.bin binary export, parameter counts, and optical geometry.
+- **Spherical LiDAR Colorization**: Direct spherical projection mapping cartesian 3D LiDAR points $[X, Y, Z]$ into spherical longitude/latitude coordinates $[u, v]$ on equirectangular frames.
+- **CLI Video Flag Alias**: Extended CLI parsers (`workflow`, `colorize`, `extract-insv`, `georeference`) with `--video` as an alias for `--insv`.
+
+### 🔄 RootSLAM & Pose-Graph Revisit Optimization
+- **Square-Root Information Smoothing**: Implemented `RootSLAM` pose graph solver with square-root landmark marginalization, right Jacobian SO(3) updates, and synthetic/real loop closure convergence.
+- **Trajectory Refinement Constraints**: Added geometric constraints (`slam_refinement*.py`) mitigating tilt degeneracy and drift across multi-pass revisits.
+
+### ✂️ Synchronized Dataset Trim & Chunking
+- **Synchronized Temporal Trim**: Subcommand `trim` and workflow flags `--trim-start` / `--trim-end` for synchronized cutting of both ROS1 bags and 360 video containers with sub-frame time accuracy.
+- **Overlapping Dataset Chunks**: Subcommand `chunk` to divide massive datasets into overlapping manageable chunks with temporal interpolation for downstream 3DGS training.
+- **UI Integration**: Integrated trim spinboxes, export dialogs, and chunking workflows directly into `UnifiedWorkflowView`.
 
 ### 🛡️ 100% Privacy-First Architecture (Telemetry-Free)
 - **Complete Telemetry Removal**: Completely eliminated all anonymous telemetry, heartbeat HTTP calls, and installation UUID tracking from the application, settings interface, and CLI/MCP layers.
@@ -23,23 +38,12 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   - `check_updates`: Remote GitHub release checking and changelog inspection.
   - `submit_feedback`: Manual, voluntary bug reporting with packaged diagnostics.
 
-### 🔄 MOLA Pose-Graph Loop-Closure Refinement
-- **Drift Elimination on Large Trajectories**: Integrated MOLA pose-graph refinement (`--revisit-refinement`) for global loop closure and trajectory optimization.
-- **Convergence Fallback Safety**: Robust error handling and fallback mechanisms to preserve SLAM outputs if loop closures are indeterminate.
-
-### 📷 Auxiliary Front-Facing Camera & Extrinsics Injection
-- **Front Camera Bag Support**: Ingestion of auxiliary camera bags (`IMAGE_*.bag`) with synchronized optical frames.
-- **Custom Extrinsic Injection**: Pass custom calibration transforms and timestamps directly via CLI (`--calib`, `--image-bag`, `--dt`) and UI settings.
-
-### 🚀 Over-The-Air (OTA) Updates & Voluntary Feedback
-- **Release Verification & Self-Update**: Query latest releases, inspect version deltas, and stage automated updates on Windows (`python lidarcamera360.py update`).
-- **Voluntary Feedback Dialog**: Intuitive Fluent UI dialog and CLI runner (`python lidarcamera360.py feedback`) generating packaged diagnostic ZIP bundles with zero personal data.
-
-### 🛡️ Core Engine Stability & Memory Safety
-- **FAST-LIVO2 VIO Out-of-Bounds Fix**: Prevented memory crashes during heavy visual feature tracking by enforcing strict boundary validation on image patch buffers.
-- **Broken Pipe Handling**: Graceful error recovery when native C++ processes terminate or disconnect.
-- **Fluent Theme Switch Stability**: Deferred stylesheet re-evaluation on theme toggle to prevent menu layout dismiss crashes.
-- **Comprehensive Quality Assurance**: 100% passing test suite across 270 unit, integration, and UI tests.
+### 🔧 Core Engine Quality & Mathematical Precision
+- **Optical Model Selection Preservation**: Enforced contract in `calibrate_third_camera_intrinsics` to preserve explicit user model choice on SfM model mismatch.
+- **Dual-Camera Recalibration Robustness**: Guaranteed `T_lidar_to_cam1_rigid_4x4` generation via rigid baseline in dual-fisheye setups without misdetecting single-camera mode.
+- **Non-Finite Point Filtering**: Added strict `np.isfinite` filtering on point clouds prior to colorization and projection.
+- **FAST-LIVO2 VIO Memory Safety**: Prevented memory crashes during heavy visual feature tracking by enforcing strict boundary validation on image patch buffers.
+- **Comprehensive Test Suite**: 100% passing test suite across 282 unit, integration, and UI tests (15 subtests).
 
 ---
 
