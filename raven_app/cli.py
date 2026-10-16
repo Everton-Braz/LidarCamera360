@@ -501,11 +501,15 @@ def run(a):
         if a.mask_persons:
             from raven_app.person_masks import read_mask_config
             read_mask_config(a.mask_config)
+        from raven_app.slam_source import active_slam_dir
         dataset=a.dataset.resolve()
+        active_slam = active_slam_dir(dataset)
         trj = pipeline.get_slam_trajectory_path(dataset)
-        if not (dataset/'slam_out/pcd/all_raw_points.pcd').is_file() or not trj.is_file():
+        if not (active_slam/'pcd/all_raw_points.pcd').is_file() or not trj.is_file():
             raise FileNotFoundError(f'Missing dataset inputs: all_raw_points.pcd or SLAM trajectory ({trj.name})')
-        for cam in ('cam0','cam1'):
+        is_equirect = not (dataset/'images'/'cam1').is_dir() or (dataset/'images'/'cam0'/'equirectangular.txt').is_file()
+        check_cams = ('cam0',) if is_equirect else ('cam0', 'cam1')
+        for cam in check_cams:
             if not any((dataset/'images'/cam).glob('*.jpg')):raise ValueError(f'Missing extracted frames in images/{cam}')
         if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset):raise RuntimeError('Spirula reconstruction failed')
         if a.recalibrate_from_sfm:pipeline.recalibrate_from_sfm(dataset,fps=a.fps)
@@ -523,12 +527,20 @@ def run(a):
                 masks_dir=masks_dir, operator_radius=a.operator_radius,
                 photometric=a.photometric, photometric_params=a.photometric_params
             )
+        third_cfgs = None
+        if getattr(a, 'third_camera', None):
+            from raven_app.third_camera import load_third_camera_configs
+            third_cfgs = load_third_camera_configs(a.third_camera)
+        elif (dataset / 'third_camera_calibrated.json').is_file():
+            from raven_app.third_camera import load_third_camera_configs
+            third_cfgs = load_third_camera_configs(dataset / 'third_camera_calibrated.json')
         if a.method in ('direct','all'):
             pipeline.colorize_via_direct_rigid(
                 dataset, a.calib, fps=a.fps, dt_override=a.dt,
                 use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
                 operator_radius=a.operator_radius,
-                photometric=a.photometric, photometric_params=a.photometric_params
+                photometric=a.photometric, photometric_params=a.photometric_params,
+                third_camera=third_cfgs
             )
         return 0
     if a.command=='workflow':
