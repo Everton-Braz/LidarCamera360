@@ -813,12 +813,16 @@ def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync):
     manifest_path = images_root / 'frames.json'
     manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
     all_times = manifest.get('timestamps', {})
-    camera_names = ['cam0', 'cam1'] + [camera.camera_name for camera in cameras]
+    is_equirect = manifest.get('video_mode') == 'equirectangular' or not (images_root / 'cam1').is_dir()
+    has_cam1 = not is_equirect and (images_root / 'cam1').is_dir() and any(name.startswith('cam1/') for name in all_times)
+    primary_camera_names = ['cam0', 'cam1'] if has_cam1 else ['cam0']
+    camera_names = primary_camera_names + [camera.camera_name for camera in cameras]
     per_camera_limit = max(20, min(40, 320 // max(1, len(camera_names))))
-    camera_fps = {'cam0': float(fps), 'cam1': float(fps)}
+    camera_fps = {name: float(fps) for name in primary_camera_names}
     camera_fps.update({camera.camera_name: float(camera.fps) for camera in cameras})
     primary_times = [float(t) for name, t in all_times.items() if name.startswith('cam0/')]
-    primary_times.extend(float(t) for name, t in all_times.items() if name.startswith('cam1/'))
+    if has_cam1:
+        primary_times.extend(float(t) for name, t in all_times.items() if name.startswith('cam1/'))
     primary_start_seconds = min(primary_times) if primary_times else None
     primary_end_seconds = max(primary_times) if primary_times else None
     def filename_start(path):
