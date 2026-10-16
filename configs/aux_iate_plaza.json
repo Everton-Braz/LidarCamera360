@@ -1,0 +1,28 @@
+{
+  "camera_name": "cam2",
+  "source_path": "D:/ARQUIVOS_TESTE_2/IATE-PLAZA-HOTEL/VID_20260929_112230.mp4",
+  "source_type": "video",
+  "enabled": true,
+  "fps": 2.0,
+  "time_offset_s": 0.0,
+  "camera_model": "PINHOLE",
+  "intrinsics": {
+    "width": 3840,
+    "height": 2160,
+    "fx": 3072.0,
+    "fy": 3072.0,
+    "cx": 1920.0,
+    "cy": 1080.0,
+    "k1": 0.0,
+    "k2": 0.0,
+    "p1": 0.0,
+    "p2": 0.0
+  },
+  "T_lidar_to_cam2_rigid_4x4": [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.15],
+    [0.0, 0.0, 1.0, 0.20],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "description": "Auxiliary frontal 4K camera (VID_20260929_112230.mp4)"
+}

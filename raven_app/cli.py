@@ -210,7 +210,7 @@ def parse(argv=None):
     wf.add_argument('--dt',type=finite)
     wf.add_argument('--recalibrate',action='store_true',default=True,help='Auto-recalibrate spatial extrinsics from SfM')
     wf.add_argument('--no-recalibrate',action='store_false',dest='recalibrate')
-    wf.add_argument('--revisit-refinement',action='store_true',default=False,help='Enable global pose graph SLAM / revisit optimization (MOLA / Loop Closure)')
+    wf.add_argument('--revisit-refinement',action='store_true',default=False,help='Enable global pose graph SLAM / revisit optimization (Loop Closure)')
     wf.add_argument('--no-revisit-refinement',action='store_false',dest='revisit_refinement')
     wf.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from beginning of dataset')
     wf.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end of dataset')

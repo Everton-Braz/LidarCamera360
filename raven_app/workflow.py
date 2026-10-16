@@ -2679,7 +2679,7 @@ def execute_unified_workflow(
     elif lio:
         run_record['slam_refinement'] = {'status': 'skipped_by_user',
                                           'reason': 'Fast path selected; global revisit optimization disabled by user'}
-        print('[*] Fast path: Global revisit optimization (MOLA / Loop Closure) skipped by user.')
+        print('[*] Fast path: Global revisit optimization (Loop Closure) skipped by user.')
     else:
         run_record['slam_refinement'] = {'status': 'unsupported_visual_mode',
                                           'reason': 'Exact world-frame scan provenance requires LiDAR + IMU mode'}

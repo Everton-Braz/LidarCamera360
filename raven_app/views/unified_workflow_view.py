@@ -357,7 +357,7 @@ class UnifiedWorkflowView(QWidget):
         recalib_row.addStretch()
         config_layout.addLayout(recalib_row)
 
-        self.revisit_refinement_chk = CheckBox(tr("Global Pose Graph SLAM Optimization (MOLA / Loop Closure)"))
+        self.revisit_refinement_chk = CheckBox(tr("Global Pose Graph SLAM Optimization (Loop Closure)"))
         self.revisit_refinement_chk.setChecked(False)
         self.revisit_refinement_chk.setToolTip(tr("Eliminates duplicate walls, ghosting, and trajectory drift by optimizing revisit loops with pose-graph SLAM. Optional; adds processing time."))
         config_layout.addWidget(self.revisit_refinement_chk)
