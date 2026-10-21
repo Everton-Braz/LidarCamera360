@@ -402,9 +402,13 @@ class MaskSettingsDialog(QDialog):
 
     def __init__(self, dataset_dir, config=None, parent=None, model_path=None,
                  backend='vulkan', insv_path=None, fps=2.0, camera_names=(),
-                 auxiliary_sources=()):
+                 auxiliary_sources=(), secondary_insv_path=None):
         super().__init__(parent)
         self.insv_path = Path(insv_path) if insv_path else None
+        self.secondary_insv_path = Path(secondary_insv_path) if secondary_insv_path else None
+        if self.insv_path:
+            from raven_app.video import normalize_dual_insv_pair
+            self.insv_path, self.secondary_insv_path = normalize_dual_insv_pair(self.insv_path, self.secondary_insv_path)
         self.fps = float(fps)
         self._frames_temp = None
         if dataset_dir:
@@ -430,7 +434,7 @@ class MaskSettingsDialog(QDialog):
                 self._is_equirectangular = True
         self._lazy_video_preview = bool(
             self.insv_path is not None
-            and not has_cached_frame_extraction(self.insv_path, self.dataset_dir, self.fps)
+            and not has_cached_frame_extraction(self.insv_path, self.dataset_dir, self.fps, secondary_insv_path=self.secondary_insv_path)
         )
         self.config = normalize_mask_config(config)
         self.auxiliary_sources = {}
@@ -605,6 +609,8 @@ class MaskSettingsDialog(QDialog):
         layout.addLayout(actions)
         self._camera_changed(self.camera_combo.currentText())
         self._start_frame_extraction_if_needed()
+        from raven_app.theme_manager import update_global_theme_stylesheet
+        update_global_theme_stylesheet()
 
     def _sync_border_spin_state(self):
         camera = self.camera_combo.currentText()
@@ -761,7 +767,7 @@ class MaskSettingsDialog(QDialog):
 
         try:
             from raven_app.video import video_preview_timeline
-            self._video_preview_timeline = video_preview_timeline(self.insv_path, self.fps)
+            self._video_preview_timeline = video_preview_timeline(self.insv_path, self.fps, secondary_insv_path=self.secondary_insv_path)
         except Exception as exc:
             self.preview_status.setText(tr('Cannot read video timeline: {error}').format(error=str(exc)))
             return
@@ -829,6 +835,8 @@ class MaskSettingsDialog(QDialog):
             '--output', str(self._video_preview_root), '--fps', format(self.fps, '.12g'),
             '--index', str(index),
         ])
+        if self.secondary_insv_path:
+            arguments.extend(['--secondary-insv', str(self.secondary_insv_path)])
         process = QProcess(self)
         self._frame_extraction_process = process
         self._frame_extraction_index = index

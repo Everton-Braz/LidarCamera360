@@ -120,12 +120,20 @@ class UnifiedWorkflowView(QWidget):
         self.image_bag_label.setFixedWidth(170)
         self.image_bag_input = LineEdit()
         self.image_bag_input.setPlaceholderText(tr("Optional IMAGE_*.bag for front camera & VIO..."))
+        self.image_bag_input.textChanged.connect(self._on_image_bag_changed)
         self.btn_browse_image_bag = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.btn_browse_image_bag.clicked.connect(self._browse_image_bag)
+        self.use_bag_images_chk = CheckBox(tr("Use Bag images in Colorization & 3DGS"))
+        self.use_bag_images_chk.setChecked(False)
+        self.use_bag_images_chk.setToolTip(tr("Extract and use frames from the image bag for point cloud colorization and 3DGS dataset export."))
+        self.bag_camera_info_label = CaptionLabel("")
+        self.bag_camera_info_label.setStyleSheet("color: #888888;")
         image_bag_row.addWidget(self.image_bag_label)
         image_bag_row.addWidget(self.image_bag_input)
         image_bag_row.addWidget(self.btn_browse_image_bag)
+        image_bag_row.addWidget(self.use_bag_images_chk)
         inputs_layout.addLayout(image_bag_row)
+        inputs_layout.addWidget(self.bag_camera_info_label)
 
         # Row 2: INSV Video
         insv_row = QHBoxLayout()
@@ -134,11 +142,58 @@ class UnifiedWorkflowView(QWidget):
         self.insv_input = LineEdit()
         self.insv_input.setPlaceholderText(tr("Select Insta360 X4 / X6 video (.insv or .mp4)..."))
         self.btn_browse_insv = PushButton(tr("Browse"), icon=FluentIcon.VIDEO)
-        self.btn_browse_insv.clicked.connect(self._browse_insv)
         insv_row.addWidget(self.insv_label)
         insv_row.addWidget(self.insv_input)
         insv_row.addWidget(self.btn_browse_insv)
         inputs_layout.addLayout(insv_row)
+
+        # Row 2.1: Dual INSV option (Insta360 ONE RS 360)
+        dual_insv_opt_row = QHBoxLayout()
+        dual_insv_spacer = BodyLabel("")
+        dual_insv_spacer.setFixedWidth(170)
+        self.dual_insv_chk = CheckBox(tr("Allow select two INSV files (Insta360 ONE RS 360)"))
+        self.dual_insv_chk.setChecked(False)
+        self.dual_insv_chk.setToolTip(tr("Enable support for dual-file 360 cameras where front and rear lenses are saved in separate .insv files."))
+        dual_insv_opt_row.addWidget(dual_insv_spacer)
+        dual_insv_opt_row.addWidget(self.dual_insv_chk)
+        dual_insv_opt_row.addStretch()
+        inputs_layout.addLayout(dual_insv_opt_row)
+
+        # Row 2.2: Secondary INSV file (Rear lens _10_)
+        self.secondary_insv_container = QWidget()
+        secondary_insv_container_layout = QVBoxLayout(self.secondary_insv_container)
+        secondary_insv_container_layout.setContentsMargins(0, 0, 0, 0)
+        secondary_insv_container_layout.setSpacing(4)
+
+        secondary_insv_row = QHBoxLayout()
+        secondary_insv_label = BodyLabel(tr("Second Lens (.insv):"))
+        secondary_insv_label.setFixedWidth(170)
+        self.secondary_insv_input = LineEdit()
+        self.secondary_insv_input.setPlaceholderText(tr("Secondary .insv file (rear lens _10_)"))
+        self.btn_browse_secondary_insv = PushButton(tr("Browse"), icon=FluentIcon.VIDEO)
+        secondary_insv_row.addWidget(secondary_insv_label)
+        secondary_insv_row.addWidget(self.secondary_insv_input)
+        secondary_insv_row.addWidget(self.btn_browse_secondary_insv)
+        secondary_insv_container_layout.addLayout(secondary_insv_row)
+
+        secondary_info_row = QHBoxLayout()
+        sec_info_spacer = BodyLabel("")
+        sec_info_spacer.setFixedWidth(170)
+        self.secondary_insv_info_label = CaptionLabel("")
+        secondary_info_row.addWidget(sec_info_spacer)
+        secondary_info_row.addWidget(self.secondary_insv_info_label)
+        secondary_info_row.addStretch()
+        secondary_insv_container_layout.addLayout(secondary_info_row)
+
+        self.secondary_insv_container.setVisible(False)
+        inputs_layout.addWidget(self.secondary_insv_container)
+
+        # Signal connections for INSV
+        self.btn_browse_insv.clicked.connect(self._browse_insv)
+        self.btn_browse_secondary_insv.clicked.connect(self._browse_secondary_insv)
+        self.dual_insv_chk.stateChanged.connect(self._on_dual_insv_toggled)
+        self.insv_input.textChanged.connect(self._on_insv_changed)
+        self.secondary_insv_input.textChanged.connect(self._on_secondary_insv_changed)
 
         # Row 2.5: Auxiliary image/video cameras
         aux_row = QHBoxLayout()
@@ -768,12 +823,27 @@ class UnifiedWorkflowView(QWidget):
                 p = Path(path)
                 self.out_input.setText(str(p.parent / f"{p.stem}_studio_output"))
 
+    def _on_image_bag_changed(self, text: str):
+        from pathlib import Path
+        p = Path(text.strip())
+        if p.is_file():
+            from raven_app.bag_io import discover_bag_image_topics
+            topics = discover_bag_image_topics(p)
+            if topics:
+                summary = ", ".join(f"{t['topic']} ({t['msgcount']} frames)" for t in topics)
+                self.bag_camera_info_label.setText(tr(f"Detected {len(topics)} image topic(s): {summary}"))
+            else:
+                self.bag_camera_info_label.setText(tr("No image topics found in this bag."))
+        else:
+            self.bag_camera_info_label.setText("")
+
     def _browse_image_bag(self):
         path, _ = QFileDialog.getOpenFileName(
             self, tr("Select Front Camera Bag (.bag)"), "", tr("ROS Bag files (*.bag);;All files (*.*)")
         )
         if path:
             self.image_bag_input.setText(path)
+            self._on_image_bag_changed(path)
 
     def _browse_insv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -781,6 +851,67 @@ class UnifiedWorkflowView(QWidget):
         )
         if path:
             self.insv_input.setText(path)
+
+    def _browse_secondary_insv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Select Secondary 360 Video (Rear Lens)"), "",
+            "Insta360 Video (*.insv *.mp4);;All files (*.*)"
+        )
+        if path:
+            self.secondary_insv_input.setText(path)
+
+    def _on_dual_insv_toggled(self, state):
+        is_checked = bool(state)
+        self.secondary_insv_container.setVisible(is_checked)
+        if not is_checked:
+            self.secondary_insv_info_label.setText("")
+        else:
+            # If primary already has a path, trigger check
+            self._on_insv_changed(self.insv_input.text())
+
+    def _on_insv_changed(self, text):
+        from raven_app.video import find_partner_insv
+        p_str = text.strip()
+        if not p_str:
+            self.secondary_insv_info_label.setText("")
+            return
+        p = Path(p_str)
+        if not p.is_file():
+            return
+        name = p.name
+        if '_00_' in name or '_10_' in name:
+            c0, c1 = find_partner_insv(p)
+            if c0 and c1:
+                # Both exist: auto-enable dual_insv and populate fields
+                if not self.dual_insv_chk.isChecked():
+                    self.dual_insv_chk.setChecked(True)
+                # Ensure c0 is in insv_input and c1 is in secondary_insv_input
+                if str(c0) != p_str:
+                    self.insv_input.blockSignals(True)
+                    self.insv_input.setText(str(c0))
+                    self.insv_input.blockSignals(False)
+                if self.secondary_insv_input.text().strip() != str(c1):
+                    self.secondary_insv_input.setText(str(c1))
+                self.secondary_insv_info_label.setText(
+                    tr(f"[+] Auto-paired Dual-File INSV: cam0 ({c0.name}) + cam1 ({c1.name})")
+                )
+            else:
+                # One lens file detected but partner not found in folder (Decision 1A)
+                if not self.dual_insv_chk.isChecked():
+                    self.dual_insv_chk.setChecked(True)
+                missing = name.replace('_00_', '_10_') if '_00_' in name else name.replace('_10_', '_00_')
+                self.secondary_insv_info_label.setText(
+                    tr(f"[!] Warning: Partner lens file '{missing}' not found in folder. Please browse manually.")
+                )
+
+    def _on_secondary_insv_changed(self, text):
+        sec_str = text.strip()
+        if sec_str and Path(sec_str).is_file():
+            prim_str = self.insv_input.text().strip()
+            if prim_str and Path(prim_str).is_file():
+                self.secondary_insv_info_label.setText(
+                    tr(f"[+] Dual-File INSV configured: {Path(prim_str).name} + {Path(sec_str).name}")
+                )
 
     def _open_add_source_dialog(self):
         from raven_app.views.add_source_dialog import AddSourceDialog
@@ -1003,12 +1134,19 @@ class UnifiedWorkflowView(QWidget):
                 InfoBar.error(title=tr('Invalid mask settings'), content=str(exc),
                               position=InfoBarPosition.TOP, parent=self)
                 return
+        sec_insv = None
+        if hasattr(self, 'dual_insv_chk') and self.dual_insv_chk.isChecked():
+            sec_text = self.secondary_insv_input.text().strip()
+            if sec_text and Path(sec_text).is_file():
+                sec_insv = Path(sec_text)
+
         dialog = MaskSettingsDialog(output, config, self,
                                     backend=self.mask_backend_combo.currentData(),
                                     insv_path=self.insv_input.text().strip() or None,
                                     fps=self.fps_spin.value(),
                                     camera_names=self._configured_aux_camera_names(),
-                                    auxiliary_sources=self.third_camera_configs)
+                                    auxiliary_sources=self.third_camera_configs,
+                                    secondary_insv_path=sec_insv)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.mask_config = dialog.settings()
             self.mask_persons_chk.setChecked(True)
@@ -1055,10 +1193,13 @@ class UnifiedWorkflowView(QWidget):
             )
             return
 
-        if not insv or not Path(insv).is_file():
+        has_insv = bool(insv and Path(insv).is_file())
+        has_aux = bool(self.third_camera_configs)
+        has_bag_images = bool(self.use_bag_images_chk.isChecked() and Path(self.image_bag_input.text().strip()).is_file())
+        if not has_insv and not has_aux and not has_bag_images:
             InfoBar.error(
-                title=tr("Invalid Insta360 Video"),
-                content=tr("Please select an Insta360 video file (.insv or .mp4)."),
+                title=tr("Missing Image Source"),
+                content=tr("Please specify a 360 video (.insv/.mp4), an auxiliary camera, or enable and select an Image Bag."),
                 orient=Qt.Orientation.Horizontal,
                 position=InfoBarPosition.TOP,
                 duration=3500,
@@ -1126,8 +1267,13 @@ class UnifiedWorkflowView(QWidget):
             "--method", method_key
         ]
 
+        if self.dual_insv_chk.isChecked() and self.secondary_insv_input.text().strip():
+            args.extend(["--secondary-insv", self.secondary_insv_input.text().strip()])
+
         if self.image_bag_input.text().strip():
             args.extend(["--image-bag", self.image_bag_input.text().strip()])
+            if self.use_bag_images_chk.isChecked():
+                args.append("--use-image-bag")
 
         args.extend(["--photometric", str(self.photometric_combo.currentData())])
         photometric_params = self.photometric_params_input.text().strip()

@@ -76,6 +76,45 @@ def frame_time(dataset_dir, name, fps=2.0):
     return (int(digits) - 1) / fps
 
 
+def find_partner_insv(path):
+    """Find partner INSV file for dual-file cameras (e.g. Insta360 ONE R / ONE RS).
+
+    Returns (cam0_path, cam1_path) where cam0 is the front lens (_00_) and cam1 is the rear lens (_10_).
+    If the input is not a dual-file pattern, returns (path, None).
+    If partner is expected but missing, returns (path, None) or (None, path).
+    """
+    if not path:
+        return None, None
+    p = Path(path)
+    name = p.name
+    if '_00_' in name:
+        sibling = p.with_name(name.replace('_00_', '_10_'))
+        return (p, sibling if sibling.is_file() else None)
+    elif '_10_' in name:
+        sibling = p.with_name(name.replace('_10_', '_00_'))
+        return (sibling if sibling.is_file() else None, p)
+    return (p, None)
+
+
+def normalize_dual_insv_pair(p1, p2=None):
+    """Ensure front lens (_00_, cam0 with telemetry) is primary and rear lens (_10_, cam1) is secondary."""
+    if not p1:
+        return None, None
+    path1 = Path(p1)
+    if not p2:
+        c0, c1 = find_partner_insv(path1)
+        if c0 and c1:
+            return c0, c1
+        return path1, None
+    path2 = Path(p2)
+    s1, s2 = path1.name, path2.name
+    if ('_10_' in s1 or s1.endswith('_10.insv')) and ('_00_' in s2 or s2.endswith('_00.insv')):
+        return path2, path1
+    return path1, path2
+
+normalize_dual_insv_pair_pyav = normalize_dual_insv_pair
+
+
 def _open_decoder(path, track, backend, threads):
     import av
     kwargs = {}
@@ -114,15 +153,23 @@ def is_equirectangular_video(path):
         return False
 
 
-def _select_decoder(path, requested, threads):
+def _select_decoder(path, requested, threads, secondary_path=None):
     if requested != 'auto':
         return requested
     import av
     with av.open(str(path)) as probe:
-        if len(probe.streams.video) != 2:
-            return 'cpu'
-        if probe.streams.video[0].codec_context.name not in ('hevc', 'h264', 'av1', 'vp9', 'mpeg2video'):
-            return 'cpu'
+        if secondary_path:
+            if len(probe.streams.video) < 1:
+                return 'cpu'
+            if probe.streams.video[0].codec_context.name not in ('hevc', 'h264', 'av1', 'vp9', 'mpeg2video'):
+                return 'cpu'
+        else:
+            if is_equirectangular_video(path):
+                pass
+            elif len(probe.streams.video) != 2:
+                return 'cpu'
+            elif probe.streams.video[0].codec_context.name not in ('hevc', 'h264', 'av1', 'vp9', 'mpeg2video'):
+                return 'cpu'
     from av.codec.hwaccel import hwdevices_available
     available = hwdevices_available()
     # Probe the actual codec/driver, not just FFmpeg's compiled-in device list.
@@ -158,19 +205,27 @@ def _write_pair(stage, number, frames, jpeg_quality):
         encoded.tofile(stage / f'cam{lens}/frame_{number:06d}.jpg')
 
 
-def _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality):
+def _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality, secondary_insv_path=None):
     source = Path(insv_path)
     stat = source.stat()
-    return dict(source=str(source.resolve()), size=stat.st_size,
-                mtime_ns=stat.st_mtime_ns, fps=fps, sharp_window=sharp_window,
-                jpeg_quality=jpeg_quality, version=3)
+    sig = dict(source=str(source.resolve()), size=stat.st_size,
+               mtime_ns=stat.st_mtime_ns, fps=fps, sharp_window=sharp_window,
+               jpeg_quality=jpeg_quality, version=4)
+    if secondary_insv_path:
+        sec = Path(secondary_insv_path)
+        if sec.is_file():
+            s_stat = sec.stat()
+            sig['secondary_source'] = str(sec.resolve())
+            sig['secondary_size'] = s_stat.st_size
+            sig['secondary_mtime_ns'] = s_stat.st_mtime_ns
+    return sig
 
 
 def has_cached_frame_extraction(insv_path, output_dir, fps=2.0, sharp_window=5,
-                                jpeg_quality=95):
+                                jpeg_quality=95, secondary_insv_path=None):
     """Return whether the matching extraction manifest and every frame exist."""
     try:
-        signature = _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality)
+        signature = _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality, secondary_insv_path)
         images = Path(output_dir) / 'images'
         manifest = images / 'frames.json'
         old = json.loads(manifest.read_text(encoding='utf-8'))
@@ -182,7 +237,7 @@ def has_cached_frame_extraction(insv_path, output_dir, fps=2.0, sharp_window=5,
         return False
 
 
-def video_preview_timeline(insv_path, fps=2.0):
+def video_preview_timeline(insv_path, fps=2.0, secondary_insv_path=None):
     """Return the selectable extraction buckets without decoding image frames."""
     import av
     if not math.isfinite(fps) or fps <= 0:
@@ -191,7 +246,10 @@ def video_preview_timeline(insv_path, fps=2.0):
     capture_times = _timelapse_times(path) if path.suffix.lower() == '.insv' else None
     with av.open(str(path)) as container:
         is_equirect = is_equirectangular_video(path)
-        if not is_equirect and len(container.streams.video) != 2:
+        if secondary_insv_path:
+            if len(container.streams.video) < 1:
+                raise ValueError('Primary video has no video tracks')
+        elif not is_equirect and len(container.streams.video) != 2:
             raise ValueError('Input must contain exactly two video tracks')
         elif is_equirect and len(container.streams.video) < 1:
             raise ValueError('Input video has no video tracks')
@@ -211,6 +269,13 @@ def video_preview_timeline(insv_path, fps=2.0):
                                  for t in capture_times}))
         durations = [float(s.duration * s.time_base) for s in container.streams.video
                      if s.duration is not None and s.time_base is not None and s.duration > 0]
+        if secondary_insv_path and Path(secondary_insv_path).is_file():
+            try:
+                with av.open(str(secondary_insv_path)) as c2:
+                    durations.extend([float(s.duration * s.time_base) for s in c2.streams.video
+                                      if s.duration is not None and s.time_base is not None and s.duration > 0])
+            except Exception:
+                pass
         duration = max(durations, default=0.0)
         if not duration and container.duration:
             duration = float(container.duration) / 1_000_000
@@ -227,10 +292,13 @@ def video_preview_timeline(insv_path, fps=2.0):
 
 def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
                                 sharp_window=5, *, decoder='auto', threads=None,
-                                jpeg_quality=95):
+                                jpeg_quality=95, secondary_insv_path=None):
     """Extract and publish just one synchronized lens pair for a timeline slot."""
     import av
-    insv_path, output_dir = Path(insv_path), Path(output_dir)
+    insv_path = Path(insv_path)
+    if secondary_insv_path:
+        insv_path, secondary_insv_path = normalize_dual_insv_pair(insv_path, secondary_insv_path)
+    output_dir = Path(output_dir)
     if not isinstance(index, int) or index < 0:
         raise ValueError('index must be a non-negative integer')
     if not math.isfinite(fps) or fps <= 0 or not isinstance(sharp_window, int) or sharp_window < 1:
@@ -239,12 +307,12 @@ def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
         threads = max(1, min(4, (os.cpu_count() or 2) // 2))
     if threads < 1 or not 1 <= jpeg_quality <= 100:
         raise ValueError('Invalid decoder thread count or JPEG quality')
-    buckets = video_preview_timeline(insv_path, fps)
+    buckets = video_preview_timeline(insv_path, fps, secondary_insv_path=secondary_insv_path)
     if index >= len(buckets):
         raise ValueError(f'Frame index {index} is outside the video timeline')
     target_bucket = buckets[index]
     capture_times = _timelapse_times(insv_path) if insv_path.suffix.lower() == '.insv' else None
-    backend = _select_decoder(insv_path, decoder, threads)
+    backend = _select_decoder(insv_path, decoder, threads, secondary_path=secondary_insv_path)
     attempts = [backend] + (['cpu'] if decoder == 'auto' and backend != 'cpu' else [])
     is_equirect = is_equirectangular_video(insv_path)
     lenses = 1 if is_equirect else 2
@@ -254,7 +322,9 @@ def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
             with ExitStack() as stack:
                 sources = []
                 for lens in range(lenses):
-                    container, stream = _open_decoder(insv_path, lens, backend, threads)
+                    src_path = secondary_insv_path if (lens == 1 and secondary_insv_path) else insv_path
+                    track = 0 if secondary_insv_path else lens
+                    container, stream = _open_decoder(src_path, track, backend, threads)
                     stack.enter_context(container)
                     sources.append((container, stream))
                 rate = float(sources[0][1].average_rate or 30)
@@ -274,10 +344,12 @@ def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
                     if all(frame is None for frame in pair):
                         break
                     if any(frame is None for frame in pair):
+                        if secondary_insv_path:
+                            break
                         raise ValueError('Video tracks have different frame counts')
                     times = [float(frame.time) - origin if frame.time is not None else source_index / rate
                              for frame in pair]
-                    if not is_equirect and abs(times[0] - times[1]) > 0.5 / rate:
+                    if not is_equirect and not secondary_insv_path and abs(times[0] - times[1]) > 0.5 / rate:
                         raise ValueError('Video tracks have mismatched presentation timestamps')
                     if capture_times is not None:
                         if source_index >= len(capture_times):
@@ -290,7 +362,11 @@ def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
                     if bucket > target_bucket:
                         break
                     if candidates < sharp_window:
-                        score = sum(_frame_sharpness(frame) for frame in pair)
+                        scores = [_frame_sharpness(frame) for frame in pair]
+                        if len(scores) == 2:
+                            score = 0.5 * (scores[0] + scores[1]) + 0.5 * min(scores[0], scores[1])
+                        else:
+                            score = sum(scores)
                         if candidate is None or score > candidate[0]:
                             candidate = score, pair, times
                         candidates += 1
@@ -321,13 +397,16 @@ def extract_video_preview_frame(insv_path, output_dir, index, fps=2.0,
 
 def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                          progress_cb=None, *, decoder='auto', threads=None,
-                         jpeg_quality=95):
+                         jpeg_quality=95, secondary_insv_path=None):
     """Extract synchronized sharp pairs using GPU decoding with CPU fallback.
 
-    Two bounded decoder workers overlap lenses; dedicated encoder jobs overlap
-    JPEG writing with decoding. Original presentation timestamps are retained.
+    Supports both single-file dual-stream INSV (Insta360 X3/X4/X5) and
+    dual-file single-stream INSV (Insta360 ONE R / ONE RS 360).
     """
-    insv_path, output_dir = Path(insv_path), Path(output_dir)
+    insv_path = Path(insv_path)
+    if secondary_insv_path:
+        insv_path, secondary_insv_path = normalize_dual_insv_pair(insv_path, secondary_insv_path)
+    output_dir = Path(output_dir)
     if not math.isfinite(fps) or fps <= 0 or not isinstance(sharp_window, int) or sharp_window < 1:
         raise ValueError('fps must be positive and finite; sharp_window must be a positive integer')
     threads = threads if threads is not None else max(1, min(4, (os.cpu_count() or 2)//2))
@@ -335,21 +414,22 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
         raise ValueError('Invalid decoder thread count or JPEG quality')
     if decoder not in ('auto', 'cpu', 'cuda', 'd3d11va', 'videotoolbox', 'vaapi'):
         raise ValueError('Unsupported decoder backend')
-    signature = _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality)
+    signature = _frame_extraction_signature(insv_path, fps, sharp_window, jpeg_quality, secondary_insv_path)
     images = output_dir / 'images'
     manifest = images / 'frames.json'
-    if has_cached_frame_extraction(insv_path, output_dir, fps, sharp_window, jpeg_quality):
+    if has_cached_frame_extraction(insv_path, output_dir, fps, sharp_window, jpeg_quality, secondary_insv_path):
         print('[*] Reusing completed video extraction.')
         return True
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     capture_times = _timelapse_times(insv_path) if insv_path.suffix.lower() == '.insv' else None
-    backend = _select_decoder(insv_path, decoder, threads)
+    backend = _select_decoder(insv_path, decoder, threads, secondary_path=secondary_insv_path)
     attempts = [backend] + (['cpu'] if decoder == 'auto' and backend != 'cpu' else [])
     is_equirect = is_equirectangular_video(insv_path)
     lenses = 1 if is_equirect else 2
     for backend in attempts:
-        print(f'[*] Video decoder: {backend}; lenses: {lenses}; threads per lens: {threads}', flush=True)
+        print(f'[*] Video decoder: {backend}; lenses: {lenses}; threads per lens: {threads}' +
+              (f' (Dual-file INSV: {insv_path.name} + {Path(secondary_insv_path).name})' if secondary_insv_path else ''), flush=True)
         try:
             with tempfile.TemporaryDirectory(prefix='frames-', dir=output_dir) as tmp, ExitStack() as stack:
                 stage = Path(tmp)
@@ -358,9 +438,20 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     (stage / cam).mkdir()
                 sources = []
                 for lens in range(lenses):
-                    container, stream = _open_decoder(insv_path, lens, backend, threads)
+                    src_path = secondary_insv_path if (lens == 1 and secondary_insv_path) else insv_path
+                    track = 0 if secondary_insv_path else lens
+                    container, stream = _open_decoder(src_path, track, backend, threads)
                     stack.enter_context(container)
                     sources.append((container, stream))
+                if secondary_insv_path:
+                    f0 = sources[0][1].frames or 0
+                    f1 = sources[1][1].frames or 0
+                    if f0 and f1:
+                        diff = abs(f0 - f1)
+                        if diff <= 5:
+                            print(f'[*] Dual INSV streams frame count difference: cam0={f0}, cam1={f1} (diff={diff} <= 5, nominal shutoff variance).')
+                        else:
+                            print(f'[!] WARNING: Dual INSV streams have significant frame count difference: cam0={f0}, cam1={f1} (diff={diff} > 5 frames).')
                 decode_pool = stack.enter_context(ThreadPoolExecutor(max_workers=lenses, thread_name_prefix='video'))
                 encode_workers = max(2, min(os.cpu_count() or 4, 4))
                 encode_pool = stack.enter_context(ThreadPoolExecutor(max_workers=encode_workers, thread_name_prefix='jpeg'))
@@ -396,12 +487,15 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                     if all(f is None for f in pair):
                         break
                     if any(f is None for f in pair):
+                        if secondary_insv_path:
+                            print(f'[*] Dual INSV stream ended at index {index}. Truncating to min frame count.')
+                            break
                         raise ValueError('Video tracks have different frame counts')
                     times = [float(f.time) - origin if f.time is not None else index / rate for f in pair]
                     if capture_times is not None and index >= len(capture_times):
                         raise ValueError('More video frames than timelapse timestamps')
                     index += 1
-                    if not is_equirect and abs(times[0] - times[1]) > 0.5 / rate:
+                    if not is_equirect and not secondary_insv_path and abs(times[0] - times[1]) > 0.5 / rate:
                         raise ValueError('Video tracks have mismatched presentation timestamps')
                     if capture_times is not None:
                         times = [float(capture_times[index - 1])] * lenses
@@ -416,7 +510,11 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                         else:
                             score_jobs = [decode_pool.submit(_frame_sharpness, frame)
                                           for frame in pair]
-                            score = sum(job.result() for job in score_jobs)
+                            scores = [job.result() for job in score_jobs]
+                            if len(scores) == 2:
+                                score = 0.5 * (scores[0] + scores[1]) + 0.5 * min(scores[0], scores[1])
+                            else:
+                                score = sum(scores)
                             if best is None or score > best[0]:
                                 best = score, pair, times
                             candidates += 1
@@ -439,9 +537,14 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
                 manifest_dict = dict(signature=signature, timestamps=timestamps,
                                      time_source='insv_timelapse' if capture_times is not None else 'video_pts',
                                      decoder=backend)
+                if secondary_insv_path:
+                    manifest_dict['secondary_insv'] = str(Path(secondary_insv_path).resolve())
+                    manifest_dict['camera_mode'] = 'dual_insv_rig'
                 if is_equirect:
                     manifest_dict['video_mode'] = 'equirectangular'
                     manifest_dict['camera_names'] = ['cam0']
+                else:
+                    manifest_dict['camera_names'] = ['cam0', 'cam1']
                 manifest.write_text(json.dumps(manifest_dict, indent=2), encoding='utf-8')
                 elapsed = max(time.perf_counter() - started, 1e-9)
                 print(f'[+] Extracted {count} synchronized sharp frame pairs in '
@@ -452,6 +555,10 @@ def extract_video_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
     return False
 
 
-# Compatibility aliases for existing integrations.
-extract_insv_frames = extract_video_frames
-extract_insv_frames_pyav = extract_video_frames
+def extract_insv_frames(insv_path, output_dir, fps=2.0, sharp_window=5,
+                        progress_cb=None, secondary_insv_path=None):
+    """Convenience wrapper around extract_video_frames with default decoder settings."""
+    return extract_video_frames(insv_path, output_dir, fps=fps, sharp_window=sharp_window,
+                                progress_cb=progress_cb, secondary_insv_path=secondary_insv_path)
+
+extract_insv_frames_pyav = extract_insv_frames

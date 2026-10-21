@@ -99,6 +99,8 @@ class PointCloudViewerWindow(QMainWindow):
         self._closing = False
         self._build_ui()
         self._setup_shortcuts()
+        from raven_app.theme_manager import update_global_theme_stylesheet
+        update_global_theme_stylesheet()
 
     @staticmethod
     def _tool(icon, text, parent):

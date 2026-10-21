@@ -59,6 +59,8 @@ class ExportViewDialog(QDialog):
 
         self._build_ui()
         self._set_initial_values()
+        from raven_app.theme_manager import update_global_theme_stylesheet
+        update_global_theme_stylesheet()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)

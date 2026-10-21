@@ -813,15 +813,27 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
         print(f"[+] Sample-SfM trajectory alignment accepted without cloud ICP: "
               f"RMSE = {best_rmse*100:.2f} cm, Scale s = {s_comp:.6f}")
 
+    trj_rmse_cm = float(best_rmse * 100)
+    MAX_SIM3_RMSE_CM = 40.0
+    is_accepted = bool((trj_rmse_cm <= MAX_SIM3_RMSE_CM) and np.isfinite(s_comp) and (0.001 < s_comp < 1000.0))
+    quality_status = "accepted" if is_accepted else "rejected"
+    rejection_reason = None if is_accepted else f"Trajectory RMSE ({trj_rmse_cm:.2f} cm) exceeds physical limit ({MAX_SIM3_RMSE_CM:.1f} cm)"
+
+    if not is_accepted:
+        print(f"[ARGON GUARD - REJECTED] Sim(3) Alignment failed physical validation: {rejection_reason}")
+
     align_data = {
         "calibration_version": CALIBRATION_VERSION,
-        "quality_status": "accepted",
+        "quality_status": quality_status,
+        "valid": is_accepted,
+        "rejection_reason": rejection_reason,
         "slam_source_signature": _active_slam_signature(
             dataset_dir, trajectory_path=slam_trj, cloud_path=slam_pcd,
             include_cloud=use_icp),
         "frame_time_source": json.loads((dataset_dir / "images" / "frames.json").read_text(encoding="utf-8")).get("time_source", "video_pts") if (dataset_dir / "images" / "frames.json").is_file() else "legacy_frame_rate",
         "initial_camera_lever_body_m": c_L_phys.tolist(),
-        "trajectory_rmse_cm": float(best_rmse * 100),
+        "trajectory_rmse_m": float(best_rmse),
+        "trajectory_rmse_cm": trj_rmse_cm,
         "scale": float(s_comp),
         "R": R_comp.tolist(),
         "t": t_comp.tolist(),
@@ -1236,6 +1248,17 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
     al = alignment if alignment is not None else current_alignment(dataset_dir, fps)
+    rmse_cm = float(al.get("trajectory_rmse_cm", al.get("trajectory_rmse_m", 0.0) * 100.0))
+    if al.get("quality_status") == "rejected" or al.get("valid") is False or rmse_cm > 40.0:
+        print(f"[ARGON GUARD] Aborting SfM rig recalibration: Sim(3) alignment is REJECTED (RMSE = {rmse_cm:.1f} cm > 40 cm).")
+        stale_calib = dataset_dir / "rig_calibration.json"
+        if stale_calib.exists():
+            try:
+                stale_calib.unlink()
+            except Exception:
+                pass
+        return None
+
     s_sim = al["scale"]
     R_sim = np.array(al["R"])
     t_sim = np.array(al["t"])
@@ -1355,12 +1378,57 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
     e0 = R0.as_euler("xyz", degrees=True)
     e1 = R1.as_euler("xyz", degrees=True)
 
+    c0_norm_cm = float(np.linalg.norm(t0) * 100)
+    c1_norm_cm = float(np.linalg.norm(t1) * 100)
+    MAX_LEVER_ARM_CM = 40.0
+
     print("\n" + "=" * 80)
     print(" PHYSICAL RIG RE-CALIBRATION FROM SFM/SPIRULA COMPLETE:")
-    print(f" Cam0: Euler XYZ={e0} | Lever arm={t0*100} cm (norm {np.linalg.norm(t0)*100:.2f} cm)")
-    print(f" Cam1: Euler XYZ={e1} | Lever arm={t1*100} cm (norm {np.linalg.norm(t1)*100:.2f} cm)")
+    print(f" Cam0: Euler XYZ={e0} | Lever arm={t0*100} cm (norm {c0_norm_cm:.2f} cm)")
+    print(f" Cam1: Euler XYZ={e1} | Lever arm={t1*100} cm (norm {c1_norm_cm:.2f} cm)")
     print(f" Relative angle between lenses: {rel_ang:.2f}° (Theoretical: 180°)")
     print("=" * 80)
+
+    if c0_norm_cm > MAX_LEVER_ARM_CM or c1_norm_cm > MAX_LEVER_ARM_CM:
+        reason = f"Lever arm exceeds physical limit of {MAX_LEVER_ARM_CM:.1f} cm (Cam0: {c0_norm_cm:.1f} cm, Cam1: {c1_norm_cm:.1f} cm)"
+        print(f"[ARGON GUARD - REJECTED] {reason}")
+        print("[*] Quarantining spurious calibration to: rig_calibration.rejected.json")
+        print("[*] Falling back to nominal factory calibration (calibracao_rigida_raven_insta360.json)")
+
+        rej_dict = {
+            "calibration_version": CALIBRATION_VERSION,
+            "quality_status": "rejected",
+            "valid": False,
+            "rejection_reason": reason,
+            "cam0_lever_arm_cm": c0_norm_cm,
+            "cam1_lever_arm_cm": c1_norm_cm,
+            "T_lidar_to_cam0_rigid_4x4": T_LC0.tolist(),
+            "T_lidar_to_cam1_rigid_4x4": T_LC1.tolist(),
+        }
+        with open(dataset_dir / "rig_calibration.rejected.json", "w", encoding="utf-8") as f:
+            json.dump(rej_dict, f, indent=2)
+
+        for name in ["rig_calibration.json", "calibracao_rigida_auto.json"]:
+            p = dataset_dir / name
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+        if align_json.is_file():
+            try:
+                with open(align_json, "r", encoding="utf-8") as f:
+                    al_data = json.load(f)
+                al_data["quality_status"] = "rejected"
+                al_data["valid"] = False
+                prev_reason = al_data.get("rejection_reason")
+                al_data["rejection_reason"] = f"{prev_reason}; {reason}" if prev_reason else reason
+                with open(align_json, "w", encoding="utf-8") as f:
+                    json.dump(al_data, f, indent=2)
+            except Exception:
+                pass
+        return None
 
     calib_dict = {
         "calibration_version": CALIBRATION_VERSION,

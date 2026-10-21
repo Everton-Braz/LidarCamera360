@@ -481,6 +481,11 @@ def extract_third_camera_frames(
         return extract_auxiliary_insv_frames(
             config, dataset_dir, target_fps=target_fps,
             sharpness_window=sharpness_window, jpeg_quality=jpeg_quality)
+    if Path(config.source_path).suffix.lower() == '.bag' or config.source_type == 'bag':
+        from raven_app.bag_io import extract_bag_auxiliary_frames
+        return extract_bag_auxiliary_frames(
+            config, dataset_dir, target_fps=target_fps,
+            sharpness_window=sharpness_window, jpeg_quality=jpeg_quality)
     dataset_dir = Path(dataset_dir)
     images_root = dataset_dir / "images"
     cam_dir = images_root / config.camera_name

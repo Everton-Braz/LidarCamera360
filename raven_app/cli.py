@@ -126,6 +126,8 @@ def parse(argv=None):
     video_preview = sub.add_parser('extract-insv-frame',
                    help='Extract one synchronized sharp lens pair for a mask preview')
     video_preview.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to .insv or .mp4 360 video')
+    video_preview.add_argument('--secondary-insv', dest='secondary_insv', type=Path, default=None,
+                               help='Optional secondary .insv file for dual-file cameras (Insta360 ONE RS 360)')
     video_preview.add_argument('--output', type=Path, required=True)
     video_preview.add_argument('--fps', type=positive, default=2.)
     video_preview.add_argument('--index', type=int, required=True,
@@ -197,6 +199,7 @@ def parse(argv=None):
     wf=sub.add_parser('workflow',help='Run end-to-end processing: Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables')
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
     wf.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Insta360 video file (.insv) or 360 equirectangular video (.mp4)')
+    wf.add_argument('--secondary-insv', dest='secondary_insv', type=Path, default=None, help='Optional secondary .insv file for dual-file cameras (Insta360 ONE RS 360)')
     wf.add_argument('--output',type=Path,required=True,help='Output directory for deliverables')
     wf.add_argument('--scanner', '--preset', choices=['auto', 'raven', 'eagle'], default='auto', help='Scanner preset (auto, raven, eagle)')
     wf.add_argument('--lidar-topic', default=None, help='LiDAR topic (default: auto-detected)')
@@ -215,6 +218,7 @@ def parse(argv=None):
     wf.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from beginning of dataset')
     wf.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end of dataset')
     wf.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for camera frame extraction')
+    wf.add_argument('--use-image-bag',action='store_true',default=False,help='Extract and include camera images from the ROS bag in colorization and 3DGS')
     wf.add_argument('--run-spirula',action='store_true',default=False,help='Run Spirula SfM if not already built')
     wf.add_argument('--export-ply',action='store_true',default=False)
     wf.add_argument('--export-pcd',action='store_true',default=False)
@@ -377,7 +381,8 @@ def run(a):
         return 0 if extract_insv_frames_pyav(a.insv, a.output, fps=a.fps) else 2
     if a.command=='extract-insv-frame':
         from raven_app.video import extract_video_preview_frame
-        return 0 if extract_video_preview_frame(a.insv, a.output, a.index, fps=a.fps) else 2
+        return 0 if extract_video_preview_frame(a.insv, a.output, a.index, fps=a.fps,
+                                           secondary_insv_path=getattr(a, 'secondary_insv', None)) else 2
     if a.command=='extract-gps':
         from raven_app.insv_gps import export_gps
         if len({p.stem.casefold() for p in a.insv}) != len(a.insv):
@@ -564,6 +569,7 @@ def run(a):
         dt_val = getattr(a, 'dt', None)
         return execute_unified_workflow(
             a.bag, a.insv, a.output,
+            secondary_insv_path=getattr(a, 'secondary_insv', None),
             lio=a.lio,
             threads=a.threads,
             lidar_topic=lidar_t,
@@ -596,8 +602,9 @@ def run(a):
             photometric=a.photometric,
             photometric_params=a.photometric_params,
             third_camera=a.third_camera,
-            revisit_refinement=getattr(a, 'revisit_refinement', False),
             image_bag_path=getattr(a, 'image_bag_path', None),
+            use_image_bag=getattr(a, 'use_image_bag', False),
+            revisit_refinement=getattr(a, 'revisit_refinement', False),
         )
     if a.command == 'mcp':
         from raven_app.mcp_server import LidarCameraMcpServer

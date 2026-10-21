@@ -26,6 +26,8 @@ class ClippingBoxDialog(QDialog):
         }
         self._updating = False
         self._build_ui()
+        from raven_app.theme_manager import update_global_theme_stylesheet
+        update_global_theme_stylesheet()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)

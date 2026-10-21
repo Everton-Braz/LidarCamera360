@@ -8,7 +8,7 @@ All values are little endian. Input starts at the beginning for IMU initializati
 import re
 from pathlib import Path
 import struct
-from typing import Optional
+from typing import Optional, Union, List, Dict, Any, Tuple
 import numpy as np
 
 MAGIC = b'FLV2\x01\0\0\0'
@@ -267,11 +267,56 @@ def find_adjacent_image_bag(bag_path: Path) -> Optional[Path]:
     return None
 
 
+def discover_bag_image_topics(bag_path: Union[str, Path]) -> List[Dict[str, Any]]:
+    """Discover image topics within a ROS1 bag file.
+
+    Returns:
+        List of dicts: [{'topic': str, 'msgtype': str, 'msgcount': int}, ...]
+    """
+    p = Path(bag_path)
+    if not p.is_file():
+        return []
+    from rosbags.highlevel import AnyReader
+    results = []
+    try:
+        with AnyReader([p]) as reader:
+            for c in reader.connections:
+                if 'Image' in c.msgtype or 'image' in c.topic.lower() or 'camera' in c.topic.lower():
+                    results.append({
+                        'topic': c.topic,
+                        'msgtype': c.msgtype,
+                        'msgcount': getattr(c, 'msgcount', 0),
+                    })
+    except Exception:
+        pass
+    return results
+
+
+def get_bag_start_time(bag_path: Union[str, Path], topic: Optional[str] = None) -> Optional[float]:
+    """Quickly read the first timestamp from a bag file in seconds."""
+    p = Path(bag_path)
+    if not p.is_file():
+        return None
+    from rosbags.highlevel import AnyReader
+    try:
+        with AnyReader([p]) as reader:
+            conns = reader.connections
+            if topic:
+                conns = [c for c in conns if c.topic == topic]
+            for c, _, raw in reader.messages(connections=conns):
+                msg = reader.deserialize(raw, c.msgtype)
+                return stamp(msg)
+    except Exception:
+        pass
+    return None
+
+
 def extract_images(bag_path: Path, output_dir: Path, *, image_bag_path: Optional[Path] = None,
-                   image_topic: Optional[str] = None, fps: float = 2.0) -> int:
+                   image_topic: Optional[str] = None, fps: float = 2.0,
+                   camera_name: str = "cam0", ref_start_time: Optional[float] = None) -> int:
     """Extract front camera frames from an IMAGE_*.bag or LiDAR bag into output_dir.
 
-    Creates output_dir/cam0 and output_dir/frames.json for workflow compatibility.
+    Creates output_dir/<camera_name> and output_dir/frames.json for workflow compatibility.
     """
     from rosbags.highlevel import AnyReader
     import json
@@ -286,13 +331,14 @@ def extract_images(bag_path: Path, output_dir: Path, *, image_bag_path: Optional
     else:
         target_bag = find_adjacent_image_bag(bag_path) or bag_path
 
-    out_images = output_dir / "cam0"
+    out_images = output_dir / camera_name
     out_images.mkdir(parents=True, exist_ok=True)
 
     extracted_count = 0
     timestamps = {}
     last_t = -1e9
     min_interval = 1.0 / max(0.1, fps) if fps > 0 else 0.0
+    first_t = None
 
     with AnyReader([target_bag]) as reader:
         conn_topics = {c.topic: c for c in reader.connections}
@@ -317,6 +363,8 @@ def extract_images(bag_path: Path, output_dir: Path, *, image_bag_path: Optional
         for c, _, raw in reader.messages(connections=connections):
             msg = reader.deserialize(raw, c.msgtype)
             t = stamp(msg)
+            if first_t is None:
+                first_t = t
             if t - last_t < min_interval:
                 continue
             last_t = t
@@ -337,17 +385,167 @@ def extract_images(bag_path: Path, output_dir: Path, *, image_bag_path: Optional
             frame_filename = f"frame_{frame_idx:06d}.jpg"
             frame_path = out_images / frame_filename
             cv2.imwrite(str(frame_path), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            rel_name = f"cam0/{frame_filename}"
-            timestamps[rel_name] = t
+            rel_name = f"{camera_name}/{frame_filename}"
+            # If reference start time provided (e.g. from LiDAR bag), compute relative seconds
+            t_val = (t - ref_start_time) if ref_start_time is not None else t
+            timestamps[rel_name] = float(t_val)
             frame_idx += 1
             extracted_count += 1
 
     manifest_path = output_dir / "frames.json"
+    existing_manifest = {}
+    if manifest_path.is_file():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing_manifest = {}
+    merged_timestamps = existing_manifest.get("timestamps", {})
+    merged_timestamps.update(timestamps)
     manifest = {
+        "schema": 1,
         "signature": f"bag_{target_bag.stem}_{extracted_count}",
         "time_source": "ros_bag",
-        "timestamps": timestamps
+        "timestamps": merged_timestamps
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return extracted_count
+
+
+def extract_bag_auxiliary_frames(
+    config: Any,
+    dataset_dir: Union[str, Path],
+    target_fps: Optional[float] = None,
+    sharpness_window: int = 3,
+    jpeg_quality: int = 95,
+) -> Tuple[List[Path], Dict[str, float]]:
+    """Extract frames from a ROS bag auxiliary camera into dataset/images/<camera_name>.
+
+    Returns:
+        (extracted_paths, timestamp_dict) mapping e.g. 'cam2/frame_000001.jpg' to relative seconds.
+    """
+    import json
+    import cv2
+    from rosbags.highlevel import AnyReader
+
+    dataset_dir = Path(dataset_dir)
+    images_root = dataset_dir / "images"
+    cam_dir = images_root / config.camera_name
+    cam_dir.mkdir(parents=True, exist_ok=True)
+
+    source_p = Path(config.source_path)
+    if not source_p.exists():
+        raise FileNotFoundError(f"Bag camera source does not exist: {source_p}")
+
+    fps = float(config.fps if target_fps is None else target_fps)
+    if fps <= 0:
+        fps = 2.0
+
+    source_stat = source_p.stat()
+    aux_sig_key = f"signature_{config.camera_name}"
+    curr_sig = {
+        "source": str(source_p.resolve()),
+        "size": source_stat.st_size,
+        "mtime_ns": source_stat.st_mtime_ns,
+        "fps": fps,
+        "camera_name": config.camera_name,
+        "version": 1,
+    }
+
+    manifest_path = images_root / "frames.json"
+    existing_data: Dict[str, Any] = {"schema": 1, "timestamps": {}}
+    if manifest_path.is_file():
+        try:
+            existing_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if "timestamps" not in existing_data or not isinstance(existing_data["timestamps"], dict):
+                existing_data["timestamps"] = {}
+        except Exception:
+            existing_data = {"schema": 1, "timestamps": {}}
+
+    existing_timestamps = existing_data["timestamps"]
+    if existing_data.get(aux_sig_key) == curr_sig:
+        prefix = f"{config.camera_name}/"
+        matched = {k: v for k, v in existing_timestamps.items() if k.startswith(prefix)}
+        if matched and all((images_root / k).is_file() for k in matched):
+            extracted = sorted([images_root / k for k in matched])
+            print(f"[*] Reusing completed bag frame extraction for '{config.camera_name}' ({len(extracted)} frames; cached).")
+            return extracted, matched
+
+    # Identify target topic
+    topics_info = discover_bag_image_topics(source_p)
+    target_topic = None
+    if getattr(config, 'source_stream_index', None) is not None and 0 <= config.source_stream_index < len(topics_info):
+        target_topic = topics_info[config.source_stream_index]['topic']
+    elif topics_info:
+        # Match by camera name index if multiple topics
+        digits = ''.join(filter(str.isdigit, config.camera_name))
+        cam_idx = (int(digits) - 2) if digits and int(digits) >= 2 else 0
+        if 0 <= cam_idx < len(topics_info):
+            target_topic = topics_info[cam_idx]['topic']
+        else:
+            target_topic = topics_info[0]['topic']
+
+    # Find reference start time from LiDAR bag if available
+    ref_start_time = None
+    cand_lidar_bags = list(source_p.parent.glob("LIDAR_*.bag")) or list(dataset_dir.glob("*.bag"))
+    if cand_lidar_bags:
+        ref_start_time = get_bag_start_time(cand_lidar_bags[0])
+
+    extracted: List[Path] = []
+    timestamps: Dict[str, float] = {}
+    last_t = -1e9
+    min_interval = 1.0 / max(0.1, fps)
+    first_t = None
+
+    with AnyReader([source_p]) as reader:
+        conn_topics = {c.topic: c for c in reader.connections}
+        if not target_topic or target_topic not in conn_topics:
+            candidates = ["/camera_front/image_raw", "/camera_front/image/compressed"]
+            for cand in candidates:
+                if cand in conn_topics:
+                    target_topic = cand
+                    break
+            if not target_topic and topics_info:
+                target_topic = topics_info[0]['topic']
+
+        if not target_topic or target_topic not in conn_topics:
+            raise RuntimeError(f"No valid image topic found in bag: {source_p}")
+
+        connections = [conn_topics[target_topic]]
+        frame_idx = 1
+        for c, _, raw in reader.messages(connections=connections):
+            msg = reader.deserialize(raw, c.msgtype)
+            t = stamp(msg)
+            if first_t is None:
+                first_t = t
+            if t - last_t < min_interval:
+                continue
+            last_t = t
+
+            if hasattr(msg, 'format'):
+                data = bytes(msg.data)
+                img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            else:
+                enc = msg.encoding.lower()
+                channels = {'bgr8': 3, 'rgb8': 3, 'mono8': 1, 'bgra8': 4, 'rgba8': 4}.get(enc, 3)
+                img = np.ndarray((msg.height, msg.width, channels), dtype=np.uint8, buffer=msg.data,
+                                 strides=(msg.step, channels, 1))
+                if enc == 'rgb8':
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                elif enc == 'rgba8':
+                    img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGRA)
+
+            frame_filename = f"frame_{frame_idx:06d}.jpg"
+            frame_path = cam_dir / frame_filename
+            cv2.imwrite(str(frame_path), img, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+            rel_name = f"{config.camera_name}/{frame_filename}"
+            t_val = (t - ref_start_time) if ref_start_time is not None else (t - first_t)
+            timestamps[rel_name] = float(t_val)
+            extracted.append(frame_path)
+            frame_idx += 1
+
+    existing_timestamps.update(timestamps)
+    existing_data[aux_sig_key] = curr_sig
+    existing_data["timestamps"] = existing_timestamps
+    manifest_path.write_text(json.dumps(existing_data, indent=2), encoding="utf-8")
+    return extracted, timestamps
 

@@ -34,7 +34,7 @@ from raven_app import __version__
 from raven_app.cli import engine, resources
 from raven_app.bag_io import export_bags
 from raven_app.slam_source import active_slam_dir
-from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, frame_time
+from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, find_partner_insv, normalize_dual_insv_pair, frame_time
 
 for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, 'reconfigure'):
@@ -68,8 +68,8 @@ def process_gps_metadata(insv_path, output_dir, formats=('geojson', 'gpx', 'csv'
     return report
 
 
-def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 2.0) -> bool:
-    return extract_insv_frames_pyav(insv_path, output_dir, fps=fps)
+def extract_insv_frames(insv_path: Path, output_dir: Path, fps: float = 2.0, secondary_insv_path: Optional[Path] = None) -> bool:
+    return extract_insv_frames_pyav(insv_path, output_dir, fps=fps, secondary_insv_path=secondary_insv_path)
 
 
 def _workflow_path_snapshot(path):
@@ -1790,11 +1790,28 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
         if (alt / "points3D.bin").is_file():
             sfm_sparse = alt
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
-    has_sfm = (sfm_sparse / 'points3D.bin').is_file() and align_json.is_file()
+    align_valid = False
+    if align_json.is_file():
+        try:
+            al_check = json.loads(align_json.read_text(encoding='utf-8'))
+            rmse_cm_check = float(al_check.get("trajectory_rmse_cm", al_check.get("trajectory_rmse_m", 0.0) * 100.0))
+            if al_check.get("quality_status") == "accepted" and al_check.get("valid") is not False and rmse_cm_check <= 40.0:
+                align_valid = True
+        except Exception:
+            pass
+    has_sfm = (sfm_sparse / 'points3D.bin').is_file() and align_valid
     if pose_source == 'auto':
         pose_source = 'sfm' if has_sfm else 'direct'
-    if pose_source == 'sfm' and not has_sfm:
-        raise FileNotFoundError('SfM pose source was requested, but sparse points or COLMAP-to-LiDAR alignment is missing')
+    if pose_source == 'sfm':
+        if not has_sfm:
+            print("[ARGON GUARD] SfM alignment is missing or rejected. Falling back to direct trajectory for 3DGS.")
+            pose_source = 'direct'
+        else:
+            alignment = json.loads(align_json.read_text(encoding='utf-8'))
+            rmse_cm_val = float(alignment.get("trajectory_rmse_cm", alignment.get("trajectory_rmse_m", 0.0) * 100.0))
+            if alignment.get('quality_status') == 'rejected' or alignment.get('valid') is False or rmse_cm_val > 40.0:
+                print(f"[ARGON GUARD] SfM alignment is REJECTED (RMSE={rmse_cm_val:.1f} cm > 40 cm). Falling back to direct trajectory for 3DGS.")
+                pose_source = 'direct'
 
     from scripts.pipeline_auto_calibrator_and_colorizer import get_slam_trajectory_path
     trj_path = get_slam_trajectory_path(dataset_dir)
@@ -2325,9 +2342,10 @@ def prepare_fastlivo_config(
 
 def execute_unified_workflow(
     bag_path: Path,
-    insv_path: Path,
+    insv_path: Optional[Path],
     output_dir: Path,
     *,
+    secondary_insv_path: Optional[Path] = None,
     lio: bool = True,
     threads: int = 4,
     lidar_topic: str = "/vanjee_722z",
@@ -2359,9 +2377,10 @@ def execute_unified_workflow(
     photometric: str = "off",
     photometric_params: Path = None,
     third_camera: Optional[Any] = None,
+    image_bag_path: Optional[Path] = None,
+    use_image_bag: bool = False,
     colmap_export_dir: Optional[Path] = None,
     revisit_refinement: bool = False,
-    image_bag_path: Optional[Path] = None,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -2400,6 +2419,71 @@ def execute_unified_workflow(
                 third_cfgs = load_third_camera_configs(p)
             elif p.exists():
                 third_cfgs = [ThirdCameraConfig(source_path=str(p), enabled=True)]
+
+    # Inject bag camera(s) if use_image_bag is True
+    if use_image_bag:
+        target_img_bag = image_bag_path
+        if not target_img_bag or not Path(target_img_bag).is_file():
+            from raven_app.bag_io import find_adjacent_image_bag
+            target_img_bag = find_adjacent_image_bag(bag_path)
+        if target_img_bag and Path(target_img_bag).is_file():
+            from raven_app.bag_io import discover_bag_image_topics
+            from raven_app.third_camera import ThirdCameraConfig
+            topics = discover_bag_image_topics(target_img_bag)
+            if topics:
+                # Load factory calibration for Raven camera if available
+                raven_cam_yaml = Path(__file__).parent.parent / 'FAST-LIVO2' / 'config' / 'camera_raven.yaml'
+                raven_lidar_yaml = Path(__file__).parent.parent / 'FAST-LIVO2' / 'config' / 'raven.yaml'
+                intrinsics = {}
+                extrinsics = np.eye(4, dtype=np.float64)
+                if raven_cam_yaml.is_file():
+                    try:
+                        import yaml
+                        with open(raven_cam_yaml, 'r', encoding='utf-8') as f:
+                            cy = yaml.safe_load(f)
+                        intrinsics = {
+                            'camera_model': 'OPENCV_FISHEYE',
+                            'width': int(cy.get('image_width', 4000)),
+                            'height': int(cy.get('image_height', 3000)),
+                            'fx': float(cy.get('cam_fx', 1123.516)),
+                            'fy': float(cy.get('cam_fy', 1124.245)),
+                            'cx': float(cy.get('cam_cx', 1542.597)),
+                            'cy': float(cy.get('cam_cy', 2110.540)),
+                            'k1': float(cy.get('cam_k1', -0.04268)),
+                            'k2': float(cy.get('cam_k2', 0.00242)),
+                            'k3': float(cy.get('cam_k3', -0.00087)),
+                            'k4': float(cy.get('cam_k4', 0.00012)),
+                        }
+                    except Exception as e:
+                        print(f"[WARN] Failed loading camera_raven.yaml: {e}")
+                if raven_lidar_yaml.is_file():
+                    try:
+                        import yaml
+                        with open(raven_lidar_yaml, 'r', encoding='utf-8') as f:
+                            ry = yaml.safe_load(f)
+                        if 'Rcl' in ry and 'Pcl' in ry:
+                            Rcl = np.array(ry['Rcl'], dtype=np.float64).reshape((3, 3))
+                            Pcl = np.array(ry['Pcl'], dtype=np.float64).reshape((3,))
+                            extrinsics[:3, :3] = Rcl
+                            extrinsics[:3, 3] = Pcl
+                    except Exception as e:
+                        print(f"[WARN] Failed loading raven.yaml extrinsics: {e}")
+
+                for idx, tinfo in enumerate(topics):
+                    cam_id = f"cam{idx + 2}"
+                    bag_cfg = ThirdCameraConfig(
+                        camera_name=cam_id,
+                        source_path=str(target_img_bag),
+                        source_type='bag',
+                        source_stream_index=idx,
+                        fps=2.0,
+                        enabled=True,
+                        intrinsics=intrinsics if idx == 0 else {},
+                        extrinsics=extrinsics if idx == 0 else np.eye(4, dtype=np.float64),
+                    )
+                    third_cfgs.append(bag_cfg)
+                    print(f"[INFO] Registered bag camera topic '{tinfo['topic']}' as auxiliary {cam_id}")
+
         elif isinstance(third_camera, dict):
             third_cfgs = load_third_camera_configs(third_camera)
     third_cfgs = [cfg for cfg in third_cfgs if cfg.enabled and cfg.source_path]
@@ -2452,11 +2536,16 @@ def execute_unified_workflow(
     # --------------------------------------------------------------------------
     # STAGE 1: Extract frames from INSV
     # --------------------------------------------------------------------------
-    print("\n[STAGE 1/7] Extracting video frames from INSV...")
     frames_manifest = output_dir / "images" / "frames.json"
     previous_frames = frames_manifest.stat().st_mtime_ns if frames_manifest.is_file() else None
-    if not extract_insv_frames(insv_path, output_dir, fps=fps):
-        raise RuntimeError("Failed to extract video frames from INSV")
+    if insv_path:
+        insv_path, secondary_insv_path = normalize_dual_insv_pair(insv_path, secondary_insv_path)
+        if secondary_insv_path:
+            print(f"\n[STAGE 1/7] Extracting video frames from Dual-File INSV:\n    Primary (cam0): {insv_path}\n    Secondary (cam1): {secondary_insv_path}")
+        else:
+            print(f"\n[STAGE 1/7] Extracting video frames from {insv_path}...")
+        if not extract_insv_frames(insv_path, output_dir, fps=fps, secondary_insv_path=secondary_insv_path):
+            raise RuntimeError("Failed to extract video frames from INSV")
     frames_changed = previous_frames is not None and frames_manifest.stat().st_mtime_ns != previous_frames
     is_timelapse = json.loads(frames_manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse'
 
@@ -2769,14 +2858,17 @@ def execute_unified_workflow(
         if recalibrate:
             print("[*] Auto-Recalibrating spatial mounting extrinsics (T_LC0, T_LC1) from SfM...")
             try:
-                pipeline.recalibrate_from_sfm(output_dir, fps=fps)
-                calib = output_dir / "rig_calibration.json"
-                if not calib.is_file():
-                    calib = output_dir / "calibracao_rigida_auto.json"
+                cal_res = pipeline.recalibrate_from_sfm(output_dir, fps=fps)
+                if cal_res is None or not (output_dir / "rig_calibration.json").is_file():
+                    calib = resolve_calibration_file(output_dir)
+                    print(f"[*] Recalibration was rejected or unavailable; using nominal factory calibration: {calib}")
+                else:
+                    calib = output_dir / "rig_calibration.json"
             except Exception as e:
                 if is_timelapse:
                     raise RuntimeError(f'Timelapse rig calibration failed: {e}') from e
                 print(f"[!] Extrinsics recalibration notice: {e}")
+                calib = resolve_calibration_file(output_dir)
 
     if method == 'direct' and (recalibrate or third_cfgs) and (
             not sparse_bin.is_file() or bool(third_cfgs)):
@@ -2959,8 +3051,27 @@ def execute_unified_workflow(
     print("\n[STAGE 6/7] Running Point Cloud Colorization...")
     cloud_state_before = {p: p.stat().st_mtime_ns for p in deliverables_dir.iterdir()
                           if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}}
+    
+    # Argon Gatekeeper: evaluate SfM alignment and rig calibration
+    align_file = output_dir / "colmap_to_lidar_alignment.json"
+    alignment_valid = True
+    if align_file.is_file():
+        try:
+            with open(align_file, "r", encoding="utf-8") as f:
+                al_data = json.load(f)
+            rmse_cm = float(al_data.get("trajectory_rmse_cm", al_data.get("trajectory_rmse_m", 0.0) * 100.0))
+            if al_data.get("quality_status") == "rejected" or al_data.get("valid") is False or rmse_cm > 40.0:
+                print(f"[ARGON GATEKEEPER] SfM Sim(3) Alignment is REJECTED (RMSE = {rmse_cm:.1f} cm > 40 cm; status={al_data.get('quality_status')}).")
+                print("[ARGON GATEKEEPER] Aborting SfM color projection and falling back to Direct Rigid colorization with nominal factory calibration...")
+                alignment_valid = False
+        except Exception as e:
+            print(f"[!] Warning checking alignment gate: {e}")
+            alignment_valid = False
+    elif method in ("sfm", "all"):
+        alignment_valid = False
+
     sfm_done = False
-    if method in ("sfm", "all") and sparse_bin.is_file():
+    if method in ("sfm", "all") and sparse_bin.is_file() and alignment_valid:
         try:
             pipeline.colorize_via_spirula_sfm(
                 output_dir, fps=fps, use_vulkan=use_vulkan,
@@ -2972,6 +3083,9 @@ def execute_unified_workflow(
             print(f"[!] SfM colorization notice: {e}")
 
     if method in ("direct", "all") or (method == "sfm" and not sfm_done):
+        if not alignment_valid or not validate_calibration_file(calib):
+            calib = resolve_calibration_file(output_dir)
+            print(f"[*] Direct Rigid colorization using resolved calibration: {calib}")
         pipeline.colorize_via_direct_rigid(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
             masks_dir=active_masks_dir, operator_radius=operator_radius,

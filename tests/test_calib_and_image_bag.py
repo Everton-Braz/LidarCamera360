@@ -87,9 +87,10 @@ def test_prepare_fastlivo_config_injects_camera_parameters(tmp_path: Path):
 
 def test_cli_accepts_image_bag_option():
     from raven_app.cli import parse
-    # Test workflow parser accepts --image-bag
-    args = parse(["workflow", "--bag", "lidar.bag", "--insv", "video.insv", "--output", "out", "--image-bag", "image.bag"])
+    # Test workflow parser accepts --image-bag and --use-image-bag
+    args = parse(["workflow", "--bag", "lidar.bag", "--insv", "video.insv", "--output", "out", "--image-bag", "image.bag", "--use-image-bag"])
     assert getattr(args, "image_bag_path", None) == Path("image.bag")
+    assert getattr(args, "use_image_bag", False) is True
 
     # Test slam parser accepts --image-bag and --calib
     slam_args = parse(["slam", "--bag", "lidar.bag", "--output", "out", "--image-bag", "image.bag", "--calib", "calib.json"])

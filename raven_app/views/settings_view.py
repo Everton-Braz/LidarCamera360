@@ -292,11 +292,10 @@ class SettingsView(QWidget):
         self.cfg["theme"] = theme_name
         save_config(self.cfg)
 
-        target_theme = Theme.DARK if idx == 0 else (Theme.LIGHT if idx == 1 else Theme.AUTO)
-
         def _apply_theme():
             try:
-                setTheme(target_theme)
+                from raven_app.theme_manager import apply_app_theme
+                apply_app_theme(theme_name)
             except Exception as exc:
                 print(f"[!] Error switching theme: {exc}")
 

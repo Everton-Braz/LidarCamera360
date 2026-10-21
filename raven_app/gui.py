@@ -47,13 +47,8 @@ class RavenMainWindow(FluentWindow):
         self.setMinimumSize(960, 660)
 
         # Apply saved theme from configuration
-        theme_pref = load_config().get("theme", "dark").lower()
-        if theme_pref == "light":
-            setTheme(Theme.LIGHT)
-        elif theme_pref == "auto":
-            setTheme(Theme.AUTO)
-        else:
-            setTheme(Theme.DARK)
+        from raven_app.theme_manager import apply_app_theme
+        apply_app_theme()
 
         # Set application and window icon
         icon = _get_app_icon()
@@ -253,13 +248,8 @@ def launch(*, on_ready=None):
     if app is None:
         app = QApplication(sys.argv)
 
-    theme_pref = cfg.get("theme", "dark").lower()
-    if theme_pref == "light":
-        setTheme(Theme.LIGHT)
-    elif theme_pref == "auto":
-        setTheme(Theme.AUTO)
-    else:
-        setTheme(Theme.DARK)
+    from raven_app.theme_manager import apply_app_theme
+    apply_app_theme(cfg.get("theme", "dark"))
 
     icon = _get_app_icon()
     if not icon.isNull():
