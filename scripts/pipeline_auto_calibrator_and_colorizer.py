@@ -1776,20 +1776,39 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
                      or cfg.get('timelapse_calibration_version') != active_alignment.get('timelapse_calibration_version'))):
             cfg = recalibrate_from_sfm(dataset_dir, fps)
 
-    p0 = cfg.get("cam0_front_intrinsics", {})
-    params0 = (p0.get("fx", 0.0), p0.get("fy", 0.0), p0.get("cx", 0.0), p0.get("cy", 0.0),
-               p0.get("k1", 0.0), p0.get("k2", 0.0), p0.get("p1", 0.0), p0.get("p2", 0.0),
-               p0.get("k3", 0.0), p0.get("k4", 0.0), p0.get("sx1", 0.0), p0.get("sy1", 0.0))
-    p1 = cfg.get("cam1_rear_intrinsics", {})
-    params1 = (p1.get("fx", 0.0), p1.get("fy", 0.0), p1.get("cx", 0.0), p1.get("cy", 0.0),
-               p1.get("k1", 0.0), p1.get("k2", 0.0), p1.get("p1", 0.0), p1.get("p2", 0.0),
-               p1.get("k3", 0.0), p1.get("k4", 0.0), p1.get("sx1", 0.0), p1.get("sy1", 0.0))
+    # Support both schema formats: calibracao_rigida (cam0_front_intrinsics/T_lidar_to_cam0_rigid_4x4) and rig_profile (Cam0/Cam1 with T_lidar_cam)
+    if 'Cam0' in cfg and 'T_lidar_cam' in cfg['Cam0']:
+        T_LC0 = np.array(cfg['Cam0']['T_lidar_cam'], dtype=np.float64)
+        T_LC1 = np.array(cfg.get('Cam1', {}).get('T_lidar_cam', np.eye(4)), dtype=np.float64)
+        # Load intrinsics from Cam0/Cam1 if present, else fallback to nominal camera_raven
+        k0 = cfg['Cam0']
+        fx0 = float(k0.get('fx', 1123.516))
+        fy0 = float(k0.get('fy', 1124.245))
+        cx0 = float(k0.get('cx', 1542.597))
+        cy0 = float(k0.get('cy', 2110.540))
+        params0 = (fx0, fy0, cx0, cy0, float(k0.get('k1', -0.04268)), float(k0.get('k2', 0.00242)),
+                   0.0, 0.0, float(k0.get('k3', -0.00087)), float(k0.get('k4', 0.00012)), 0.0, 0.0)
+        k1 = cfg.get('Cam1', {})
+        fx1 = float(k1.get('fx', 1123.516))
+        fy1 = float(k1.get('fy', 1124.245))
+        cx1 = float(k1.get('cx', 1542.597))
+        cy1 = float(k1.get('cy', 2110.540))
+        params1 = (fx1, fy1, cx1, cy1, float(k1.get('k1', -0.04268)), float(k1.get('k2', 0.00242)),
+                   0.0, 0.0, float(k1.get('k3', -0.00087)), float(k1.get('k4', 0.00012)), 0.0, 0.0)
+    else:
+        p0 = cfg.get("cam0_front_intrinsics", {})
+        params0 = (p0.get("fx", 0.0), p0.get("fy", 0.0), p0.get("cx", 0.0), p0.get("cy", 0.0),
+                   p0.get("k1", 0.0), p0.get("k2", 0.0), p0.get("p1", 0.0), p0.get("p2", 0.0),
+                   p0.get("k3", 0.0), p0.get("k4", 0.0), p0.get("sx1", 0.0), p0.get("sy1", 0.0))
+        p1 = cfg.get("cam1_rear_intrinsics", {})
+        params1 = (p1.get("fx", 0.0), p1.get("fy", 0.0), p1.get("cx", 0.0), p1.get("cy", 0.0),
+                   p1.get("k1", 0.0), p1.get("k2", 0.0), p1.get("p1", 0.0), p1.get("p2", 0.0),
+                   p1.get("k3", 0.0), p1.get("k4", 0.0), p1.get("sx1", 0.0), p1.get("sy1", 0.0))
+        T_LC0 = np.array(cfg.get("T_lidar_to_cam0_rigid_4x4", np.eye(4)))
+        T_LC1 = np.array(cfg.get("T_lidar_to_cam1_rigid_4x4", np.eye(4)))
 
-    T_LC0 = np.array(cfg.get("T_lidar_to_cam0_rigid_4x4", np.eye(4)))
     R_LC0 = T_LC0[:3, :3]
     t_LC0 = T_LC0[:3, 3]
-
-    T_LC1 = np.array(cfg.get("T_lidar_to_cam1_rigid_4x4", np.eye(4)))
     R_LC1 = T_LC1[:3, :3]
     t_LC1 = T_LC1[:3, 3]
 
