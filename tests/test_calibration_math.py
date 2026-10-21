@@ -39,8 +39,8 @@ class CalibrationMathTests(unittest.TestCase):
             )
             identity = Rot.identity()
             images = [
-                {"name": "cam0/frame_000001.jpg", "C": np.array([11., 0., 0.]), "R_cw": np.eye(3), "cam_id": 1},
-                {"name": "cam1/frame_000001.jpg", "C": np.array([9., 0., 0.]), "R_cw": np.eye(3), "cam_id": 2},
+                {"name": "cam0/frame_000001.jpg", "C": np.array([10.15, 0., 0.]), "R_cw": np.eye(3), "cam_id": 1},
+                {"name": "cam1/frame_000001.jpg", "C": np.array([9.85, 0., 0.]), "R_cw": np.eye(3), "cam_id": 2},
             ]
             cameras = {
                 1: {"model_id": 10, "params": tuple(np.arange(12, dtype=float) + 100), "width": 3840, "height": 3840},
@@ -52,8 +52,8 @@ class CalibrationMathTests(unittest.TestCase):
                  patch.object(pipeline, "frame_time", return_value=0.0):
                 pipeline.recalibrate_from_sfm(root, fps=2.0)
             result = json.loads((root / "rig_calibration.json").read_text())
-            np.testing.assert_allclose([result["T_lidar_to_cam0_rigid_4x4"][i][3] for i in range(3)], [1., 0., 0.], atol=1e-12)
-            np.testing.assert_allclose([result["T_lidar_to_cam1_rigid_4x4"][i][3] for i in range(3)], [-1., 0., 0.], atol=1e-12)
+            np.testing.assert_allclose([result["T_lidar_to_cam0_rigid_4x4"][i][3] for i in range(3)], [0.15, 0., 0.], atol=1e-12)
+            np.testing.assert_allclose([result["T_lidar_to_cam1_rigid_4x4"][i][3] for i in range(3)], [-0.15, 0., 0.], atol=1e-12)
             self.assertEqual(result["cam0_front_intrinsics"]["fx"], 100.0)
             self.assertEqual(result["cam1_rear_intrinsics"]["fx"], 200.0)
             self.assertEqual(result["cam0_front_intrinsics"]["sx1"], 110.0)

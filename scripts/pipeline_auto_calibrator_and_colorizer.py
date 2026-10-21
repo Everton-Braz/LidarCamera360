@@ -1806,9 +1806,10 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
         try:
             with open(align_json, "r", encoding="utf-8") as f:
                 al = json.load(f)
-                dt_sync = al.get("dt_sync_seconds", None)
-                if dt_sync is not None:
-                    print(f"[*] Synchronization inherited from COLMAP Sim(3): Δt = {dt_sync:.4f}s")
+                if al.get('quality_status') != 'rejected' and al.get('valid') is not False and al.get('trajectory_rmse_cm', 999.0) <= 40.0:
+                    dt_sync = al.get("dt_sync_seconds", None)
+                    if dt_sync is not None:
+                        print(f"[*] Synchronization inherited from COLMAP Sim(3): Δt = {dt_sync:.4f}s")
         except Exception:
             pass
 

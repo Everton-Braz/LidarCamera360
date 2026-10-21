@@ -2216,6 +2216,51 @@ def _postprocess_3dgs_dataset(out_dir: Path, dataset_dir: Path):
     setup_sparse_compatibility(out_dir)
 
 
+def validate_calibration_file(calib_path: Optional[Path], max_lever_arm_cm: float = 40.0) -> bool:
+    """Check that calibration file exists and does not exceed physical mounting limits."""
+    if not calib_path:
+        return False
+    p = Path(calib_path)
+    if not p.is_file():
+        return False
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get('quality_status') == 'rejected' or data.get('valid') is False:
+            return False
+        for key in ('T_lidar_to_cam0_rigid_4x4', 'T_lidar_to_camera_rigid_4x4', 'T_lidar_cam', 'T_CL'):
+            if key in data:
+                mat = np.array(data[key])
+                if mat.shape == (4, 4):
+                    lever_norm_cm = float(np.linalg.norm(mat[:3, 3]) * 100.0)
+                    if lever_norm_cm > max_lever_arm_cm:
+                        return False
+        if 'T_lidar_to_cam1_rigid_4x4' in data:
+            mat1 = np.array(data['T_lidar_to_cam1_rigid_4x4'])
+            if mat1.shape == (4, 4):
+                lever_norm_cm = float(np.linalg.norm(mat1[:3, 3]) * 100.0)
+                if lever_norm_cm > max_lever_arm_cm:
+                    return False
+        return True
+    except Exception:
+        return False
+
+
+def resolve_calibration_file(output_dir: Path, is_eagle: bool = False, calib_json: Optional[Path] = None) -> Path:
+    """Resolve the best available calibration file, falling back to nominal factory calibration if invalid/rejected."""
+    if calib_json and Path(calib_json).is_file() and validate_calibration_file(calib_json):
+        return Path(calib_json)
+    for name in ("rig_calibration.json", "calibracao_rigida_auto.json"):
+        p = output_dir / name
+        if p.is_file() and validate_calibration_file(p):
+            return p
+    if is_eagle and (resources() / "configs/rig_profile_eagle.json").is_file():
+        return resources() / "configs/rig_profile_eagle.json"
+    elif (resources() / "configs/rig_profile.json").is_file():
+        return resources() / "configs/rig_profile.json"
+    return resources() / "calibracao_rigida_raven_insta360.json"
+
+
 def prepare_fastlivo_config(
     base_config: Path,
     output_dir: Path,
@@ -2780,6 +2825,26 @@ def execute_unified_workflow(
     active_temp.write_text(json.dumps(active_data, indent=2), encoding='utf-8')
     active_temp.replace(active_manifest)
 
+    # Convert dt_sync to SLAM trajectory reference frame if auto-computed
+    if dt_override is None and raw_trj.is_file():
+        try:
+            from rosbags.highlevel import AnyReader
+            with AnyReader([Path(bag_path)]) as b:
+                t0_bag = float(b.start_time * 1e-9)
+            t0_slam = None
+            with open(raw_trj, 'r', encoding='utf-8') as tf:
+                for line in tf:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        t0_slam = float(line.split()[0])
+                        break
+            if t0_slam is not None and t0_bag is not None:
+                slam_delay = float(t0_slam - t0_bag)
+                dt_sync = dt_sync + slam_delay
+                print(f"[+] Converted temporal offset to SLAM trajectory reference: Δt_slam = {dt_sync:.4f}s (SLAM start delay: {slam_delay:.4f}s)")
+        except Exception as e:
+            print(f"[!] Notice adjusting dt_sync to SLAM reference: {e}")
+
     # --------------------------------------------------------------------------
     # STAGE 4: SfM Alignment & Dynamic Spatial Extrinsics Recalibration
     # --------------------------------------------------------------------------
@@ -2802,16 +2867,7 @@ def execute_unified_workflow(
             calibrate_third_camera_intrinsics,
             save_third_camera_config,
         )
-    calib = calib_json or (output_dir / "rig_calibration.json")
-    if not calib.is_file():
-        calib = output_dir / "calibracao_rigida_auto.json"
-    if not calib.is_file():
-        if is_eagle and (resources() / "configs/rig_profile_eagle.json").is_file():
-            calib = resources() / "configs/rig_profile_eagle.json"
-        elif (resources() / "configs/rig_profile.json").is_file():
-            calib = resources() / "configs/rig_profile.json"
-        else:
-            calib = resources() / "calibracao_rigida_raven_insta360.json"
+    calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json)
 
     if (method in ("sfm", "all") or run_spirula or (frames_changed and sparse_bin.is_file())) and (not sparse_bin.is_file() or frames_changed):
         print("[*] Running Spirula SfM (Vulkan GPU Headless)...")
@@ -2844,7 +2900,15 @@ def execute_unified_workflow(
         print("[*] Performing Metric Sim(3) Alignment (Spirula COLMAP -> LiDAR Ground Truth)...")
         try:
             align_data = pipeline.align_colmap_to_lidar(output_dir, fps=fps, dt_hint=dt_sync)
-            dt_sync = float(align_data.get("dt_sync_seconds", dt_sync))
+            alignment_valid = (
+                align_data.get('quality_status') != 'rejected'
+                and align_data.get('valid') is not False
+                and align_data.get('trajectory_rmse_cm', 999.0) <= 40.0
+            )
+            if alignment_valid:
+                dt_sync = float(align_data.get("dt_sync_seconds", dt_sync))
+            else:
+                print(f"[*] Sim(3) alignment is invalid/rejected; keeping IMU-based time synchronization Δt = {dt_sync:.4f}s")
             rmse_cm = align_data.get('trajectory_rmse_cm')
             if rmse_cm is not None and rmse_cm > 2.0:
                 print(f"[QUALITY WARNING] SfM-to-FAST-LIVO2 trajectory RMSE is {rmse_cm:.2f} cm; "
@@ -2860,7 +2924,7 @@ def execute_unified_workflow(
             try:
                 cal_res = pipeline.recalibrate_from_sfm(output_dir, fps=fps)
                 if cal_res is None or not (output_dir / "rig_calibration.json").is_file():
-                    calib = resolve_calibration_file(output_dir)
+                    calib = resolve_calibration_file(output_dir, is_eagle=is_eagle)
                     print(f"[*] Recalibration was rejected or unavailable; using nominal factory calibration: {calib}")
                 else:
                     calib = output_dir / "rig_calibration.json"
@@ -2868,7 +2932,7 @@ def execute_unified_workflow(
                 if is_timelapse:
                     raise RuntimeError(f'Timelapse rig calibration failed: {e}') from e
                 print(f"[!] Extrinsics recalibration notice: {e}")
-                calib = resolve_calibration_file(output_dir)
+                calib = resolve_calibration_file(output_dir, is_eagle=is_eagle)
 
     if method == 'direct' and (recalibrate or third_cfgs) and (
             not sparse_bin.is_file() or bool(third_cfgs)):
@@ -3084,7 +3148,7 @@ def execute_unified_workflow(
 
     if method in ("direct", "all") or (method == "sfm" and not sfm_done):
         if not alignment_valid or not validate_calibration_file(calib):
-            calib = resolve_calibration_file(output_dir)
+            calib = resolve_calibration_file(output_dir, is_eagle=is_eagle)
             print(f"[*] Direct Rigid colorization using resolved calibration: {calib}")
         pipeline.colorize_via_direct_rigid(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
