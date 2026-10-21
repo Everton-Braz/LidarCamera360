@@ -1899,7 +1899,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     use_drift_correction = False
     sparse_img_bin = dataset_dir / "sparse" / "0" / "images.bin"
     is_timelapse = active_alignment.get('frame_time_source') == 'insv_timelapse'
-    if align_json.exists() and sparse_img_bin.exists() and not is_timelapse:
+    alignment_valid = active_alignment.get('valid', True) and active_alignment.get('quality_status') != 'rejected'
+    if align_json.exists() and sparse_img_bin.exists() and not is_timelapse and alignment_valid:
         try:
             with open(align_json, "r", encoding="utf-8") as f:
                 al = json.load(f)

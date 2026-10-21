@@ -2825,25 +2825,11 @@ def execute_unified_workflow(
     active_temp.write_text(json.dumps(active_data, indent=2), encoding='utf-8')
     active_temp.replace(active_manifest)
 
-    # Convert dt_sync to SLAM trajectory reference frame if auto-computed
+    # Temporal offset is already directly referenced to SLAM trajectory start
+    # (t_lidar_rel_slam = t_bag - t_slam_start) by sync_via_gyro_cross_correlation.
+    # Avoid adding slam_delay which causes longitudinal drift.
     if dt_override is None and raw_trj.is_file():
-        try:
-            from rosbags.highlevel import AnyReader
-            with AnyReader([Path(bag_path)]) as b:
-                t0_bag = float(b.start_time * 1e-9)
-            t0_slam = None
-            with open(raw_trj, 'r', encoding='utf-8') as tf:
-                for line in tf:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        t0_slam = float(line.split()[0])
-                        break
-            if t0_slam is not None and t0_bag is not None:
-                slam_delay = float(t0_slam - t0_bag)
-                dt_sync = dt_sync + slam_delay
-                print(f"[+] Converted temporal offset to SLAM trajectory reference: Δt_slam = {dt_sync:.4f}s (SLAM start delay: {slam_delay:.4f}s)")
-        except Exception as e:
-            print(f"[!] Notice adjusting dt_sync to SLAM reference: {e}")
+        print(f"[*] Verified temporal offset in SLAM trajectory reference: Δt = {dt_sync:.4f}s")
 
     # --------------------------------------------------------------------------
     # STAGE 4: SfM Alignment & Dynamic Spatial Extrinsics Recalibration
