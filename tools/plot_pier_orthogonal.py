@@ -13,8 +13,8 @@ import numpy as np
 import open3d as o3d
 import matplotlib.pyplot as plt
 
-DELIVERABLE_PLY = Path('D:/ARQUIVOS_TESTE_2/PIER/LIDAR_20261020115929_studio_output/deliverables/lidar_colored_direct_rigid_20261021_194433.ply')
-TRJ_TXT = Path('D:/ARQUIVOS_TESTE_2/PIER/LIDAR_20261020115929_studio_output/slam_raw_f8a83ade028dd052024e/result/Raven_3DMakerPro_Scan.txt')
+DELIVERABLE_PLY = Path('D:/ARQUIVOS_TESTE_2/PIER/LidarCamera360_CLI_Output/deliverables/lidar_colored_direct_rigid_20261021_213644.ply')
+TRJ_TXT = Path('D:/ARQUIVOS_TESTE_2/PIER/LidarCamera360_CLI_Output/slam_raw_f8a83ade028dd052024e/result/Raven_3DMakerPro_Scan.txt')
 OUTPUT_PNG = Path('D:/ARQUIVOS_TESTE_2/PIER/pier_orthogonal_views.png')
 
 def main():
