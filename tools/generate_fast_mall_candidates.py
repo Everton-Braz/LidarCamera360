@@ -201,7 +201,9 @@ def main():
         ax.set_ylim(cy - hw, cy + hw)
         ax.grid(True, color='#2c2c36', linestyle='--', alpha=0.5)
 
-    out_comp = DATASET_DIR / 'candidates_zoom/mall_candidates_comparison.png'
+    out_dir = DATASET_DIR / 'candidates_zoom'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_comp = out_dir / 'mall_candidates_comparison.png'
     plt.tight_layout()
     plt.savefig(str(out_comp), dpi=220, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close()
@@ -221,7 +223,7 @@ def main():
         ax_s.set_xlim(cx - hw, cx + hw)
         ax_s.set_ylim(cy - hw, cy + hw)
         ax_s.grid(True, color='#2c2c36', linestyle='--', alpha=0.5)
-        single_out = DATASET_DIR / f'candidates_zoom/mall_candidate_{idx_c+1}_detail.png'
+        single_out = out_dir / f'mall_candidate_{idx_c+1}_detail.png'
         plt.tight_layout()
         plt.savefig(str(single_out), dpi=260, facecolor=fig_s.get_facecolor(), edgecolor='none')
         plt.close()
