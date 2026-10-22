@@ -1794,8 +1794,7 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
     if align_json.is_file():
         try:
             al_check = json.loads(align_json.read_text(encoding='utf-8'))
-            rmse_cm_check = float(al_check.get("trajectory_rmse_cm", al_check.get("trajectory_rmse_m", 0.0) * 100.0))
-            if al_check.get("quality_status") == "accepted" and al_check.get("valid") is not False and rmse_cm_check <= 40.0:
+            if al_check.get("quality_status") == "accepted" and al_check.get("valid") is not False:
                 align_valid = True
         except Exception:
             pass
@@ -1808,9 +1807,8 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
             pose_source = 'direct'
         else:
             alignment = json.loads(align_json.read_text(encoding='utf-8'))
-            rmse_cm_val = float(alignment.get("trajectory_rmse_cm", alignment.get("trajectory_rmse_m", 0.0) * 100.0))
-            if alignment.get('quality_status') == 'rejected' or alignment.get('valid') is False or rmse_cm_val > 40.0:
-                print(f"[ARGON GUARD] SfM alignment is REJECTED (RMSE={rmse_cm_val:.1f} cm > 40 cm). Falling back to direct trajectory for 3DGS.")
+            if alignment.get('quality_status') == 'rejected' or alignment.get('valid') is False:
+                print("[ARGON GUARD] SfM alignment is REJECTED. Falling back to direct trajectory for 3DGS.")
                 pose_source = 'direct'
 
     from scripts.pipeline_auto_calibrator_and_colorizer import get_slam_trajectory_path
@@ -2889,7 +2887,6 @@ def execute_unified_workflow(
             alignment_valid = (
                 align_data.get('quality_status') != 'rejected'
                 and align_data.get('valid') is not False
-                and align_data.get('trajectory_rmse_cm', 999.0) <= 40.0
             )
             if alignment_valid:
                 dt_sync = float(align_data.get("dt_sync_seconds", dt_sync))
@@ -3109,9 +3106,9 @@ def execute_unified_workflow(
         try:
             with open(align_file, "r", encoding="utf-8") as f:
                 al_data = json.load(f)
-            rmse_cm = float(al_data.get("trajectory_rmse_cm", al_data.get("trajectory_rmse_m", 0.0) * 100.0))
-            if al_data.get("quality_status") == "rejected" or al_data.get("valid") is False or rmse_cm > 40.0:
-                print(f"[ARGON GATEKEEPER] SfM Sim(3) Alignment is REJECTED (RMSE = {rmse_cm:.1f} cm > 40 cm; status={al_data.get('quality_status')}).")
+            if al_data.get("quality_status") == "rejected" or al_data.get("valid") is False:
+                rmse_cm = float(al_data.get("trajectory_rmse_cm", al_data.get("trajectory_rmse_m", 0.0) * 100.0))
+                print(f"[ARGON GATEKEEPER] SfM Sim(3) Alignment is REJECTED (RMSE = {rmse_cm:.1f} cm; status={al_data.get('quality_status')}).")
                 print("[ARGON GATEKEEPER] Aborting SfM color projection and falling back to Direct Rigid colorization with nominal factory calibration...")
                 alignment_valid = False
         except Exception as e:
