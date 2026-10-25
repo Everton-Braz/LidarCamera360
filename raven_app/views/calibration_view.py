@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QSizePolicy
+    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QSizePolicy, QInputDialog
 )
 from qfluentwidgets import (
     CardWidget, TitleLabel, SubtitleLabel, BodyLabel,
@@ -13,6 +13,7 @@ from qfluentwidgets import (
 )
 from raven_app.i18n import tr
 from raven_app.config import get_app_root
+from raven_app.profile_manager import list_available_profiles, save_profile_from_calibration
 
 
 class CalibrationView(QWidget):
