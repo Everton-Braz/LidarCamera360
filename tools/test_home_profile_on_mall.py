@@ -91,14 +91,16 @@ def main():
                 relevant_frames.append((p.name, t_vid))
                 
     print(f'[+] Relevant video frames: {len(relevant_frames)}')
-    img_cache0 = {fn: cv2.imread(str(DATASET_DIR / f'images/cam0/{fn}')) for fn, _ in relevant_frames}
-    img_cache1 = {fn: cv2.imread(str(DATASET_DIR / f'images/cam1/{fn}')) for fn, _ in relevant_frames}
-    
+    # Subsample frames to 25 evenly spaced frames to speed up and stay ultra light
+    step = max(1, len(relevant_frames) // 25)
+    eval_frames = relevant_frames[::step]
+    print(f'[+] Using {len(eval_frames)} keyframes for evaluation')
+
     configs = [
         ('Calibração Antiga (Nominal v0.2.0 - Ty Invertido)', T0_nom, T1_nom),
         ('Novo Perfil: Raven + X4 Montagem 1 (Validado 20261022home)', T0_home, T1_home)
     ]
-    
+
     results = []
     for title, T0, T1 in configs:
         print(f'[*] Rendering {title}...')
@@ -106,8 +108,8 @@ def main():
         R_LC1, t_LC1 = T1[:3, :3], T1[:3, 3]
         best_dist = np.full(len(pts), 999.0, dtype=np.float32)
         colors = np.zeros((len(pts), 3), dtype=np.uint8)
-        
-        for fn, t_vid in relevant_frames:
+
+        for fn, t_vid in eval_frames:
             t_q = t_slam[0] + (t_vid - dt_eval)
             if not (t_slam_start <= t_q <= t_slam_end):
                 continue
@@ -116,7 +118,10 @@ def main():
             p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
             R_L = slerp(t_q).as_matrix()
             pts_body = (R_L.T @ (pts - p_L).T).T
-            
+
+            img0 = None
+            img1 = None
+
             # Cam0 (3840x3840)
             pts_c0 = (R_LC0 @ pts_body.T).T + t_LC0
             m0 = pts_c0[:, 2] > 0.3
@@ -128,10 +133,12 @@ def main():
                     dists = pts_c0[m0, 2][val0]
                     closer = dists < best_dist[sub]
                     if np.any(closer):
+                        if img0 is None:
+                            img0 = cv2.imread(str(DATASET_DIR / f'images/cam0/{fn}'))
                         tk = sub[closer]
-                        colors[tk] = img_cache0[fn][np.clip(v0[val0][closer].round().astype(int), 0, 3839), np.clip(u0[val0][closer].round().astype(int), 0, 3839)][:, ::-1]
+                        colors[tk] = img0[np.clip(v0[val0][closer].round().astype(int), 0, 3839), np.clip(u0[val0][closer].round().astype(int), 0, 3839)][:, ::-1]
                         best_dist[tk] = dists[closer]
-                        
+
             # Cam1 (3840x3840)
             pts_c1 = (R_LC1 @ pts_body.T).T + t_LC1
             m1 = pts_c1[:, 2] > 0.3
@@ -143,8 +150,10 @@ def main():
                     dists = pts_c1[m1, 2][val1]
                     closer = dists < best_dist[sub]
                     if np.any(closer):
+                        if img1 is None:
+                            img1 = cv2.imread(str(DATASET_DIR / f'images/cam1/{fn}'))
                         tk = sub[closer]
-                        colors[tk] = img_cache1[fn][np.clip(v1[val1][closer].round().astype(int), 0, 3839), np.clip(u1[val1][closer].round().astype(int), 0, 3839)][:, ::-1]
+                        colors[tk] = img1[np.clip(v1[val1][closer].round().astype(int), 0, 3839), np.clip(u1[val1][closer].round().astype(int), 0, 3839)][:, ::-1]
                         best_dist[tk] = dists[closer]
                         
         results.append((title, colors))

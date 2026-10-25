@@ -115,20 +115,20 @@ class CalibrationView(QWidget):
         json_actions = QHBoxLayout()
         json_actions.setSpacing(8)
         self.profile_combo = ComboBox()
-        self.profile_combo.addItems([
-            tr("Raven (3DMakerPro + Insta360)"),
-            tr("Eagle (Livox + Insta360)"),
-            tr("Load Custom JSON File...")
-        ])
+        self._available_profiles = []
+        self._populate_profiles_combo()
         self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
-        self.btn_reload = PushButton(tr("Reload"), icon=FluentIcon.SYNC)
+        self.btn_save_as_profile = PushButton(tr("Salvar Perfil..."), icon=FluentIcon.ADD)
+        self.btn_save_as_profile.clicked.connect(self._save_as_new_profile)
+        self.btn_reload = PushButton(tr("Recarregar"), icon=FluentIcon.SYNC)
         self.btn_reload.clicked.connect(self._load_calibration)
-        self.btn_save = PushButton(tr("Save Changes"), icon=FluentIcon.SAVE)
+        self.btn_save = PushButton(tr("Salvar"), icon=FluentIcon.SAVE)
         self.btn_save.clicked.connect(self._save_calibration)
-        self.btn_export = PushButton(tr("Export As..."), icon=FluentIcon.SHARE)
+        self.btn_export = PushButton(tr("Exportar"), icon=FluentIcon.SHARE)
         self.btn_export.clicked.connect(self._export_calibration)
 
         json_actions.addWidget(self.profile_combo)
+        json_actions.addWidget(self.btn_save_as_profile)
         json_actions.addWidget(self.btn_reload)
         json_actions.addWidget(self.btn_save)
         json_actions.addWidget(self.btn_export)
@@ -142,19 +142,54 @@ class CalibrationView(QWidget):
         json_layout.addWidget(self.json_edit)
         layout.addWidget(json_card, stretch=1)
 
+    def _populate_profiles_combo(self):
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self._available_profiles = list_available_profiles()
+        for p in self._available_profiles:
+            tag = " (Padrão)" if p.get('is_default') else ""
+            self.profile_combo.addItem(f"{p['name']}{tag}")
+        self.profile_combo.addItem(tr("Carregar Arquivo JSON..."))
+        self.profile_combo.blockSignals(False)
+
+    def _save_as_new_profile(self):
+        name, ok = QInputDialog.getText(
+            self,
+            tr("Salvar Perfil de Hardware"),
+            tr("Nome do perfil de calibração (ex: Raven Lidar + Insta360 X4 - Montagem 1):"),
+        )
+        if ok and name.strip():
+            try:
+                data = json.loads(self.json_edit.toPlainText())
+                saved_path = save_profile_from_calibration(data, name.strip())
+                self._populate_profiles_combo()
+                self._calib_path = saved_path
+                for i, p in enumerate(self._available_profiles):
+                    if p['path'] == str(saved_path):
+                        self.profile_combo.setCurrentIndex(i)
+                        break
+                InfoBar.success(
+                    title=tr("Perfil Salvo"),
+                    content=tr(f"Perfil '{name.strip()}' salvo com sucesso!"),
+                    parent=self,
+                    duration=3000,
+                )
+            except Exception as e:
+                InfoBar.error(
+                    title=tr("Erro ao Salvar Perfil"),
+                    content=str(e),
+                    parent=self,
+                    duration=4000,
+                )
+
     def _on_profile_selected(self, index: int):
-        root = get_app_root()
-        if index == 0:  # Raven
-            self._calib_path = root / "calibracao_rigida_raven_insta360.json"
-            if not self._calib_path.is_file():
-                self._calib_path = root / "configs" / "rig_profile.json"
+        if index < len(self._available_profiles):
+            p = self._available_profiles[index]
+            self._calib_path = Path(p['path'])
             self._load_calibration()
-        elif index == 1:  # Eagle
-            self._calib_path = root / "configs" / "rig_profile_eagle.json"
-            self._load_calibration()
-        elif index == 2:  # Custom
+        elif index == len(self._available_profiles):
             path, _ = QFileDialog.getOpenFileName(
-                self, tr("Select Rig Calibration JSON"), "", "JSON files (*.json);;All files (*.*)"
+                self, tr("Selecionar JSON de Calibração"), "", "JSON files (*.json);;All files (*.*)"
             )
             if path:
                 self._calib_path = Path(path)
