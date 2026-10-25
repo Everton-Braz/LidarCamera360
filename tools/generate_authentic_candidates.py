@@ -68,8 +68,8 @@ def main():
     pts = pts_all[mask]
     print(f'[+] Window points: {len(pts):,}')
 
-    # Exact parameters from automatic_calibration_20261021_211521.json
-    with open(DATASET_DIR / 'deliverables/automatic_calibration_20261021_211521.json') as f:
+    # Exact parameters from calibracao_rigida_auto.json (original deliverable matrix)
+    with open(DATASET_DIR / 'calibracao_rigida_auto.json') as f:
         ref_calib = json.load(f)
 
     T0_ref = np.array(ref_calib['T_lidar_to_cam0_rigid_4x4'], dtype=np.float64)
