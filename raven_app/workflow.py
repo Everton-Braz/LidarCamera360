@@ -2254,6 +2254,10 @@ def resolve_calibration_file(output_dir: Path, is_eagle: bool = False, calib_jso
             return p
     if is_eagle and (resources() / "configs/rig_profile_eagle.json").is_file():
         return resources() / "configs/rig_profile_eagle.json"
+    # Default to user verified hardware profile (Raven Montagem 1)
+    montagem1 = resources() / "configs/profiles/raven_x4_montagem_1.json"
+    if montagem1.is_file():
+        return montagem1
     elif (resources() / "configs/rig_profile.json").is_file():
         return resources() / "configs/rig_profile.json"
     return resources() / "calibracao_rigida_raven_insta360.json"
