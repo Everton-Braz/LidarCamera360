@@ -8,6 +8,16 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### 🌐 Equirectangular exports and wide auxiliary cameras
+- **Gyro sync for exported MP4s**: an equirectangular MP4 exported by Insta360 Studio has no gyro trailer. The sibling INSV with the same name and duration (same time base) is now used for the IMU cross-correlation. On SMALL-DATASET-TEST: Δt −7.746 s, correlation 0.999.
+- **360 main camera in the rig refinement**: an equirectangular dataset is refined as a single EQUIRECTANGULAR camera at the profile's cam0 mount.
+  - A coarse search over the 24 axis-aligned orientations finds how the export is oriented. The held-out check compares against the profile's orientation.
+  - The written calibration is a proper equirectangular one (no cam1 keys).
+- **Narrow cameras (phones)**: the clock scan re-freezes visibility for every candidate offset. Points leaving the frame no longer make far-off offsets look better.
+- **Sample SfM**: when the sample's main rig fails the plausibility gates, the hardware profile is kept as the main rig and auxiliary cameras are still calibrated. Before, every attempt crashed. An exploratory solve no longer marks its alignment as rejected.
+- **Refinement results are keyed on the solver version**, so an updated solver never reuses a stale cached result.
+- TESTE_3_CAMERAS with the 0.6× phone as OPENCV: sample SfM now calibrates it (fx ≈ 2646 px, 37/37 poses). The photometric refinement is accepted for both the X4 (+19.2 %) and the phone (+3.1 %).
+
 ### 🧭 Any camera model and auxiliary cameras in the rig refinement (Phase 2)
 - **`raven_app/camera_models.py`** is one projection and validity layer for THIN_PRISM_FISHEYE, OPENCV_FISHEYE, PINHOLE, OPENCV and EQUIRECTANGULAR cameras. It uses the colorizer's own 12-parameter packing.
 - **The refinement is generic over *bodies*** (cameras sharing one housing and one clock). The main rig is cam0 + cam1, or a single equirectangular cam0. Each auxiliary camera (`third_camera.json`) is a body with its own clock.

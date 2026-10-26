@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
 import time
 from dataclasses import dataclass, field
@@ -48,7 +49,7 @@ from raven_app.camera_models import CameraModel
 from raven_app.rig_gates import load_reference, rig_gate_failures
 from raven_app.slam_source import active_slam_dir
 
-REFINEMENT_VERSION = 2
+REFINEMENT_VERSION = 3   # bump whenever the solver changes: cached results are keyed on it
 MIN_HOLDOUT_IMPROVEMENT = 0.01
 MAX_AUX_LEVER_ARM_M = 1.5
 
@@ -74,6 +75,7 @@ class RigBody:
     bound_trans_m: float = 0.10
     refine_translation: bool = True     # single far-looking cameras barely observe it
     params: np.ndarray = field(default=None)
+    initial_T: Optional[Dict[str, np.ndarray]] = None   # mounts before any coarse search
 
     def __post_init__(self):
         if self.params is None:
@@ -143,6 +145,73 @@ def main_body_from_calibration(calib, dt, *, dataset=None, fix_dt=False, dt_wind
     except (ValueError, TypeError, KeyError):
         return None
     return RigBody('main', cameras, float(dt), dt_window=dt_window, fix_dt=fix_dt)
+
+
+def equirectangular_dataset(dataset):
+    """True when the dataset's main camera is a stitched 360 video (single cam0, 2:1 frames)."""
+    images = Path(dataset) / 'images'
+    try:
+        if json.loads((images / 'frames.json').read_text(encoding='utf-8')).get('video_mode') == 'equirectangular':
+            return True
+    except (OSError, ValueError):
+        pass
+    if (images / 'cam1').is_dir():
+        return False
+    width, height = _image_size(dataset, 'cam0')
+    return bool(width) and abs(width - 2 * height) <= 2
+
+
+def _image_size(dataset, camera):
+    from PIL import Image
+    first = next(iter(sorted((Path(dataset) / 'images' / camera).glob('*.jpg'))), None)
+    if first is None:
+        return 0, 0
+    with Image.open(first) as image:
+        return image.size
+
+
+def cube_rotations():
+    """The 24 proper rotations mapping coordinate axes onto coordinate axes."""
+    out = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1.0, -1.0), repeat=3):
+            R = np.zeros((3, 3))
+            for row, (col, sign) in enumerate(zip(perm, signs)):
+                R[row, col] = sign
+            if np.linalg.det(R) > 0:
+                out.append(R)
+    return out
+
+
+def _coarse_orientation(problem, body, log, sigma=8.0):
+    """Pick the axis-aligned orientation of a 360 camera that best explains the images.
+
+    How a stitched equirectangular export is oriented relative to the hardware
+    profile's lens is unknown (export settings), so the 24 axis-aligned rotations
+    are scored; a 360 camera sees every direction, so one frozen visibility serves all.
+    """
+    problem.use_bodies([body.name])
+    problem.set_blur(sigma)
+    problem.freeze_visibility(problem.state())
+    camera = body.cameras[0]
+    base = camera.T.copy()
+    body.initial_T = {camera.name: base.copy()}
+    costs = []
+    for R in cube_rotations():
+        camera.T = base.copy()
+        camera.T[:3, :3] = base[:3, :3] @ R
+        costs.append(problem.cost(problem.state(), penalize_missing=False))
+    order = np.argsort(costs)
+    best = cube_rotations()[int(order[0])]
+    camera.T = base.copy()
+    camera.T[:3, :3] = base[:3, :3] @ best
+    log(f'[*] Coarse 360 orientation ({body.name}): best of 24 axis-aligned rotations, cost '
+        f'{costs[order[0]]:.4f} (next {costs[order[1]]:.4f}, profile orientation {costs[_identity_index()]:.4f})')
+    return {'costs': [round(float(c), 5) for c in costs], 'best_rotation': best.tolist()}
+
+
+def _identity_index():
+    return next(i for i, R in enumerate(cube_rotations()) if np.allclose(R, np.eye(3)))
 
 
 def auxiliary_body(camera, main_dt, *, dt_window=3.0):
@@ -331,12 +400,26 @@ def _signature(dataset, init_path, dt_init, mode, frames, fix_dt, aux_cameras):
     }
 
 
+def _narrow(body):
+    """Bodies whose views lose points at the image border when their clock shifts."""
+    return any(not c.model.is_fisheye and c.model.model != 'EQUIRECTANGULAR' for c in body.cameras)
+
+
+def _dt_cost(problem, body, offset):
+    x = body.params.copy()
+    x[-1] = offset
+    state = problem.state({body.name: x})
+    if _narrow(body):
+        # A narrow camera's frozen visibility belongs to the initial clock: points that
+        # leave the frame would vanish from the mean and favour far-off offsets.
+        problem.freeze_visibility(state)
+    return problem.cost(state, penalize_missing=False)
+
+
 def _scan_dt(problem, body, log):
     """Dense dt scan of one body (two levels when the clock is known only within seconds)."""
     def cost_at(offset):
-        x = body.params.copy()
-        x[-1] = offset
-        return problem.cost(problem.state({body.name: x}), penalize_missing=False)
+        return _dt_cost(problem, body, offset)
 
     coarse_step = max(0.02, body.dt_window / 30.0)
     grid = np.arange(-body.dt_window, body.dt_window + 1e-9, coarse_step)
@@ -350,17 +433,19 @@ def _scan_dt(problem, body, log):
     order = np.argsort(grid)
     log(f'[*] Photometric dt scan ({body.name}): Δt {body.dt:.4f}s -> {body.dt + best:.4f}s '
         f'(cost {scan.min():.4f} vs {cost_at(0.0):.4f})')
+    if _narrow(body):
+        problem.freeze_visibility(problem.state())
     return best, {'offsets': grid[order].round(3).tolist(), 'cost': scan[order].round(5).tolist()}
 
 
 def _rescan_dt(problem, body, half_width=0.1, step=0.01):
-    def cost_at(offset):
-        x = body.params.copy()
-        x[-1] = offset
-        return problem.cost(problem.state({body.name: x}), penalize_missing=False)
-
     grid = body.params[-1] + np.arange(-half_width, half_width + 1e-9, step)
-    return float(grid[int(np.argmin([cost_at(g) for g in grid]))])
+    best = float(grid[int(np.argmin([_dt_cost(problem, body, g) for g in grid]))])
+    if _narrow(body):
+        x = body.params.copy()
+        x[-1] = best
+        problem.freeze_visibility(problem.state({body.name: x}))
+    return best
 
 
 def _refine_body(problem, body, mode, blur, maxfev, log, trusted=()):
@@ -421,7 +506,12 @@ def _holdout(dataset, bodies, holdout_names, body_name, refined, common, trusted
         trial.append(clone)
     problem = RigProblem(dataset, trial, holdout_names, **{**common, 'log': lambda *_: None})
     problem.use_bodies(list(trusted) + [body_name])
-    states = {'initial': problem.state({body_name: np.zeros(refined.size)}),
+    initial = copy.deepcopy(problem.bodies[body_name])
+    for camera in initial.cameras:
+        camera.T = (initial.initial_T or {}).get(camera.name, camera.T)
+    transforms, dts = problem.state()
+    T_initial, dt_initial = initial.transforms(np.zeros(refined.size))
+    states = {'initial': ({**transforms, **T_initial}, {**dts, body_name: dt_initial}),
               'refined': problem.state({body_name: refined})}
     scores = {label: [] for label in states}
     medians = {}
@@ -459,6 +549,14 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
     if main is None:
         raise ValueError('Rig refinement needs T_lidar_to_cam0_rigid_4x4 and cam0_front_intrinsics '
                          'with a supported camera model')
+    coarse_orientation = False
+    if equirectangular_dataset(dataset) and main.cameras[0].model.model != 'EQUIRECTANGULAR':
+        # A stitched 360 video replaces the profile's fisheye pair: one equirectangular
+        # camera at the cam0 mount, orientation found by the coarse search below.
+        width, height = _image_size(dataset, 'cam0')
+        main = RigBody('main', [RigCamera('cam0', CameraModel('EQUIRECTANGULAR', width, height), main.cameras[0].T)],
+                       main.dt, dt_window=main.dt_window, fix_dt=main.fix_dt)
+        coarse_orientation = True
     if fix_dt and mode == 'dt' and not aux_cameras:
         raise ValueError('Nothing to refine: mode "dt" with a fixed dt')
     aux_cameras = [c for c in (aux_cameras or []) if getattr(c, 'enabled', True)]
@@ -496,6 +594,8 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
         raise ValueError(f'Too few frames inside the trajectory for rig refinement ({len(problem.names)})')
 
     report = {'signature': signature, 'mode': mode, 'fix_dt': bool(fix_dt), 'bodies': [], 'skipped': skipped}
+    if coarse_orientation:
+        report['coarse_orientation'] = _coarse_orientation(problem, main, log)
     verdicts = {}
     trusted = []
     for body in bodies:
@@ -559,6 +659,14 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
                 Rot.from_matrix(T0n[:3, :3].T @ T1n[:3, :3]).as_rotvec()))),
             'lens_baseline_cm': float(np.linalg.norm(T0n[:3, 3] - T1n[:3, 3]) * 100),
         })
+    if main.cameras[0].model.model == 'EQUIRECTANGULAR':
+        cam = main.cameras[0].model
+        candidate['lens_model'] = 'EQUIRECTANGULAR'
+        candidate['camera'] = 'Equirectangular_360'
+        candidate['cam0_front_intrinsics'] = {'camera_model': 'EQUIRECTANGULAR', 'width': cam.width, 'height': cam.height}
+        for key in ('T_lidar_to_cam1_rigid_4x4', 'cam1_rear_intrinsics', 'lever_arm_cam1_meters',
+                    'rotation_euler_xyz_deg_cam1', 'relative_lens_angle_deg', 'lens_baseline_cm'):
+            candidate.pop(key, None)
     main_reason = (main_report or {}).get('rejection_reason') if main_report else 'main body not refined'
     candidate.update(quality_status='accepted' if accepted_main else 'rejected', valid=accepted_main,
                      rejection_reason=None if accepted_main else main_reason)

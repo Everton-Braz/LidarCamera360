@@ -90,6 +90,35 @@ def test_equirectangular_main_camera_recovers_time_offset(tmp_path):
     assert abs(result['dt_sync_seconds']) <= 0.04
 
 
+def test_equirectangular_export_orientation_is_found_from_a_fisheye_profile(tmp_path):
+    root = tmp_path / 'export'
+    _write_slam(root)
+    W, H = 1600, 800
+    rays = _rays('EQUIRECTANGULAR', W, H)
+    # The stitched export is centred 90 degrees away from the profile's cam0 lens.
+    R_true = R_CAM0 @ Rot.from_euler('y', 90, degrees=True).as_matrix()
+    (root / 'images' / 'cam0').mkdir(parents=True)
+    stamps = {}
+    for index, t in enumerate(np.arange(1.0, 19.0, 0.5), start=1):
+        name = f'cam0/frame_{index:06d}.jpg'
+        cv2.imwrite(str(root / 'images' / name), _render(t, R_true, T_CAM0, rays, (H, W)))
+        stamps[name] = float(t)
+    (root / 'images' / 'frames.json').write_text(json.dumps({'timestamps': stamps, 'video_mode': 'equirectangular'}),
+                                                 encoding='utf-8')
+    fisheye = dict(camera_model='THIN_PRISM_FISHEYE', fx=120., fy=120., cx=200., cy=200., k1=0., k2=0., p1=0., p2=0.,
+                   k3=0., k4=0., sx1=0., sy1=0., width=400, height=400)
+    profile = _rig_json(root / 'x4_profile.json', [('cam0', fisheye, R_CAM0, T_CAM0), ('cam1', fisheye, R_CAM1, T_CAM1)])
+
+    result = refine_rig(root, profile, 0.0, mode='photometric', fix_dt=True, frames=12, output=root / 'out.json',
+                        log=lambda *_: None)
+
+    assert result['lens_model'] == 'EQUIRECTANGULAR' and 'T_lidar_to_cam1_rigid_4x4' not in result
+    assert result['cam0_front_intrinsics'] == {'camera_model': 'EQUIRECTANGULAR', 'width': W, 'height': H}
+    R = np.asarray(result['T_lidar_to_cam0_rigid_4x4'])[:3, :3]
+    assert np.degrees(Rot.from_matrix(R_true.T @ R).magnitude()) < 1.0
+    assert result['quality_status'] == 'accepted'
+
+
 @pytest.fixture(scope='module')
 def two_body_capture(tmp_path_factory):
     root = tmp_path_factory.mktemp('two_body') / 'dataset'

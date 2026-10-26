@@ -129,6 +129,21 @@ def test_bounded_sample_sfm_retries_with_fine_clock_hint_and_accepts_all_cameras
         "calibration_source"] == "sample_sfm"
 
 
+def test_rejected_sample_main_rig_keeps_profile_and_still_calibrates_aux_camera(tmp_path, monkeypatch):
+    output, camera, calls = _install_bounded_sample_stubs(tmp_path, monkeypatch, accept_at=1)
+    import scripts.pipeline_auto_calibrator_and_colorizer as pipeline
+    monkeypatch.setattr(pipeline, "recalibrate_from_sfm", lambda *_args, **_kwargs: None)
+    profile = Path(__file__).resolve().parents[1] / "configs" / "profiles" / "raven_x4_montagem_1.json"
+
+    calibrated = workflow._calibrate_aux_cameras_from_sample_sfm(
+        output, [camera], fps=2.0, dt_sync=0.0, reference_profile=profile)
+
+    assert workflow._aux_camera_calibration_ready(calibrated[0])
+    rig = json.loads((output / "rig_calibration.json").read_text(encoding="utf-8"))
+    assert rig["calibration_source"] == "hardware_profile"
+    assert rig["T_lidar_to_cam0_rigid_4x4"] == PROFILE["T_lidar_to_cam0_rigid_4x4"]
+
+
 def test_bounded_sample_sfm_preserves_three_rejected_windows_without_final_rig(
     tmp_path, monkeypatch
 ):

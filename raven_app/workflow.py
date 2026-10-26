@@ -240,6 +240,40 @@ def extract_insv_gyro(insv_path: Path):
     return t_cam_s, cam_gyro_norm
 
 
+def gyro_telemetry_source(video_path: Path) -> Path:
+    """The file holding the camera gyro for ``video_path``.
+
+    An equirectangular MP4 exported by Insta360 Studio has no gyro trailer, but the
+    original INSV with the same name sits next to it and shares its time base when
+    the export is untrimmed (same duration).  Anything else is returned unchanged.
+    """
+    video_path = Path(video_path)
+    if video_path.suffix.lower() == '.insv':
+        return video_path
+
+    def duration(path):
+        import av
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            if stream.duration:
+                return float(stream.duration * stream.time_base)
+            return float(container.duration / 1e6) if container.duration else None
+
+    try:
+        target = duration(video_path)
+    except Exception:
+        return video_path
+    for candidate in sorted(video_path.parent.glob(video_path.stem + '*.insv')):
+        try:
+            other = duration(candidate)
+        except Exception:
+            continue
+        if target is not None and other is not None and abs(target - other) <= 0.5:
+            print(f"[*] Gyro telemetry from {candidate.name} (same recording and duration as {video_path.name})")
+            return candidate
+    return video_path
+
+
 def auto_sync_imu_gyro(bag_path: Path, insv_path: Path,
                        imu_topic: str = None) -> Optional[float]:
     """Estimate the clip offset inside the complete LiDAR recording.
@@ -1047,6 +1081,17 @@ def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync, r
                 rig = pipeline.recalibrate_from_sfm(
                     sample_root, fps=fps, alignment=alignment, write_outputs=False,
                     trajectory_path=trajectory_path, reference_profile=reference_profile)
+                if rig is None:
+                    # The sample's main rig failed the plausibility gates; auxiliary
+                    # cameras are aligned through the Sim(3), so keep the hardware
+                    # profile as the main rig instead of abandoning the attempt.
+                    from raven_app.rig_gates import load_reference
+                    profile_rig = load_reference(reference_profile)
+                    if profile_rig is None:
+                        raise RuntimeError('Sample SfM main rig was rejected and no hardware profile is available')
+                    rig = dict(profile_rig, calibration_source='hardware_profile',
+                               dt_sync_seconds=float(alignment['dt_sync_seconds']),
+                               sample_sfm_main_rig='rejected by the plausibility gates; hardware profile kept')
 
                 camera_failures = []
                 for camera in attempt_cameras:
@@ -1218,7 +1263,7 @@ def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync, r
                 shutil.copy2(sample_images / 'frames.json', evidence / 'images' / 'frames.json')
                 (evidence / 'colmap_to_lidar_alignment.json').write_text(
                     json.dumps(alignment, indent=2), encoding='utf-8')
-                rig['calibration_source'] = 'sample_sfm'
+                rig.setdefault('calibration_source', 'sample_sfm')
                 rig['sample_sfm_evidence'] = 'calibration/sample_sfm'
                 rig['sample_sfm_method'] = sample_method
                 rig['sample_sfm_window_fraction'] = fraction
@@ -1352,7 +1397,7 @@ def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync, r
                           for name, record in support_records.items()))
                 print(f'    Pose support: {support_path}')
             rig = dict(best_attempt['rig'])
-            rig['calibration_source'] = 'sample_sfm'
+            rig.setdefault('calibration_source', 'sample_sfm')
             rig['sample_sfm_alignment_rmse_cm'] = best_attempt['alignment_rmse_cm']
             rig['sample_sfm_window_fraction'] = best_attempt['window_fraction']
             rig['sample_sfm_method'] = best_attempt.get('method', 'bounded_temporal_window')
@@ -2693,7 +2738,7 @@ def execute_unified_workflow(
         dt_sync = dt_override
         print(f"[*] Using manual time offset Δt = {dt_sync:.4f}s")
     else:
-        dt_sync = gyro_dt = auto_sync_imu_gyro(bag_path, insv_path, imu_topic=imu_topic)
+        dt_sync = gyro_dt = auto_sync_imu_gyro(bag_path, gyro_telemetry_source(insv_path), imu_topic=imu_topic)
         if dt_sync is None:
             print("[*] Searching for fallback/hint sync in existing calibration or defaulting to 0.0s for initial pose search...")
             dt_sync = 0.0

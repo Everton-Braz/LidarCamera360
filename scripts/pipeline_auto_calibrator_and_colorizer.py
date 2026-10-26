@@ -1471,6 +1471,9 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
         }
         with open(dataset_dir / "rig_calibration.rejected.json", "w", encoding="utf-8") as f:
             json.dump(rej_dict, f, indent=2)
+        if not write_outputs:
+            # Exploratory solve (e.g. a sample-SfM attempt): its alignment stays usable.
+            return None
 
         for name in ["rig_calibration.json", "calibracao_rigida_auto.json"]:
             p = dataset_dir / name
