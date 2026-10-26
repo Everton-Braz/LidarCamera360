@@ -22,7 +22,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import cv2
 import numpy as np
@@ -34,6 +34,7 @@ from raven_app import __version__
 from raven_app.cli import engine, resources
 from raven_app.bag_io import export_bags
 from raven_app.slam_source import active_slam_dir
+from raven_app.time_gating import DEFAULT_TIME_WINDOW_S
 from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, find_partner_insv, normalize_dual_insv_pair, frame_time
 
 for stream in (sys.stdout, sys.stderr):
@@ -803,7 +804,7 @@ def _validate_sample_sfm_component_coverage(sparse_dir, selected_files, attempt_
     return coverage
 
 
-def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync):
+def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync, reference_profile=None):
     """Calibrate the per-session rig from bounded SfM, then recover with all frames."""
     from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
     from raven_app.third_camera import align_third_camera_to_rig, ThirdCameraConfig
@@ -1045,7 +1046,7 @@ def _calibrate_aux_cameras_from_sample_sfm(dataset_dir, cameras, fps, dt_sync):
                     alignment_method=alignment.get('alignment_method'))
                 rig = pipeline.recalibrate_from_sfm(
                     sample_root, fps=fps, alignment=alignment, write_outputs=False,
-                    trajectory_path=trajectory_path)
+                    trajectory_path=trajectory_path, reference_profile=reference_profile)
 
                 camera_failures = []
                 for camera in attempt_cameras:
@@ -2214,47 +2215,57 @@ def _postprocess_3dgs_dataset(out_dir: Path, dataset_dir: Path):
     setup_sparse_compatibility(out_dir)
 
 
-def validate_calibration_file(calib_path: Optional[Path], max_lever_arm_cm: float = 40.0) -> bool:
-    """Check that calibration file exists and does not exceed physical mounting limits."""
-    if not calib_path:
-        return False
-    p = Path(calib_path)
-    if not p.is_file():
-        return False
+def calibration_gate_failures(calib_path: Optional[Path], max_lever_arm_cm: float = 40.0,
+                              reference_profile: Optional[Path] = None) -> List[str]:
+    """Reasons a calibration file must not be used (empty list = usable)."""
+    if not calib_path or not Path(calib_path).is_file():
+        return ['file not found']
     try:
-        with open(p, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if data.get('quality_status') == 'rejected' or data.get('valid') is False:
-            return False
-        for key in ('T_lidar_to_cam0_rigid_4x4', 'T_lidar_to_camera_rigid_4x4', 'T_lidar_cam', 'T_CL'):
-            if key in data:
-                mat = np.array(data[key])
-                if mat.shape == (4, 4):
-                    lever_norm_cm = float(np.linalg.norm(mat[:3, 3]) * 100.0)
-                    if lever_norm_cm > max_lever_arm_cm:
-                        return False
-        if 'T_lidar_to_cam1_rigid_4x4' in data:
-            mat1 = np.array(data['T_lidar_to_cam1_rigid_4x4'])
-            if mat1.shape == (4, 4):
-                lever_norm_cm = float(np.linalg.norm(mat1[:3, 3]) * 100.0)
-                if lever_norm_cm > max_lever_arm_cm:
-                    return False
-        return True
-    except Exception:
-        return False
+        data = json.loads(Path(calib_path).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        return [f'unreadable ({exc})']
+    if data.get('quality_status') == 'rejected' or data.get('valid') is False:
+        return [f"marked rejected ({data.get('rejection_reason') or data.get('quality_status')})"]
+    from raven_app.rig_gates import load_reference, rig_gate_failures
+    return rig_gate_failures(data, load_reference(reference_profile),
+                             {'max_lever_arm_cm': max_lever_arm_cm})
 
 
-def resolve_calibration_file(output_dir: Path, is_eagle: bool = False, calib_json: Optional[Path] = None) -> Path:
-    """Resolve the best available calibration file, falling back to nominal factory calibration if invalid/rejected."""
-    if calib_json and Path(calib_json).is_file() and validate_calibration_file(calib_json):
-        return Path(calib_json)
+def validate_calibration_file(calib_path: Optional[Path], max_lever_arm_cm: float = 40.0,
+                              reference_profile: Optional[Path] = None) -> bool:
+    """Check that a calibration exists, is not rejected and is physically plausible.
+
+    With ``reference_profile`` the rig must also stay close to that hardware profile
+    (lens baseline, angle between lenses, per-lens rotation and position).
+    """
+    return not calibration_gate_failures(calib_path, max_lever_arm_cm, reference_profile)
+
+
+def resolve_calibration_file(output_dir: Path, is_eagle: bool = False, calib_json: Optional[Path] = None,
+                             profile: Optional[str] = None) -> Path:
+    """Resolve the calibration to use: explicit file > plausible per-dataset calibration > hardware profile.
+
+    Per-dataset calibrations are checked against the selected hardware profile, so a
+    stale implausible ``rig_calibration.json`` (e.g. from an SfM solve) is never used.
+    """
+    from raven_app.profile_manager import resolve_profile
+    reference = resolve_profile(profile, is_eagle=is_eagle)
+    if calib_json and Path(calib_json).is_file():
+        reasons = calibration_gate_failures(calib_json, reference_profile=reference)
+        if not reasons:
+            return Path(calib_json)
+        print(f"[!] Ignoring calibration {Path(calib_json).name}: {'; '.join(reasons)}")
     for name in ("rig_calibration.json", "calibracao_rigida_auto.json"):
         p = output_dir / name
-        if p.is_file() and validate_calibration_file(p):
-            return p
+        if p.is_file():
+            reasons = calibration_gate_failures(p, reference_profile=reference)
+            if not reasons:
+                return p
+            print(f"[!] Ignoring {name}: {'; '.join(reasons)}")
+    if reference is not None and reference.is_file():
+        return reference
     if is_eagle and (resources() / "configs/rig_profile_eagle.json").is_file():
         return resources() / "configs/rig_profile_eagle.json"
-    # Default to user verified hardware profile (Raven Montagem 1)
     montagem1 = resources() / "configs/profiles/raven_x4_montagem_1.json"
     if montagem1.is_file():
         return montagem1
@@ -2428,6 +2439,8 @@ def execute_unified_workflow(
     use_image_bag: bool = False,
     colmap_export_dir: Optional[Path] = None,
     revisit_refinement: bool = False,
+    profile: Optional[str] = None,
+    time_window: float = DEFAULT_TIME_WINDOW_S,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -2616,11 +2629,12 @@ def execute_unified_workflow(
     # STAGE 2: Time synchronization (IMU Cross-Correlation)
     # --------------------------------------------------------------------------
     print("\n[STAGE 2/7] Temporal Synchronization...")
+    gyro_dt = None
     if dt_override is not None:
         dt_sync = dt_override
         print(f"[*] Using manual time offset Δt = {dt_sync:.4f}s")
     else:
-        dt_sync = auto_sync_imu_gyro(bag_path, insv_path, imu_topic=imu_topic)
+        dt_sync = gyro_dt = auto_sync_imu_gyro(bag_path, insv_path, imu_topic=imu_topic)
         if dt_sync is None:
             print("[*] Searching for fallback/hint sync in existing calibration or defaulting to 0.0s for initial pose search...")
             dt_sync = 0.0
@@ -2641,8 +2655,12 @@ def execute_unified_workflow(
                             break
                     except Exception:
                         pass
+    # A manual or accepted gyro offset is final: SfM may align at it but never moves it.
+    dt_locked = dt_override is not None or gyro_dt is not None
     run_record['resolved_dt_sync_seconds'] = float(dt_sync)
-    run_record['synchronization_source'] = 'manual_override' if dt_override is not None else ('imu_gyro_correlation' if dt_sync != 0.0 else 'fallback_zero')
+    run_record['dt_locked'] = dt_locked
+    run_record['synchronization_source'] = ('manual_override' if dt_override is not None else
+                                            'imu_gyro_correlation' if gyro_dt is not None else 'fallback_hint')
     _persist_workflow_run(output_dir, run_record)
 
     # --------------------------------------------------------------------------
@@ -2855,7 +2873,11 @@ def execute_unified_workflow(
             calibrate_third_camera_intrinsics,
             save_third_camera_config,
         )
-    calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json)
+    from raven_app.profile_manager import resolve_profile
+    reference_profile = resolve_profile(profile, is_eagle=is_eagle)
+    run_record['rig_profile'] = str(reference_profile) if reference_profile else None
+    print(f"[*] Hardware rig profile: {reference_profile.name if reference_profile else 'none'}")
+    calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json, profile=profile)
 
     if (method in ("sfm", "all") or run_spirula or (frames_changed and sparse_bin.is_file())) and (not sparse_bin.is_file() or frames_changed):
         print("[*] Running Spirula SfM (Vulkan GPU Headless)...")
@@ -2887,13 +2909,17 @@ def execute_unified_workflow(
     if sparse_bin.is_file() and not (method == 'direct' and third_cfgs):
         print("[*] Performing Metric Sim(3) Alignment (Spirula COLMAP -> LiDAR Ground Truth)...")
         try:
-            align_data = pipeline.align_colmap_to_lidar(output_dir, fps=fps, dt_hint=dt_sync)
+            align_data = pipeline.align_colmap_to_lidar(
+                output_dir, fps=fps, dt_hint=dt_sync,
+                dt_search_halfwidth=0.0 if dt_locked else 2.0)
             alignment_valid = (
                 align_data.get('quality_status') != 'rejected'
                 and align_data.get('valid') is not False
             )
-            if alignment_valid:
+            if alignment_valid and not dt_locked:
                 dt_sync = float(align_data.get("dt_sync_seconds", dt_sync))
+            elif alignment_valid:
+                print(f"[*] Sim(3) alignment solved at the locked time offset Δt = {dt_sync:.4f}s")
             else:
                 print(f"[*] Sim(3) alignment is invalid/rejected; keeping IMU-based time synchronization Δt = {dt_sync:.4f}s")
             rmse_cm = align_data.get('trajectory_rmse_cm')
@@ -2909,17 +2935,17 @@ def execute_unified_workflow(
         if recalibrate:
             print("[*] Auto-Recalibrating spatial mounting extrinsics (T_LC0, T_LC1) from SfM...")
             try:
-                cal_res = pipeline.recalibrate_from_sfm(output_dir, fps=fps)
+                cal_res = pipeline.recalibrate_from_sfm(output_dir, fps=fps, reference_profile=reference_profile)
                 if cal_res is None or not (output_dir / "rig_calibration.json").is_file():
-                    calib = resolve_calibration_file(output_dir, is_eagle=is_eagle)
-                    print(f"[*] Recalibration was rejected or unavailable; using nominal factory calibration: {calib}")
+                    calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, profile=profile)
+                    print(f"[*] Recalibration was rejected or unavailable; using: {calib}")
                 else:
                     calib = output_dir / "rig_calibration.json"
             except Exception as e:
                 if is_timelapse:
                     raise RuntimeError(f'Timelapse rig calibration failed: {e}') from e
                 print(f"[!] Extrinsics recalibration notice: {e}")
-                calib = resolve_calibration_file(output_dir, is_eagle=is_eagle)
+                calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, profile=profile)
 
     if method == 'direct' and (recalibrate or third_cfgs) and (
             not sparse_bin.is_file() or bool(third_cfgs)):
@@ -2927,9 +2953,20 @@ def execute_unified_workflow(
               "the full SfM reconstruction remains skipped.")
         try:
             third_cfgs = _calibrate_aux_cameras_from_sample_sfm(
-                output_dir, third_cfgs, fps, dt_sync)
+                output_dir, third_cfgs, fps, dt_sync, reference_profile=reference_profile)
             calib = output_dir / 'rig_calibration.json'
-            dt_sync = float(json.loads(calib.read_text(encoding='utf-8'))['dt_sync_seconds'])
+            reasons = calibration_gate_failures(calib, reference_profile=reference_profile)
+            if reasons and not third_cfgs:
+                quarantine = output_dir / 'rig_calibration.rejected.json'
+                calib.replace(quarantine)
+                (output_dir / 'calibracao_rigida_auto.json').unlink(missing_ok=True)
+                calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json, profile=profile)
+                run_record['sample_sfm_rig'] = {'status': 'rejected', 'reasons': reasons}
+                print(f"[!] Sample-SfM rig rejected ({'; '.join(reasons)}); quarantined to {quarantine.name}, using {calib.name}")
+            elif reasons:
+                print(f"[!] Sample-SfM rig is implausible ({'; '.join(reasons)}); kept because auxiliary cameras were calibrated against it")
+            if not dt_locked and calib.name == 'rig_calibration.json':
+                dt_sync = float(json.loads(calib.read_text(encoding='utf-8'))['dt_sync_seconds'])
         except Exception as e:
             run_record.update(
                 status='failed',
@@ -3113,7 +3150,7 @@ def execute_unified_workflow(
             if al_data.get("quality_status") == "rejected" or al_data.get("valid") is False:
                 rmse_cm = float(al_data.get("trajectory_rmse_cm", al_data.get("trajectory_rmse_m", 0.0) * 100.0))
                 print(f"[ARGON GATEKEEPER] SfM Sim(3) Alignment is REJECTED (RMSE = {rmse_cm:.1f} cm; status={al_data.get('quality_status')}).")
-                print("[ARGON GATEKEEPER] Aborting SfM color projection and falling back to Direct Rigid colorization with nominal factory calibration...")
+                print("[ARGON GATEKEEPER] Aborting SfM color projection and falling back to Direct Rigid colorization with the validated calibration or hardware profile...")
                 alignment_valid = False
         except Exception as e:
             print(f"[!] Warning checking alignment gate: {e}")
@@ -3127,21 +3164,22 @@ def execute_unified_workflow(
             pipeline.colorize_via_spirula_sfm(
                 output_dir, fps=fps, use_vulkan=use_vulkan,
                 masks_dir=active_masks_dir, operator_radius=operator_radius,
-                photometric=photometric, photometric_params=photometric_params
+                photometric=photometric, photometric_params=photometric_params,
+                time_window=time_window
             )
             sfm_done = True
         except Exception as e:
             print(f"[!] SfM colorization notice: {e}")
 
     if method in ("direct", "all") or (method == "sfm" and not sfm_done):
-        if not alignment_valid or not validate_calibration_file(calib):
-            calib = resolve_calibration_file(output_dir, is_eagle=is_eagle)
+        if not alignment_valid or not validate_calibration_file(calib, reference_profile=reference_profile):
+            calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json, profile=profile)
             print(f"[*] Direct Rigid colorization using resolved calibration: {calib}")
         pipeline.colorize_via_direct_rigid(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
             masks_dir=active_masks_dir, operator_radius=operator_radius,
             photometric=photometric, photometric_params=photometric_params,
-            third_camera=calibrated_cameras
+            third_camera=calibrated_cameras, time_window=time_window
         )
 
     # --------------------------------------------------------------------------
@@ -3179,12 +3217,14 @@ def execute_unified_workflow(
     # Packaging Deliverables
     # --------------------------------------------------------------------------
     print("\n[*] Packaging Deliverables...")
-    if not export_ply:
-        for f in deliverables_dir.glob("*.ply"):
-            try: f.unlink()
-            except Exception: pass
-    if not export_pcd:
-        for f in deliverables_dir.glob("*.pcd"):
+    if not export_ply and not export_pcd:
+        print("[*] No cloud format selected; keeping the PLY so the colorized cloud is not lost.")
+        export_ply = True
+    produced_clouds = [p for p in deliverables_dir.iterdir()
+                       if p.is_file() and p.suffix.lower() in {'.ply', '.pcd'}
+                       and (p not in cloud_state_before or p.stat().st_mtime_ns != cloud_state_before[p])]
+    for f in produced_clouds:
+        if (f.suffix.lower() == '.ply' and not export_ply) or (f.suffix.lower() == '.pcd' and not export_pcd):
             try: f.unlink()
             except Exception: pass
 

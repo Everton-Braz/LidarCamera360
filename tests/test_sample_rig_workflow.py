@@ -9,6 +9,9 @@ import pytest
 from raven_app import workflow
 from raven_app.third_camera import ThirdCameraConfig
 
+PROFILE = json.loads((Path(__file__).resolve().parents[1] / "configs" / "profiles"
+                      / "raven_x4_montagem_1.json").read_text(encoding="utf-8"))
+
 
 def test_bounded_sfm_sample_preserves_temporal_overlap(tmp_path):
     frames = [
@@ -158,7 +161,7 @@ def _dataset(tmp_path, monkeypatch):
     bag.touch()
     video.touch()
 
-    def extract(_video, destination, fps):
+    def extract(_video, destination, fps, **_kwargs):
         images = Path(destination) / "images"
         images.mkdir(parents=True, exist_ok=True)
         (images / "frames.json").write_text(
@@ -172,14 +175,21 @@ def _dataset(tmp_path, monkeypatch):
     return output, bag, video
 
 
-def _install_sample_calibration(monkeypatch, reports, calls):
-    def calibrate(output_dir, cameras, fps, dt_sync):
+def _install_sample_calibration(monkeypatch, reports, calls, *, lever_shift_m=0.0):
+    def calibrate(output_dir, cameras, fps, dt_sync, **_kwargs):
         calls.append((tuple(camera.camera_name for camera in cameras), fps, dt_sync))
+        transforms = [np.asarray(PROFILE[key]) for key in
+                      ("T_lidar_to_cam0_rigid_4x4", "T_lidar_to_cam1_rigid_4x4")]
+        for transform in transforms:
+            transform[1, 3] += lever_shift_m
         rig = {
             "calibration_source": "sample_sfm",
             "dt_sync_seconds": 2.75,
             "T_LC0": "sample calibrated primary transform",
             "T_LC1": "sample calibrated secondary transform",
+            "lens_model": "THIN_PRISM_FISHEYE",
+            "T_lidar_to_cam0_rigid_4x4": transforms[0].tolist(),
+            "T_lidar_to_cam1_rigid_4x4": transforms[1].tolist(),
         }
         (Path(output_dir) / "rig_calibration.json").write_text(
             json.dumps(rig), encoding="utf-8"
@@ -206,7 +216,7 @@ def _run_direct(output, bag, video, *, third_camera=None, export_colmap=False):
     )
 
 
-def test_direct_without_aux_camera_uses_sample_rig_and_clock(tmp_path, monkeypatch):
+def test_direct_without_aux_camera_uses_sample_rig_and_locked_gyro_clock(tmp_path, monkeypatch):
     output, bag, video = _dataset(tmp_path, monkeypatch)
     calibration_calls = []
     _install_sample_calibration(monkeypatch, {}, calibration_calls)
@@ -214,6 +224,13 @@ def test_direct_without_aux_camera_uses_sample_rig_and_clock(tmp_path, monkeypat
 
     def colorize(dataset, calib_path, **kwargs):
         colorization.update(dataset=dataset, calib_path=calib_path, **kwargs)
+        deliverables = Path(dataset) / "deliverables"
+        deliverables.mkdir(exist_ok=True)
+        (deliverables / "lidar_colored_direct_rigid_new.ply").write_bytes(b"ply")
+        (deliverables / "lidar_colored_direct_rigid_new.pcd").write_bytes(b"pcd")
+
+    (output / "deliverables").mkdir(parents=True)
+    (output / "deliverables" / "lidar_colored_previous_run.pcd").write_bytes(b"old")
 
     monkeypatch.setattr(
         "scripts.pipeline_auto_calibrator_and_colorizer.colorize_via_direct_rigid",
@@ -224,8 +241,15 @@ def test_direct_without_aux_camera_uses_sample_rig_and_clock(tmp_path, monkeypat
 
     assert calibration_calls == [((), 2.0, -0.125)]
     assert Path(colorization["calib_path"]) == output.resolve() / "rig_calibration.json"
-    assert colorization["dt_override"] == 2.75
+    # An accepted gyro sync is final: the sample-SfM clock (2.75 s) must not move it.
+    assert colorization["dt_override"] == -0.125
     assert colorization["third_camera"] == []
+    assert colorization["time_window"] == workflow.DEFAULT_TIME_WINDOW_S
+    # No export format selected: this run's PLY is kept, its PCD dropped, older deliverables untouched.
+    deliverables = output / "deliverables"
+    assert (deliverables / "lidar_colored_direct_rigid_new.ply").is_file()
+    assert not (deliverables / "lidar_colored_direct_rigid_new.pcd").exists()
+    assert (deliverables / "lidar_colored_previous_run.pcd").is_file()
     saved_rig = json.loads((output / "rig_calibration.json").read_text(encoding="utf-8"))
     assert saved_rig["calibration_source"] == "sample_sfm"
     assert saved_rig["T_LC0"] == "sample calibrated primary transform"
@@ -234,6 +258,30 @@ def test_direct_without_aux_camera_uses_sample_rig_and_clock(tmp_path, monkeypat
     assert saved_run["settings"]["fps_by_camera"] == {"cam0": 2.0, "cam1": 2.0}
     assert [camera["camera_name"] for camera in saved_run["cameras"]] == ["cam0", "cam1"]
     assert saved_run["image_extraction"]["manifest"] == "images/frames.json"
+
+
+def test_implausible_sample_rig_is_quarantined_and_profile_is_used(tmp_path, monkeypatch):
+    output, bag, video = _dataset(tmp_path, monkeypatch)
+    calibration_calls = []
+    # HarmonyMall-like SfM rig: both lenses ~29 cm away from the hardware profile.
+    _install_sample_calibration(monkeypatch, {}, calibration_calls, lever_shift_m=-0.29)
+    colorization = {}
+    monkeypatch.setattr(
+        "scripts.pipeline_auto_calibrator_and_colorizer.colorize_via_direct_rigid",
+        lambda dataset, calib_path, **kwargs: colorization.update(calib_path=calib_path, **kwargs),
+    )
+
+    assert _run_direct(output, bag, video) == 0
+
+    assert Path(colorization["calib_path"]).name == "raven_x4_montagem_1.json"
+    assert colorization["dt_override"] == -0.125
+    assert not (output / "rig_calibration.json").exists()
+    rejected = json.loads((output / "rig_calibration.rejected.json").read_text(encoding="utf-8"))
+    assert rejected["calibration_source"] == "sample_sfm"
+    saved_run = json.loads((output / "workflow_config.json").read_text(encoding="utf-8"))["runs"][-1]
+    assert saved_run["sample_sfm_rig"]["status"] == "rejected"
+    assert any("position differs" in reason for reason in saved_run["sample_sfm_rig"]["reasons"])
+    assert saved_run["dt_locked"] is True
 
 
 def test_workflow_expands_auxiliary_insv_into_both_lens_views(tmp_path, monkeypatch):

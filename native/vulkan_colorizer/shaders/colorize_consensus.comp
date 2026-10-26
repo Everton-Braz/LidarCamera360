@@ -3,7 +3,7 @@ layout(local_size_x = 256) in;
 
 layout(std140, set = 0, binding = 0) uniform CameraUBO {
     mat4 R_cw;          // 64 bytes: Rotation world -> camera (col-major)
-    vec4 C_world;       // 16 bytes: Optical center (xyz)
+    vec4 C_world;       // 16 bytes: Optical center (xyz), w = view time (s)
     vec4 intrinsics1;   // 16 bytes: fx, fy, cx, cy
     vec4 dist_radial;   // 16 bytes: k1, k2, k3, k4
     vec4 dist_prism;    // 16 bytes: p1, p2, sx1, sy1
@@ -12,7 +12,7 @@ layout(std140, set = 0, binding = 0) uniform CameraUBO {
     float min_z;        // 4 bytes:  0.15
     float max_radius;   // 4 bytes:  1620.0
     uint num_points;    // 4 bytes:  total points
-    uint pad0;          // 4 bytes
+    float time_window;  // 4 bytes:  ±seconds between point scan time and view time; 0 disables
     vec4 log_gain;      // RGB log exposure / white balance; w enables correction
     vec4 vignette;      // achromatic k1, k2, k3 for r^2, r^4, r^6
     vec4 ppisp_h[3];    // row-major 3x3; row0.w enables the advanced path
@@ -21,7 +21,7 @@ layout(std140, set = 0, binding = 0) uniform CameraUBO {
 
 struct Point3D {
     float x, y, z;
-    float intensity;
+    float scan_time;    // seconds, same clock as C_world.w (0 when untimed)
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer PointsIn {
@@ -95,6 +95,8 @@ vec3 apply_ppisp_homography(vec3 rgb) {
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= num_points) return;
+    // Time gating: a view only sees the scene as it was scanned around its own time.
+    if (time_window > 0.0 && abs(points[idx].scan_time - C_world.w) > time_window) return;
 
     vec3 P_world = vec3(points[idx].x, points[idx].y, points[idx].z);
     vec3 diff = P_world - C_world.xyz;

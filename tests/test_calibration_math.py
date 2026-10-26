@@ -49,7 +49,10 @@ class CalibrationMathTests(unittest.TestCase):
             with patch.object(pipeline, "load_trajectory", return_value=(np.array([0., 1.]), np.array([[10., 0., 0.], [20., 0., 0.]]), Rot.from_euler("xyz", [[0, 0, 0], [0, 0, 0]], degrees=True))), \
                  patch.object(pipeline, "load_colmap_images", return_value=images), \
                  patch.object(pipeline, "load_colmap_cameras", return_value=cameras), \
-                 patch.object(pipeline, "frame_time", return_value=0.0):
+                 patch.object(pipeline, "frame_time", return_value=0.0), \
+                 patch("raven_app.profile_manager.resolve_profile", return_value=None):
+                # Synthetic rig unrelated to any hardware profile: only the absolute
+                # lever-arm gate applies (profile gates are covered in test_rig_gates).
                 pipeline.recalibrate_from_sfm(root, fps=2.0)
             result = json.loads((root / "rig_calibration.json").read_text())
             np.testing.assert_allclose([result["T_lidar_to_cam0_rigid_4x4"][i][3] for i in range(3)], [0.15, 0., 0.], atol=1e-12)

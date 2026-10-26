@@ -98,7 +98,7 @@ def _view_advanced(path, photometric, images_dir):
 
 
 def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images_dir=None,
-                   photometric=None):
+                   photometric=None, point_times=None, view_times=None, time_window=0.0):
     """Return RGB8, or None on native failure so callers can run the CPU fallback.
 
     Protocol RVC1/RVC2: uint32 point/view counts, packed float4 points; each view is
@@ -108,7 +108,13 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
     photometric values per view; RVC4 combines those values with person masks.
     RVC5/RVC6 append a row-major 3x3 PPISP homography and a [4,3,3,RGB]
     bilateral grid (flattened C-order), with RVC6 also carrying masks.
+    RVT1..RVT6 are the time-gated forms of RVC1..RVC6: point w is the scan time and
+    each view's 24 values are followed by float32 (view time, window). A view only
+    sees points scanned within ±window of its time (window 0 = ungated view).
     """
+    timed = time_window > 0 and point_times is not None and view_times is not None
+    if timed and (len(point_times) != len(points) or len(view_times) != len(views)):
+        raise ValueError('point_times/view_times must match points/views')
     if masks_dir is not None and images_dir is None:
         raise ValueError('images_dir is required for person masks')
     if photometric is not None and not isinstance(photometric, dict):
@@ -131,11 +137,16 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
                          b'RVC4' if photometric is not None and masks_dir is not None else
                          b'RVC3' if photometric is not None else
                          b'RVC2' if masks_dir is not None else b'RVC1')
+                if timed:
+                    magic = b'RVT' + magic[3:]
+                    time_origin = float(np.min(point_times))
                 stream.write(struct.pack('<4sII', magic, len(points), len(views)))
                 # Shift large survey coordinates before float32 conversion.
                 origin = np.asarray(points[0], dtype=np.float64)
                 packed = np.zeros((len(points), 4), dtype='<f4')
                 packed[:, :3] = points - origin
+                if timed:
+                    packed[:, 3] = np.asarray(point_times, dtype=np.float64) - time_origin
                 packed.tofile(stream)
                 del packed
                 for view_i, (path, rotation, center, params) in enumerate(views):
@@ -147,6 +158,10 @@ def colorize_views(points, views, work_dir, device_id=-1, masks_dir=None, images
                         raise ValueError('Nonfinite camera parameters')
                     stream.write(struct.pack('<I', len(name)) + name)
                     values.astype('<f4').tofile(stream)
+                    if timed:
+                        view_time = view_times[view_i]
+                        gate = (0.0, 0.0) if view_time is None else (view_time - time_origin, time_window)
+                        np.asarray(gate, dtype='<f4').tofile(stream)
                     if masks_dir is not None:
                         from raven_app.person_masks import mask_path
                         mask = mask_path(path, images_dir, masks_dir)

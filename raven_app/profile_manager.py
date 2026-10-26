@@ -47,6 +47,47 @@ def list_available_profiles() -> List[Dict[str, str]]:
         
     return profiles
 
+DEFAULT_PROFILE_FILE = "raven_x4_montagem_1.json"
+EAGLE_PROFILE = Path("configs") / "rig_profile_eagle.json"
+
+
+def resolve_profile(profile: Optional[str] = None, is_eagle: bool = False) -> Optional[Path]:
+    """Resolve the hardware rig profile used as prior and plausibility reference.
+
+    ``profile`` may be a JSON path or a profile id (file stem or ``profile_id``).
+    Without one, Eagle captures use the Eagle profile and everything else the profile
+    marked ``is_default`` (falling back to the Raven + X4 mount 1 profile).
+    """
+    pdir = get_profiles_dir()
+    if profile:
+        candidate = Path(profile)
+        if candidate.suffix.lower() == '.json' and candidate.is_file():
+            return candidate
+        by_stem = pdir / f'{profile}.json'
+        if by_stem.is_file():
+            return by_stem
+        for p in sorted(pdir.glob('*.json')):
+            try:
+                if json.loads(p.read_text(encoding='utf-8')).get('profile_id') == profile:
+                    return p
+            except (OSError, ValueError):
+                continue
+        raise ValueError(f'Unknown rig profile: {profile}')
+    if is_eagle and (get_app_root() / EAGLE_PROFILE).is_file():
+        return get_app_root() / EAGLE_PROFILE
+    defaults = []
+    for p in sorted(pdir.glob('*.json')):
+        try:
+            if json.loads(p.read_text(encoding='utf-8')).get('is_default') is True:
+                defaults.append(p)
+        except (OSError, ValueError):
+            continue
+    preferred = pdir / DEFAULT_PROFILE_FILE
+    if preferred in defaults or (not defaults and preferred.is_file()):
+        return preferred
+    return defaults[0] if defaults else None
+
+
 def save_profile_from_calibration(data: dict, profile_name: str) -> Path:
     """
     Save a confirmed rig calibration as a named profile that persists for future runs.
@@ -59,6 +100,7 @@ def save_profile_from_calibration(data: dict, profile_name: str) -> Path:
     data_copy = dict(data)
     data_copy['name'] = profile_name
     data_copy['profile_id'] = slug
+    data_copy['is_default'] = False
     
     out_path.write_text(json.dumps(data_copy, indent=2), encoding='utf-8')
     return out_path

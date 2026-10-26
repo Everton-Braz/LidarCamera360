@@ -33,8 +33,9 @@ from scipy.spatial.transform import Slerp
 from scipy.ndimage import minimum_filter
 from raven_app.video import frame_time
 from raven_app.slam_source import active_slam_dir
-from raven_app.person_masks import load_keep_mask, keep_samples, masked_operator_keep
+from raven_app.person_masks import check_masks_match_frames, load_keep_mask, keep_samples, masked_operator_keep
 from raven_app.vulkan_engine import get_vulkan_bin, colorize_views
+from raven_app.time_gating import DEFAULT_TIME_WINDOW_S, point_scan_times, window_slice
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -75,7 +76,8 @@ def _active_slam_signature(dataset_dir, *, trajectory_path=None, cloud_path=None
 # LEITURA DE DADOS
 # ==============================================================================
 
-def load_pcd(path):
+def load_pcd(path, return_mask=False):
+    """Load finite XYZ points; with ``return_mask`` also return the per-raw-point finite mask."""
     print(f"[*] Loading PCD cloud: {path.name}...")
     with open(path, "rb") as f:
         header = {}
@@ -112,7 +114,7 @@ def load_pcd(path):
         mask = np.isfinite(xyz).all(axis=1)
         xyz = xyz[mask]
     print(f"    Loaded points: {len(xyz):,}")
-    return xyz
+    return (xyz, mask) if return_mask else xyz
 
 
 def get_slam_trajectory_path(dataset_dir):
@@ -675,7 +677,7 @@ def _validate_sfm_camera_models(sparse_dir, auxiliary_flags):
 
 
 def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
-                          trajectory_path=None, use_icp=True):
+                          trajectory_path=None, use_icp=True, dt_search_halfwidth=2.0):
     """Executa o alinhamento de alta precisão Sim(3) + ICP entre COLMAP e LiDAR"""
     manifest = dataset_dir / 'images/frames.json'
     if manifest.is_file() and json.loads(manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse':
@@ -726,7 +728,10 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
     best_sim3 = None
 
     if dt_hint is not None:
-        dts = np.linspace(dt_hint - 2.0, dt_hint + 2.0, 401)
+        # A locked clock (manual or accepted gyro sync) passes halfwidth 0: the
+        # alignment is solved at that dt and never moves it.
+        steps = int(round(dt_search_halfwidth * 100))
+        dts = np.linspace(dt_hint - dt_search_halfwidth, dt_hint + dt_search_halfwidth, 2 * steps + 1)
     else:
         dts = np.linspace(-100.0, 50.0, 1501)
 
@@ -1268,7 +1273,7 @@ def sync_via_gyro_cross_correlation(insv_path, bag_path, trj_path):
 
 
 def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=True,
-                         trajectory_path=None):
+                         trajectory_path=None, reference_profile=None):
     """Recalibrate with high precision os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
     sparse_dir = dataset_dir / "sparse" / "0"
     slam_trj = trajectory_path or get_slam_trajectory_path(dataset_dir)
@@ -1438,11 +1443,21 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
     print(f" Relative angle between lenses: {rel_ang:.2f}° (Theoretical: 180°)")
     print("=" * 80)
 
-    if c0_norm_cm > MAX_LEVER_ARM_CM or c1_norm_cm > MAX_LEVER_ARM_CM:
-        reason = f"Lever arm exceeds physical limit of {MAX_LEVER_ARM_CM:.1f} cm (Cam0: {c0_norm_cm:.1f} cm, Cam1: {c1_norm_cm:.1f} cm)"
+    # A rigid mount does not change between captures: the SfM solve may only nudge
+    # the hardware profile (lens baseline, angle between lenses, rotation, position).
+    from raven_app.rig_gates import load_reference, rig_gate_failures
+    if reference_profile is None:
+        from raven_app.profile_manager import resolve_profile
+        reference_profile = resolve_profile()
+    gate_reasons = rig_gate_failures(
+        {'lens_model': 'THIN_PRISM_FISHEYE', 'T_lidar_to_cam0_rigid_4x4': T_LC0.tolist(),
+         'T_lidar_to_cam1_rigid_4x4': T_LC1.tolist()},
+        load_reference(reference_profile), {'max_lever_arm_cm': MAX_LEVER_ARM_CM})
+    if gate_reasons:
+        reason = "Implausible SfM rig: " + "; ".join(gate_reasons)
         print(f"[ARGON GUARD - REJECTED] {reason}")
         print("[*] Quarantining spurious calibration to: rig_calibration.rejected.json")
-        print("[*] Falling back to nominal factory calibration (calibracao_rigida_raven_insta360.json)")
+        print(f"[*] Falling back to the hardware profile ({Path(reference_profile).name if reference_profile else 'factory calibration'})")
 
         rej_dict = {
             "calibration_version": CALIBRATION_VERSION,
@@ -1533,10 +1548,16 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
 
 
 def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=None, operator_radius=0.0,
-                           photometric='off', photometric_params=None):
-    """Executa a coloração de alta precisão projetando as poses alinhadas do SfM"""
+                           photometric='off', photometric_params=None, time_window=DEFAULT_TIME_WINDOW_S):
+    """Executa a coloração de alta precisão projetando as poses alinhadas do SfM.
+
+    With ``time_window`` > 0 each SfM view only colours (and occludes with) points
+    scanned within ±time_window seconds of its capture (frame time - alignment dt).
+    """
     if operator_radius > 0 and masks_dir is None:
         raise ValueError('Operator removal requires person masks (--mask-persons or --masks-dir); a trajectory radius alone can erase doors and walls')
+    if masks_dir is not None:
+        check_masks_match_frames(masks_dir, dataset_dir / "images")
     from raven_app.photometric import prepare, apply_rgb
     photo_views = prepare(dataset_dir, photometric, photometric_params, masks_dir)
     sparse_dir = dataset_dir / "sparse" / "0"
@@ -1561,11 +1582,29 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
     if al.get('frame_time_source') == 'insv_timelapse':
         from raven_app.timelapse_calibration import rejected_pose_overrides
         pose_overrides = rejected_pose_overrides(dataset_dir, al, images)
-    pts_lidar = load_pcd(slam_pcd)
+    pts_lidar, finite_mask = load_pcd(slam_pcd, return_mask=True)
     n_pts = len(pts_lidar)
+    point_times = (point_scan_times(active_slam_dir(dataset_dir), finite_mask)
+                   if time_window and time_window > 0 else None)
+    t_slam_start, dt_align = None, al.get('dt_sync_seconds')
+    if point_times is not None and dt_align is None:
+        print("[!] Time gating disabled: the SfM alignment has no dt_sync_seconds")
+        point_times = None
+    if point_times is not None:
+        t_slam_start = float(load_trajectory(get_slam_trajectory_path(dataset_dir))[0][0])
+        print(f"[*] Time-gated colorization: each view sees points scanned within ±{time_window:.1f}s")
+
+    def view_time_of(name):
+        if point_times is None:
+            return None
+        try:
+            return t_slam_start + frame_time(dataset_dir, name, fps) - float(dt_align)
+        except (KeyError, OSError, ValueError):
+            return None
 
     operator_views = []
     gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() and not is_equirect_cam else None
+    gpu_view_times = []
     K_VIEWS = 3
     top_scores = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS), dtype=np.float32)
     top_colors = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS, 3), dtype=np.uint8)
@@ -1599,11 +1638,17 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
 
         if operator_radius and masks_dir is not None:
             operator_views.append((img_path, R_cw_lidar, C_lidar, view_params))
+        view_time = view_time_of(im['name'])
         if gpu_views is not None and not is_equirect_cam:
             gpu_views.append((img_path, R_cw_lidar, C_lidar, view_params))
+            gpu_view_times.append(view_time)
             continue
 
-        P_cam = (R_cw_lidar @ (pts_lidar - C_lidar).T).T
+        window = (window_slice(point_times, view_time, time_window)
+                  if view_time is not None else slice(0, n_pts))
+        if window.stop <= window.start:
+            continue
+        P_cam = (R_cw_lidar @ (pts_lidar[window] - C_lidar).T).T
         if is_equirect_cam:
             d = np.linalg.norm(P_cam, axis=1)
             idx_valid = np.where(d > 0.15)[0]
@@ -1641,7 +1686,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         v_c = v[mask_circle]
         d_c = d[mask_circle]
         r_c = r_px[mask_circle]
-        idx_c = idx_valid[mask_circle]
+        idx_c = idx_valid[mask_circle] + window.start
 
         # Z-Buffer raster de oclusão
         ug = np.clip(np.floor(u_c * zbuf_w / camera['width']).astype(np.int32), 0, zbuf_w - 1)
@@ -1696,11 +1741,13 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
     print("[*] Solving statistical consensus SfM...")
     if gpu_views is not None:
         colors = colorize_views(pts_lidar, gpu_views, dataset_dir, masks_dir=masks_dir, images_dir=dataset_dir / "images",
+                                point_times=point_times, view_times=gpu_view_times,
+                                time_window=time_window if point_times is not None else 0.0,
                                 **({'photometric': photo_views} if photo_views is not None else {}))
         if colors is None:
             return colorize_via_spirula_sfm(dataset_dir, fps=fps, use_vulkan=False, masks_dir=masks_dir,
                                            operator_radius=operator_radius, photometric=photometric,
-                                           photometric_params=photometric_params)
+                                           photometric_params=photometric_params, time_window=time_window)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)
@@ -1785,8 +1832,16 @@ def _prepare_direct_photometric(dataset_dir, mode, params, masks_dir):
     return prepare(dataset_dir, mode, params, masks_dir)
 
 def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_override=None, use_vulkan=True, masks_dir=None, operator_radius=0.0,
-                            photometric='off', photometric_params=None, third_camera=None):
-    """Executa a coloração direta rápida usando matriz rígida e tempo calibrado"""
+                            photometric='off', photometric_params=None, third_camera=None,
+                            time_window=DEFAULT_TIME_WINDOW_S):
+    """Executa a coloração direta rápida usando matriz rígida e tempo calibrado.
+
+    Poses come only from the SLAM trajectory and the rigid calibration. With
+    ``time_window`` > 0 each view only colours (and occludes with) points scanned
+    within ±time_window seconds of the view.
+    """
+    if masks_dir is not None:
+        check_masks_match_frames(masks_dir, Path(dataset_dir) / "images")
     from raven_app.photometric import apply_rgb
     photo_views = _prepare_direct_photometric(
         dataset_dir, photometric, photometric_params, masks_dir)
@@ -1893,8 +1948,12 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     else:
         print(f"[*] Active time synchronization: Δt = {dt_sync:.4f}s")
 
-    pts_lidar = load_pcd(slam_pcd)
+    pts_lidar, finite_mask = load_pcd(slam_pcd, return_mask=True)
     n_pts = len(pts_lidar)
+    point_times = (point_scan_times(active_slam_dir(dataset_dir), finite_mask)
+                   if time_window and time_window > 0 else None)
+    if point_times is not None:
+        print(f"[*] Time-gated colorization: each view sees points scanned within ±{time_window:.1f}s")
 
     t_slam, pos_slam, rot_slam = load_trajectory(slam_trj)
     t_slam_start = t_slam[0]
@@ -1932,6 +1991,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
 
     operator_views = []
     gpu_views = [] if use_vulkan and get_vulkan_bin().is_file() and not is_equirect else None
+    gpu_view_times = []
     K_VIEWS = 3
     top_scores = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS), dtype=np.float32)
     top_colors = np.zeros((n_pts if gpu_views is None else 0, K_VIEWS, 3), dtype=np.uint8)
@@ -1943,61 +2003,6 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     print("\n" + "=" * 80)
     print(" DIRECT RIGID COLORIZATION (TOP-3 MULTI-VIEW CONSENSUS)")
     print("=" * 80)
-
-    # Se alinhamento SfM existir, calcular correção suave de drift da trajetória (Amostragem de Keyframes)
-    use_drift_correction = False
-    sparse_img_bin = dataset_dir / "sparse" / "0" / "images.bin"
-    is_timelapse = active_alignment.get('frame_time_source') == 'insv_timelapse'
-    alignment_valid = active_alignment.get('valid', True) and active_alignment.get('quality_status') != 'rejected'
-    if align_json.exists() and sparse_img_bin.exists() and not is_timelapse and alignment_valid:
-        try:
-            with open(align_json, "r", encoding="utf-8") as f:
-                al = json.load(f)
-            s_sim = al["scale"]
-            R_sim = np.array(al["R"])
-            t_sim = np.array(al["t"])
-            sfm_imgs = load_colmap_images(sparse_img_bin)
-            cam0_sfm = [im for im in sfm_imgs if im["name"].startswith("cam0")]
-            cam0_sfm.sort(key=lambda x: int("".join(filter(str.isdigit, x["name"]))))
-
-            n_samples = len(cam0_sfm)
-            sample_indices = np.linspace(0, len(cam0_sfm) - 1, n_samples).astype(int)
-            sample_imgs = [cam0_sfm[i] for i in sample_indices]
-
-            sample_times = []
-            delta_p_list = []
-            delta_R_list = []
-
-            for im in sample_imgs:
-                fn = int("".join(filter(str.isdigit, im["name"])))
-                t_vid = frame_time(dataset_dir, im["name"], fps)
-                t_q = t_slam_start + (t_vid - dt_sync)
-                if not (t_slam_start <= t_q <= t_slam_end):
-                    continue
-
-                C_sfm = s_sim * (R_sim @ im["C"]) + t_sim
-                R_wc_sfm = (im["R_cw"] @ R_sim.T).T
-
-                R_L_sfm = R_wc_sfm @ R_LC0.T
-                p_L_sfm = C_sfm - R_L_sfm @ t_LC0
-
-                idx = np.clip(np.searchsorted(t_slam, t_q), 1, len(t_slam) - 1)
-                w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
-                p_L_slam = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
-                R_L_slam = slerp(t_q).as_matrix()
-
-                delta_p_list.append(p_L_sfm - p_L_slam)
-                delta_R_list.append(R_L_sfm @ R_L_slam.T)
-                sample_times.append(t_q)
-
-            if len(sample_times) >= 2:
-                sample_times = np.array(sample_times)
-                delta_p_arr = np.array(delta_p_list)
-                slerp_delta_R = Slerp(sample_times, Rot.from_matrix(delta_R_list))
-                use_drift_correction = True
-                print(f"[*] Trajectory drift correction enabled with {len(sample_times)} SfM keyframes!")
-        except Exception as e:
-            print(f"[!] Warning: Could not load SfM drift correction: {e}")
 
     events = []
     for k in range(num_frames):
@@ -2070,33 +2075,38 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     events.sort(key=lambda event: (event[0], event[2], event[3].name))
     for event_index, (video_time, camera_offset, cam_name, img_path, params,
                       R_LC, t_LC, model, pose_override) in enumerate(events):
+        view_time = None
         if pose_override is not None:
             R_cw, p_cam = pose_override
         else:
             t_query = t_slam_start + (video_time - dt_sync - camera_offset)
             if not (t_slam_start <= t_query <= t_slam_end):
                 continue
+            view_time = t_query
             idx = np.clip(np.searchsorted(t_slam, t_query), 1, len(t_slam) - 1)
             w = (t_query - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
             p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
             R_L = slerp(t_query).as_matrix()
-            if use_drift_correction and sample_times[0] <= t_query <= sample_times[-1]:
-                dp = np.array([np.interp(t_query, sample_times, delta_p_arr[:, ax]) for ax in range(3)])
-                p_L += dp
-                R_L = slerp_delta_R(t_query).as_matrix() @ R_L
             p_cam = p_L + R_L @ t_LC
             R_cw = (R_L @ R_LC).T
         if operator_radius and masks_dir is not None:
             operator_views.append((img_path, R_cw, p_cam, params))
         if gpu_views is not None:
             gpu_views.append((img_path, R_cw, p_cam, params))
+            gpu_view_times.append(view_time)
             continue
+
+        window = (window_slice(point_times, view_time, time_window)
+                  if point_times is not None and view_time is not None else slice(0, n_pts))
+        if window.stop <= window.start:
+            continue
+        pts_view = pts_lidar[window]
 
         img_bgr = cv2.imread(str(img_path))
         if img_bgr is None:
             continue
         height, width = img_bgr.shape[:2]
-        P_cam = (R_cw @ (pts_lidar - p_cam).T).T
+        P_cam = (R_cw @ (pts_view - p_cam).T).T
         if model == "EQUIRECTANGULAR":
             camera_radius = 0.5 * np.hypot(width, height)
             distances = np.linalg.norm(P_cam, axis=1)
@@ -2122,7 +2132,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
         if not np.any(valid):
             continue
         u, v, distances = u[valid], v[valid], distances[valid]
-        r_px, point_indices = r_px[valid], idx_valid[valid]
+        r_px, point_indices = r_px[valid], idx_valid[valid] + window.start
         scale_x, scale_y = width / zbuf_w, height / zbuf_h
         ug = np.clip(np.floor(u / scale_x).astype(np.int32), 0, zbuf_w - 1)
         vg = np.clip(np.floor(v / scale_y).astype(np.int32), 0, zbuf_h - 1)
@@ -2160,12 +2170,14 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     print("[*] Solving statistical consensus and removing projection outliers...")
     if gpu_views is not None:
         colors = colorize_views(pts_lidar, gpu_views, dataset_dir, masks_dir=masks_dir, images_dir=dataset_dir / "images",
+                                point_times=point_times, view_times=gpu_view_times,
+                                time_window=time_window if point_times is not None else 0.0,
                                 **({'photometric': photo_views} if photo_views is not None else {}))
         if colors is None:
             return colorize_via_direct_rigid(dataset_dir, calib_json_path, fps=fps, dt_override=dt_sync, use_vulkan=False,
                                              masks_dir=masks_dir, operator_radius=operator_radius,
                                              photometric=photometric, photometric_params=photometric_params,
-                                             third_camera=third_camera)
+                                             third_camera=third_camera, time_window=time_window)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)

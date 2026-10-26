@@ -38,6 +38,39 @@ def mask_path(image_path, images_dir, masks_dir):
     return Path(masks_dir) / (relative.as_posix() + '.png')
 
 
+def check_masks_match_frames(masks_dir, images_dir, tolerance_s=0.05):
+    """Refuse a mask set generated for a different frame extraction.
+
+    Masks are matched to images by file name, which is only meaningful when both
+    come from the same extraction: masks from a 1 fps extraction applied to 2 fps
+    images land on the wrong frames from the second frame on.  The mask set's own
+    extraction manifest is ``<masks_dir>/../images/frames.json``.
+    """
+    mask_manifest = Path(masks_dir).parent / 'images' / 'frames.json'
+    image_manifest = Path(images_dir) / 'frames.json'
+    if (not mask_manifest.is_file() or not image_manifest.is_file()
+            or mask_manifest.resolve() == image_manifest.resolve()):
+        return
+    try:
+        masks = json.loads(mask_manifest.read_text(encoding='utf-8'))
+        images = json.loads(image_manifest.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    mask_fps = (masks.get('signature') or {}).get('fps')
+    image_fps = (images.get('signature') or {}).get('fps')
+    if mask_fps is not None and image_fps is not None and mask_fps != image_fps:
+        raise ValueError(f'Person masks in {masks_dir} were generated for a {mask_fps} fps extraction, '
+                         f'but the images were extracted at {image_fps} fps; regenerate the masks '
+                         '(--mask-persons) instead of reusing them')
+    mask_times, image_times = masks.get('timestamps') or {}, images.get('timestamps') or {}
+    shifted = [name for name in image_times.keys() & mask_times.keys()
+               if abs(float(image_times[name]) - float(mask_times[name])) > tolerance_s]
+    if shifted:
+        raise ValueError(f'Person masks in {masks_dir} belong to a different frame extraction '
+                         f'({len(shifted)} frames have other capture times, e.g. {sorted(shifted)[0]}); '
+                         'regenerate the masks (--mask-persons) instead of reusing them')
+
+
 def load_keep_mask(image_path, images_dir, masks_dir):
     path = mask_path(image_path, images_dir, masks_dir)
     if not path.is_file():

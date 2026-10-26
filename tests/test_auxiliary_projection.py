@@ -1,4 +1,5 @@
 import json
+import os
 import struct
 
 import numpy as np
@@ -125,6 +126,9 @@ def test_sample_alignment_cache_uses_external_trajectory_signature(tmp_path, mon
     assert pipeline.current_alignment(sample) == saved
 
     trajectory.write_text('updated trajectory source')
+    # Two writes inside one filesystem timestamp tick keep the same mtime on Windows.
+    stat = trajectory.stat()
+    os.utime(trajectory, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
     seen = {}
     monkeypatch.setattr(pipeline, 'align_colmap_to_lidar',
                         lambda *args, **kwargs: seen.update(kwargs) or {'recomputed': True})

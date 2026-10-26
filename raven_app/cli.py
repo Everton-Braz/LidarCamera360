@@ -96,6 +96,16 @@ def add_photometric_options(p):
                    help='Fitted photometric calibration JSON (used with a photometric correction mode)')
 
 
+def add_rig_options(p):
+    from raven_app.time_gating import DEFAULT_TIME_WINDOW_S
+    p.add_argument('--profile', default=None,
+                   help='Hardware rig profile id or JSON path: prior and plausibility reference '
+                        'for per-capture calibrations (default: the profile marked is_default)')
+    p.add_argument('--time-window', type=float, default=DEFAULT_TIME_WINDOW_S,
+                   help='Colour each LiDAR point only from frames within ±seconds of its scan time, '
+                        f'so cars/people that moved between passes do not ghost (default: {DEFAULT_TIME_WINDOW_S:g}; 0 disables)')
+
+
 def bag_options(p):
     p.add_argument('--bag',type=Path,nargs='+',required=True,help='One merged bag, or non-overlapping split bags')
     p.add_argument('--scanner', '--preset', choices=['auto', 'raven', 'eagle'], default='auto', help='Scanner preset (auto, raven, eagle)')
@@ -196,6 +206,7 @@ def parse(argv=None):
     add_photometric_options(color)
     color.add_argument('--third-camera', type=Path, default=None,
                        help='Optional path to third camera JSON configuration, video file, or image folder')
+    add_rig_options(color)
     wf=sub.add_parser('workflow',help='Run end-to-end processing: Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables')
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
     wf.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Insta360 video file (.insv) or 360 equirectangular video (.mp4)')
@@ -237,6 +248,7 @@ def parse(argv=None):
                     help='Optional path to third camera JSON configuration, video file, or image folder')
     add_mask_options(wf)
     add_photometric_options(wf)
+    add_rig_options(wf)
     
     # MCP Server
     mcp = sub.add_parser('mcp', help='Run native Model Context Protocol (MCP) server for AI agent automation')
@@ -517,7 +529,9 @@ def run(a):
         for cam in check_cams:
             if not any((dataset/'images'/cam).glob('*.jpg')):raise ValueError(f'Missing extracted frames in images/{cam}')
         if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset):raise RuntimeError('Spirula reconstruction failed')
-        if a.recalibrate_from_sfm:pipeline.recalibrate_from_sfm(dataset,fps=a.fps)
+        from raven_app.profile_manager import resolve_profile
+        reference_profile = resolve_profile(a.profile)
+        if a.recalibrate_from_sfm:pipeline.recalibrate_from_sfm(dataset,fps=a.fps,reference_profile=reference_profile)
         masks_dir = a.masks_dir
         if a.mask_persons:
             from raven_app.person_masks import generate_person_masks
@@ -530,7 +544,8 @@ def run(a):
             pipeline.colorize_via_spirula_sfm(
                 dataset, fps=a.fps, use_vulkan=not a.no_vulkan,
                 masks_dir=masks_dir, operator_radius=a.operator_radius,
-                photometric=a.photometric, photometric_params=a.photometric_params
+                photometric=a.photometric, photometric_params=a.photometric_params,
+                time_window=a.time_window
             )
         third_cfgs = None
         if getattr(a, 'third_camera', None):
@@ -540,12 +555,15 @@ def run(a):
             from raven_app.third_camera import load_third_camera_configs
             third_cfgs = load_third_camera_configs(dataset / 'third_camera_calibrated.json')
         if a.method in ('direct','all'):
+            from raven_app.workflow import resolve_calibration_file
+            calib = resolve_calibration_file(dataset, calib_json=a.calib, profile=a.profile)
+            print(f'[*] Calibration: {calib}')
             pipeline.colorize_via_direct_rigid(
-                dataset, a.calib, fps=a.fps, dt_override=a.dt,
+                dataset, calib, fps=a.fps, dt_override=a.dt,
                 use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
                 operator_radius=a.operator_radius,
                 photometric=a.photometric, photometric_params=a.photometric_params,
-                third_camera=third_cfgs
+                third_camera=third_cfgs, time_window=a.time_window
             )
         return 0
     if a.command=='workflow':
@@ -605,6 +623,8 @@ def run(a):
             image_bag_path=getattr(a, 'image_bag_path', None),
             use_image_bag=getattr(a, 'use_image_bag', False),
             revisit_refinement=getattr(a, 'revisit_refinement', False),
+            profile=a.profile,
+            time_window=a.time_window,
         )
     if a.command == 'mcp':
         from raven_app.mcp_server import LidarCameraMcpServer

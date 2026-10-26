@@ -6,6 +6,19 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [Unreleased]
+
+### 🎯 Colorization of dynamic scenes and calibration safety (Phase 0)
+- **Time-gated colorization**: each camera view only colours, and occludes with, LiDAR points scanned within ±6 s of its capture (`--time-window`, 0 disables). Cars that left or arrived between passes and people walking no longer paint the other pass. It is implemented in the Vulkan engine (protocol `RVT1`..`RVT6`: point `w` = scan time, per-view time and window), the CPU fallback and the reconstruction (SfM) path. Per-point times come from the SLAM `scan_ranges.csv`.
+- **Direct mode uses SLAM poses only**: removed the hidden SfM "trajectory drift correction" that replaced SLAM poses whenever an SfM alignment existed, even a poor one.
+- **Locked time offset**: a manual `--dt` or an accepted gyro sync is final. The SfM alignment is solved at that offset and never moves it. The sample-SfM rig no longer overrides it either.
+- **Rig plausibility gates** (`raven_app/rig_gates.py`): SfM and sample-SfM rigs are rejected when they leave the hardware profile, by lens baseline ±1.5 cm, angle between lenses ±2°, 10° rotation or 8 cm position per lens, or a 40 cm lever arm. They are quarantined to `rig_calibration.rejected.json`, and the workflow falls back to the profile. Stale implausible per-dataset calibrations are ignored by the resolver.
+- **Hardware profile selection**: `--profile <id|path>` on `workflow` and `colorize`. The default is the profile marked `is_default`, and Eagle captures use the Eagle profile. `colorize` without `--calib` now resolves a validated calibration.
+- **Mask/frames consistency**: `--masks-dir` from another extraction (different fps or frame times) is refused with a clear message instead of being applied to the wrong frames by file name.
+- **No silent loss of the colorized cloud**: with no export format selected, the run's PLY is kept. Format filtering only deletes clouds produced by this run, never older deliverables.
+
+---
+
 ## [v0.3.0] - 2026-10-15
 
 ### 🌐 360° Equirectangular Video Support
