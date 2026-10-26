@@ -346,6 +346,9 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
                      rejection_reason='; '.join(reasons) or None)
     report['seconds'] = round(time.time() - t_start, 1)
     candidate['photometric_report'] = report
+    if output.is_file():
+        # Different inputs (or a calibration made elsewhere): keep the last one recoverable.
+        output.replace(output.with_name(output.stem + '.previous.json'))
     output.write_text(json.dumps(candidate, indent=2), encoding='utf-8')
     log(f'[{"+" if not reasons else "!"}] Photometric rig refinement {candidate["quality_status"]}: '
         f'held-out cost {holdout["initial"]["cost"]:.4f} -> {holdout["refined"]["cost"]:.4f} '

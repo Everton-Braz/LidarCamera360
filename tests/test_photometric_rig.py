@@ -136,6 +136,18 @@ def test_refinement_result_is_reused_for_the_same_inputs(synthetic_capture):
     assert any('Reusing photometric rig refinement' in m for m in messages)
 
 
+def test_existing_calibration_from_other_inputs_is_kept_as_previous(synthetic_capture):
+    root, profile = synthetic_capture
+    output = root / 'handmade.json'
+    output.write_text('{"made": "elsewhere"}', encoding='utf-8')
+
+    refine_rig(root, profile, 0.15, mode='dt', frames=12, dt_window=0.3,
+               reference_profile=profile, output=output, log=lambda *_: None)
+
+    assert json.loads((root / 'handmade.previous.json').read_text(encoding='utf-8')) == {'made': 'elsewhere'}
+    assert 'photometric_report' in json.loads(output.read_text(encoding='utf-8'))
+
+
 def test_unsupported_camera_models_are_refused(tmp_path):
     pinhole = dict(fx=1., fy=1., cx=0., cy=0., k1=0., k2=0., p1=0., p2=0., k3=0., k4=0., sx1=0., sy1=-999.)
     calib = {'T_lidar_to_cam0_rigid_4x4': np.eye(4).tolist(), 'T_lidar_to_cam1_rigid_4x4': np.eye(4).tolist(),
