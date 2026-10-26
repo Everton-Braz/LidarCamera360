@@ -2215,6 +2215,48 @@ def _postprocess_3dgs_dataset(out_dir: Path, dataset_dir: Path):
     setup_sparse_compatibility(out_dir)
 
 
+RIG_REFINE_MODES = ('photometric', 'dt', 'none')
+DEFAULT_RIG_REFINE = 'photometric'
+PHOTOMETRIC_RIG_FILE = 'rig_calibration_photometric.json'
+
+
+def _refine_rig_for_colorization(output_dir, calib, dt_sync, run_record, *, mode, init_calibration,
+                                 fix_dt, masks_dir, reference_profile):
+    """Run the photometric rig/dt refinement; return the (calibration, dt) to colourise with.
+
+    The refinement starts from the explicit calibration or the hardware profile (never
+    from an earlier per-dataset result) and is written to its own file, so a rejected
+    attempt never replaces a usable calibration.  Unsupported cameras are skipped.
+    """
+    from raven_app.photometric_rig import refine_rig
+    print(f"\n[*] Rig refinement ({mode}) from {Path(init_calibration).name}, Δt = {dt_sync:.4f}s"
+          + (" (fixed)" if fix_dt else ""))
+    if fix_dt and mode == 'dt':
+        run_record['rig_refinement'] = {'status': 'skipped', 'reason': 'manual time offset is final'}
+        print("[*] Rig refinement skipped: the manual time offset is final and only dt was requested.")
+        return calib, dt_sync
+    try:
+        result = refine_rig(output_dir, init_calibration, dt_sync, masks_dir=masks_dir, mode=mode,
+                            fix_dt=fix_dt, reference_profile=reference_profile,
+                            output=Path(output_dir) / PHOTOMETRIC_RIG_FILE)
+    except (ValueError, FileNotFoundError) as exc:
+        run_record['rig_refinement'] = {'status': 'skipped', 'reason': str(exc)}
+        print(f"[*] Rig refinement skipped: {exc}")
+        return calib, dt_sync
+    report = result.get('photometric_report', {})
+    run_record['rig_refinement'] = {
+        'status': result.get('quality_status'), 'mode': mode, 'reason': result.get('rejection_reason'),
+        'dt_sync_seconds': result.get('dt_sync_seconds'), 'holdout': report.get('holdout'),
+        'seconds': report.get('seconds'),
+    }
+    if result.get('quality_status') != 'accepted':
+        print(f"[*] Keeping {Path(calib).name} and Δt = {dt_sync:.4f}s")
+        return calib, dt_sync
+    refined_dt = dt_sync if fix_dt else float(result['dt_sync_seconds'])
+    run_record['resolved_dt_sync_seconds'] = refined_dt
+    return Path(output_dir) / PHOTOMETRIC_RIG_FILE, refined_dt
+
+
 def calibration_gate_failures(calib_path: Optional[Path], max_lever_arm_cm: float = 40.0,
                               reference_profile: Optional[Path] = None) -> List[str]:
     """Reasons a calibration file must not be used (empty list = usable)."""
@@ -2255,7 +2297,7 @@ def resolve_calibration_file(output_dir: Path, is_eagle: bool = False, calib_jso
         if not reasons:
             return Path(calib_json)
         print(f"[!] Ignoring calibration {Path(calib_json).name}: {'; '.join(reasons)}")
-    for name in ("rig_calibration.json", "calibracao_rigida_auto.json"):
+    for name in (PHOTOMETRIC_RIG_FILE, "rig_calibration.json", "calibracao_rigida_auto.json"):
         p = output_dir / name
         if p.is_file():
             reasons = calibration_gate_failures(p, reference_profile=reference)
@@ -2441,6 +2483,7 @@ def execute_unified_workflow(
     revisit_refinement: bool = False,
     profile: Optional[str] = None,
     time_window: float = DEFAULT_TIME_WINDOW_S,
+    rig_refine: str = DEFAULT_RIG_REFINE,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -2448,6 +2491,8 @@ def execute_unified_workflow(
     seed_percent = validate_seed_percent(seed_percent)
     if operator_radius > 0 and not (mask_persons or masks_dir is not None):
         raise ValueError('Operator removal requires person masks; a trajectory radius alone can erase fixed objects')
+    if rig_refine not in RIG_REFINE_MODES:
+        raise ValueError(f"rig_refine must be one of {RIG_REFINE_MODES}")
     if method == "trajectory":
         method = "direct"
     elif method == "reconstruction":
@@ -3175,6 +3220,13 @@ def execute_unified_workflow(
         if not alignment_valid or not validate_calibration_file(calib, reference_profile=reference_profile):
             calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json, profile=profile)
             print(f"[*] Direct Rigid colorization using resolved calibration: {calib}")
+        if rig_refine != 'none':
+            calib, dt_sync = _refine_rig_for_colorization(
+                output_dir, calib, dt_sync, run_record, mode=rig_refine,
+                init_calibration=Path(calib_json) if calib_json else reference_profile,
+                fix_dt=dt_override is not None, masks_dir=active_masks_dir,
+                reference_profile=reference_profile)
+            _persist_workflow_run(output_dir, run_record)
         pipeline.colorize_via_direct_rigid(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
             masks_dir=active_masks_dir, operator_radius=operator_radius,

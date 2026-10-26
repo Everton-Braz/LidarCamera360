@@ -399,5 +399,14 @@
   "Select Folder with Extracted Images": "Selecionar Pasta com Imagens Extraídas",
   "Missing Media Source": "Fonte de Mídia Ausente",
   "Please select a video file or image folder, or disable auxiliary source.": "Por favor, selecione um arquivo de vídeo ou pasta de imagens, ou desative a fonte auxiliar.",
-  "PPISP + bilateral grid": "PPISP + grade bilateral"
+  "PPISP + bilateral grid": "PPISP + grade bilateral",
+  "Rig profile:": "Perfil do rig:",
+  "Rig refinement:": "Refinamento do rig:",
+  "Time window (s):": "Janela de tempo (s):",
+  "Photometric (recommended)": "Fotométrico (recomendado)",
+  "Time offset only": "Somente o offset de tempo",
+  "default": "padrão",
+  "Hardware profile of your scanner + camera mount. It is the starting point of the per-capture refinement and the reference that rejects implausible calibrations.": "Perfil de hardware do seu scanner + montagem da câmera. É o ponto de partida do refinamento de cada captura e a referência que rejeita calibrações implausíveis.",
+  "Photometric: refines the time offset and the mount by multi-view colour consistency; kept only if it improves held-out frames. Time offset only: faster. Off: use the profile as is.": "Fotométrico: refina o offset de tempo e a montagem pela consistência de cor entre vistas; só é aceito se melhorar quadros de validação. Somente o offset de tempo: mais rápido. Off: usa o perfil como está.",
+  "Each LiDAR point is coloured only from frames taken within this many seconds of its scan, so cars or people that moved between passes do not leave ghost colours. 0 disables.": "Cada ponto LiDAR é colorido apenas por quadros capturados até esta quantidade de segundos do seu escaneamento, para que carros ou pessoas que se moveram entre passadas não deixem cores fantasmas. 0 desativa."
 }

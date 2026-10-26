@@ -1,6 +1,6 @@
 # Plan: rig calibration for any LiDAR + camera + mount
 
-**Date:** 2026-10-26 · **Branch:** dev · **Status:** Phase 0 implemented (uncommitted, see CHANGELOG [Unreleased]); phases 1–5 pending
+**Date:** 2026-10-26 · **Branch:** dev · **Status:** Phase 0 and Phase 1 (two-lens rigs, GUI profile/refinement selectors) implemented; phases 2–5 pending
 
 ## 1. Why: what PIER and HarmonyMall showed
 

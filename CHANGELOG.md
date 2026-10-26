@@ -8,6 +8,13 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### 📐 Per-capture photometric rig refinement (Phase 1)
+- **`raven_app/photometric_rig.py`** refines the time offset and the mount of the dual-fisheye rig by multi-view colour consistency, starting from the hardware profile. It always runs a dense dt scan, then coarse-to-fine Powell with a weak profile prior.
+- **Acceptance rule**: a result is used only if it lowers the cost on held-out frames (never seen by the fit) by ≥ 1 % and passes the rig plausibility gates. Otherwise the profile and the gyro dt are kept, and the rejected attempt is recorded.
+- **Workflow and `colorize`**: refinement runs before direct colorization (`--rig-refine photometric|dt|none`, default `photometric`). The result is written to `rig_calibration_photometric.json` and reused while its inputs are unchanged. A manual `--dt` stays fixed (mount only). HarmonyMall: about 4 min, held-out cost −5.4 % vs the profile.
+- **`lidarcamera360 calibrate`** runs the refinement alone and prints the verdict and held-out metrics. It exits 3 when the result is rejected.
+- **GUI**: the workflow page has a rig profile selector, a rig refinement mode and the colorization time window. They are passed as `--profile`, `--rig-refine` and `--time-window`, with pt-BR translations.
+
 ### 🎯 Colorization of dynamic scenes and calibration safety (Phase 0)
 - **Time-gated colorization**: each camera view only colours, and occludes with, LiDAR points scanned within ±6 s of its capture (`--time-window`, 0 disables). Cars that left or arrived between passes and people walking no longer paint the other pass. It is implemented in the Vulkan engine (protocol `RVT1`..`RVT6`: point `w` = scan time, per-view time and window), the CPU fallback and the reconstruction (SfM) path. Per-point times come from the SLAM `scan_ranges.csv`.
 - **Direct mode uses SLAM poses only**: removed the hidden SfM "trajectory drift correction" that replaced SLAM poses whenever an SfM alignment existed, even a poor one.

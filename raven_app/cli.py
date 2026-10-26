@@ -104,6 +104,15 @@ def add_rig_options(p):
     p.add_argument('--time-window', type=float, default=DEFAULT_TIME_WINDOW_S,
                    help='Colour each LiDAR point only from frames within ±seconds of its scan time, '
                         f'so cars/people that moved between passes do not ghost (default: {DEFAULT_TIME_WINDOW_S:g}; 0 disables)')
+    add_rig_refine_option(p)
+
+
+def add_rig_refine_option(p, default='photometric'):
+    p.add_argument('--rig-refine', choices=('photometric', 'dt', 'none'), default=default,
+                   help='Per-capture refinement before direct colorization: photometric = time offset '
+                        'and mount by multi-view colour consistency, accepted only if it improves '
+                        'held-out frames and stays close to the profile; dt = time offset only; '
+                        f'none = use the calibration as is (default: {default})')
 
 
 def bag_options(p):
@@ -194,6 +203,15 @@ def parse(argv=None):
     slam.add_argument('--calib','--calib-json',dest='calib_json',type=Path,default=None,help='Optional calibration JSON file')
     slam.add_argument('--output',type=Path,required=True)
     slam.add_argument('--threads',type=int,choices=range(1,257),metavar='1..256',default=min(4,os.cpu_count() or 1))
+    cal=sub.add_parser('calibrate',help='Refine the rig and time offset of a processed dataset (photometric), without colorizing')
+    cal.add_argument('--dataset',type=Path,required=True)
+    cal.add_argument('--calib','--calib-json',type=Path,help='Initial calibration (default: the hardware profile)')
+    cal.add_argument('--profile',default=None,help='Hardware rig profile id or JSON path (prior and plausibility reference)')
+    cal.add_argument('--dt',type=finite,help='Initial time offset in the SLAM reference (default: from the initial calibration)')
+    cal.add_argument('--fix-dt',action='store_true',help='Keep --dt fixed and refine the mount only')
+    cal.add_argument('--masks-dir',type=Path,help='Person masks of this dataset (white = keep)')
+    cal.add_argument('--frames',type=int,default=30,help='Frames per lens used by the fit (default: 30)')
+    add_rig_refine_option(cal)
     color=sub.add_parser('colorize',help='Run the existing calibration and colorization pipeline')
     color.add_argument('--dataset',type=Path,required=True)
     color.add_argument('--method',choices=['sfm','direct','all','trajectory','reconstruction'],default='direct')
@@ -513,6 +531,31 @@ def run(a):
                 try:child.wait(timeout=30)
                 except subprocess.TimeoutExpired:child.terminate();child.wait()
                 raise
+    if a.command=='calibrate':
+        from raven_app.profile_manager import resolve_profile
+        from raven_app.photometric_rig import refine_rig
+        from raven_app.workflow import PHOTOMETRIC_RIG_FILE
+        if a.rig_refine == 'none':
+            raise ValueError('calibrate needs --rig-refine photometric or dt')
+        dataset = a.dataset.resolve()
+        reference = resolve_profile(a.profile)
+        init = a.calib or reference
+        dt = a.dt if a.dt is not None else json.loads(Path(init).read_text(encoding='utf-8')).get('dt_sync_seconds')
+        if dt is None:
+            raise ValueError('No initial time offset: pass --dt (SLAM reference, e.g. from the workflow log)')
+        if a.masks_dir:
+            from raven_app.person_masks import check_masks_match_frames
+            check_masks_match_frames(a.masks_dir, dataset / 'images')
+        result = refine_rig(dataset, init, float(dt), masks_dir=a.masks_dir, mode=a.rig_refine,
+                            fix_dt=a.fix_dt, frames=a.frames, reference_profile=reference,
+                            output=dataset / PHOTOMETRIC_RIG_FILE)
+        report = result.get('photometric_report', {})
+        print(json.dumps({'calibration': str(dataset / PHOTOMETRIC_RIG_FILE),
+                          'quality_status': result.get('quality_status'),
+                          'rejection_reason': result.get('rejection_reason'),
+                          'dt_sync_seconds': result.get('dt_sync_seconds'),
+                          'holdout': report.get('holdout')}, indent=2))
+        return 0 if result.get('quality_status') == 'accepted' else 3
     if a.command=='colorize':
         from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
         if a.mask_persons:
@@ -531,6 +574,9 @@ def run(a):
         if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset):raise RuntimeError('Spirula reconstruction failed')
         from raven_app.profile_manager import resolve_profile
         reference_profile = resolve_profile(a.profile)
+        if a.masks_dir:
+            from raven_app.person_masks import check_masks_match_frames
+            check_masks_match_frames(a.masks_dir, dataset / 'images')
         if a.recalibrate_from_sfm:pipeline.recalibrate_from_sfm(dataset,fps=a.fps,reference_profile=reference_profile)
         masks_dir = a.masks_dir
         if a.mask_persons:
@@ -555,11 +601,21 @@ def run(a):
             from raven_app.third_camera import load_third_camera_configs
             third_cfgs = load_third_camera_configs(dataset / 'third_camera_calibrated.json')
         if a.method in ('direct','all'):
-            from raven_app.workflow import resolve_calibration_file
+            from raven_app.workflow import resolve_calibration_file, _refine_rig_for_colorization
             calib = resolve_calibration_file(dataset, calib_json=a.calib, profile=a.profile)
             print(f'[*] Calibration: {calib}')
+            dt = a.dt
+            if a.rig_refine != 'none':
+                dt_init = dt if dt is not None else json.loads(Path(calib).read_text(encoding='utf-8')).get('dt_sync_seconds')
+                if dt_init is None:
+                    print('[*] Rig refinement skipped: no time offset to start from (pass --dt)')
+                else:
+                    calib, dt = _refine_rig_for_colorization(
+                        dataset, calib, float(dt_init), {}, mode=a.rig_refine,
+                        init_calibration=a.calib or reference_profile, fix_dt=a.dt is not None,
+                        masks_dir=masks_dir, reference_profile=reference_profile)
             pipeline.colorize_via_direct_rigid(
-                dataset, calib, fps=a.fps, dt_override=a.dt,
+                dataset, calib, fps=a.fps, dt_override=dt,
                 use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
                 operator_radius=a.operator_radius,
                 photometric=a.photometric, photometric_params=a.photometric_params,
@@ -625,6 +681,7 @@ def run(a):
             revisit_refinement=getattr(a, 'revisit_refinement', False),
             profile=a.profile,
             time_window=a.time_window,
+            rig_refine=a.rig_refine,
         )
     if a.command == 'mcp':
         from raven_app.mcp_server import LidarCameraMcpServer

@@ -26,6 +26,12 @@ from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag
 from raven_app.seed_export import dataset_seed_point_count, seed_point_count
 from raven_app.i18n import tr
 
+RIG_REFINE_CHOICES = (
+    ("Photometric (recommended)", "photometric"),
+    ("Time offset only", "dt"),
+    ("Off", "none"),
+)
+
 
 class UnifiedWorkflowView(QWidget):
     """WinUI Fluent view providing single-screen end-to-end processing.
@@ -411,6 +417,33 @@ class UnifiedWorkflowView(QWidget):
         recalib_row.addWidget(self.recalibrate_chk)
         recalib_row.addStretch()
         config_layout.addLayout(recalib_row)
+
+        rig_row = QHBoxLayout()
+        self.rig_profile_label = CaptionLabel(tr("Rig profile:"))
+        self.rig_profile_combo = ComboBox()
+        self.rig_profile_combo.setMinimumWidth(260)
+        self._populate_rig_profiles()
+        self.rig_refine_label = CaptionLabel(tr("Rig refinement:"))
+        self.rig_refine_combo = ComboBox()
+        for text, mode in RIG_REFINE_CHOICES:
+            self.rig_refine_combo.addItem(tr(text), userData=mode)
+        self.rig_refine_combo.setCurrentIndex(0)
+        self.time_window_label = CaptionLabel(tr("Time window (s):"))
+        self.time_window_spin = DoubleSpinBox()
+        self.time_window_spin.setRange(0.0, 120.0)
+        self.time_window_spin.setSingleStep(1.0)
+        self.time_window_spin.setValue(6.0)
+        self._update_rig_tooltips()
+        rig_row.addWidget(self.rig_profile_label)
+        rig_row.addWidget(self.rig_profile_combo)
+        rig_row.addSpacing(12)
+        rig_row.addWidget(self.rig_refine_label)
+        rig_row.addWidget(self.rig_refine_combo)
+        rig_row.addSpacing(12)
+        rig_row.addWidget(self.time_window_label)
+        rig_row.addWidget(self.time_window_spin)
+        rig_row.addStretch()
+        config_layout.addLayout(rig_row)
 
         self.revisit_refinement_chk = CheckBox(tr("Global Pose Graph SLAM Optimization (Loop Closure)"))
         self.revisit_refinement_chk.setChecked(False)
@@ -1020,6 +1053,33 @@ class UnifiedWorkflowView(QWidget):
         if path:
             self.photometric_params_input.setText(path)
 
+    def _populate_rig_profiles(self):
+        """Fill the hardware rig profile selector; the default profile comes first."""
+        from raven_app.profile_manager import list_available_profiles
+        self.rig_profile_combo.clear()
+        for profile in list_available_profiles():
+            label = profile['name'] + (f" ({tr('default')})" if profile.get('is_default') else '')
+            self.rig_profile_combo.addItem(label, userData=profile['path'])
+
+    def _update_rig_tooltips(self):
+        self.rig_profile_combo.setToolTip(tr(
+            "Hardware profile of your scanner + camera mount. It is the starting point of the "
+            "per-capture refinement and the reference that rejects implausible calibrations."))
+        self.rig_refine_combo.setToolTip(tr(
+            "Photometric: refines the time offset and the mount by multi-view colour consistency; "
+            "kept only if it improves held-out frames. Time offset only: faster. Off: use the profile as is."))
+        self.time_window_spin.setToolTip(tr(
+            "Each LiDAR point is coloured only from frames taken within this many seconds of its "
+            "scan, so cars or people that moved between passes do not leave ghost colours. 0 disables."))
+
+    def _rig_args(self):
+        args = ["--rig-refine", str(self.rig_refine_combo.currentData()),
+                "--time-window", f"{float(self.time_window_spin.value()):g}"]
+        profile = self.rig_profile_combo.currentData()
+        if profile:
+            args.extend(["--profile", str(profile)])
+        return args
+
     def _update_photometric_controls(self, *_):
         enabled = self.photometric_combo.currentData() != "off"
         self.photometric_params_caption.setEnabled(enabled)
@@ -1291,6 +1351,7 @@ class UnifiedWorkflowView(QWidget):
             args.append("--recalibrate")
         else:
             args.append("--no-recalibrate")
+        args.extend(self._rig_args())
 
         if self.trim_chk.isChecked():
             if self.trim_start_spin.value() > 0:
@@ -1644,6 +1705,12 @@ class UnifiedWorkflowView(QWidget):
         self._update_photometric_controls()
 
         self.recalibrate_chk.setText(tr("Auto-Recalibrate Spatial Extrinsics from SfM Alignment"))
+        self.rig_profile_label.setText(tr("Rig profile:"))
+        self.rig_refine_label.setText(tr("Rig refinement:"))
+        for index, (text, _mode) in enumerate(RIG_REFINE_CHOICES):
+            self.rig_refine_combo.setItemText(index, tr(text))
+        self.time_window_label.setText(tr("Time window (s):"))
+        self._update_rig_tooltips()
         self.mask_persons_chk.setText(tr("Generate masks"))
         self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
         self.mask_backend_label.setText(tr("Mask backend:"))
