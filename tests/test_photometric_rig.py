@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as Rot
 
-from raven_app.photometric_rig import refine_rig, supported_calibration
+from raven_app.photometric_rig import main_body_from_calibration, refine_rig
 
 ROOM = np.array([[-5.0, 25.0], [-6.0, 6.0], [-1.5, 3.0]])   # x, y, z bounds (m)
 R_CAM0 = np.array([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]])   # looks along body +x
@@ -148,9 +148,14 @@ def test_existing_calibration_from_other_inputs_is_kept_as_previous(synthetic_ca
     assert 'photometric_report' in json.loads(output.read_text(encoding='utf-8'))
 
 
-def test_unsupported_camera_models_are_refused(tmp_path):
-    pinhole = dict(fx=1., fy=1., cx=0., cy=0., k1=0., k2=0., p1=0., p2=0., k3=0., k4=0., sx1=0., sy1=-999.)
-    calib = {'T_lidar_to_cam0_rigid_4x4': np.eye(4).tolist(), 'T_lidar_to_cam1_rigid_4x4': np.eye(4).tolist(),
-             'cam0_front_intrinsics': pinhole, 'cam1_rear_intrinsics': pinhole}
-    assert supported_calibration(calib) is None
-    assert supported_calibration({'lens_model': 'EQUIRECTANGULAR'}) is None
+def test_main_body_accepts_any_supported_model_and_refuses_incomplete_calibrations():
+    pinhole = dict(fx=1., fy=1., cx=0., cy=0., k1=0., k2=0., p1=0., p2=0., k3=0., k4=0., sx1=0., sy1=0.)
+    calib = {'T_lidar_to_cam0_rigid_4x4': np.eye(4).tolist(), 'cam0_front_intrinsics': {**pinhole, 'camera_model': 'PINHOLE'}}
+    body = main_body_from_calibration(calib, 1.0)
+    assert [c.name for c in body.cameras] == ['cam0'] and body.cameras[0].model.model == 'PINHOLE'
+    equirect = {'lens_model': 'EQUIRECTANGULAR', 'T_lidar_to_cam0_rigid_4x4': np.eye(4).tolist(),
+                'T_lidar_to_cam1_rigid_4x4': np.eye(4).tolist(), 'cam1_rear_intrinsics': pinhole,
+                'cam0_front_intrinsics': {'camera_model': 'EQUIRECTANGULAR', 'width': 2000, 'height': 1000}}
+    assert [c.name for c in main_body_from_calibration(equirect, 0.0).cameras] == ['cam0']
+    assert main_body_from_calibration({'lens_model': 'EQUIRECTANGULAR'}, 0.0) is None
+    assert main_body_from_calibration({**calib, 'cam0_front_intrinsics': {**pinhole, 'camera_model': 'KANNALA'}}, 0.0) is None

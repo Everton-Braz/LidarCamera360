@@ -451,6 +451,55 @@ def test_rejected_aux_camera_is_saved_and_blocks_colorization(
     assert [camera["fps"] for camera in saved_run["cameras"]] == [2.0, 2.0, 3.0, 1.5]
 
 
+def test_aux_camera_rejected_by_sample_sfm_is_rescued_by_photometric_refinement(
+    tmp_path, monkeypatch
+):
+    output, bag, video = _dataset(tmp_path, monkeypatch)
+    camera_path = tmp_path / "phone.mp4"
+    camera_path.touch()
+    reports = {
+        "cam2": {
+            "intrinsics": {"status": "sfm_calibrated"},
+            "extrinsics": {"status": "uncalibrated", "reason": "phone-video time offset is ambiguous"},
+            "sample_sfm": {"status": "rejected", "reason": "no rigid-pose candidate passed quality gates"},
+        },
+    }
+    _install_sample_calibration(monkeypatch, reports, [])
+    monkeypatch.setattr("raven_app.third_camera.extract_third_camera_frames", lambda camera, _output: ([], None))
+    refine_calls = {}
+
+    def refine(dataset, init, dt, **kwargs):
+        refine_calls.update(kwargs)
+        cameras = []
+        for camera in kwargs["aux_cameras"]:
+            data = camera.to_dict()
+            data["time_offset_s"] = 0.8
+            data["calibration_report"] = {
+                **camera.calibration_report,
+                "extrinsics": {"status": "calibrated", "source": "photometric_multiview_consistency"},
+                "time_offset": {"status": "calibrated", "applied": True, "seconds": 0.8},
+            }
+            cameras.append(data)
+        return {"quality_status": "rejected", "rejection_reason": "held-out", "auxiliary_cameras": cameras,
+                "photometric_report": {}}
+
+    monkeypatch.setattr("raven_app.photometric_rig.refine_rig", refine)
+    colorization = {}
+    monkeypatch.setattr(
+        "scripts.pipeline_auto_calibrator_and_colorizer.colorize_via_direct_rigid",
+        lambda dataset, calib_path, **kwargs: colorization.update(calib_path=calib_path, **kwargs),
+    )
+
+    assert _run_direct(output, bag, video, third_camera=[{
+        "camera_name": "cam2", "source_path": str(camera_path), "fps": 3.0, "calibration_report": {}}]) == 0
+
+    assert [camera.camera_name for camera in refine_calls["aux_cameras"]] == ["cam2"]
+    assert [camera.camera_name for camera in colorization["third_camera"]] == ["cam2"]
+    assert colorization["third_camera"][0].time_offset_s == 0.8
+    saved = json.loads((output / "third_camera_calibrated.json").read_text(encoding="utf-8"))
+    assert saved["cameras"][0]["calibration_report"]["extrinsics"]["status"] == "calibrated"
+
+
 def test_required_sample_rig_calibration_failure_is_recorded_and_stops_workflow(
     tmp_path, monkeypatch
 ):

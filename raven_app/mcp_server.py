@@ -14,6 +14,42 @@ from raven_app import __version__
 from raven_app.branding import APP_NAME, APP_DESCRIPTION
 
 
+# MCP argument -> CLI flag per command; booleans become bare flags.
+_CLI_OPTIONS = {
+    'calibrate': {'dataset': '--dataset', 'calib': '--calib', 'profile': '--profile', 'dt': '--dt',
+                  'fix_dt': '--fix-dt', 'masks_dir': '--masks-dir', 'mode': '--rig-refine', 'frames': '--frames'},
+    'workflow': {'bag': '--bag', 'insv': '--insv', 'output': '--output', 'method': '--method', 'fps': '--fps',
+                 'profile': '--profile', 'rig_refine': '--rig-refine', 'time_window': '--time-window',
+                 'revisit_refinement': '--revisit-refinement', 'dt': '--dt', 'calib': '--calib',
+                 'mask_persons': '--mask-persons', 'mask_backend': '--mask-backend', 'mask_config': '--mask-config',
+                 'masks_dir': '--masks-dir', 'operator_radius': '--operator-radius', 'third_camera': '--third-camera',
+                 'export_ply': '--export-ply', 'export_pcd': '--export-pcd'},
+    'colorize': {'dataset': '--dataset', 'method': '--method', 'calib': '--calib', 'profile': '--profile',
+                 'dt': '--dt', 'masks_dir': '--masks-dir', 'operator_radius': '--operator-radius',
+                 'rig_refine': '--rig-refine', 'time_window': '--time-window'},
+}
+
+
+def _cli_arguments(command, arguments):
+    options = _CLI_OPTIONS[command]
+    unknown = sorted(set(arguments) - set(options))
+    if unknown:
+        raise ValueError(f"Unsupported argument(s) for {command}: {', '.join(unknown)}")
+    if command == 'workflow':
+        arguments = {'export_ply': True, **arguments}
+    args = []
+    for key, flag in options.items():
+        if key not in arguments or arguments[key] is None:
+            continue
+        value = arguments[key]
+        if isinstance(value, bool):
+            if value:
+                args.append(flag)
+        else:
+            args += [flag, str(value)]
+    return args
+
+
 class LidarCameraMcpServer:
     """JSON-RPC 2.0 stdio MCP Server implementing Model Context Protocol specification."""
 
@@ -21,6 +57,14 @@ class LidarCameraMcpServer:
         self.server_name = f"{APP_NAME}-MCP"
         self.server_version = __version__
         self.tools = self._register_tools()
+        self._jobs = None
+
+    @property
+    def jobs(self):
+        if self._jobs is None:
+            from raven_app.mcp_jobs import JobManager
+            self._jobs = JobManager()
+        return self._jobs
 
     def _register_tools(self) -> List[Dict[str, Any]]:
         return [
@@ -105,6 +149,112 @@ class LidarCameraMcpServer:
                     },
                     "required": ["insv_path", "output_dir"]
                 }
+            },
+            {
+                "name": "list_profiles",
+                "description": "List hardware rig profiles (scanner + camera mount) and which one is the default.",
+                "inputSchema": {"type": "object", "properties": {}}
+            },
+            {
+                "name": "get_profile",
+                "description": "Read a hardware rig profile (id or JSON path; default profile when omitted).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"profile": {"type": "string", "description": "Profile id or JSON path."}}
+                }
+            },
+            {
+                "name": "validate_calibration",
+                "description": "Check whether a rig calibration JSON is usable: not rejected and physically close to the hardware profile (lens baseline, angle between lenses, per-lens rotation/position, lever arm).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "calibration_path": {"type": "string"},
+                        "profile": {"type": "string", "description": "Reference profile id or path (default profile when omitted)."}
+                    },
+                    "required": ["calibration_path"]
+                }
+            },
+            {
+                "name": "calibrate_rig",
+                "description": "Start a background job refining the rig mount and time offset(s) of a processed dataset by multi-view colour consistency (accepted only if held-out frames improve). Returns a job_id; poll get_job_status.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "dataset": {"type": "string", "description": "Processed output directory (images/, SLAM, frames.json)."},
+                        "calib": {"type": "string", "description": "Initial calibration (default: hardware profile)."},
+                        "profile": {"type": "string"},
+                        "dt": {"type": "number", "description": "Initial time offset, SLAM reference."},
+                        "fix_dt": {"type": "boolean", "default": False},
+                        "masks_dir": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["photometric", "dt"], "default": "photometric"},
+                        "frames": {"type": "integer", "default": 30}
+                    },
+                    "required": ["dataset"]
+                }
+            },
+            {
+                "name": "run_workflow",
+                "description": "Start the end-to-end workflow (bag + 360 video -> SLAM -> sync -> rig refinement -> time-gated colorization -> deliverables) as a background job. Returns a job_id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "bag": {"type": "string"}, "insv": {"type": "string", "description": "INSV or equirectangular MP4."},
+                        "output": {"type": "string"},
+                        "method": {"type": "string", "enum": ["direct", "sfm", "all", "trajectory", "reconstruction"], "default": "direct"},
+                        "fps": {"type": "number", "default": 2.0},
+                        "profile": {"type": "string"},
+                        "rig_refine": {"type": "string", "enum": ["photometric", "dt", "none"], "default": "photometric"},
+                        "time_window": {"type": "number", "default": 6.0},
+                        "revisit_refinement": {"type": "boolean", "default": False, "description": "Loop closure."},
+                        "dt": {"type": "number"},
+                        "calib": {"type": "string"},
+                        "mask_persons": {"type": "boolean", "default": False},
+                        "mask_backend": {"type": "string", "enum": ["vulkan", "tensorrt"]},
+                        "mask_config": {"type": "string"},
+                        "masks_dir": {"type": "string"},
+                        "operator_radius": {"type": "number"},
+                        "third_camera": {"type": "string"},
+                        "export_ply": {"type": "boolean", "default": True},
+                        "export_pcd": {"type": "boolean", "default": False}
+                    },
+                    "required": ["bag", "insv", "output"]
+                }
+            },
+            {
+                "name": "colorize",
+                "description": "Start a background job colorizing an already processed dataset (rig refinement + time-gated colorization). Returns a job_id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "dataset": {"type": "string"},
+                        "method": {"type": "string", "enum": ["direct", "sfm", "all", "trajectory", "reconstruction"], "default": "direct"},
+                        "calib": {"type": "string"}, "profile": {"type": "string"}, "dt": {"type": "number"},
+                        "masks_dir": {"type": "string"}, "operator_radius": {"type": "number"},
+                        "rig_refine": {"type": "string", "enum": ["photometric", "dt", "none"], "default": "photometric"},
+                        "time_window": {"type": "number", "default": 6.0}
+                    },
+                    "required": ["dataset"]
+                }
+            },
+            {
+                "name": "get_job_status",
+                "description": "Status of a background job: running/succeeded/failed/cancelled, current stage, outputs, rig refinement verdicts and the log tail.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"job_id": {"type": "string"}, "tail": {"type": "integer", "default": 40}},
+                    "required": ["job_id"]
+                }
+            },
+            {
+                "name": "cancel_job",
+                "description": "Stop a running background job.",
+                "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}
+            },
+            {
+                "name": "list_jobs",
+                "description": "Recent background jobs and their status.",
+                "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}}}
             },
             {
                 "name": "submit_feedback",
@@ -199,6 +349,38 @@ class LidarCameraMcpServer:
                 yaw_deg=yaw_deg,
                 generate_orthophoto_file=ortho
             )
+
+        elif name == "list_profiles":
+            from raven_app.profile_manager import list_available_profiles, resolve_profile
+            default = resolve_profile()
+            return {"default": str(default) if default else None, "profiles": list_available_profiles()}
+
+        elif name == "get_profile":
+            from raven_app.profile_manager import resolve_profile
+            path = resolve_profile(arguments.get("profile"))
+            if path is None:
+                raise ValueError("No hardware rig profile is available")
+            return {"path": str(path), "profile": json.loads(Path(path).read_text(encoding="utf-8"))}
+
+        elif name == "validate_calibration":
+            from raven_app.profile_manager import resolve_profile
+            from raven_app.workflow import calibration_gate_failures
+            reference = resolve_profile(arguments.get("profile"))
+            reasons = calibration_gate_failures(Path(arguments["calibration_path"]), reference_profile=reference)
+            return {"usable": not reasons, "reasons": reasons, "reference_profile": str(reference) if reference else None}
+
+        elif name in ("calibrate_rig", "run_workflow", "colorize"):
+            command = {"calibrate_rig": "calibrate", "run_workflow": "workflow", "colorize": "colorize"}[name]
+            return self.jobs.start(name, [command] + _cli_arguments(command, arguments))
+
+        elif name == "get_job_status":
+            return self.jobs.status(arguments["job_id"], tail=int(arguments.get("tail", 40)))
+
+        elif name == "cancel_job":
+            return self.jobs.cancel(arguments["job_id"])
+
+        elif name == "list_jobs":
+            return self.jobs.list(limit=int(arguments.get("limit", 20)))
 
         elif name == "submit_feedback":
             from raven_app.feedback import gather_diagnostics, build_github_issue_url, send_feedback_webhook

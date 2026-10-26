@@ -8,6 +8,25 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### 🧭 Any camera model and auxiliary cameras in the rig refinement (Phase 2)
+- **`raven_app/camera_models.py`** is one projection and validity layer for THIN_PRISM_FISHEYE, OPENCV_FISHEYE, PINHOLE, OPENCV and EQUIRECTANGULAR cameras. It uses the colorizer's own 12-parameter packing.
+- **The refinement is generic over *bodies*** (cameras sharing one housing and one clock). The main rig is cam0 + cam1, or a single equirectangular cam0. Each auxiliary camera (`third_camera.json`) is a body with its own clock.
+  - Bodies are refined one after another: the main rig first, then each auxiliary camera against it.
+  - An auxiliary camera refines its rotation and clock, keeping the measured lever arm; the clock gets a two-level ±3 s scan.
+  - Each body has its own held-out acceptance.
+- **Robustness**:
+  - Points leaving the image or field of view keep a penalty, so the mount cannot "look away" to lower the cost.
+  - Bounded mount search.
+  - Clock and rotation are re-centred alternately: a yaw error trades off against the clock while the rig turns.
+  - Held-out scoring compares both states on the same observations.
+  - Correct `cv2.resize` pixel-centre mapping.
+- **Workflow**: in direct mode, an auxiliary camera that failed the sample-SfM calibration but has calibrated intrinsics is deferred to the photometric refinement. It is coloured if accepted; otherwise the workflow stops before colorization, as before. Results are saved to `third_camera_calibrated.json`.
+
+### 🤖 MCP calibration and processing tools
+- New tools: `list_profiles`, `get_profile`, `validate_calibration`, `calibrate_rig`, `run_workflow`, `colorize`, `get_job_status`, `cancel_job` and `list_jobs`.
+- Long runs are background CLI jobs (`raven_app/mcp_jobs.py`) with a persisted log and state. Their status reports the stage, outputs and rig-refinement verdicts.
+- CLI errors without a message (e.g. `MemoryError`) now print their type instead of an empty line.
+
 ### 📐 Per-capture photometric rig refinement (Phase 1)
 - **`raven_app/photometric_rig.py`** refines the time offset and the mount of the dual-fisheye rig by multi-view colour consistency, starting from the hardware profile. It always runs a dense dt scan, then coarse-to-fine Powell with a weak profile prior.
 - **Acceptance rule**: a result is used only if it lowers the cost on held-out frames (never seen by the fit) by ≥ 1 % and passes the rig plausibility gates. Otherwise the profile and the gyro dt are kept, and the rejected attempt is recorded.

@@ -2220,41 +2220,55 @@ DEFAULT_RIG_REFINE = 'photometric'
 PHOTOMETRIC_RIG_FILE = 'rig_calibration_photometric.json'
 
 
+def _refinable_aux_camera(camera):
+    """Auxiliary cameras with calibrated intrinsics and a rigid mount can be refined."""
+    status = (camera.calibration_report or {}).get('intrinsics', {}).get('status')
+    return getattr(camera, 'enabled', True) and status in ('sfm_calibrated', 'calibrated', 'verified')
+
+
 def _refine_rig_for_colorization(output_dir, calib, dt_sync, run_record, *, mode, init_calibration,
-                                 fix_dt, masks_dir, reference_profile):
-    """Run the photometric rig/dt refinement; return the (calibration, dt) to colourise with.
+                                 fix_dt, masks_dir, reference_profile, aux_cameras=()):
+    """Run the photometric rig/clock refinement; return (calibration, dt, auxiliary cameras).
 
     The refinement starts from the explicit calibration or the hardware profile (never
     from an earlier per-dataset result) and is written to its own file, so a rejected
-    attempt never replaces a usable calibration.  Unsupported cameras are skipped.
+    attempt never replaces a usable calibration.  Auxiliary cameras come back updated
+    (marked calibrated only when their own held-out check passed); unsupported
+    cameras are skipped.
     """
     from raven_app.photometric_rig import refine_rig
+    from raven_app.third_camera import ThirdCameraConfig
+    aux_cameras = [camera for camera in aux_cameras if _refinable_aux_camera(camera)]
     print(f"\n[*] Rig refinement ({mode}) from {Path(init_calibration).name}, Δt = {dt_sync:.4f}s"
-          + (" (fixed)" if fix_dt else ""))
-    if fix_dt and mode == 'dt':
+          + (" (fixed)" if fix_dt else "")
+          + (f", auxiliary: {', '.join(c.camera_name for c in aux_cameras)}" if aux_cameras else ""))
+    if fix_dt and mode == 'dt' and not aux_cameras:
         run_record['rig_refinement'] = {'status': 'skipped', 'reason': 'manual time offset is final'}
         print("[*] Rig refinement skipped: the manual time offset is final and only dt was requested.")
-        return calib, dt_sync
+        return calib, dt_sync, []
     try:
         result = refine_rig(output_dir, init_calibration, dt_sync, masks_dir=masks_dir, mode=mode,
-                            fix_dt=fix_dt, reference_profile=reference_profile,
+                            fix_dt=fix_dt, reference_profile=reference_profile, aux_cameras=aux_cameras,
                             output=Path(output_dir) / PHOTOMETRIC_RIG_FILE)
     except (ValueError, FileNotFoundError) as exc:
         run_record['rig_refinement'] = {'status': 'skipped', 'reason': str(exc)}
         print(f"[*] Rig refinement skipped: {exc}")
-        return calib, dt_sync
+        return calib, dt_sync, []
     report = result.get('photometric_report', {})
+    updated = [ThirdCameraConfig.from_dict(data) for data in result.get('auxiliary_cameras', [])]
     run_record['rig_refinement'] = {
         'status': result.get('quality_status'), 'mode': mode, 'reason': result.get('rejection_reason'),
         'dt_sync_seconds': result.get('dt_sync_seconds'), 'holdout': report.get('holdout'),
         'seconds': report.get('seconds'),
+        'auxiliary': {camera.camera_name: (camera.calibration_report or {}).get('photometric_refinement')
+                      for camera in updated},
     }
     if result.get('quality_status') != 'accepted':
         print(f"[*] Keeping {Path(calib).name} and Δt = {dt_sync:.4f}s")
-        return calib, dt_sync
+        return calib, dt_sync, updated
     refined_dt = dt_sync if fix_dt else float(result['dt_sync_seconds'])
     run_record['resolved_dt_sync_seconds'] = refined_dt
-    return Path(output_dir) / PHOTOMETRIC_RIG_FILE, refined_dt
+    return Path(output_dir) / PHOTOMETRIC_RIG_FILE, refined_dt, updated
 
 
 def calibration_gate_failures(calib_path: Optional[Path], max_lever_arm_cm: float = 40.0,
@@ -3033,6 +3047,7 @@ def execute_unified_workflow(
                 f'Required per-session sample SfM camera calibration failed: {e}') from e
 
     calibrated_cameras = []
+    pending_aux_cameras = []
     updated_third_cfgs = []
     full_sfm_pose_support_records = {}
     for third_cfg in third_cfgs:
@@ -3137,6 +3152,12 @@ def execute_unified_workflow(
         ]
         failed_cameras = [camera for camera in third_cfgs
                           if camera not in calibrated_cameras]
+        if (failed_cameras and method == 'direct' and rig_refine == 'photometric'
+                and all(_refinable_aux_camera(camera) for camera in failed_cameras)):
+            pending_aux_cameras = failed_cameras
+            print("[*] Auxiliary camera calibration deferred to the photometric rig refinement: "
+                  + ', '.join(camera.camera_name for camera in failed_cameras))
+            failed_cameras = []
         if failed_cameras:
             reasons = []
             for camera in failed_cameras:
@@ -3221,12 +3242,32 @@ def execute_unified_workflow(
             calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json, profile=profile)
             print(f"[*] Direct Rigid colorization using resolved calibration: {calib}")
         if rig_refine != 'none':
-            calib, dt_sync = _refine_rig_for_colorization(
+            rigid_aux = [camera for camera in third_cfgs
+                         if camera in pending_aux_cameras or _aux_camera_calibration_ready(camera)]
+            calib, dt_sync, refined_aux = _refine_rig_for_colorization(
                 output_dir, calib, dt_sync, run_record, mode=rig_refine,
                 init_calibration=Path(calib_json) if calib_json else reference_profile,
                 fix_dt=dt_override is not None, masks_dir=active_masks_dir,
-                reference_profile=reference_profile)
+                reference_profile=reference_profile, aux_cameras=rigid_aux)
+            if refined_aux:
+                by_name = {camera.camera_name: camera for camera in refined_aux}
+                third_cfgs = [by_name.get(camera.camera_name, camera) for camera in third_cfgs]
+                from raven_app.third_camera import save_third_camera_config
+                save_third_camera_config(third_cfgs, output_dir / "third_camera_calibrated.json")
+                calibrated_cameras = [by_name.get(camera.camera_name, camera) for camera in calibrated_cameras]
+                calibrated_cameras += [by_name[camera.camera_name] for camera in pending_aux_cameras
+                                       if camera.camera_name in by_name
+                                       and _aux_camera_calibration_ready(by_name[camera.camera_name])]
             _persist_workflow_run(output_dir, run_record)
+        unresolved = [camera.camera_name for camera in pending_aux_cameras
+                      if camera.camera_name not in {c.camera_name for c in calibrated_cameras}]
+        if unresolved:
+            message = ('Enabled auxiliary cameras must all pass calibration before colorization; '
+                       'the photometric rig refinement did not calibrate: ' + ', '.join(unresolved))
+            run_record.update(status='failed', failure={
+                'stage': 'auxiliary_camera_calibration', 'reason': message})
+            _persist_workflow_run(output_dir, run_record)
+            raise RuntimeError(message)
         pipeline.colorize_via_direct_rigid(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
             masks_dir=active_masks_dir, operator_radius=operator_radius,

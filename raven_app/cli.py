@@ -210,7 +210,9 @@ def parse(argv=None):
     cal.add_argument('--dt',type=finite,help='Initial time offset in the SLAM reference (default: from the initial calibration)')
     cal.add_argument('--fix-dt',action='store_true',help='Keep --dt fixed and refine the mount only')
     cal.add_argument('--masks-dir',type=Path,help='Person masks of this dataset (white = keep)')
-    cal.add_argument('--frames',type=int,default=30,help='Frames per lens used by the fit (default: 30)')
+    cal.add_argument('--frames',type=int,default=30,help='Frames per camera used by the fit (default: 30)')
+    cal.add_argument('--third-camera',type=Path,default=None,
+                     help='Auxiliary cameras to refine as separate bodies (default: <dataset>/third_camera_calibrated.json if present)')
     add_rig_refine_option(cal)
     color=sub.add_parser('colorize',help='Run the existing calibration and colorization pipeline')
     color.add_argument('--dataset',type=Path,required=True)
@@ -546,15 +548,28 @@ def run(a):
         if a.masks_dir:
             from raven_app.person_masks import check_masks_match_frames
             check_masks_match_frames(a.masks_dir, dataset / 'images')
+        from raven_app.third_camera import load_third_camera_configs, save_third_camera_config, ThirdCameraConfig
+        from raven_app.workflow import _refinable_aux_camera
+        aux_source = a.third_camera or (dataset / 'third_camera_calibrated.json')
+        aux_all = load_third_camera_configs(aux_source) if Path(aux_source).is_file() else []
         result = refine_rig(dataset, init, float(dt), masks_dir=a.masks_dir, mode=a.rig_refine,
                             fix_dt=a.fix_dt, frames=a.frames, reference_profile=reference,
+                            aux_cameras=[c for c in aux_all if _refinable_aux_camera(c)],
                             output=dataset / PHOTOMETRIC_RIG_FILE)
         report = result.get('photometric_report', {})
+        refined_aux = {d['camera_name']: ThirdCameraConfig.from_dict(d) for d in result.get('auxiliary_cameras', [])}
+        if refined_aux:
+            save_third_camera_config([refined_aux.get(c.camera_name, c) for c in aux_all],
+                                     dataset / 'third_camera_calibrated.json')
         print(json.dumps({'calibration': str(dataset / PHOTOMETRIC_RIG_FILE),
                           'quality_status': result.get('quality_status'),
                           'rejection_reason': result.get('rejection_reason'),
                           'dt_sync_seconds': result.get('dt_sync_seconds'),
-                          'holdout': report.get('holdout')}, indent=2))
+                          'holdout': report.get('holdout'),
+                          'auxiliary': {b['body']: {'quality_status': b['quality_status'], 'dt': b['dt'],
+                                                    'rejection_reason': b['rejection_reason'],
+                                                    'improvement': b['holdout']['improvement']}
+                                        for b in report.get('bodies', []) if b['body'] != 'main'}}, indent=2))
         return 0 if result.get('quality_status') == 'accepted' else 3
     if a.command=='colorize':
         from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
@@ -610,10 +625,16 @@ def run(a):
                 if dt_init is None:
                     print('[*] Rig refinement skipped: no time offset to start from (pass --dt)')
                 else:
-                    calib, dt = _refine_rig_for_colorization(
+                    calib, dt, refined_aux = _refine_rig_for_colorization(
                         dataset, calib, float(dt_init), {}, mode=a.rig_refine,
                         init_calibration=a.calib or reference_profile, fix_dt=a.dt is not None,
-                        masks_dir=masks_dir, reference_profile=reference_profile)
+                        masks_dir=masks_dir, reference_profile=reference_profile,
+                        aux_cameras=third_cfgs or [])
+                    if refined_aux:
+                        by_name = {camera.camera_name: camera for camera in refined_aux}
+                        third_cfgs = [by_name.get(camera.camera_name, camera) for camera in third_cfgs]
+                        from raven_app.third_camera import save_third_camera_config
+                        save_third_camera_config(third_cfgs, dataset / 'third_camera_calibrated.json')
             pipeline.colorize_via_direct_rigid(
                 dataset, calib, fps=a.fps, dt_override=dt,
                 use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
@@ -799,7 +820,8 @@ def main(argv=None):
         print('Cancelled.', file=sys.stderr)
         return 130
     except Exception as e:
-        print(f'RavenCalibrator: {e}', file=sys.stderr)
+        # Some errors (MemoryError, bare AssertionError) carry no message: name the type.
+        print(f'RavenCalibrator: {str(e) or type(e).__name__}', file=sys.stderr)
         return 2
 
 
