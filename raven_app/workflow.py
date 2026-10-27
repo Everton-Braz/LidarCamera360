@@ -2265,6 +2265,19 @@ DEFAULT_RIG_REFINE = 'photometric'
 PHOTOMETRIC_RIG_FILE = 'rig_calibration_photometric.json'
 
 
+def _aux_cameras_from_profile(cameras, profile, is_eagle=False):
+    """Auxiliary cameras the selected rig profile already calibrates need no sample SfM."""
+    from raven_app.profile_manager import resolve_profile
+    from raven_app.rig_profile import apply_profile_to_aux_cameras, load_profile
+    try:
+        path = resolve_profile(profile, is_eagle=is_eagle)
+        rig = load_profile(path) if path else None
+    except (ValueError, OSError) as exc:
+        print(f"[!] Rig profile auxiliary cameras unavailable: {exc}")
+        return list(cameras)
+    return apply_profile_to_aux_cameras(cameras, rig)
+
+
 def _refinable_aux_camera(camera):
     """Auxiliary cameras with calibrated intrinsics and a rigid mount can be refined."""
     status = (camera.calibration_report or {}).get('intrinsics', {}).get('status')
@@ -2654,6 +2667,8 @@ def execute_unified_workflow(
     if third_cfgs:
         from raven_app.third_camera import expand_auxiliary_camera_configs
         third_cfgs = expand_auxiliary_camera_configs(third_cfgs)
+        third_cfgs = _aux_cameras_from_profile(
+            third_cfgs, profile, ('livox' in (lidar_topic or '').lower()) or ('eagle' in str(bag_path).lower()))
 
     run_record = {
         'run_id': str(time.time_ns()),
@@ -2962,7 +2977,8 @@ def execute_unified_workflow(
     stage4_sfm = (method in ("sfm", "all") or run_spirula or
                   (frames_changed and sparse_bin.is_file()))
     direct_sample_calibration_required = (
-        method == 'direct' and (bool(third_cfgs) or (recalibrate and not sparse_bin.is_file())))
+        method == 'direct' and (any(not _aux_camera_calibration_ready(c) for c in third_cfgs)
+                                or (recalibrate and not sparse_bin.is_file())))
     sample_sfm_required = direct_sample_calibration_required
     stage4_title = ("Multi-View SfM Alignment & Spatial Recalibration"
                     if stage4_sfm else

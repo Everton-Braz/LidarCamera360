@@ -85,6 +85,7 @@ def test_resolver_keeps_plausible_dataset_calibration(tmp_path):
 
 def test_resolve_profile_by_path_id_and_default(tmp_path, monkeypatch):
     monkeypatch.setattr(profile_manager, 'get_profiles_dir', lambda: tmp_path)
+    monkeypatch.setattr(profile_manager, 'get_user_profiles_dir', lambda: tmp_path / 'user')
     data = dict(_profile(), profile_id='custom_rig', is_default=False)
     (tmp_path / 'my_rig.json').write_text(json.dumps(data), encoding='utf-8')
     default = dict(_profile(), is_default=True)
@@ -100,6 +101,7 @@ def test_resolve_profile_by_path_id_and_default(tmp_path, monkeypatch):
 
 def test_saved_profiles_never_claim_to_be_the_default(tmp_path, monkeypatch):
     monkeypatch.setattr(profile_manager, 'get_profiles_dir', lambda: tmp_path)
+    monkeypatch.setattr(profile_manager, 'get_user_profiles_dir', lambda: tmp_path / 'user')
     saved = profile_manager.save_profile_from_calibration(dict(_profile(), is_default=True), 'Copy')
     assert json.loads(saved.read_text(encoding='utf-8'))['is_default'] is False
 

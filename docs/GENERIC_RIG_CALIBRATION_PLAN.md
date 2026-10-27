@@ -1,6 +1,6 @@
 # Plan: rig calibration for any LiDAR + camera + mount
 
-**Date:** 2026-10-26 · **Branch:** dev · **Status:** Phases 0–2 implemented (any camera model, auxiliary camera bodies) plus the MCP part of Phase 4; profile v2 file format, new-rig wizard (Phase 3), GUI profile editor and speed (Phase 5) pending
+**Date:** 2026-10-26 · **Branch:** dev · **Status:** Phases 0–5 implemented. Profile v2 lives in `raven_app/rig_profile.py` (not a `rig/` package). The new-rig start uses hand-eye calibration from motion (`raven_app/rig_handeye.py`) instead of the blurred photometric grid of 2.4: the grid could not separate a 3 s clock error from a 15° mount error on PIER, while hand-eye recovers both. The speed work uses threads + float32 instead of Vulkan/numba.
 
 ## 1. Why: what PIER and HarmonyMall showed
 

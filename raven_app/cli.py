@@ -1,6 +1,7 @@
 """Lazy imports keep --help/--version fast and headless commands GUI-free."""
 import argparse
 import json
+import time
 import os
 from pathlib import Path
 import signal
@@ -213,7 +214,45 @@ def parse(argv=None):
     cal.add_argument('--frames',type=int,default=30,help='Frames per camera used by the fit (default: 30)')
     cal.add_argument('--third-camera',type=Path,default=None,
                      help='Auxiliary cameras to refine as separate bodies (default: <dataset>/third_camera_calibrated.json if present)')
+    cal.add_argument('--coarse',action='store_true',
+                     help='New rig: wide time-offset scan and mount rotation grid before the fine solve (profile from the wizard / measurements)')
+    cal.add_argument('--coarse-dt-window',type=finite,default=10.0,help='Half-width in seconds of the coarse time-offset scan (default: 10)')
+    cal.add_argument('--save-profile',metavar='NAME',default=None,help='Save an accepted result as a new rig profile with this name')
+    cal.add_argument('--report',type=Path,default=None,help='Also write the JSON summary to this file')
     add_rig_refine_option(cal)
+    prof=sub.add_parser('profile',help='List, inspect, create and validate hardware rig profiles')
+    prof_sub=prof.add_subparsers(dest='profile_command',required=True)
+    prof_sub.add_parser('list',help='Bundled and user profiles (the default first)')
+    prof_show=prof_sub.add_parser('show',help='Print a profile as v2 JSON')
+    prof_show.add_argument('profile')
+    prof_validate=prof_sub.add_parser('validate',help='Check a profile or calibration JSON')
+    prof_validate.add_argument('file',type=Path)
+    prof_import=prof_sub.add_parser('import',help='Copy a profile or calibration JSON into the user profiles')
+    prof_import.add_argument('file',type=Path)
+    prof_import.add_argument('--name',default=None)
+    prof_export=prof_sub.add_parser('export',help='Write a profile to a file')
+    prof_export.add_argument('profile')
+    prof_export.add_argument('file',type=Path)
+    prof_create=prof_sub.add_parser('create',help='New profile from a calibration result (e.g. rig_calibration_photometric.json)')
+    prof_create.add_argument('--from-calibration',type=Path,required=True)
+    prof_create.add_argument('--name',required=True)
+    prof_create.add_argument('--base',default=None,help='Profile the calibration started from (scanner, priors)')
+    prof_new=prof_sub.add_parser('new',help='New rig from a camera model and a measured mount (then run calibrate --coarse)')
+    prof_new.add_argument('--name',required=True)
+    prof_new.add_argument('--camera',required=True,help='Camera catalogue id (see: profile cameras)')
+    prof_new.add_argument('--scanner',choices=('raven','eagle','generic'),default='generic')
+    prof_new.add_argument('--scanner-model',default='')
+    prof_new.add_argument('--offset-cm',type=finite,nargs=3,default=(0.0,0.0,0.0),metavar=('X','Y','Z'),
+                          help='Camera centre in the LiDAR frame (x forward, y left, z up), centimetres')
+    prof_new.add_argument('--orientation',default='lens_forward',help='Mount orientation preset (see: profile cameras)')
+    prof_new.add_argument('--rpy',type=finite,nargs=3,default=(0.0,0.0,0.0),metavar=('ROLL','PITCH','YAW'),
+                          help='Extra mount rotation in degrees')
+    prof_new.add_argument('--width',type=int,default=None)
+    prof_new.add_argument('--height',type=int,default=None)
+    prof_new.add_argument('--set-default',action='store_true')
+    prof_default=prof_sub.add_parser('set-default',help='Use this profile when none is given')
+    prof_default.add_argument('profile')
+    prof_sub.add_parser('cameras',help='Camera catalogue and mount orientation presets for "profile new"')
     color=sub.add_parser('colorize',help='Run the existing calibration and colorization pipeline')
     color.add_argument('--dataset',type=Path,required=True)
     color.add_argument('--method',choices=['sfm','direct','all','trajectory','reconstruction'],default='direct')
@@ -543,6 +582,9 @@ def run(a):
         reference = resolve_profile(a.profile)
         init = a.calib or reference
         dt = a.dt if a.dt is not None else json.loads(Path(init).read_text(encoding='utf-8')).get('dt_sync_seconds')
+        if dt is None and a.coarse:
+            dt = 0.0
+            print(f'[*] No initial time offset: the coarse scan searches ±{a.coarse_dt_window:g} s around 0')
         if dt is None:
             raise ValueError('No initial time offset: pass --dt (SLAM reference, e.g. from the workflow log)')
         if a.masks_dir:
@@ -552,25 +594,45 @@ def run(a):
         from raven_app.workflow import _refinable_aux_camera
         aux_source = a.third_camera or (dataset / 'third_camera_calibrated.json')
         aux_all = load_third_camera_configs(aux_source) if Path(aux_source).is_file() else []
+        aux_all = _profile_aux_cameras(aux_all, reference, dataset)
         result = refine_rig(dataset, init, float(dt), masks_dir=a.masks_dir, mode=a.rig_refine,
                             fix_dt=a.fix_dt, frames=a.frames, reference_profile=reference,
                             aux_cameras=[c for c in aux_all if _refinable_aux_camera(c)],
-                            output=dataset / PHOTOMETRIC_RIG_FILE)
+                            output=dataset / PHOTOMETRIC_RIG_FILE, coarse=a.coarse,
+                            coarse_dt_window=a.coarse_dt_window)
         report = result.get('photometric_report', {})
         refined_aux = {d['camera_name']: ThirdCameraConfig.from_dict(d) for d in result.get('auxiliary_cameras', [])}
         if refined_aux:
             save_third_camera_config([refined_aux.get(c.camera_name, c) for c in aux_all],
                                      dataset / 'third_camera_calibrated.json')
-        print(json.dumps({'calibration': str(dataset / PHOTOMETRIC_RIG_FILE),
-                          'quality_status': result.get('quality_status'),
-                          'rejection_reason': result.get('rejection_reason'),
-                          'dt_sync_seconds': result.get('dt_sync_seconds'),
-                          'holdout': report.get('holdout'),
-                          'auxiliary': {b['body']: {'quality_status': b['quality_status'], 'dt': b['dt'],
-                                                    'rejection_reason': b['rejection_reason'],
-                                                    'improvement': b['holdout']['improvement']}
-                                        for b in report.get('bodies', []) if b['body'] != 'main'}}, indent=2))
+        summary = {'calibration': str(dataset / PHOTOMETRIC_RIG_FILE),
+                   'quality_status': result.get('quality_status'),
+                   'rejection_reason': result.get('rejection_reason'),
+                   'dt_sync_seconds': result.get('dt_sync_seconds'),
+                   'holdout': report.get('holdout'),
+                   'seconds': report.get('seconds'),
+                   'auxiliary': {b['body']: {'quality_status': b['quality_status'], 'dt': b['dt'],
+                                             'rejection_reason': b['rejection_reason'],
+                                             'improvement': b['holdout']['improvement']}
+                                 for b in report.get('bodies', []) if b['body'] != 'main'}}
+        if a.save_profile:
+            if result.get('quality_status') == 'accepted':
+                from raven_app.profile_manager import save_profile_from_calibration
+                holdout = report.get('holdout') or {}
+                summary['saved_profile'] = str(save_profile_from_calibration(
+                    result, a.save_profile, base_profile=str(reference) if reference else None,
+                    validated_on={'dataset': str(dataset), 'date': time.strftime('%Y-%m-%d'),
+                                  'holdout_cost_before': (holdout.get('initial') or {}).get('cost'),
+                                  'holdout_cost_after': (holdout.get('refined') or {}).get('cost')}))
+            else:
+                summary['saved_profile'] = None
+                print('[!] Profile not saved: the calibration was rejected')
+        if a.report:
+            Path(a.report).write_text(json.dumps(summary, indent=2), encoding='utf-8')
+        print(json.dumps(summary, indent=2))
         return 0 if result.get('quality_status') == 'accepted' else 3
+    if a.command=='profile':
+        return _profile_command(a)
     if a.command=='colorize':
         from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
         if a.mask_persons:
@@ -806,6 +868,83 @@ def run(a):
             print(f"  [{c['name']}] Bag: {c['bag_duration']:.1f}s | Video: {c['video_duration']:.1f}s | Overlap: {c['overlap_sec']:.1f}s")
         return 0
     raise ValueError('Unknown command')
+
+
+def _profile_aux_cameras(configs, reference, dataset):
+    """Auxiliary cameras for calibrate: the given configs, completed from the profile, plus
+    profile cameras whose frames the dataset has."""
+    from raven_app.rig_profile import apply_profile_to_aux_cameras, load_profile
+    try:
+        rig = load_profile(reference) if reference else None
+    except (OSError, ValueError):
+        return list(configs)
+    configs = apply_profile_to_aux_cameras(configs, rig)
+    names = {c.camera_name for c in configs}
+    for camera in (rig.auxiliary_camera_configs() if rig else []):
+        if camera.camera_name not in names and (Path(dataset) / 'images' / camera.camera_name).is_dir():
+            configs.append(camera)
+    return configs
+
+
+def _profile_command(a):
+    from raven_app import profile_manager as pm
+    from raven_app.rig_profile import load_profile, save_profile, slugify, validate_profile
+    command = a.profile_command
+    if command == 'list':
+        print(json.dumps(pm.list_available_profiles(), indent=2))
+        return 0
+    if command == 'cameras':
+        from raven_app.rig_bootstrap import CAPTURE_ADVICE, MOUNT_ORIENTATIONS, catalogue_choices
+        print(json.dumps({'cameras': catalogue_choices(),
+                          'orientations': {k: v['label'] for k, v in MOUNT_ORIENTATIONS.items()},
+                          'capture_advice': CAPTURE_ADVICE}, indent=2, ensure_ascii=False))
+        return 0
+    if command == 'show':
+        print(json.dumps(load_profile(pm.resolve_profile(a.profile)).to_dict(), indent=2))
+        return 0
+    if command == 'validate':
+        try:
+            data = json.loads(Path(a.file).read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            print(json.dumps({'valid': False, 'errors': [str(exc)]}, indent=2))
+            return 3
+        errors = validate_profile(data)
+        print(json.dumps({'valid': not errors, 'errors': errors}, indent=2))
+        return 0 if not errors else 3
+    if command == 'import':
+        profile = load_profile(a.file)
+        if a.name:
+            profile.name, profile.profile_id = a.name, slugify(a.name)
+        profile.is_default = False
+        print(save_profile(profile, pm.get_user_profiles_dir() / f'{slugify(profile.profile_id)}.json'))
+        return 0
+    if command == 'export':
+        profile = load_profile(pm.resolve_profile(a.profile))
+        Path(a.file).write_text(json.dumps(profile.to_dict(), indent=2), encoding='utf-8')
+        print(a.file)
+        return 0
+    if command == 'create':
+        data = json.loads(Path(a.from_calibration).read_text(encoding='utf-8'))
+        if data.get('quality_status') == 'rejected':
+            raise ValueError(f'{a.from_calibration} was rejected: {data.get("rejection_reason")}')
+        print(pm.save_profile_from_calibration(data, a.name, base_profile=a.base))
+        return 0
+    if command == 'new':
+        from raven_app.rig_bootstrap import build_profile
+        profile = build_profile(a.name, camera=a.camera, scanner_preset=a.scanner, scanner_model=a.scanner_model,
+                                offset_cm=tuple(a.offset_cm), orientation=a.orientation,
+                                extra_rpy_deg=tuple(a.rpy), width=a.width, height=a.height)
+        path = save_profile(profile, pm.get_user_profiles_dir() / f'{profile.profile_id}.json')
+        if a.set_default:
+            pm.set_default_profile(str(path))
+        print(path)
+        print(f'[*] Next: process a capture with --profile {profile.profile_id} --rig-refine none, then run '
+              f'calibrate --dataset <output> --profile {profile.profile_id} --coarse --save-profile "{a.name}"')
+        return 0
+    if command == 'set-default':
+        print(pm.set_default_profile(a.profile))
+        return 0
+    raise ValueError(f'Unknown profile command {command}')
 
 
 def main(argv=None):

@@ -34,7 +34,9 @@ import copy
 import hashlib
 import itertools
 import json
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -52,6 +54,9 @@ from raven_app.slam_source import active_slam_dir
 REFINEMENT_VERSION = 3   # bump whenever the solver changes: cached results are keyed on it
 MIN_HOLDOUT_IMPROVEMENT = 0.01
 MAX_AUX_LEVER_ARM_M = 1.5
+# A bootstrapped profile is a ruler measurement: allow the solve to move far from it.
+MAX_HANDEYE_RESIDUAL_DEG = 2.0
+COARSE_GATE_LIMITS = {'max_rotation_delta_deg': 30.0, 'max_translation_delta_cm': 25.0}
 
 
 @dataclass
@@ -76,6 +81,7 @@ class RigBody:
     refine_translation: bool = True     # single far-looking cameras barely observe it
     params: np.ndarray = field(default=None)
     initial_T: Optional[Dict[str, np.ndarray]] = None   # mounts before any coarse search
+    initial_dt: Optional[float] = None                  # clock before any coarse search
 
     def __post_init__(self):
         if self.params is None:
@@ -214,6 +220,103 @@ def _identity_index():
     return next(i for i, R in enumerate(cube_rotations()) if np.allclose(R, np.eye(3)))
 
 
+def _rotate_body(body, base, rotation):
+    """Turn every camera of ``body`` by ``rotation`` (LiDAR frame) about the body centre."""
+    centre = np.mean([T[:3, 3] for T in base.values()], axis=0)
+    G = np.eye(4)
+    G[:3, :3] = rotation
+    G[:3, 3] = centre - rotation @ centre
+    for camera in body.cameras:
+        camera.T = G @ base[camera.name]
+
+
+def _coarse_mount(problem, body, log, *, half_deg, step_deg, sigma):
+    """Grid search of the body's mount rotation (roll, pitch, yaw about its centre).
+
+    A measured mount is only good to about ±15°; Powell from there falls into the
+    wrong basin, so the rotation is first chosen on a grid with heavily blurred images
+    (a wide basin).  Visibility is re-frozen per candidate: a wide-angle rig sees
+    almost the same points from any nearby orientation, while a fixed set would
+    punish every candidate that turns points out of the frozen views.
+    """
+    problem.use_bodies([body.name])
+    problem.set_blur(sigma)
+    base = {c.name: c.T.copy() for c in body.cameras}
+    angles = np.arange(-half_deg, half_deg + 1e-9, step_deg)
+    results = []
+    for rpy in itertools.product(angles, repeat=3):
+        _rotate_body(body, base, Rot.from_euler('xyz', rpy, degrees=True).as_matrix())
+        state = problem.state()
+        problem.freeze_visibility(state)
+        results.append((problem.cost(state, penalize_missing=False), rpy))
+    results.sort(key=lambda item: item[0])
+    best_cost, best = results[0]
+    _rotate_body(body, base, Rot.from_euler('xyz', best, degrees=True).as_matrix())
+    zero = next(c for c, rpy in results if not any(rpy))
+    log(f'[*] Coarse mount search ({body.name}) ±{half_deg:g}° step {step_deg:g}° σ={sigma:g}px: '
+        f'roll/pitch/yaw {best[0]:+.1f}/{best[1]:+.1f}/{best[2]:+.1f}° cost {best_cost:.4f} '
+        f'(start {zero:.4f}, {len(results)} candidates)')
+    return {'half_deg': half_deg, 'step_deg': step_deg, 'sigma': sigma, 'best_rpy_deg': list(best),
+            'cost': round(float(best_cost), 5), 'start_cost': round(float(zero), 5)}
+
+
+def _coarse_dt(problem, body, log, *, window, sigma):
+    """Wide dt scan for a clock known only within seconds (no gyro); baked into ``body.dt``."""
+    problem.use_bodies([body.name])
+    problem.set_blur(sigma)
+    problem.freeze_visibility(problem.state())
+    saved = body.dt_window
+    body.dt_window = window
+    try:
+        best, scan = _scan_dt(problem, body, log)
+    finally:
+        body.dt_window = saved
+    body.dt += best
+    body.params[-1] = 0.0
+    return {'window': window, 'sigma': sigma, 'offset': float(best), 'dt': float(body.dt)}
+
+
+def _coarse_handeye(dataset, body, trajectory, log, *, window, masks_dir=None):
+    """Mount rotation and clock of ``body`` from motion (``rig_handeye``), baked into the body."""
+    from raven_app.rig_handeye import handeye_initialisation
+    reference = body.cameras[0]
+    if body.initial_T is None:
+        body.initial_T = {c.name: c.T.copy() for c in body.cameras}
+    if body.initial_dt is None:
+        body.initial_dt = body.dt
+    dt, R, report = handeye_initialisation(dataset, reference.name, reference.model, trajectory, body.dt,
+                                           window=0.0 if body.fix_dt else window, masks_dir=masks_dir, log=log)
+    base = {c.name: c.T.copy() for c in body.cameras}
+    G = R @ reference.T[:3, :3].T
+    _rotate_body(body, base, G)
+    report.update(rotation_change_deg=float(np.degrees(np.linalg.norm(Rot.from_matrix(G).as_rotvec()))),
+                  dt_change_s=float(dt - body.dt))
+    body.dt = float(dt)
+    body.params[-1] = 0.0
+    log(f'[*] Hand-eye start ({body.name}): mount turned by {report["rotation_change_deg"]:.1f}°, '
+        f'clock moved by {report["dt_change_s"]:+.3f}s')
+    return report
+
+
+def _coarse_main(dataset, body, names, common, log, *, dt_window):
+    """Coarse-to-fine start for a mount known to ±15° / ±10 cm and a clock to ±``dt_window``."""
+    t0 = time.time()
+    if body.initial_T is None:
+        body.initial_T = {c.name: c.T.copy() for c in body.cameras}
+    body.initial_dt = body.dt
+    problem = RigProblem(dataset, [body], names, **{**common, 'scale': 0.125, 'npts': 60000})
+    report = {'steps': []}
+    if not body.fix_dt and dt_window > body.dt_window:
+        report['steps'].append({'dt': _coarse_dt(problem, body, log, window=dt_window, sigma=4.0)})
+    report['steps'].append({'mount': _coarse_mount(problem, body, log, half_deg=15.0, step_deg=5.0, sigma=4.0)})
+    if not body.fix_dt:
+        report['steps'].append({'dt': _coarse_dt(problem, body, log, window=max(1.0, body.dt_window), sigma=2.0)})
+    report['steps'].append({'mount': _coarse_mount(problem, body, log, half_deg=4.0, step_deg=2.0, sigma=2.0)})
+    report['seconds'] = round(time.time() - t0, 1)
+    log(f'[*] Coarse rig search finished in {report["seconds"]:.0f}s, Δt {body.dt:.4f}s')
+    return report
+
+
 def auxiliary_body(camera, main_dt, *, dt_window=3.0):
     """Body for an auxiliary camera (ThirdCameraConfig) with intrinsics already calibrated."""
     status = (camera.calibration_report or {}).get('intrinsics', {}).get('status')
@@ -227,6 +330,17 @@ def auxiliary_body(camera, main_dt, *, dt_window=3.0):
                    prior_rot_deg=10.0, prior_trans_m=0.2, bound_rot_deg=12.0, bound_trans_m=0.4,
                    refine_translation=False)
     return body
+
+
+_EXECUTOR = None
+
+
+def _executor():
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        _EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(8, (os.cpu_count() or 2) - 1)),
+                                       thread_name_prefix='photometric')
+    return _EXECUTOR
 
 
 class RigProblem:
@@ -255,11 +369,12 @@ class RigProblem:
         idx = np.flatnonzero(distance < max_range)
         if len(idx) > npts:
             idx = np.random.default_rng(seed).choice(idx, npts, replace=False)
-        self.X = xyz[idx]
+        self.X = xyz[idx].astype(np.float32)
+        self._poses = {}
+        self.obs_X = {}
         log(f'[*] Photometric rig problem: {len(self.names)} frames '
             f'({", ".join(sorted({n.split("/")[0] for n in self.names}))}), {len(self.X):,} LiDAR points')
-        self.raw = {}
-        for n in self.names:
+        def load(n):
             img = cv2.imread(str(self.dataset / 'images' / n), cv2.IMREAD_GRAYSCALE)
             img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA).astype(np.float32)
             H, W = img.shape
@@ -269,7 +384,9 @@ class RigProblem:
                 if m is not None:
                     mk &= cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST) > 127
             mk = cv2.erode(mk.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
-            self.raw[n] = (img, mk)
+            return img, mk
+
+        self.raw = dict(zip(self.names, _executor().map(load, self.names)))
         self.set_blur(0)
 
     def pose(self, tq):
@@ -278,11 +395,13 @@ class RigProblem:
         return p, self.slerp(tq).as_matrix()
 
     def set_blur(self, sigma):
-        self.img = {}
-        for n, (im, mk) in self.raw.items():
+        def normalised(item):
+            im, mk = item
             g = cv2.GaussianBlur(im, (0, 0), sigma) if sigma > 0 else im
             v = g[mk] if mk.any() else g.ravel()
-            self.img[n] = (((g - v.mean()) / (v.std() + 1e-6)).astype(np.float32), mk)
+            return ((g - v.mean()) / (v.std() + 1e-6)).astype(np.float32), mk
+
+        self.img = dict(zip(self.raw, _executor().map(normalised, self.raw.values())))
 
     def state(self, overrides=None):
         """Per-camera transform and per-body dt, with ``overrides`` = {body: params}."""
@@ -293,15 +412,32 @@ class RigProblem:
             dts[name] = dt
         return transforms, dts
 
-    def _project(self, n, state, idx=None):
+    def _frame_pose(self, n, dt):
+        key = (n, float(dt))
+        pose = self._poses.get(key)
+        if pose is None:
+            pL, RL = self.pose(np.array([self.t[0] + self.ft[n] - dt]))
+            if len(self._poses) > 50000:
+                self._poses.clear()
+            pose = self._poses[key] = (pL[0], RL[0])
+        return pose
+
+    def _project(self, n, state, idx=None, X=None):
         transforms, dts = state
         cam = n.split('/')[0]
         T = transforms[cam]
-        pL, RL = self.pose(np.array([self.t[0] + self.ft[n] - dts[self.camera_body[cam]]]))
-        pc = pL[0] + RL[0] @ T[:3, 3]
-        Rwc = RL[0] @ T[:3, :3]
-        X = self.X if idx is None else self.X[idx]
-        u, v, valid, depth = self.models[cam].project((X - pc) @ Rwc)
+        pL, RL = self._frame_pose(n, dts[self.camera_body[cam]])
+        pc = pL + RL @ T[:3, 3]
+        Rwc = RL @ T[:3, :3]
+        if X is None:
+            X = self.X if idx is None else self.X[idx]
+        # float32 is ample for metres around the origin and halves the memory traffic.
+        # The 3x3 product is spelled out: frames run in worker threads and a BLAS call
+        # from several threads at once can crash some OpenBLAS builds.
+        D = X - pc.astype(np.float32)
+        R = Rwc.astype(np.float32)
+        P = D[:, :1] * R[0] + D[:, 1:2] * R[1] + D[:, 2:3] * R[2]
+        u, v, valid, depth = self.models[cam].project(P)
         # Pixel-centre convention of cv2.resize: full-res u maps to (u + 0.5) * s - 0.5.
         return (u + 0.5) * self.scale - 0.5, (v + 0.5) * self.scale - 0.5, valid, depth
 
@@ -313,9 +449,7 @@ class RigProblem:
         return [n for n in self.names if self.active is None or n.split('/')[0] in self.active]
 
     def freeze_visibility(self, state, zcell=4):
-        self.obs = []
-        self.obs_names = self._active_names()
-        for n in self.obs_names:
+        def visible(n):
             u, v, valid, d = self._project(n, state)
             img, mk = self.img[n]
             H, W = img.shape
@@ -327,39 +461,51 @@ class RigProblem:
             cell = (vi // zcell) * (W // zcell + 1) + ui // zcell
             zb = np.full(cell.max() + 1 if len(cell) else 1, np.inf)
             np.minimum.at(zb, cell, d[ii])
-            self.obs.append(ii[d[ii] <= zb[cell] * 1.03 + 0.05])
+            return ii[d[ii] <= zb[cell] * 1.03 + 0.05]
+
+        self.obs_names = self._active_names()
+        self.obs = list(_executor().map(visible, self.obs_names))
         cnt = (np.bincount(np.concatenate(self.obs), minlength=len(self.X)) if self.obs
                else np.zeros(len(self.X), int))
         self.obs = [o[cnt[o] >= 3] for o in self.obs]
+        self.obs_X = {n: self.X[o] for n, o in zip(self.obs_names, self.obs)}
         return int((cnt >= 3).sum()), int(sum(len(o) for o in self.obs))
 
+    def _sample(self, n, ii, state):
+        """Grey values of observations ``ii`` in frame ``n`` (bilinear) and how many fell outside."""
+        u, v, valid, _ = self._project(n, state, ii, X=self.obs_X.get(n))
+        img, _ = self.img[n]
+        H, W = img.shape
+        ok = valid & (u >= 0) & (v >= 0) & (u < W - 1) & (v < H - 1)
+        u, v, ii = u[ok], v[ok], ii[ok]
+        x0 = u.astype(np.int32)
+        y0 = v.astype(np.int32)
+        ax = (u - x0).astype(np.float32)
+        ay = (v - y0).astype(np.float32)
+        fl = img.ravel()
+        k = y0 * W + x0
+        s = (fl[k] * (1 - ax) + fl[k + 1] * ax) * (1 - ay) + (fl[k + W] * (1 - ax) + fl[k + W + 1] * ax) * ay
+        return ii, s, int(len(ok) - len(ii))
+
     def residuals(self, state, return_missing=False):
-        pid, val = [], []
-        missing = 0
-        for n, ii in zip(self.obs_names, self.obs):
-            u, v, valid, _ = self._project(n, state, ii)
-            img, _ = self.img[n]
-            H, W = img.shape
-            ok = valid & (u >= 0) & (v >= 0) & (u < W - 1) & (v < H - 1)
-            missing += int((~ok).sum())
-            u, v, ii = u[ok], v[ok], ii[ok]
-            x0 = u.astype(np.int32)
-            y0 = v.astype(np.int32)
-            ax = (u - x0).astype(np.float32)
-            ay = (v - y0).astype(np.float32)
-            fl = img.ravel()
-            k = y0 * W + x0
-            s = (fl[k] * (1 - ax) + fl[k + 1] * ax) * (1 - ay) + (fl[k + W] * (1 - ax) + fl[k + W + 1] * ax) * ay
-            pid.append(ii)
-            val.append(s)
-        if not pid:
+        # Frames are independent and numpy releases the GIL in the heavy array work,
+        # so they are sampled in parallel; the result is identical to a serial loop.
+        jobs = list(zip(self.obs_names, self.obs))
+        if len(jobs) > 1:
+            parts = list(_executor().map(lambda job: self._sample(job[0], job[1], state), jobs))
+        else:
+            parts = [self._sample(n, ii, state) for n, ii in jobs]
+        missing = sum(p[2] for p in parts)
+        if not parts:
             residuals = np.zeros(0, np.float32)
         else:
-            pid = np.concatenate(pid)
-            val = np.concatenate(val)
+            pid = np.concatenate([p[0] for p in parts])
+            val = np.concatenate([p[1] for p in parts])
             cnt = np.bincount(pid, minlength=len(self.X))
-            mean = np.bincount(pid, val, minlength=len(self.X)) / np.maximum(cnt, 1)
-            residuals = (val - mean[pid]) * np.sqrt(cnt[pid] / np.maximum(cnt[pid] - 1, 1))
+            mean = (np.bincount(pid, val, minlength=len(self.X)) / np.maximum(cnt, 1)).astype(np.float32)
+            # Unbiased deviation from the multi-view mean: sqrt(n / (n - 1)) per point.
+            unbias = np.sqrt(cnt / np.maximum(cnt - 1, 1)).astype(np.float32)
+            residuals = (val - mean[pid]) * unbias[pid]
         return (residuals, missing) if return_missing else residuals
 
     def cost(self, state, c=0.5, missing_residual=3.0, penalize_missing=True):
@@ -376,7 +522,8 @@ class RigProblem:
         total = len(r) + missing
         if not total:
             return float('inf')
-        return float((np.sum(np.log1p((r / c) ** 2)) + missing * np.log1p(missing_residual ** 2)) / total)
+        z = r * np.float32(1.0 / c)
+        return float((np.sum(np.log1p(z * z), dtype=np.float64) + missing * np.log1p(missing_residual ** 2)) / total)
 
 
 def _frame_names(dataset, cameras):
@@ -509,6 +656,8 @@ def _holdout(dataset, bodies, holdout_names, body_name, refined, common, trusted
     initial = copy.deepcopy(problem.bodies[body_name])
     for camera in initial.cameras:
         camera.T = (initial.initial_T or {}).get(camera.name, camera.T)
+    if initial.initial_dt is not None:
+        initial.dt = initial.initial_dt
     transforms, dts = problem.state()
     T_initial, dt_initial = initial.transforms(np.zeros(refined.size))
     states = {'initial': ({**transforms, **T_initial}, {**dts, body_name: dt_initial}),
@@ -529,7 +678,8 @@ def _holdout(dataset, bodies, holdout_names, body_name, refined, common, trusted
 
 def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='photometric',
                fix_dt=False, frames=30, dt_window=0.6, blur=(4.0, 2.0), maxfev=400,
-               reference_profile=None, output=None, aux_cameras=None, aux_dt_window=3.0, log=print):
+               reference_profile=None, output=None, aux_cameras=None, aux_dt_window=3.0,
+               coarse=False, coarse_dt_window=10.0, log=print):
     """Refine the rig (``mode='photometric'``) or only the clocks (``mode='dt'``) for one capture.
 
     Returns the written main calibration dict.  Its ``quality_status`` is 'accepted'
@@ -539,6 +689,13 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
     as separate bodies afterwards; ``result['auxiliary_cameras']`` holds their updated
     configs, marked calibrated only when their own held-out check passes.
     An up-to-date result with the same signature is reused.
+
+    ``coarse=True`` is for a new rig whose profile comes from measurements
+    (``rig_bootstrap``): every body first gets its mount rotation and clock from
+    motion (``rig_handeye``, clock searched ±``coarse_dt_window``, kept with
+    ``fix_dt``; a photometric grid is the fallback for the main body), the fine
+    solve gets a wider box, and the gates allow larger moves away from the
+    unvalidated profile but require camera and scanner rotations to agree.
     """
     from scripts.pipeline_auto_calibrator_and_colorizer import get_slam_trajectory_path, load_pcd, load_trajectory
 
@@ -561,6 +718,12 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
         raise ValueError('Nothing to refine: mode "dt" with a fixed dt')
     aux_cameras = [c for c in (aux_cameras or []) if getattr(c, 'enabled', True)]
     signature = _signature(dataset, init_calibration, dt_init, mode, frames, fix_dt, aux_cameras)
+    if coarse:
+        if mode != 'photometric':
+            raise ValueError('The coarse search needs mode "photometric"')
+        signature['coarse'] = {'dt_window': float(coarse_dt_window)}
+        main.prior_rot_deg, main.prior_trans_m = 15.0, 0.10
+        main.bound_rot_deg, main.bound_trans_m = 6.0, 0.15
     if output.is_file():
         try:
             previous = json.loads(output.read_text(encoding='utf-8'))
@@ -589,13 +752,30 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
         fit_names += names[::step]
         holdout_names += names[step // 2::step]
     common = dict(points=points, trajectory=trajectory, masks_dir=masks_dir, log=log)
+    report = {'signature': signature, 'mode': mode, 'fix_dt': bool(fix_dt), 'bodies': [], 'skipped': skipped}
+    handeye = {}
+    if coarse:
+        # A measured mount (±15°) and an unknown clock (±seconds) are outside the
+        # photometric basin; motion gives both to about a degree / a few ms.
+        for body in bodies:
+            try:
+                handeye[body.name] = _coarse_handeye(dataset, body, trajectory, log, masks_dir=masks_dir,
+                                                     window=coarse_dt_window if body is main else
+                                                     max(aux_dt_window, coarse_dt_window))
+            except (ValueError, cv2.error) as exc:
+                log(f'[!] Hand-eye start ({body.name}) failed: {exc}')
+                handeye[body.name] = {'error': str(exc)}
+        report['handeye'] = handeye
     problem = RigProblem(dataset, bodies, fit_names, **common)
     if sum(n.split('/')[0] in [c.name for c in main.cameras] for n in problem.names) < 8:
         raise ValueError(f'Too few frames inside the trajectory for rig refinement ({len(problem.names)})')
 
-    report = {'signature': signature, 'mode': mode, 'fix_dt': bool(fix_dt), 'bodies': [], 'skipped': skipped}
+    if coarse_orientation and 'error' not in handeye.get('main', {'error': True}):
+        coarse_orientation = False   # hand-eye already found the full orientation
     if coarse_orientation:
         report['coarse_orientation'] = _coarse_orientation(problem, main, log)
+    if coarse and 'error' in handeye.get('main', {}):
+        report['coarse_search'] = _coarse_main(dataset, main, fit_names, common, log, dt_window=coarse_dt_window)
     verdicts = {}
     trusted = []
     for body in bodies:
@@ -610,13 +790,21 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
         if improvement < MIN_HOLDOUT_IMPROVEMENT:
             reasons.append(f'held-out cost improved by {improvement * 100:.1f}% '
                            f'(needs {MIN_HOLDOUT_IMPROVEMENT * 100:.0f}%)')
+        if coarse:
+            motion = handeye.get(body.name, {})
+            if 'error' in motion and body is not main:
+                reasons.append(f'no hand-eye start: {motion["error"]}')
+            elif motion.get('median_residual_deg', 0.0) > MAX_HANDEYE_RESIDUAL_DEG:
+                reasons.append(f'camera and scanner rotations disagree by {motion["median_residual_deg"]:.1f}° '
+                               f'(median, limit {MAX_HANDEYE_RESIDUAL_DEG:g}°): not rigidly mounted or wrong intrinsics')
         transforms, dt = body.transforms()
         if body is main:
             candidate = {'lens_model': main.cameras[0].model.model,
                          'T_lidar_to_cam0_rigid_4x4': transforms['cam0'].tolist()}
             if 'cam1' in transforms:
                 candidate['T_lidar_to_cam1_rigid_4x4'] = transforms['cam1'].tolist()
-            reasons += rig_gate_failures(candidate, load_reference(reference_profile))
+            reasons += rig_gate_failures(candidate, load_reference(reference_profile),
+                                         COARSE_GATE_LIMITS if coarse else None)
         else:
             lever = float(np.linalg.norm(transforms[body.cameras[0].name][:3, 3]))
             if lever > MAX_AUX_LEVER_ARM_M:
@@ -626,6 +814,10 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
         verdicts[body.name] = not reasons
         if reasons:
             body.params = np.zeros(body.size)   # later bodies are refined against the initial state
+            for camera in body.cameras:
+                camera.T = (body.initial_T or {}).get(camera.name, camera.T)
+            if body.initial_dt is not None:
+                body.dt = body.initial_dt
         log(f'[{"+" if not reasons else "!"}] Photometric rig refinement ({body.name}) '
             f'{"accepted" if not reasons else "rejected"}: held-out cost '
             f'{body_report["holdout"]["initial"]["cost"]:.4f} -> {body_report["holdout"]["refined"]["cost"]:.4f} '

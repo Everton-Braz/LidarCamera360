@@ -1,303 +1,722 @@
-"""Calibration and rig geometry view."""
+"""Rig profiles view: pick, edit, create and validate hardware rig profiles."""
 import json
-import math
+import tempfile
 from pathlib import Path
+
+import numpy as np
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QSizePolicy, QInputDialog
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QSizePolicy, QInputDialog,
+    QTableWidgetItem, QHeaderView, QAbstractItemView
 )
 from qfluentwidgets import (
-    CardWidget, TitleLabel, SubtitleLabel, BodyLabel,
-    CaptionLabel, StrongBodyLabel, PushButton, ComboBox,
-    PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition
+    CardWidget, TitleLabel, SubtitleLabel, BodyLabel, CaptionLabel, StrongBodyLabel,
+    PushButton, PrimaryPushButton, ComboBox, LineEdit, DoubleSpinBox, SpinBox, CheckBox,
+    PlainTextEdit, TableWidget, FluentIcon, InfoBar, InfoBarPosition, MessageBoxBase,
+    SmoothScrollArea
 )
+from scipy.spatial.transform import Rotation as Rot
+
 from raven_app.i18n import tr
-from raven_app.config import get_app_root
-from raven_app.profile_manager import list_available_profiles, save_profile_from_calibration
+from raven_app.profile_manager import (get_user_profiles_dir, list_available_profiles, resolve_profile,
+                                       save_profile_from_calibration, set_default_profile)
+from raven_app.rig_profile import (SCANNER_PRESETS, Body, CameraSpec, RigProfile, load_profile, save_profile,
+                                   slugify, validate_profile)
+from raven_app.camera_models import SUPPORTED_MODELS
+
+# Table columns: camera, body, model, image size, focal/centre, position (cm), mount rotation (deg).
+COLUMNS = ('Camera', 'Body', 'Model', 'Width', 'Height', 'fx', 'fy', 'cx', 'cy',
+           'X cm', 'Y cm', 'Z cm', 'Roll°', 'Pitch°', 'Yaw°')
+_FORWARD = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=float)
+_BACKWARD = np.array([[0, 0, -1], [1, 0, 0], [0, -1, 0]], dtype=float)
+
+
+def _lens_frame(profile, body_index, camera_index):
+    """Rotation of a lens in an upright camera body: the main body's second lens looks backward."""
+    return _BACKWARD if body_index == 0 and camera_index == 1 else _FORWARD
+
+
+def camera_rows(profile):
+    """Table rows (strings / numbers) of a profile; rotations shown relative to an upright, forward lens."""
+    rows = []
+    for b, body in enumerate(profile.bodies):
+        for c, camera in enumerate(body.cameras):
+            T = np.asarray(camera.T, dtype=float)
+            rpy = Rot.from_matrix(T[:3, :3] @ _lens_frame(profile, b, c).T).as_euler('xyz', degrees=True)
+            intr = camera.intrinsics
+            rows.append([camera.name, body.body_id, camera.model, camera.width, camera.height,
+                         intr.get('fx', 0.0), intr.get('fy', 0.0), intr.get('cx', 0.0), intr.get('cy', 0.0),
+                         *(T[:3, 3] * 100.0), *rpy])
+    return rows
+
+
+def apply_camera_rows(profile, rows):
+    """Write edited table rows back into ``profile`` (same camera order as ``camera_rows``)."""
+    index = 0
+    for b, body in enumerate(profile.bodies):
+        for c, camera in enumerate(body.cameras):
+            row = rows[index]
+            index += 1
+            camera.model = str(row[2]).upper()
+            camera.width, camera.height = int(row[3]), int(row[4])
+            if camera.model == 'EQUIRECTANGULAR':
+                camera.intrinsics = {}
+            else:
+                camera.intrinsics.update({k: float(v) for k, v in zip(('fx', 'fy', 'cx', 'cy'), row[5:9])})
+            T = np.eye(4)
+            T[:3, :3] = Rot.from_euler('xyz', [float(v) for v in row[12:15]], degrees=True).as_matrix() \
+                @ _lens_frame(profile, b, c)
+            T[:3, 3] = np.array([float(v) for v in row[9:12]]) / 100.0
+            camera.T = T.tolist()
+    return profile
+
+
+class NewRigDialog(MessageBoxBase):
+    """Wizard: scanner, camera from the catalogue and a measured mount -> starting profile."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from raven_app.rig_bootstrap import CAMERA_CATALOGUE, CAPTURE_ADVICE, MOUNT_ORIENTATIONS
+        self.viewLayout.addWidget(SubtitleLabel(tr('New rig'), self))
+        intro = CaptionLabel(tr(
+            'Describe your scanner, camera and how the camera sits on the scanner. A ruler measurement '
+            'and the closest orientation are enough: the first calibration finds the exact mount and '
+            'time offset from the capture itself.'), self)
+        intro.setWordWrap(True)
+        self.viewLayout.addWidget(intro)
+        grid = QGridLayout()
+        self.name_edit = LineEdit(self)
+        self.name_edit.setPlaceholderText(tr('e.g. Raven + GoPro on pole'))
+        self.scanner_combo = ComboBox(self)
+        for key, preset in SCANNER_PRESETS.items():
+            self.scanner_combo.addItem(preset['model'], userData=key)
+        self.camera_combo = ComboBox(self)
+        for key, entry in CAMERA_CATALOGUE.items():
+            self.camera_combo.addItem(entry['label'], userData=key)
+        self.orientation_combo = ComboBox(self)
+        for key, entry in MOUNT_ORIENTATIONS.items():
+            self.orientation_combo.addItem(tr(entry['label']), userData=key)
+        self.offset = [self._spin(-200, 200, ' cm') for _ in range(3)]
+        self.rpy = [self._spin(-180, 180, '°') for _ in range(3)]
+        self.width_spin = SpinBox(self)
+        self.height_spin = SpinBox(self)
+        for spin in (self.width_spin, self.height_spin):
+            spin.setRange(0, 16384)
+            spin.setSpecialValueText(tr('catalogue'))
+        rows = [(tr('Profile name'), self.name_edit), (tr('Scanner'), self.scanner_combo),
+                (tr('Camera'), self.camera_combo), (tr('Orientation'), self.orientation_combo)]
+        for r, (label, widget) in enumerate(rows):
+            grid.addWidget(BodyLabel(label, self), r, 0)
+            grid.addWidget(widget, r, 1, 1, 3)
+        r = len(rows)
+        grid.addWidget(BodyLabel(tr('Camera centre X / Y / Z (x forward, y left, z up)'), self), r, 0)
+        for i, spin in enumerate(self.offset):
+            grid.addWidget(spin, r, 1 + i)
+        grid.addWidget(BodyLabel(tr('Extra roll / pitch / yaw'), self), r + 1, 0)
+        for i, spin in enumerate(self.rpy):
+            grid.addWidget(spin, r + 1, 1 + i)
+        grid.addWidget(BodyLabel(tr('Image width / height (0 = catalogue)'), self), r + 2, 0)
+        grid.addWidget(self.width_spin, r + 2, 1)
+        grid.addWidget(self.height_spin, r + 2, 2)
+        self.viewLayout.addLayout(grid)
+        advice = CaptionLabel(tr('Capture for the first calibration: ') + tr(CAPTURE_ADVICE), self)
+        advice.setWordWrap(True)
+        self.viewLayout.addWidget(advice)
+        self.yesButton.setText(tr('Create profile'))
+        self.cancelButton.setText(tr('Cancel'))
+        self.widget.setMinimumWidth(640)
+
+    def _spin(self, low, high, suffix):
+        spin = DoubleSpinBox(self)
+        spin.setRange(low, high)
+        spin.setDecimals(1)
+        spin.setSuffix(suffix)
+        return spin
+
+    def validate(self):
+        return bool(self.name_edit.text().strip())
+
+    def build(self):
+        from raven_app.rig_bootstrap import build_profile
+        return build_profile(
+            self.name_edit.text().strip(), camera=self.camera_combo.currentData(),
+            scanner_preset=self.scanner_combo.currentData(),
+            offset_cm=tuple(s.value() for s in self.offset),
+            orientation=self.orientation_combo.currentData(), extra_rpy_deg=tuple(s.value() for s in self.rpy),
+            width=self.width_spin.value() or None, height=self.height_spin.value() or None)
 
 
 class CalibrationView(QWidget):
-    """WinUI Fluent view for inspecting and editing LiDAR-Camera calibration."""
+    """WinUI Fluent view for hardware rig profiles (scanner + cameras + mount)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("CalibrationView")
-        self._calib_path = get_app_root() / "calibracao_rigida_raven_insta360.json"
+        self._profile = None
+        self._profile_path = None
+        self._validation_report = None
+        self._validation_result = None
+        self._runner = None
         self._init_ui()
-        self._load_calibration()
+        self._populate_profiles_combo()
+        self._on_profile_selected(0)
 
+    # -- layout ----------------------------------------------------------------
     def _init_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = SmoothScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(36, 24, 36, 24)
         layout.setSpacing(16)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
-        # Header
-        header_layout = QVBoxLayout()
-        header_layout.setSpacing(4)
-        self.header_title = TitleLabel(tr("LiDAR-Camera Rig Calibration"))
-        self.header_subtitle = CaptionLabel(
-            tr("Spatial rigid lever-arm extrinsics & Thin Prism dual-fisheye optical models")
-        )
-        header_layout.addWidget(self.header_title)
-        header_layout.addWidget(self.header_subtitle)
-        layout.addLayout(header_layout)
+        self.header_title = TitleLabel(tr("Rig Profiles"))
+        self.header_subtitle = CaptionLabel(tr(
+            "Your scanner, cameras and how they are mounted. The profile is the starting point of every "
+            "capture's calibration and the reference that rejects implausible results."))
+        self.header_subtitle.setWordWrap(True)
+        layout.addWidget(self.header_title)
+        layout.addWidget(self.header_subtitle)
 
-        # Summary Metrics Row
-        metrics_row = QHBoxLayout()
-        metrics_row.setSpacing(16)
+        # Profile picker and actions
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.profile_combo = ComboBox()
+        self.profile_combo.setMinimumWidth(320)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
+        self.btn_new = PrimaryPushButton(tr("New rig..."), icon=FluentIcon.ADD)
+        self.btn_new.clicked.connect(self._new_rig)
+        self.btn_import = PushButton(tr("Import..."), icon=FluentIcon.DOWNLOAD)
+        self.btn_import.clicked.connect(self._import_profile)
+        self.btn_export = PushButton(tr("Export..."), icon=FluentIcon.SHARE)
+        self.btn_export.clicked.connect(self._export_profile)
+        self.btn_default = PushButton(tr("Use as default"), icon=FluentIcon.ACCEPT)
+        self.btn_default.clicked.connect(self._set_default)
+        for widget in (self.profile_combo, self.btn_new, self.btn_import, self.btn_export, self.btn_default):
+            actions.addWidget(widget)
+        actions.addStretch()
+        layout.addLayout(actions)
 
-        # Card 1: Hardware Rig
-        rig_card = CardWidget(self)
-        rig_layout = QVBoxLayout(rig_card)
-        rig_layout.setContentsMargins(16, 14, 16, 14)
-        self.title_hardware = SubtitleLabel(tr("Sensor Hardware"))
-        rig_layout.addWidget(self.title_hardware)
-        self.lbl_scanner = StrongBodyLabel("LiDAR: 3DMakerPro Raven")
-        self.lbl_camera = StrongBodyLabel("Camera: Insta360 X4 Dual Fisheye")
-        self.lbl_optics = CaptionLabel("Model: THIN_PRISM_FISHEYE (OpenCV)")
-        rig_layout.addWidget(self.lbl_scanner)
-        rig_layout.addWidget(self.lbl_camera)
-        rig_layout.addWidget(self.lbl_optics)
-        metrics_row.addWidget(rig_card)
+        # Profile form
+        form_card = CardWidget(self)
+        form = QGridLayout(form_card)
+        form.setContentsMargins(16, 14, 16, 14)
+        form.setHorizontalSpacing(12)
+        self.title_profile = SubtitleLabel(tr("Profile"))
+        form.addWidget(self.title_profile, 0, 0, 1, 4)
+        self.name_edit = LineEdit()
+        self.scanner_combo = ComboBox()
+        for key, preset in SCANNER_PRESETS.items():
+            self.scanner_combo.addItem(preset['model'], userData=key)
+        self.scanner_model_edit = LineEdit()
+        self.description_edit = LineEdit()
+        form.addWidget(BodyLabel(tr("Name")), 1, 0)
+        form.addWidget(self.name_edit, 1, 1)
+        form.addWidget(BodyLabel(tr("Scanner")), 1, 2)
+        form.addWidget(self.scanner_combo, 1, 3)
+        form.addWidget(BodyLabel(tr("Scanner model")), 2, 0)
+        form.addWidget(self.scanner_model_edit, 2, 1)
+        form.addWidget(BodyLabel(tr("Description")), 2, 2)
+        form.addWidget(self.description_edit, 2, 3)
+        self.status_label = CaptionLabel()
+        self.status_label.setWordWrap(True)
+        form.addWidget(self.status_label, 3, 0, 1, 4)
+        layout.addWidget(form_card)
 
-        # Card 2: Lever-Arm Offsets
-        lever_card = CardWidget(self)
-        lever_layout = QVBoxLayout(lever_card)
-        lever_layout.setContentsMargins(16, 14, 16, 14)
-        self.title_lever = SubtitleLabel(tr("Rigid Lever-Arm"))
-        lever_layout.addWidget(self.title_lever)
-        self.lbl_lever_cam0 = StrongBodyLabel()
-        self.lbl_lever_cam1 = StrongBodyLabel()
-        self.lbl_norm_dist = CaptionLabel()
-        lever_layout.addWidget(self.lbl_lever_cam0)
-        lever_layout.addWidget(self.lbl_lever_cam1)
-        lever_layout.addWidget(self.lbl_norm_dist)
-        metrics_row.addWidget(lever_card)
+        # Cameras
+        cam_card = CardWidget(self)
+        cam_layout = QVBoxLayout(cam_card)
+        cam_layout.setContentsMargins(16, 14, 16, 14)
+        self.title_cameras = SubtitleLabel(tr("Cameras and mount"))
+        cam_layout.addWidget(self.title_cameras)
+        hint = CaptionLabel(tr(
+            "Position: camera centre in the LiDAR frame. Rotation: relative to an upright camera whose lens "
+            "looks forward (the second lens of a dual-fisheye camera looks backward)."))
+        hint.setWordWrap(True)
+        cam_layout.addWidget(hint)
+        self.camera_table = TableWidget(self)
+        self.camera_table.setColumnCount(len(COLUMNS))
+        self.camera_table.setHorizontalHeaderLabels([tr(c) for c in COLUMNS])
+        self.camera_table.verticalHeader().hide()
+        self.camera_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.camera_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.camera_table.setMinimumHeight(170)
+        cam_layout.addWidget(self.camera_table)
+        cam_actions = QHBoxLayout()
+        self.btn_add_aux = PushButton(tr("Add auxiliary camera"), icon=FluentIcon.ADD)
+        self.btn_add_aux.clicked.connect(self._add_aux_camera)
+        self.btn_remove_aux = PushButton(tr("Remove selected auxiliary camera"), icon=FluentIcon.DELETE)
+        self.btn_remove_aux.clicked.connect(self._remove_aux_camera)
+        self.btn_save = PrimaryPushButton(tr("Save"), icon=FluentIcon.SAVE)
+        self.btn_save.clicked.connect(self._save_profile)
+        self.btn_save_as = PushButton(tr("Save as new profile..."), icon=FluentIcon.COPY)
+        self.btn_save_as.clicked.connect(self._save_profile_as)
+        for widget in (self.btn_add_aux, self.btn_remove_aux):
+            cam_actions.addWidget(widget)
+        cam_actions.addStretch()
+        cam_actions.addWidget(self.btn_save_as)
+        cam_actions.addWidget(self.btn_save)
+        cam_layout.addLayout(cam_actions)
+        self.geometry_label = CaptionLabel()
+        self.geometry_label.setWordWrap(True)
+        cam_layout.addWidget(self.geometry_label)
+        layout.addWidget(cam_card)
 
-        # Card 3: Rotation & Angles
-        rot_card = CardWidget(self)
-        rot_layout = QVBoxLayout(rot_card)
-        rot_layout.setContentsMargins(16, 14, 16, 14)
-        self.title_rot = SubtitleLabel(tr("Orientation & Sync"))
-        rot_layout.addWidget(self.title_rot)
-        self.lbl_lens_angle = StrongBodyLabel()
-        self.lbl_euler_cam0 = CaptionLabel()
-        self.lbl_euler_cam1 = CaptionLabel()
-        self.lbl_capture_offset = CaptionLabel()
-        rot_layout.addWidget(self.lbl_lens_angle)
-        rot_layout.addWidget(self.lbl_euler_cam0)
-        rot_layout.addWidget(self.lbl_euler_cam1)
-        rot_layout.addWidget(self.lbl_capture_offset)
-        metrics_row.addWidget(rot_card)
+        # Validate on a dataset
+        val_card = CardWidget(self)
+        val_layout = QVBoxLayout(val_card)
+        val_layout.setContentsMargins(16, 14, 16, 14)
+        self.title_validate = SubtitleLabel(tr("Validate on a capture"))
+        val_layout.addWidget(self.title_validate)
+        val_hint = CaptionLabel(tr(
+            "Choose a processed output folder (images + SLAM). The calibration refines the time offset and the "
+            "mount by multi-view colour consistency and keeps the result only if frames it never used agree "
+            "better. A new rig needs the coarse search: it finds the mount and clock from how the camera turns."))
+        val_hint.setWordWrap(True)
+        val_layout.addWidget(val_hint)
+        row = QHBoxLayout()
+        self.dataset_edit = LineEdit()
+        self.dataset_edit.setPlaceholderText(tr("Processed output folder"))
+        self.btn_dataset = PushButton(tr("Browse..."), icon=FluentIcon.FOLDER)
+        self.btn_dataset.clicked.connect(self._browse_dataset)
+        self.coarse_check = CheckBox(tr("Coarse search (new rig)"))
+        self.dt_edit = LineEdit()
+        self.dt_edit.setPlaceholderText(tr("Time offset (s), optional"))
+        self.dt_edit.setMaximumWidth(180)
+        self.btn_validate = PrimaryPushButton(tr("Calibrate"), icon=FluentIcon.PLAY)
+        self.btn_validate.clicked.connect(self._start_validation)
+        self.btn_save_result = PushButton(tr("Save result as profile..."), icon=FluentIcon.SAVE_AS)
+        self.btn_save_result.setEnabled(False)
+        self.btn_save_result.clicked.connect(self._save_validation_result)
+        for widget in (self.dataset_edit, self.btn_dataset, self.dt_edit, self.coarse_check, self.btn_validate,
+                       self.btn_save_result):
+            row.addWidget(widget)
+        val_layout.addLayout(row)
+        self.verdict_label = StrongBodyLabel()
+        self.verdict_label.setWordWrap(True)
+        val_layout.addWidget(self.verdict_label)
+        self.validation_log = PlainTextEdit()
+        self.validation_log.setReadOnly(True)
+        self.validation_log.setMinimumHeight(140)
+        self.validation_log.setStyleSheet(
+            "PlainTextEdit { background-color: #0c1219; color: #a9c7df; font-family: 'Consolas', "
+            "'Courier New'; font-size: 12px; border-radius: 6px; padding: 8px; }")
+        val_layout.addWidget(self.validation_log)
+        layout.addWidget(val_card)
 
-        for card in (rig_card, lever_card, rot_card):
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        for label in (self.lbl_scanner, self.lbl_camera, self.lbl_optics,
-                      self.lbl_lever_cam0, self.lbl_lever_cam1, self.lbl_norm_dist,
-                      self.lbl_lens_angle, self.lbl_euler_cam0, self.lbl_euler_cam1,
-                      self.lbl_capture_offset):
-            label.setWordWrap(True)
-            label.setMinimumWidth(0)
-            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-
-        layout.addLayout(metrics_row)
-
-        # JSON Configuration Card
+        # Advanced: raw JSON
         json_card = CardWidget(self)
         json_layout = QVBoxLayout(json_card)
         json_layout.setContentsMargins(16, 14, 16, 14)
-        json_layout.setSpacing(10)
-
-        json_title = SubtitleLabel("Full Calibration Configuration (JSON)")
-        json_title.setWordWrap(True)
-        json_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        json_layout.addWidget(json_title)
-
-        json_actions = QHBoxLayout()
-        json_actions.setSpacing(8)
-        self.profile_combo = ComboBox()
-        self._available_profiles = []
-        self._populate_profiles_combo()
-        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
-        self.btn_save_as_profile = PushButton(tr("Salvar Perfil..."), icon=FluentIcon.ADD)
-        self.btn_save_as_profile.clicked.connect(self._save_as_new_profile)
-        self.btn_reload = PushButton(tr("Recarregar"), icon=FluentIcon.SYNC)
-        self.btn_reload.clicked.connect(self._load_calibration)
-        self.btn_save = PushButton(tr("Salvar"), icon=FluentIcon.SAVE)
-        self.btn_save.clicked.connect(self._save_calibration)
-        self.btn_export = PushButton(tr("Exportar"), icon=FluentIcon.SHARE)
-        self.btn_export.clicked.connect(self._export_calibration)
-
-        json_actions.addWidget(self.profile_combo)
-        json_actions.addWidget(self.btn_save_as_profile)
-        json_actions.addWidget(self.btn_reload)
-        json_actions.addWidget(self.btn_save)
-        json_actions.addWidget(self.btn_export)
-        json_actions.addStretch()
-        json_layout.addLayout(json_actions)
-
+        json_head = QHBoxLayout()
+        self.title_json = SubtitleLabel(tr("Advanced: profile JSON"))
+        self.btn_toggle_json = PushButton(tr("Show"))
+        self.btn_toggle_json.clicked.connect(self._toggle_json)
+        self.btn_apply_json = PushButton(tr("Apply JSON"), icon=FluentIcon.SYNC)
+        self.btn_apply_json.clicked.connect(self._apply_json)
+        json_head.addWidget(self.title_json)
+        json_head.addStretch()
+        json_head.addWidget(self.btn_apply_json)
+        json_head.addWidget(self.btn_toggle_json)
+        json_layout.addLayout(json_head)
         self.json_edit = PlainTextEdit()
         self.json_edit.setStyleSheet(
-            "PlainTextEdit { background-color: #0c1219; color: #a9c7df; font-family: 'Consolas', 'Courier New'; font-size: 12px; border-radius: 6px; padding: 8px; }"
-        )
+            "PlainTextEdit { background-color: #0c1219; color: #a9c7df; font-family: 'Consolas', "
+            "'Courier New'; font-size: 12px; border-radius: 6px; padding: 8px; }")
+        self.json_edit.setMinimumHeight(320)
+        self.json_edit.hide()
+        self.btn_apply_json.hide()
         json_layout.addWidget(self.json_edit)
-        layout.addWidget(json_card, stretch=1)
+        layout.addWidget(json_card)
+        layout.addStretch()
 
-    def _populate_profiles_combo(self):
+    # -- profiles ----------------------------------------------------------------
+    def _populate_profiles_combo(self, select_path=None):
         self.profile_combo.blockSignals(True)
         self.profile_combo.clear()
         self._available_profiles = list_available_profiles()
-        for p in self._available_profiles:
-            tag = " (Padrão)" if p.get('is_default') else ""
-            self.profile_combo.addItem(f"{p['name']}{tag}")
-        self.profile_combo.addItem(tr("Carregar Arquivo JSON..."))
+        selected = 0
+        for i, p in enumerate(self._available_profiles):
+            tags = [tr("default")] if p.get('is_default') else []
+            if p.get('source') == 'user':
+                tags.append(tr("mine"))
+            label = p['name'] + (f" ({', '.join(tags)})" if tags else '')
+            self.profile_combo.addItem(label, userData=p['path'])
+            if select_path and Path(p['path']) == Path(select_path):
+                selected = i
+        self.profile_combo.setCurrentIndex(selected)
         self.profile_combo.blockSignals(False)
+        return selected
 
-    def _save_as_new_profile(self):
-        name, ok = QInputDialog.getText(
-            self,
-            tr("Salvar Perfil de Hardware"),
-            tr("Nome do perfil de calibração (ex: Raven Lidar + Insta360 X4 - Montagem 1):"),
-        )
-        if ok and name.strip():
-            try:
-                data = json.loads(self.json_edit.toPlainText())
-                saved_path = save_profile_from_calibration(data, name.strip())
-                self._populate_profiles_combo()
-                self._calib_path = saved_path
-                for i, p in enumerate(self._available_profiles):
-                    if p['path'] == str(saved_path):
-                        self.profile_combo.setCurrentIndex(i)
-                        break
-                InfoBar.success(
-                    title=tr("Perfil Salvo"),
-                    content=tr(f"Perfil '{name.strip()}' salvo com sucesso!"),
-                    parent=self,
-                    duration=3000,
-                )
-            except Exception as e:
-                InfoBar.error(
-                    title=tr("Erro ao Salvar Perfil"),
-                    content=str(e),
-                    parent=self,
-                    duration=4000,
-                )
+    def _on_profile_selected(self, index):
+        if not 0 <= index < len(self._available_profiles):
+            return
+        path = Path(self._available_profiles[index]['path'])
+        try:
+            self._show_profile(load_profile(path), path)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._error(tr("Cannot read profile"), str(exc))
 
-    def _on_profile_selected(self, index: int):
-        if index < len(self._available_profiles):
-            p = self._available_profiles[index]
-            self._calib_path = Path(p['path'])
-            self._load_calibration()
-        elif index == len(self._available_profiles):
-            path, _ = QFileDialog.getOpenFileName(
-                self, tr("Selecionar JSON de Calibração"), "", "JSON files (*.json);;All files (*.*)"
-            )
-            if path:
-                self._calib_path = Path(path)
-                self._load_calibration()
+    def _show_profile(self, profile, path=None):
+        self._profile = profile
+        self._profile_path = Path(path) if path else None
+        self.name_edit.setText(profile.name)
+        index = self.scanner_combo.findData(profile.scanner.get('preset', 'generic'))
+        self.scanner_combo.setCurrentIndex(max(index, 0))
+        self.scanner_model_edit.setText(str(profile.scanner.get('model', '')))
+        self.description_edit.setText(profile.description)
+        self._fill_table(profile)
+        self._refresh_status()
+        self.json_edit.setPlainText(json.dumps(profile.to_dict(), indent=2))
+        bootstrap = (profile.extra.get('bootstrap') or {}).get('needs_coarse_calibration')
+        self.coarse_check.setChecked(bool(bootstrap))
 
-    def _load_calibration(self):
-        if self._calib_path.is_file():
-            try:
-                content = self._calib_path.read_text(encoding='utf-8')
-                data = json.loads(content)
-                self.json_edit.setPlainText(json.dumps(data, indent=2))
-                self.lbl_scanner.setText(f"LiDAR: {str(data.get('scanner', 'Raven')).replace('_', ' ')}")
-                self.lbl_camera.setText(f"Camera: {str(data.get('camera', 'Insta360 X4')).replace('_', ' ')}")
-                self.lbl_optics.setText(f"Lens Model: {data.get('lens_model', 'THIN_PRISM_FISHEYE')}")
-                self._refresh_summary(data)
-            except Exception as e:
-                self.json_edit.setPlainText(f"Error loading calibration: {e}")
+    def _fill_table(self, profile):
+        rows = camera_rows(profile)
+        self.camera_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, value in enumerate(row):
+                if c == 2:
+                    combo = ComboBox()
+                    combo.addItems(list(SUPPORTED_MODELS))
+                    combo.setCurrentText(str(value))
+                    self.camera_table.setCellWidget(r, c, combo)
+                    continue
+                text = value if isinstance(value, str) else (f'{value:.0f}' if c in (3, 4) else f'{value:.3f}')
+                item = QTableWidgetItem(text)
+                if c < 2:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.camera_table.setItem(r, c, item)
+
+    def _table_rows(self):
+        rows = []
+        for r in range(self.camera_table.rowCount()):
+            row = []
+            for c in range(len(COLUMNS)):
+                if c == 2:
+                    row.append(self.camera_table.cellWidget(r, c).currentText())
+                elif c < 2:
+                    row.append(self.camera_table.item(r, c).text())
+                else:
+                    row.append(float(self.camera_table.item(r, c).text().replace(',', '.')))
+            rows.append(row)
+        return rows
+
+    def form_profile(self):
+        """The profile as edited in the form (a copy; raises ValueError on bad input)."""
+        if self._profile is None:
+            raise ValueError(tr("No profile loaded"))
+        profile = RigProfile.from_dict(self._profile.to_dict())
+        profile.name = self.name_edit.text().strip() or profile.name
+        preset = self.scanner_combo.currentData() or 'generic'
+        profile.scanner = {**SCANNER_PRESETS.get(preset, {}), **profile.scanner, 'preset': preset,
+                           'model': self.scanner_model_edit.text().strip() or SCANNER_PRESETS[preset]['model']}
+        if preset != self._profile.scanner.get('preset'):
+            profile.scanner.update(lidar_topic=SCANNER_PRESETS[preset]['lidar_topic'],
+                                   imu_topic=SCANNER_PRESETS[preset]['imu_topic'])
+        profile.description = self.description_edit.text().strip()
+        try:
+            apply_camera_rows(profile, self._table_rows())
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError(tr("Check the camera table: {error}", error=exc)) from exc
+        return profile
+
+    def _refresh_status(self):
+        profile = self._profile
+        if profile is None:
+            return
+        source = tr("your profile") if self._profile_path and self._is_user_path(self._profile_path) \
+            else tr("bundled profile (saving creates your own copy)")
+        errors = validate_profile(profile)
+        parts = [source]
+        if profile.validated_on:
+            parts.append(tr("validated on: ") + ', '.join(str(v.get('dataset')) for v in profile.validated_on[-3:]))
+        if (profile.extra.get('bootstrap') or {}).get('needs_coarse_calibration'):
+            parts.append(tr("not calibrated yet: run Calibrate with the coarse search on a capture"))
+        if errors:
+            parts.append(tr("problems: ") + '; '.join(errors))
+        self.status_label.setText(' · '.join(parts))
+        main = profile.main.cameras
+        if len(main) > 1:
+            T0, T1 = np.asarray(main[0].T), np.asarray(main[1].T)
+            angle = np.degrees(np.linalg.norm(Rot.from_matrix(T0[:3, :3].T @ T1[:3, :3]).as_rotvec()))
+            baseline = np.linalg.norm(T0[:3, 3] - T1[:3, 3]) * 100
+            self.geometry_label.setText(tr("Lens baseline {baseline:.2f} cm · angle between lenses {angle:.2f}°",
+                                           baseline=baseline, angle=angle))
+        else:
+            self.geometry_label.setText(tr("Lever arm cam0 {lever:.1f} cm",
+                                           lever=float(np.linalg.norm(np.asarray(main[0].T)[:3, 3]) * 100)))
 
     @staticmethod
-    def _transform_summary(data, camera):
-        matrix = data.get(f"T_lidar_to_{camera}_rigid_4x4")
-        if not isinstance(matrix, list) or len(matrix) < 3 or any(len(row) < 4 for row in matrix[:3]):
-            raise ValueError(f"missing transform for {camera}")
-        r = [row[:3] for row in matrix[:3]]
-        t = [float(matrix[i][3]) for i in range(3)]
-        norm = math.sqrt(sum(value * value for value in t)) * 100.0
-        # Matches the calibration pipeline's rotation_euler_xyz_deg convention.
-        pitch = math.degrees(math.asin(max(-1.0, min(1.0, -r[2][0]))))
-        roll = math.degrees(math.atan2(r[2][1], r[2][2]))
-        yaw = math.degrees(math.atan2(r[1][0], r[0][0]))
-        return t, norm, (roll, pitch, yaw), r
-
-    def _refresh_summary(self, data):
+    def _is_user_path(path):
         try:
-            c0, c1 = (self._transform_summary(data, camera) for camera in ("cam0", "cam1"))
-            self.lbl_lever_cam0.setText(
-                f"Cam0: ΔX={c0[0][0] * 100:+.2f} cm, ΔY={c0[0][1] * 100:+.2f} cm, ΔZ={c0[0][2] * 100:+.2f} cm"
-            )
-            self.lbl_lever_cam1.setText(
-                f"Cam1: ΔX={c1[0][0] * 100:+.2f} cm, ΔY={c1[0][1] * 100:+.2f} cm, ΔZ={c1[0][2] * 100:+.2f} cm"
-            )
-            self.lbl_norm_dist.setText(f"Lever-arm norms: Cam0 {c0[1]:.2f} cm · Cam1 {c1[1]:.2f} cm")
-            self.lbl_euler_cam0.setText("Cam0 Euler XYZ: " + self._format_euler(c0[2]))
-            self.lbl_euler_cam1.setText("Cam1 Euler XYZ: " + self._format_euler(c1[2]))
-            relative = [[sum(c1[3][i][k] * c0[3][j][k] for k in range(3)) for j in range(3)] for i in range(3)]
-            angle = math.degrees(math.acos(max(-1.0, min(1.0, (sum(relative[i][i] for i in range(3)) - 1.0) / 2.0))))
-            self.lbl_lens_angle.setText(f"Relative lens angle: {angle:.2f}°")
-            reference = data.get("reference_capture")
-            offset = reference.get("dt_sync_seconds") if isinstance(reference, dict) else data.get("dt_sync_seconds")
-            label = "Reference capture offset" if isinstance(reference, dict) else "Capture time offset"
-            self.lbl_capture_offset.setText(f"{label}: {float(offset):+.3f} s" if offset is not None else f"{label}: unavailable")
-        except (TypeError, ValueError, KeyError, IndexError, ZeroDivisionError) as exc:
-            self.lbl_lens_angle.setText(f"Transform summary unavailable: {exc}")
+            return Path(path).resolve().parent == get_user_profiles_dir().resolve()
+        except OSError:
+            return False
 
-    @staticmethod
-    def _format_euler(values):
-        return ", ".join(f"{axis} {value:+.2f}°" for axis, value in zip(("R", "P", "Y"), values))
-
-    def _save_calibration(self):
-        text = self.json_edit.toPlainText().strip()
+    def _save_profile(self):
         try:
-            data = json.loads(text)
-            self._calib_path.write_text(json.dumps(data, indent=2), encoding='utf-8')
-            self._refresh_summary(data)
-            InfoBar.success(
-                title="Saved",
-                content="Calibration parameters successfully saved.",
-                orient=Qt.Orientation.Horizontal,
-                position=InfoBarPosition.TOP,
-                duration=3500,
-                parent=self
-            )
-        except json.JSONDecodeError as e:
-            InfoBar.error(
-                title="JSON Syntax Error",
-                content=f"Invalid JSON format: {e}",
-                orient=Qt.Orientation.Horizontal,
-                position=InfoBarPosition.TOP,
-                duration=4000,
-                parent=self
-            )
-        except OSError as e:
-            InfoBar.error(title="Save Error", content=f"Could not write calibration: {e}",
-                          orient=Qt.Orientation.Horizontal, position=InfoBarPosition.TOP,
-                          duration=5000, parent=self)
+            profile = self.form_profile()
+            if self._profile_path is not None and self._is_user_path(self._profile_path):
+                path = self._profile_path
+            else:
+                path = get_user_profiles_dir() / f'{slugify(profile.profile_id)}.json'
+                profile.is_default = False
+            path = save_profile(profile, path)
+        except (ValueError, OSError) as exc:
+            self._error(tr("Profile not saved"), str(exc))
+            return
+        self._populate_profiles_combo(path)
+        self._show_profile(load_profile(path), path)
+        self._success(tr("Profile saved"), str(path))
 
-    def _export_calibration(self):
-        dest, _ = QFileDialog.getSaveFileName(
-            self, "Export Calibration", "calibration.json", "JSON files (*.json)"
-        )
+    def _save_profile_as(self):
+        name, ok = QInputDialog.getText(self, tr("Save as new profile"), tr("Profile name:"))
+        if not ok or not name.strip():
+            return
+        try:
+            profile = self.form_profile()
+            profile.name, profile.profile_id, profile.is_default = name.strip(), slugify(name), False
+            path = save_profile(profile, get_user_profiles_dir() / f'{profile.profile_id}.json')
+        except (ValueError, OSError) as exc:
+            self._error(tr("Profile not saved"), str(exc))
+            return
+        self._populate_profiles_combo(path)
+        self._show_profile(load_profile(path), path)
+        self._success(tr("Profile saved"), str(path))
+
+    def _new_rig(self):
+        dialog = NewRigDialog(self.window())
+        if not dialog.exec():
+            return
+        try:
+            profile = dialog.build()
+            path = save_profile(profile, get_user_profiles_dir() / f'{profile.profile_id}.json')
+        except (ValueError, OSError) as exc:
+            self._error(tr("Profile not created"), str(exc))
+            return
+        self._populate_profiles_combo(path)
+        self._show_profile(load_profile(path), path)
+        self._success(tr("Profile created"), tr(
+            "Process a capture with this profile (rig refinement off), then calibrate it here with the coarse search."))
+
+    def _import_profile(self):
+        path, _ = QFileDialog.getOpenFileName(self, tr("Import profile or calibration"), "",
+                                              "JSON files (*.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            profile = load_profile(path)
+            profile.is_default = False
+            saved = save_profile(profile, get_user_profiles_dir() / f'{slugify(profile.profile_id)}.json')
+        except (ValueError, OSError) as exc:
+            self._error(tr("Import failed"), str(exc))
+            return
+        self._populate_profiles_combo(saved)
+        self._show_profile(load_profile(saved), saved)
+        self._success(tr("Profile imported"), str(saved))
+
+    def _export_profile(self):
+        try:
+            profile = self.form_profile()
+        except ValueError as exc:
+            self._error(tr("Export failed"), str(exc))
+            return
+        dest, _ = QFileDialog.getSaveFileName(self, tr("Export profile"), f"{profile.profile_id}.json",
+                                              "JSON files (*.json)")
         if dest:
-            Path(dest).write_text(self.json_edit.toPlainText(), encoding='utf-8')
-            InfoBar.success(
-                title="Exported",
-                content=f"Calibration exported to {dest}",
-                orient=Qt.Orientation.Horizontal,
-                position=InfoBarPosition.TOP,
-                duration=3500,
-                parent=self
-            )
+            Path(dest).write_text(json.dumps(profile.to_dict(), indent=2), encoding='utf-8')
+            self._success(tr("Exported"), dest)
+
+    def _set_default(self):
+        if self._profile_path is None:
+            return
+        try:
+            set_default_profile(str(self._profile_path))
+        except (ValueError, OSError) as exc:
+            self._error(tr("Default not changed"), str(exc))
+            return
+        if resolve_profile() != self._profile_path:
+            self._error(tr("Default not changed"),
+                        tr("Another of your profiles is marked as default; save this one as your own copy first."))
+            return
+        self._populate_profiles_combo(self._profile_path)
+        self._success(tr("Default profile"), self._profile.name)
+
+    def _add_aux_camera(self):
+        try:
+            profile = self.form_profile()
+        except ValueError as exc:
+            self._error(tr("Camera not added"), str(exc))
+            return
+        names = {c.name for c in profile.cameras}
+        index = 2
+        while f'cam{index}' in names:
+            index += 1
+        name = f'cam{index}'
+        from raven_app.rig_bootstrap import CAMERA_CATALOGUE, camera_intrinsics
+        entry = CAMERA_CATALOGUE['phone_main']
+        T = np.eye(4)
+        T[:3, :3] = _FORWARD
+        profile.bodies.append(Body(name, [CameraSpec(name, entry['model'], entry['width'], entry['height'],
+                                                     camera_intrinsics(entry), T.tolist())],
+                                   sync='photometric', dt_tolerance_s=3.0, source='video'))
+        self._show_profile(profile, self._profile_path)
+
+    def _remove_aux_camera(self):
+        rows = sorted({i.row() for i in self.camera_table.selectedIndexes()})
+        if not rows:
+            return
+        try:
+            profile = self.form_profile()
+        except ValueError as exc:
+            self._error(tr("Camera not removed"), str(exc))
+            return
+        names = {self.camera_table.item(r, 0).text() for r in rows}
+        if any(n in ('cam0', 'cam1') for n in names):
+            self._error(tr("Camera not removed"), tr("cam0/cam1 belong to the main camera"))
+            return
+        profile.bodies = [profile.main] + [
+            b for b in profile.auxiliary if not any(c.name in names for c in b.cameras)]
+        self._show_profile(profile, self._profile_path)
+
+    def _toggle_json(self):
+        visible = not self.json_edit.isVisible()
+        if visible:
+            try:
+                self.json_edit.setPlainText(json.dumps(self.form_profile().to_dict(), indent=2))
+            except ValueError:
+                pass
+        self.json_edit.setVisible(visible)
+        self.btn_apply_json.setVisible(visible)
+        self.btn_toggle_json.setText(tr("Hide") if visible else tr("Show"))
+
+    def _apply_json(self):
+        try:
+            profile = RigProfile.from_dict(json.loads(self.json_edit.toPlainText()))
+        except (ValueError, KeyError, TypeError) as exc:
+            self._error(tr("Invalid profile JSON"), str(exc))
+            return
+        self._show_profile(profile, self._profile_path)
+
+    # -- validation on a capture -------------------------------------------------
+    def _browse_dataset(self):
+        path = QFileDialog.getExistingDirectory(self, tr("Processed output folder"))
+        if path:
+            self.dataset_edit.setText(path)
+
+    def validation_args(self, profile_path, report_path):
+        """CLI arguments of the calibrate job for the current form state."""
+        args = ['calibrate', '--dataset', self.dataset_edit.text().strip(), '--profile', str(profile_path),
+                '--report', str(report_path)]
+        dt = self.dt_edit.text().strip().replace(',', '.')
+        if dt:
+            args += ['--dt', str(float(dt))]
+        if self.coarse_check.isChecked():
+            args.append('--coarse')
+        return args
+
+    def _start_validation(self):
+        from raven_app.process_runner import ProcessRunner
+        dataset = Path(self.dataset_edit.text().strip())
+        if not (dataset / 'images' / 'frames.json').is_file():
+            self._error(tr("Not a processed capture"), tr("{path} has no images/frames.json", path=dataset))
+            return
+        try:
+            profile = self.form_profile()
+            float(self.dt_edit.text().strip().replace(',', '.') or 0)
+        except ValueError as exc:
+            self._error(tr("Cannot calibrate"), str(exc))
+            return
+        work = Path(tempfile.mkdtemp(prefix='rig_validate_'))
+        profile_path = work / f'{profile.profile_id}.json'
+        profile_path.write_text(json.dumps(profile.to_dict(), indent=2), encoding='utf-8')
+        self._validation_report = work / 'report.json'
+        self._validation_result = None
+        self.btn_save_result.setEnabled(False)
+        self.validation_log.clear()
+        self.verdict_label.setText(tr("Calibrating..."))
+        if self._runner is None:
+            self._runner = ProcessRunner(self)
+            self._runner.log_received.connect(self.validation_log.appendPlainText)
+            self._runner.finished.connect(self._on_validation_finished)
+        self.btn_validate.setEnabled(False)
+        if not self._runner.start_job(self.validation_args(profile_path, self._validation_report),
+                                      log_path=work / 'calibrate.log'):
+            self.btn_validate.setEnabled(True)
+            self._error(tr("Busy"), tr("A calibration is already running"))
+
+    def _on_validation_finished(self, code):
+        self.btn_validate.setEnabled(True)
+        try:
+            summary = json.loads(self._validation_report.read_text(encoding='utf-8'))
+        except (OSError, ValueError, AttributeError):
+            self.verdict_label.setText(tr("Calibration failed (exit code {code}); see the log.", code=code))
+            return
+        holdout = summary.get('holdout') or {}
+        before = (holdout.get('initial') or {}).get('cost')
+        after = (holdout.get('refined') or {}).get('cost')
+        accepted = summary.get('quality_status') == 'accepted'
+        text = tr("Accepted" if accepted else "Rejected")
+        if before is not None and after is not None:
+            text += tr(": held-out cost {before:.3f} -> {after:.3f} ({gain:+.1f}%)",
+                       before=before, after=after, gain=(1 - after / before) * 100)
+        if summary.get('dt_sync_seconds') is not None:
+            text += tr(", time offset {dt:.3f} s", dt=summary['dt_sync_seconds'])
+        if summary.get('rejection_reason'):
+            text += f" — {summary['rejection_reason']}"
+        for name, aux in (summary.get('auxiliary') or {}).items():
+            text += f" · {name}: {tr(aux.get('quality_status', ''))}"
+        self.verdict_label.setText(text)
+        if accepted:
+            self._validation_result = Path(summary['calibration'])
+            self.btn_save_result.setEnabled(True)
+
+    def _save_validation_result(self):
+        if self._validation_result is None:
+            return
+        name, ok = QInputDialog.getText(self, tr("Save result as profile"), tr("Profile name:"),
+                                        text=self.name_edit.text().strip())
+        if not ok or not name.strip():
+            return
+        try:
+            data = json.loads(self._validation_result.read_text(encoding='utf-8'))
+            holdout = (data.get('photometric_report') or {}).get('holdout') or {}
+            path = save_profile_from_calibration(
+                data, name.strip(), base_profile=str(self._profile_path) if self._profile_path else None,
+                validated_on={'dataset': self.dataset_edit.text().strip(),
+                              'holdout_cost_before': (holdout.get('initial') or {}).get('cost'),
+                              'holdout_cost_after': (holdout.get('refined') or {}).get('cost')})
+        except (OSError, ValueError) as exc:
+            self._error(tr("Profile not saved"), str(exc))
+            return
+        self._populate_profiles_combo(path)
+        self._show_profile(load_profile(path), path)
+        self._success(tr("Profile saved"), str(path))
+
+    # -- helpers -----------------------------------------------------------------
+    def _success(self, title, content):
+        InfoBar.success(title=title, content=content, orient=Qt.Orientation.Horizontal,
+                        position=InfoBarPosition.TOP, duration=3500, parent=self)
+
+    def _error(self, title, content):
+        InfoBar.error(title=title, content=content, orient=Qt.Orientation.Horizontal,
+                      position=InfoBarPosition.TOP, duration=6000, parent=self)
 
     def retranslate_ui(self):
         """Update all text elements dynamically when the language changes."""
-        self.header_title.setText(tr("LiDAR-Camera Rig Calibration"))
-        self.header_subtitle.setText(
-            tr("Spatial rigid lever-arm extrinsics & Thin Prism dual-fisheye optical models")
-        )
-        self.title_hardware.setText(tr("Sensor Hardware"))
-        self.title_lever.setText(tr("Rigid Lever-Arm"))
-        self.title_rot.setText(tr("Orientation & Sync"))
+        self.header_title.setText(tr("Rig Profiles"))
+        self.header_subtitle.setText(tr(
+            "Your scanner, cameras and how they are mounted. The profile is the starting point of every "
+            "capture's calibration and the reference that rejects implausible results."))
+        self.title_profile.setText(tr("Profile"))
+        self.title_cameras.setText(tr("Cameras and mount"))
+        self.title_validate.setText(tr("Validate on a capture"))
+        self.title_json.setText(tr("Advanced: profile JSON"))
+        self.camera_table.setHorizontalHeaderLabels([tr(c) for c in COLUMNS])

@@ -17,7 +17,8 @@ from raven_app.branding import APP_NAME, APP_DESCRIPTION
 # MCP argument -> CLI flag per command; booleans become bare flags.
 _CLI_OPTIONS = {
     'calibrate': {'dataset': '--dataset', 'calib': '--calib', 'profile': '--profile', 'dt': '--dt',
-                  'fix_dt': '--fix-dt', 'masks_dir': '--masks-dir', 'mode': '--rig-refine', 'frames': '--frames'},
+                  'fix_dt': '--fix-dt', 'masks_dir': '--masks-dir', 'mode': '--rig-refine', 'frames': '--frames',
+                  'coarse': '--coarse', 'coarse_dt_window': '--coarse-dt-window', 'save_profile': '--save-profile'},
     'workflow': {'bag': '--bag', 'insv': '--insv', 'output': '--output', 'method': '--method', 'fps': '--fps',
                  'profile': '--profile', 'rig_refine': '--rig-refine', 'time_window': '--time-window',
                  'revisit_refinement': '--revisit-refinement', 'dt': '--dt', 'calib': '--calib',
@@ -188,9 +189,62 @@ class LidarCameraMcpServer:
                         "fix_dt": {"type": "boolean", "default": False},
                         "masks_dir": {"type": "string"},
                         "mode": {"type": "string", "enum": ["photometric", "dt"], "default": "photometric"},
-                        "frames": {"type": "integer", "default": 30}
+                        "frames": {"type": "integer", "default": 30},
+                        "coarse": {"type": "boolean", "default": False,
+                                   "description": "New rig (profile from new_profile): wide time-offset scan and mount rotation grid first."},
+                        "coarse_dt_window": {"type": "number", "default": 10.0},
+                        "save_profile": {"type": "string", "description": "Save an accepted result as a new profile with this name."}
                     },
                     "required": ["dataset"]
+                }
+            },
+            {
+                "name": "validate_profile",
+                "description": "Check a rig profile or calibration JSON (v1 or v2): camera models, intrinsics, orthonormal rotations, plausible lever arms.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"profile": {"type": "string", "description": "Profile id or JSON path."},
+                                   "data": {"type": "object", "description": "Profile JSON to check instead of a file."}}
+                }
+            },
+            {
+                "name": "save_profile",
+                "description": "Save a rig profile: from an accepted calibration result (calibration_path) or from profile JSON (data). Goes to the user profiles folder.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "calibration_path": {"type": "string"},
+                        "data": {"type": "object"},
+                        "base_profile": {"type": "string", "description": "Profile the calibration started from."},
+                        "set_default": {"type": "boolean", "default": False}
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "camera_catalogue",
+                "description": "Camera models and mount orientation presets accepted by new_profile, plus capture advice for calibrating a new rig.",
+                "inputSchema": {"type": "object", "properties": {}}
+            },
+            {
+                "name": "new_profile",
+                "description": "Create a starting profile for a new rig from a catalogue camera and a measured mount (±15°, ±10 cm). Calibrate it with calibrate_rig(coarse=true, save_profile=...) on a processed capture.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "camera": {"type": "string", "description": "Catalogue id (camera_catalogue)."},
+                        "scanner": {"type": "string", "enum": ["raven", "eagle", "generic"], "default": "generic"},
+                        "scanner_model": {"type": "string"},
+                        "offset_cm": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3,
+                                      "description": "Camera centre in the LiDAR frame (x forward, y left, z up)."},
+                        "orientation": {"type": "string", "default": "lens_forward"},
+                        "rpy_deg": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                        "width": {"type": "integer"},
+                        "height": {"type": "integer"}
+                    },
+                    "required": ["name", "camera"]
                 }
             },
             {
@@ -360,7 +414,62 @@ class LidarCameraMcpServer:
             path = resolve_profile(arguments.get("profile"))
             if path is None:
                 raise ValueError("No hardware rig profile is available")
-            return {"path": str(path), "profile": json.loads(Path(path).read_text(encoding="utf-8"))}
+            from raven_app.rig_profile import load_profile
+            return {"path": str(path), "profile": load_profile(path).to_dict()}
+
+        elif name == "validate_profile":
+            from raven_app.profile_manager import resolve_profile
+            from raven_app.rig_profile import validate_profile
+            if arguments.get("data") is not None:
+                data, source = arguments["data"], None
+            else:
+                source = resolve_profile(arguments.get("profile"))
+                if source is None:
+                    raise ValueError("No hardware rig profile is available")
+                data = json.loads(Path(source).read_text(encoding="utf-8"))
+            errors = validate_profile(data)
+            return {"valid": not errors, "errors": errors, "path": str(source) if source else None}
+
+        elif name == "save_profile":
+            from raven_app import profile_manager as pm
+            from raven_app.rig_profile import RigProfile, save_profile, slugify
+            if arguments.get("calibration_path"):
+                data = json.loads(Path(arguments["calibration_path"]).read_text(encoding="utf-8"))
+                if data.get("quality_status") == "rejected":
+                    raise ValueError(f"Calibration was rejected: {data.get('rejection_reason')}")
+                path = pm.save_profile_from_calibration(data, arguments["name"],
+                                                        base_profile=arguments.get("base_profile"))
+            elif arguments.get("data") is not None:
+                profile = RigProfile.from_dict(arguments["data"])
+                profile.name, profile.profile_id, profile.is_default = arguments["name"], slugify(arguments["name"]), False
+                path = save_profile(profile, pm.get_user_profiles_dir() / f"{profile.profile_id}.json")
+            else:
+                raise ValueError("Pass calibration_path or data")
+            if arguments.get("set_default"):
+                pm.set_default_profile(str(path))
+            return {"path": str(path)}
+
+        elif name == "camera_catalogue":
+            from raven_app.rig_bootstrap import CAPTURE_ADVICE, MOUNT_ORIENTATIONS, catalogue_choices
+            return {"cameras": catalogue_choices(),
+                    "orientations": {k: v["label"] for k, v in MOUNT_ORIENTATIONS.items()},
+                    "capture_advice": CAPTURE_ADVICE}
+
+        elif name == "new_profile":
+            from raven_app import profile_manager as pm
+            from raven_app.rig_bootstrap import build_profile
+            from raven_app.rig_profile import save_profile
+            profile = build_profile(arguments["name"], camera=arguments["camera"],
+                                    scanner_preset=arguments.get("scanner", "generic"),
+                                    scanner_model=arguments.get("scanner_model", ""),
+                                    offset_cm=tuple(arguments.get("offset_cm") or (0.0, 0.0, 0.0)),
+                                    orientation=arguments.get("orientation", "lens_forward"),
+                                    extra_rpy_deg=tuple(arguments.get("rpy_deg") or (0.0, 0.0, 0.0)),
+                                    width=arguments.get("width"), height=arguments.get("height"))
+            path = save_profile(profile, pm.get_user_profiles_dir() / f"{profile.profile_id}.json")
+            return {"path": str(path), "profile_id": profile.profile_id,
+                    "next": "Process a capture with this profile, then calibrate_rig(dataset, profile=profile_id, "
+                            "coarse=true, save_profile=name)."}
 
         elif name == "validate_calibration":
             from raven_app.profile_manager import resolve_profile

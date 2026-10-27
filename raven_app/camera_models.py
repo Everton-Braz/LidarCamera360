@@ -61,7 +61,9 @@ class CameraModel:
 
     def project(self, P):
         """Camera-frame points -> (u, v, valid, depth) in full-resolution pixels."""
-        P = np.asarray(P, dtype=np.float64)
+        P = np.asarray(P)
+        if P.dtype != np.float32:
+            P = P.astype(np.float64)
         depth = np.linalg.norm(P, axis=1)
         if self.model == 'EQUIRECTANGULAR':
             lon = np.arctan2(P[:, 0], P[:, 2])

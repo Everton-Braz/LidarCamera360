@@ -8,6 +8,49 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### 🧰 Rig profiles v2, new-rig calibration and a faster refinement (Phases 3–5)
+- **Profile v2**: one file describes any setup — scanner plus bodies of cameras (main camera `cam0` [+ `cam1`], auxiliary cameras with their own clock), each with its model, intrinsics and mount (`raven_app/rig_profile.py`).
+  - v1 files (every existing calibration JSON) migrate on load. Saved v2 files keep the v1 keys, so every colorizer reads them unchanged. The bundled Raven + X4 and Eagle profiles are now v2; their transforms and intrinsics are identical.
+  - Your profiles live in `%APPDATA%\LidarCamera360\profiles`, so app updates keep them. A user profile with the same file name replaces a bundled one; `is_default` picks the default.
+  - Auxiliary cameras in a profile fill in a capture's `--third-camera` entries that only name a source: no sample SfM is needed for a camera the profile already calibrates.
+- **New rig without a validated profile (Phase 3)**:
+  - `profile new` (CLI), `new_profile` (MCP) and the **New rig…** wizard in the GUI build a starting profile. You give:
+    - a camera from the catalogue: Insta360 X3/X4/X5/ONE RS 1-inch, any equirectangular 360, GoPro MAX, phone main / ultra-wide, GoPro Wide, generic pinhole;
+    - the measured camera offset;
+    - an orientation preset.
+  - The scanner tilt is built in, so the presets reproduce the validated Raven and Eagle mounts within 1.4°.
+  - `calibrate --coarse` first estimates the clock and the mount rotation of every camera from motion (hand-eye):
+    - the camera's rotation between frames (SIFT + essential matrix) is matched against the SLAM trajectory;
+    - their angles give the clock without any mount guess, and the rotation axes give the mount.
+    - Hand-eye accuracy against the accepted calibrations:
+
+      | Dataset | Clock | Mount |
+      |---|---|---|
+      | PIER | 2 ms | 0.19° |
+      | HarmonyMall | 2.5 ms | 0.17° |
+      | Equirect video | 2 ms | 0.16° |
+      | TESTE_3 X4 | 4 ms | 0.26° |
+      | TESTE_3 phone | 14 ms | 0.8° |
+    - The photometric refinement then finishes.
+  - Exit test on PIER: starting 15° / 12 cm / 2.8 s away from the accepted calibration, it ended 0.02° / 0.85 cm / 0.06 ms away in 195 s.
+  - A camera whose rotations disagree with the scanner's by more than 2° (median) is rejected: it is not rigidly mounted or has wrong intrinsics.
+  - `--save-profile NAME` stores an accepted result as a profile, with the capture in `validated_on`.
+- **CLI**: `profile list | show | validate | import | export | create --from-calibration | new | set-default | cameras`; `calibrate --coarse --coarse-dt-window --save-profile --report`.
+- **MCP**: `validate_profile`, `save_profile`, `camera_catalogue`, `new_profile`; `calibrate_rig` takes `coarse`, `coarse_dt_window` and `save_profile`; `get_profile` returns v2.
+- **GUI — Rig Calibration page rebuilt as a profile editor**:
+  - profile list (yours and bundled, default first);
+  - a form for the name, scanner and description;
+  - a camera table: model drop-down, image size, focal length / centre, position in cm, and rotation relative to an upright forward lens;
+  - add or remove auxiliary cameras;
+  - save (a bundled profile is saved as your own copy), save as, import, export, use as default, and the New rig wizard.
+  - **Validate on a capture** runs `calibrate` (optionally with the coarse search), shows the held-out verdict and saves an accepted result as a profile.
+  - The raw JSON editor is under Advanced.
+- **Speed (Phase 5)**:
+  - Frames are projected and sampled in parallel threads, in float32, with cached frame poses and pre-gathered points. Images load and blur in parallel.
+  - One cost evaluation went from 0.55 s to 0.15 s and a visibility freeze from 3.0 s to 0.5 s, with the same cost value to 5 decimals.
+  - PIER refinement: 349 s → 121 s, same result (Δt −7.0255 s, held-out +29.8 %).
+  - The 3×3 rotation is written out instead of a BLAS matmul, because concurrent OpenBLAS calls crashed.
+
 ### 🌐 Equirectangular exports and wide auxiliary cameras
 - **Gyro sync for exported MP4s**: an equirectangular MP4 exported by Insta360 Studio has no gyro trailer. The sibling INSV with the same name and duration (same time base) is now used for the IMU cross-correlation. On SMALL-DATASET-TEST: Δt −7.746 s, correlation 0.999.
 - **360 main camera in the rig refinement**: an equirectangular dataset is refined as a single EQUIRECTANGULAR camera at the profile's cam0 mount.
