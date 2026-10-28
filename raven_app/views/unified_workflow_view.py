@@ -1317,7 +1317,6 @@ class UnifiedWorkflowView(QWidget):
         args = [
             "workflow",
             "--bag", bag,
-            "--insv", insv,
             "--output", out,
             "--scanner", scanner_key,
             "--lidar-topic", self.lidar_topic.text().strip() or "/vanjee_722z",
@@ -1326,6 +1325,9 @@ class UnifiedWorkflowView(QWidget):
             "--fps", str(self.fps_spin.value()),
             "--method", method_key
         ]
+
+        if insv and Path(insv).is_file():
+            args.extend(["--insv", insv])
 
         if self.dual_insv_chk.isChecked() and self.secondary_insv_input.text().strip():
             args.extend(["--secondary-insv", self.secondary_insv_input.text().strip()])

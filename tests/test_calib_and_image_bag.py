@@ -77,10 +77,13 @@ def test_prepare_fastlivo_config_injects_camera_parameters(tmp_path: Path):
     assert cam_yaml.is_file()
     with open(cam_yaml, "r", encoding="utf-8") as f:
         cam_loaded = yaml.safe_load(f)
-    assert cam_loaded["cam_fx"] == 1120.0
-    assert cam_loaded["cam_fy"] == 1125.0
-    assert cam_loaded["cam_cx"] == 1540.0
-    assert cam_loaded["cam_cy"] == 2110.0
+    # image_payload hands the VIO frames reduced by the model's 0.25 scale, so the
+    # model is written at that size (portrait, like the factory calibration).
+    assert (cam_loaded["cam_width"], cam_loaded["cam_height"], cam_loaded["scale"]) == (750, 1000, 1.0)
+    assert cam_loaded["cam_fx"] == 1120.0 * 0.25
+    assert cam_loaded["cam_fy"] == 1125.0 * 0.25
+    assert cam_loaded["cam_cx"] == 1540.0 * 0.25
+    assert cam_loaded["cam_cy"] == 2110.0 * 0.25
     assert cam_loaded["k1"] == -0.04
     assert cam_loaded["k2"] == 0.002
 

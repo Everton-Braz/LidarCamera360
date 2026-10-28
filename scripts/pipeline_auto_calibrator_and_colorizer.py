@@ -613,6 +613,7 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None,
             "--camera-model", "thin-prism-fisheye"
         ]
     cmd.extend(auxiliary_flags)
+    cmd.extend(["--decode-threads", "4", "--decode-budget", "512"])
     if force_rebuild:
         cmd.append('--no-resume')
     if vulkan_dev >= 0:
@@ -704,7 +705,13 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
     col_imgs = load_colmap_images(sparse_dir / "images.bin")
 
     # Filtrar cam0 para busca temporal
-    cam0 = [im for im in col_imgs if im["name"].startswith("cam0/")]
+    cam0 = [im for im in col_imgs if im["name"].replace('\\', '/').startswith("cam0/")]
+    if not cam0:
+        prefixes = sorted({im["name"].replace('\\', '/').split("/")[0] + "/" for im in col_imgs if "/" in im["name"].replace('\\', '/')})
+        if prefixes:
+            cam0 = [im for im in col_imgs if im["name"].replace('\\', '/').startswith(prefixes[0])]
+        else:
+            cam0 = list(col_imgs)
     def get_frame_num(name):
         digits = "".join(filter(str.isdigit, Path(name).stem))
         return int(digits) if digits else 0
@@ -712,7 +719,7 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
 
     t0_slam = t_slam[0]
     t1_slam = t_slam[-1]
-    min_overlap = max(10, int(len(cam0) * 0.40))
+    min_overlap = max(1, min(10, len(cam0))) if len(cam0) < 10 else max(10, int(len(cam0) * 0.40))
 
     # Nominal physical camera arm offset for initial camera center approximation
     # The trajectory is gravity-aligned (world +Z up). Express the upright
@@ -1276,6 +1283,13 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
                          trajectory_path=None, reference_profile=None):
     """Recalibrate with high precision os parâmetros de montagem T_LC0 e T_LC1 usando as poses do SfM/Spirula"""
     sparse_dir = dataset_dir / "sparse" / "0"
+    images_bin = sparse_dir / "images.bin"
+    if images_bin.is_file():
+        sfm_images = load_colmap_images(images_bin)
+        has_cam0 = any(im['name'].replace('\\', '/').startswith('cam0/') for im in sfm_images)
+        if not has_cam0:
+            print("[*] No dual-fisheye cam0 images found in SfM model; skipping cam0/cam1 spatial recalibration.")
+            return None
     slam_trj = trajectory_path or get_slam_trajectory_path(dataset_dir)
     align_json = dataset_dir / "colmap_to_lidar_alignment.json"
 
@@ -1361,6 +1375,11 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
             is_equirect = json.loads(manifest.read_text(encoding='utf-8')).get('video_mode') == 'equirectangular'
         except Exception:
             pass
+
+    has_cam0_images = any(im['name'].replace('\\', '/').startswith('cam0/') for im in images)
+    if not has_cam0_images:
+        print("[*] No dual-fisheye cam0 images found in SfM model; skipping cam0/cam1 spatial recalibration.")
+        return None
 
     R0, t0 = solve_lens("cam0/")
     has_cam1_images = any(im['name'].startswith('cam1/') for im in images)
@@ -1963,8 +1982,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     t_slam_end = t_slam[-1]
     slerp = Slerp(t_slam, rot_slam)
 
-    front = {p.name: p for p in (dataset_dir / "images" / "cam0").glob("*.jpg")}
-    rear = {p.name: p for p in (dataset_dir / "images" / "cam1").glob("*.jpg")}
+    front = {p.name: p for p in (dataset_dir / "images" / "cam0").glob("*.jpg")} if (dataset_dir / "images" / "cam0").is_dir() else {}
+    rear = {p.name: p for p in (dataset_dir / "images" / "cam1").glob("*.jpg")} if (dataset_dir / "images" / "cam1").is_dir() else {}
     manifest_path = dataset_dir / "images" / "frames.json"
     is_equirect = False
     if manifest_path.is_file():
@@ -1974,9 +1993,13 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
         except Exception:
             pass
 
+    auxiliary_cameras = (third_camera if isinstance(third_camera, (list, tuple))
+                         else [third_camera] if third_camera else [])
+    has_aux = any(getattr(c, 'enabled', True) for c in auxiliary_cameras)
+
     if is_equirect:
         pairs = sorted(front.keys(), key=lambda name: frame_time(dataset_dir, "cam0/" + name, fps))
-        if not pairs:
+        if not pairs and not has_aux:
             raise ValueError("No equirectangular cam0 images found")
         cam0_files = [front[name] for name in pairs]
         cam1_files = []
@@ -1984,9 +2007,9 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     else:
         pairs = sorted(front.keys() & rear.keys(),
                        key=lambda name: frame_time(dataset_dir, "cam0/" + name, fps))
-        if not pairs:
-            raise ValueError("No synchronized front/rear image pairs found")
-        if front.keys() != rear.keys():
+        if not pairs and not has_aux:
+            raise ValueError("No synchronized front/rear image pairs found and no auxiliary camera available")
+        if front.keys() != rear.keys() and pairs:
             print(f"[!] Skipping {len(front.keys() ^ rear.keys())} unpaired lens images")
         cam0_files = [front[name] for name in pairs]
         cam1_files = [rear[name] for name in pairs]

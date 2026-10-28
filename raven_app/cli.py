@@ -71,6 +71,15 @@ def ratio(value):
     return v
 
 
+def optional_path(value):
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned or cleaned == '.':
+        return None
+    return Path(cleaned)
+
+
 def add_mask_options(p):
     p.add_argument('--mask-persons', action='store_true',
                    help='Generate RF-DETR and configured fixed-area masks before colorization')
@@ -275,8 +284,8 @@ def parse(argv=None):
     add_rig_options(color)
     wf=sub.add_parser('workflow',help='Run end-to-end processing: Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables')
     wf.add_argument('--bag',type=Path,required=True,help='LiDAR ROS bag file')
-    wf.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Insta360 video file (.insv) or 360 equirectangular video (.mp4)')
-    wf.add_argument('--secondary-insv', dest='secondary_insv', type=Path, default=None, help='Optional secondary .insv file for dual-file cameras (Insta360 ONE RS 360)')
+    wf.add_argument('--insv', '--video', dest='insv', type=optional_path, nargs='?', const=None, required=False, default=None, help='Insta360 video file (.insv) or 360 equirectangular video (.mp4)')
+    wf.add_argument('--secondary-insv', dest='secondary_insv', type=optional_path, nargs='?', const=None, default=None, help='Optional secondary .insv file for dual-file cameras (Insta360 ONE RS 360)')
     wf.add_argument('--output',type=Path,required=True,help='Output directory for deliverables')
     wf.add_argument('--scanner', '--preset', choices=['auto', 'raven', 'eagle'], default='auto', help='Scanner preset (auto, raven, eagle)')
     wf.add_argument('--lidar-topic', default=None, help='LiDAR topic (default: auto-detected)')
@@ -372,6 +381,12 @@ def parse(argv=None):
         p.error('--operator-radius requires --mask-persons or --masks-dir; removing a trajectory corridor can erase fixed objects')
     if getattr(a, 'photometric_params', None) is not None and getattr(a, 'photometric', 'off') == 'off':
         p.error('--photometric-params requires --photometric to be enabled')
+    if getattr(a, 'command', None) == 'workflow':
+        has_insv = bool(getattr(a, 'insv', None) is not None)
+        has_img_bag = bool(getattr(a, 'use_image_bag', False))
+        has_aux = bool(getattr(a, 'third_camera', None))
+        if not (has_insv or has_img_bag or has_aux):
+            p.error('workflow requires a camera source: specify --insv, --use-image-bag (with --image-bag), or --third-camera')
     if a.headless and a.command in (None,'gui'):p.error('--headless requires a processing or inspection command')
     return a
 
@@ -978,6 +993,8 @@ def main(argv=None):
         print('Cancelled.', file=sys.stderr)
         return 130
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         # Some errors (MemoryError, bare AssertionError) carry no message: name the type.
         print(f'RavenCalibrator: {str(e) or type(e).__name__}', file=sys.stderr)
         return 2

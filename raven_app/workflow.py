@@ -117,7 +117,7 @@ def _persist_workflow_run(output_dir, record):
 
 def _workflow_image_extraction_snapshot(output_dir, third_cameras):
     manifest_path = Path(output_dir) / 'images' / 'frames.json'
-    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
     is_equirect = manifest.get('video_mode') == 'equirectangular'
     signatures = {'cam0': manifest.get('signature')} if is_equirect else {'cam0': manifest.get('signature'), 'cam1': manifest.get('signature')}
     insv_signatures = manifest.get('auxiliary_insv_signatures', {})
@@ -146,7 +146,7 @@ def _workflow_settings_snapshot(bag_path, insv_path, output_dir, *, fps, method,
         {'camera_name': name, 'source_type': 'insv',
          'source': _workflow_path_snapshot(insv_path), 'fps': float(fps)}
         for name in ('cam0', 'cam1')
-    ]
+    ] if insv_path else []
     for camera in third_cameras:
         config = camera.to_dict()
         config['source_snapshot'] = _workflow_path_snapshot(camera.source_path)
@@ -1888,7 +1888,7 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
     if align_json.is_file():
         try:
             al_check = json.loads(align_json.read_text(encoding='utf-8'))
-            if al_check.get("quality_status") == "accepted" and al_check.get("valid") is not False:
+            if al_check.get("quality_status") in (None, "accepted") and al_check.get("valid") is not False:
                 align_valid = True
         except Exception:
             pass
@@ -1997,8 +1997,13 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
                 continue
             allowed_names.add(name)
             selected_images.append((name, image_path))
-        if not any(name.startswith(('cam0/', 'cam1/')) for name in allowed_names):
-            raise ValueError('No accepted cam0/cam1 SfM poses remain inside the SLAM time window')
+        has_primary_images = any(im['name'].startswith(('cam0/', 'cam1/')) for im in source_image_records)
+        if has_primary_images:
+            if not any(name.startswith(('cam0/', 'cam1/')) for name in allowed_names):
+                raise ValueError('No accepted cam0/cam1 SfM poses remain inside the SLAM time window')
+        else:
+            if not allowed_names:
+                raise ValueError('No accepted auxiliary SfM poses remain inside the SLAM time window')
         print(f"  [*] SfM pose filter: {len(allowed_names)} accepted/in-window images; "
               f"{len(source_image_records) - len(allowed_names)} rejected, out-of-window, uncalibrated, or missing")
     else:
@@ -2086,8 +2091,13 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
                                       float(getattr(camera, 'time_offset_s', 0.0))):
                     allowed_names.add(name)
                     selected_images.append((name, image_path))
-        if not any(name.startswith(('cam0/', 'cam1/')) for name in allowed_names):
-            raise ValueError('No cam0/cam1 images overlap the SLAM trajectory time window')
+        has_primary = any((dataset_dir / 'images' / c).is_dir() for c in primary_camera_names)
+        if has_primary:
+            if not any(name.startswith(('cam0/', 'cam1/')) for name in allowed_names):
+                raise ValueError('No cam0/cam1 images overlap the SLAM trajectory time window')
+        else:
+            if not allowed_names:
+                raise ValueError('No auxiliary images overlap the SLAM trajectory time window')
 
     camera_files = []
     for name, source in selected_images:
@@ -2319,6 +2329,96 @@ def _postprocess_3dgs_dataset(out_dir: Path, dataset_dir: Path):
 RIG_REFINE_MODES = ('photometric', 'dt', 'none')
 DEFAULT_RIG_REFINE = 'photometric'
 PHOTOMETRIC_RIG_FILE = 'rig_calibration_photometric.json'
+
+
+def _bag_camera_factory_calibration(bag_path, image_bag, calib_json, topic):
+    """Factory calibration of the scanner's own camera (calib.json next to the bags).
+
+    calib.json and FAST-LIVO2's camera_raven.yaml describe the front camera in its
+    portrait orientation (3000x4000, cx 1542, cy 2110) while the bag stores landscape
+    4000x3000 frames.  On BSJADE the SfM camera sits -90.5 deg about the optical axis
+    from the factory mount and fits cx/cy 1902/1536 (factory, rotated: 1890/1542), so
+    the frames are rotated 90 deg counter-clockwise (270 clockwise) before use.
+    Returns None when no factory calibration is found.
+    """
+    import yaml
+    from raven_app.bag_io import first_image_size
+    from raven_app.cli import resources
+    candidates = [Path(calib_json)] if calib_json else []
+    candidates += [Path(bag_path).parent / 'calibration' / 'calib.json', Path(bag_path).parent / 'calib.json']
+    data = None
+    for candidate in candidates:
+        try:
+            loaded = json.loads(candidate.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if 'front' in (loaded.get('camera_info') or {}) and 'front' in (loaded.get('out_put') or {}):
+            data, source = loaded, candidate
+            break
+    if data is None:
+        return None
+    K = data['camera_info']['front']['K']
+    coeff = list(data['camera_info']['front'].get('coeff') or []) + [0.0] * 4
+    model = {}
+    for path in (Path(__file__).parent.parent / 'FAST-LIVO2' / 'config' / 'camera_raven.yaml',
+                 resources() / 'FAST-LIVO2' / 'config' / 'camera_raven.yaml'):
+        if path.is_file():
+            model = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+            break
+    width, height = int(model.get('cam_width', 3000)), int(model.get('cam_height', 4000))
+    frame = first_image_size(image_bag, topic)
+    if frame is None or frame == (width, height):
+        rotation = 0
+    elif frame == (height, width):
+        rotation = 270
+    else:
+        raise ValueError(f'Bag frames are {frame[0]}x{frame[1]} but the factory calibration '
+                         f'describes {width}x{height} images')
+    # transform_matrix maps LiDAR points into the camera (FAST-LIVO2's Rcl/Pcl), while
+    # T_lidar_to_cam*_rigid_4x4 is the camera's pose in the LiDAR frame, so it is
+    # inverted.  The vendor rotation is close to 180 deg and nearly symmetric, so the
+    # uninverted matrix is only 1.2 deg / 7 cm off and still looks almost aligned.
+    T_cam_from_lidar = _validate_rigid_transform(data['out_put']['front']['transform_matrix'],
+                                                 'factory LiDAR-to-camera calibration')
+    status = {'status': 'calibrated', 'source': 'factory_calibration', 'path': str(source)}
+    return {
+        'intrinsics': {'width': float(width), 'height': float(height),
+                       'fx': float(K[0]), 'fy': float(K[4]), 'cx': float(K[2]), 'cy': float(K[5]),
+                       'k1': float(coeff[0]), 'k2': float(coeff[1]), 'k3': float(coeff[2]), 'k4': float(coeff[3]),
+                       'p1': 0.0, 'p2': 0.0},
+        'T_lidar_to_cam': [[float(v) for v in row] for row in np.linalg.inv(T_cam_from_lidar)],
+        'image_rotation_deg': rotation,
+        'calibration_report': {
+            'intrinsics': dict(status), 'extrinsics': dict(status),
+            # Bag frames share the LiDAR clock; the offset is set exactly once the SLAM
+            # trajectory exists (_apply_bag_camera_clocks).
+            'time_offset': {'status': 'unknown', 'source': 'bag_clock', 'applied': False},
+            'sample_sfm': {'status': 'skipped', 'reason': 'factory calibration'},
+        },
+    }
+
+
+def _apply_bag_camera_clocks(output_dir, cameras, trajectory_path, dt_sync):
+    """Set each bag camera's clock offset from its bag timestamps; return the offsets found.
+
+    Frame times count from the bag start and the trajectory from its first pose, so the
+    exact offset in the SLAM reference is t_slam[0] - origin; the camera's own offset is
+    what remains after the main clock ``dt_sync``.
+    """
+    from raven_app.bag_io import bag_time_origin
+    clocks = {}
+    for camera in cameras:
+        if getattr(camera, 'source_type', None) != 'bag':
+            continue
+        t0 = float(np.loadtxt(trajectory_path, ndmin=2, max_rows=1)[0, 0])
+        clock = t0 - bag_time_origin(output_dir, camera.camera_name)
+        clocks[camera.camera_name] = clock
+        camera.time_offset_s = clock - float(dt_sync)
+        report = dict(camera.calibration_report or {})
+        report['time_offset'] = {'status': 'configured', 'source': 'bag_clock', 'applied': True,
+                                 'seconds': camera.time_offset_s, 'slam_reference_seconds': clock}
+        camera.calibration_report = report
+    return clocks
 
 
 def _aux_cameras_from_profile(cameras, profile, is_eagle=False):
@@ -2558,6 +2658,16 @@ def prepare_fastlivo_config(
                 cam_dict["k2"] = float(coeff[1])
                 cam_dict["k3"] = float(coeff[2])
                 cam_dict["k4"] = float(coeff[3])
+            # Normalize and scale down camera model to avoid OpenCV out-of-memory errors in C++ VIO
+            s = float(cam_dict.get("scale", 1.0))
+            if (s > 0 and s < 1.0) or cam_dict.get("cam_width", 0) > 1200:
+                scale_factor = s if (0 < s < 1.0) else 0.25
+                cam_dict["cam_width"] = int(round(cam_dict.get("cam_width", 3000) * scale_factor))
+                cam_dict["cam_height"] = int(round(cam_dict.get("cam_height", 4000) * scale_factor))
+                for param in ("cam_fx", "cam_fy", "cam_cx", "cam_cy"):
+                    if param in cam_dict:
+                        cam_dict[param] = float(cam_dict[param]) * scale_factor
+                cam_dict["scale"] = 1.0
             cam_yaml_out.parent.mkdir(parents=True, exist_ok=True)
             with open(cam_yaml_out, "w", encoding="utf-8") as cf:
                 yaml.dump(cam_dict, cf, default_flow_style=False)
@@ -2615,6 +2725,20 @@ def execute_unified_workflow(
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
+    has_insv = bool(
+        insv_path is not None
+        and str(insv_path).strip() not in ("", ".")
+        and Path(insv_path).is_file()
+    )
+    if not has_insv:
+        insv_path = None
+    has_secondary = bool(
+        secondary_insv_path is not None
+        and str(secondary_insv_path).strip() not in ("", ".")
+        and Path(secondary_insv_path).is_file()
+    )
+    if not has_secondary:
+        secondary_insv_path = None
     from raven_app.seed_export import validate_seed_percent
     seed_percent = validate_seed_percent(seed_percent)
     if operator_radius > 0 and not (mask_persons or masks_dir is not None):
@@ -2664,58 +2788,28 @@ def execute_unified_workflow(
             from raven_app.third_camera import ThirdCameraConfig
             topics = discover_bag_image_topics(target_img_bag)
             if topics:
-                # Load factory calibration for Raven camera if available
-                raven_cam_yaml = Path(__file__).parent.parent / 'FAST-LIVO2' / 'config' / 'camera_raven.yaml'
-                raven_lidar_yaml = Path(__file__).parent.parent / 'FAST-LIVO2' / 'config' / 'raven.yaml'
-                intrinsics = {}
-                extrinsics = np.eye(4, dtype=np.float64)
-                if raven_cam_yaml.is_file():
-                    try:
-                        import yaml
-                        with open(raven_cam_yaml, 'r', encoding='utf-8') as f:
-                            cy = yaml.safe_load(f)
-                        intrinsics = {
-                            'camera_model': 'OPENCV_FISHEYE',
-                            'width': int(cy.get('image_width', 4000)),
-                            'height': int(cy.get('image_height', 3000)),
-                            'fx': float(cy.get('cam_fx', 1123.516)),
-                            'fy': float(cy.get('cam_fy', 1124.245)),
-                            'cx': float(cy.get('cam_cx', 1542.597)),
-                            'cy': float(cy.get('cam_cy', 2110.540)),
-                            'k1': float(cy.get('cam_k1', -0.04268)),
-                            'k2': float(cy.get('cam_k2', 0.00242)),
-                            'k3': float(cy.get('cam_k3', -0.00087)),
-                            'k4': float(cy.get('cam_k4', 0.00012)),
-                        }
-                    except Exception as e:
-                        print(f"[WARN] Failed loading camera_raven.yaml: {e}")
-                if raven_lidar_yaml.is_file():
-                    try:
-                        import yaml
-                        with open(raven_lidar_yaml, 'r', encoding='utf-8') as f:
-                            ry = yaml.safe_load(f)
-                        if 'Rcl' in ry and 'Pcl' in ry:
-                            Rcl = np.array(ry['Rcl'], dtype=np.float64).reshape((3, 3))
-                            Pcl = np.array(ry['Pcl'], dtype=np.float64).reshape((3,))
-                            extrinsics[:3, :3] = Rcl
-                            extrinsics[:3, 3] = Pcl
-                    except Exception as e:
-                        print(f"[WARN] Failed loading raven.yaml extrinsics: {e}")
-
+                factory = _bag_camera_factory_calibration(bag_path, target_img_bag, calib_json,
+                                                          topics[0]['topic'])
                 for idx, tinfo in enumerate(topics):
                     cam_id = f"cam{idx + 2}"
                     bag_cfg = ThirdCameraConfig(
                         camera_name=cam_id,
+                        camera_model='OPENCV_FISHEYE',
                         source_path=str(target_img_bag),
                         source_type='bag',
                         source_stream_index=idx,
-                        fps=2.0,
+                        fps=float(fps) if float(fps) > 0 else 2.0,
                         enabled=True,
-                        intrinsics=intrinsics if idx == 0 else {},
-                        extrinsics=extrinsics if idx == 0 else np.eye(4, dtype=np.float64),
                     )
+                    if idx == 0 and factory is not None:
+                        bag_cfg.intrinsics = factory['intrinsics']
+                        bag_cfg.T_lidar_to_cam2_rigid_4x4 = factory['T_lidar_to_cam']
+                        bag_cfg.image_rotation_deg = factory['image_rotation_deg']
+                        bag_cfg.calibration_report = factory['calibration_report']
                     third_cfgs.append(bag_cfg)
-                    print(f"[INFO] Registered bag camera topic '{tinfo['topic']}' as auxiliary {cam_id}")
+                    print(f"[INFO] Registered bag camera topic '{tinfo['topic']}' as auxiliary {cam_id}"
+                          + (f" (factory calibration, frames rotated {bag_cfg.image_rotation_deg} deg)"
+                             if idx == 0 and factory is not None else ""))
 
         elif isinstance(third_camera, dict):
             third_cfgs = load_third_camera_configs(third_camera)
@@ -2773,7 +2867,7 @@ def execute_unified_workflow(
     # --------------------------------------------------------------------------
     frames_manifest = output_dir / "images" / "frames.json"
     previous_frames = frames_manifest.stat().st_mtime_ns if frames_manifest.is_file() else None
-    if insv_path:
+    if has_insv and insv_path:
         insv_path, secondary_insv_path = normalize_dual_insv_pair(insv_path, secondary_insv_path)
         if secondary_insv_path:
             print(f"\n[STAGE 1/7] Extracting video frames from Dual-File INSV:\n    Primary (cam0): {insv_path}\n    Secondary (cam1): {secondary_insv_path}")
@@ -2781,8 +2875,15 @@ def execute_unified_workflow(
             print(f"\n[STAGE 1/7] Extracting video frames from {insv_path}...")
         if not extract_insv_frames(insv_path, output_dir, fps=fps, secondary_insv_path=secondary_insv_path):
             raise RuntimeError("Failed to extract video frames from INSV")
-    frames_changed = previous_frames is not None and frames_manifest.stat().st_mtime_ns != previous_frames
-    is_timelapse = json.loads(frames_manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse'
+    else:
+        print("\n[STAGE 1/7] No primary INSV video specified; extracting bag / auxiliary camera frames...")
+    frames_changed = previous_frames is not None and frames_manifest.is_file() and frames_manifest.stat().st_mtime_ns != previous_frames
+    is_timelapse = False
+    if frames_manifest.is_file():
+        try:
+            is_timelapse = json.loads(frames_manifest.read_text(encoding='utf-8')).get('time_source') == 'insv_timelapse'
+        except Exception:
+            is_timelapse = False
 
     for third_cfg in third_cfgs:
         print(f"\n[*] Extracting auxiliary frames from {third_cfg.camera_name}...")
@@ -2798,7 +2899,7 @@ def execute_unified_workflow(
     _persist_workflow_run(output_dir, run_record)
 
     # Auxiliary orientation/source changes invalidate SfM just like INSV changes.
-    frames_changed = previous_frames is not None and frames_manifest.stat().st_mtime_ns != previous_frames
+    frames_changed = previous_frames is not None and frames_manifest.is_file() and frames_manifest.stat().st_mtime_ns != previous_frames
 
     # --------------------------------------------------------------------------
     # STAGE 2: Time synchronization (IMU Cross-Correlation)
@@ -2808,6 +2909,10 @@ def execute_unified_workflow(
     if dt_override is not None:
         dt_sync = dt_override
         print(f"[*] Using manual time offset Δt = {dt_sync:.4f}s")
+    elif not has_insv or not insv_path:
+        print("[*] No primary INSV video: bag camera frames share the LiDAR clock; "
+              "Δt is set from their timestamps once the SLAM trajectory exists.")
+        dt_sync = 0.0
     else:
         dt_sync = gyro_dt = auto_sync_imu_gyro(bag_path, gyro_telemetry_source(insv_path), imu_topic=imu_topic)
         if dt_sync is None:
@@ -2835,7 +2940,8 @@ def execute_unified_workflow(
     run_record['resolved_dt_sync_seconds'] = float(dt_sync)
     run_record['dt_locked'] = dt_locked
     run_record['synchronization_source'] = ('manual_override' if dt_override is not None else
-                                            'imu_gyro_correlation' if gyro_dt is not None else 'fallback_hint')
+                                            'imu_gyro_correlation' if gyro_dt is not None else
+                                            'rosbag_time_base' if not has_insv else 'fallback_hint')
     _persist_workflow_run(output_dir, run_record)
 
     # --------------------------------------------------------------------------
@@ -2889,6 +2995,11 @@ def execute_unified_workflow(
         if not eng.is_file():
             raise FileNotFoundError(f"Native engine missing at {eng}; run tools/build_windows.ps1")
 
+        # Clean up any partial/interrupted SLAM results that would block fastlivo2
+        for partial_dir in (slam_out / "pcd", slam_out / "result", slam_out / "Colmap", slam_out / "image"):
+            if partial_dir.is_dir():
+                shutil.rmtree(partial_dir, ignore_errors=True)
+
         if is_eagle and (resources() / "FAST-LIVO2/config/eagle.yaml").is_file():
             config_path = resources() / "FAST-LIVO2/config/eagle.yaml"
         else:
@@ -2931,9 +3042,19 @@ def execute_unified_workflow(
         # Determine bags for SLAM
         from raven_app.bag_io import find_adjacent_image_bag
         resolved_image_bag = image_bag_path or find_adjacent_image_bag(bag_path)
+        vio_rotation = 0
         if not lio and resolved_image_bag and Path(resolved_image_bag).is_file():
             print(f"[*] VIO mode: fusing front camera stream from {Path(resolved_image_bag).name}")
             slam_bags = [bag_path, resolved_image_bag]
+            # The VIO camera model is the factory (portrait) one: rotate frames to match it.
+            bag_cameras = [c for c in third_cfgs if getattr(c, 'source_type', None) == 'bag']
+            try:
+                vio_rotation = (bag_cameras[0].image_rotation_deg if bag_cameras else
+                                (_bag_camera_factory_calibration(bag_path, resolved_image_bag, calib_json,
+                                                                 '/camera_front/image_raw')
+                                 or {}).get('image_rotation_deg', 0))
+            except Exception as e:
+                print(f"[!] VIO frame orientation unknown, frames are passed as stored: {e}")
         else:
             slam_bags = [bag_path]
 
@@ -2954,7 +3075,7 @@ def execute_unified_workflow(
                         lidar_topic=lidar_topic,
                         imu_topic=imu_topic,
                         image_topic="/camera_front/image_raw" if not lio else None,
-                        lio=lio
+                        lio=lio, image_rotation_deg=vio_rotation
                     )
                 except (BrokenPipeError, OSError):
                     pass
@@ -3025,6 +3146,18 @@ def execute_unified_workflow(
     # Avoid adding slam_delay which causes longitudinal drift.
     if dt_override is None and raw_trj.is_file():
         print(f"[*] Verified temporal offset in SLAM trajectory reference: Δt = {dt_sync:.4f}s")
+    bag_clocks = _apply_bag_camera_clocks(output_dir, third_cfgs, raw_trj, dt_sync) if raw_trj.is_file() else {}
+    if bag_clocks and not has_insv and dt_override is None:
+        # Without a primary video the bag camera clock is the main clock, and it is exact.
+        dt_sync = next(iter(bag_clocks.values()))
+        _apply_bag_camera_clocks(output_dir, third_cfgs, raw_trj, dt_sync)
+        dt_locked = True
+        run_record['resolved_dt_sync_seconds'] = float(dt_sync)
+        run_record['dt_locked'] = True
+        run_record['synchronization_source'] = 'rosbag_time_base'
+        _persist_workflow_run(output_dir, run_record)
+    for name, clock in bag_clocks.items():
+        print(f"[*] {name}: bag timestamps give Δt = {clock:.4f}s in the SLAM trajectory reference")
 
     # --------------------------------------------------------------------------
     # STAGE 4: SfM Alignment & Dynamic Spatial Extrinsics Recalibration
@@ -3032,9 +3165,10 @@ def execute_unified_workflow(
     sparse_bin = output_dir / "sparse" / "0" / "points3D.bin"
     stage4_sfm = (method in ("sfm", "all") or run_spirula or
                   (frames_changed and sparse_bin.is_file()))
+    # Without a 360 video there is no cam0/cam1 rig to recalibrate.
     direct_sample_calibration_required = (
         method == 'direct' and (any(not _aux_camera_calibration_ready(c) for c in third_cfgs)
-                                or (recalibrate and not sparse_bin.is_file())))
+                                or (recalibrate and has_insv and not sparse_bin.is_file())))
     sample_sfm_required = direct_sample_calibration_required
     stage4_title = ("Multi-View SfM Alignment & Spatial Recalibration"
                     if stage4_sfm else
@@ -3072,6 +3206,9 @@ def execute_unified_workflow(
         print("[*] Calibrating auxiliary camera intrinsics from the shared SfM model...")
         intrinsic_cameras = []
         for camera in third_cfgs:
+            if ((camera.calibration_report or {}).get('intrinsics') or {}).get('source') == 'factory_calibration':
+                intrinsic_cameras.append(camera)
+                continue
             try:
                 camera = calibrate_third_camera_intrinsics(output_dir, camera)
                 print(f"[+] {camera.camera_name}: intrinsics fitted from SfM")
@@ -3124,7 +3261,7 @@ def execute_unified_workflow(
                 calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, profile=profile)
 
     if method == 'direct' and (recalibrate or third_cfgs) and (
-            not sparse_bin.is_file() or bool(third_cfgs)):
+            not sparse_bin.is_file() or bool(third_cfgs)) and (has_insv or sample_sfm_required):
         print("[*] Per-session rig calibration requires a bounded SfM sample; "
               "the full SfM reconstruction remains skipped.")
         try:
@@ -3342,7 +3479,9 @@ def execute_unified_workflow(
         alignment_valid = False
 
     sfm_done = False
-    if method in ("sfm", "all") and sparse_bin.is_file() and alignment_valid:
+    # SfM projection serves the 360 rig; bag cameras without one are colorized by their
+    # calibrated rigid mount, which the per-image SfM poses (Sim3-aligned) cannot beat.
+    if method in ("sfm", "all") and sparse_bin.is_file() and alignment_valid and has_insv:
         try:
             pipeline.colorize_via_spirula_sfm(
                 output_dir, fps=fps, use_vulkan=use_vulkan,
@@ -3397,14 +3536,17 @@ def execute_unified_workflow(
     # --------------------------------------------------------------------------
     print("\n[STAGE 7/7] Georeferencing and packaging deliverables...")
     if process_gps:
-        print("\n[GPS] Extracting native GPS metadata and selected formats...")
-        gps_report = process_gps_metadata(insv_path, deliverables_dir / 'gps', gps_formats)
-        print(f"[GPS] {gps_report['unique_fixes']} unique fixes; {gps_report['georeferencing_status']}")
-        print(f"[GPS] Metadata saved in {deliverables_dir / 'gps'}")
+        if has_insv and insv_path:
+            print("\n[GPS] Extracting native GPS metadata and selected formats...")
+            gps_report = process_gps_metadata(insv_path, deliverables_dir / 'gps', gps_formats)
+            print(f"[GPS] {gps_report['unique_fixes']} unique fixes; {gps_report['georeferencing_status']}")
+            print(f"[GPS] Metadata saved in {deliverables_dir / 'gps'}")
+        else:
+            print("\n[GPS] Skipping INSV GPS metadata extraction (no INSV video file provided).")
 
     # Automatic placement is deliberately after colorization so only this run's
     # produced clouds are considered, and before local-format cleanup.
-    if process_gps:
+    if process_gps and has_insv and insv_path:
         try:
             from raven_app.automatic_georeference import automatic_georeference
             produced = [p for p in deliverables_dir.iterdir()

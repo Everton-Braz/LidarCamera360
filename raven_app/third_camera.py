@@ -66,6 +66,10 @@ class ThirdCameraConfig:
         ]
     )
     description: str = "Frontal smartphone camera"
+    # Clockwise rotation applied to decoded frames so they match the calibrated image
+    # (0, 90, 180 or 270): the Raven front camera stores landscape frames, but its
+    # factory calibration describes the portrait image.
+    image_rotation_deg: int = 0
     calibration_report: Dict[str, Any] = field(
         default_factory=lambda: {
             "intrinsics": {"status": "uncalibrated", "source": "configuration"},
@@ -107,6 +111,7 @@ class ThirdCameraConfig:
             "intrinsics",
             "T_lidar_to_cam2_rigid_4x4",
             "description",
+            "image_rotation_deg",
             "calibration_report",
         ):
             if k in data:

@@ -325,8 +325,11 @@ def auxiliary_body(camera, main_dt, *, dt_window=3.0):
     intr = dict(camera.intrinsics)
     model = CameraModel.from_intrinsics(camera.camera_model, intr)
     T = np.asarray(camera.T_lidar_to_cam2_rigid_4x4, dtype=np.float64)
+    # Frames from a bag share the LiDAR clock, so their offset is exact, not searched.
+    clock = (camera.calibration_report or {}).get('time_offset', {})
+    bag_clock = clock.get('source') == 'bag_clock' and bool(clock.get('applied'))
     body = RigBody(camera.camera_name, [RigCamera(camera.camera_name, model, T)],
-                   float(main_dt) + float(camera.time_offset_s or 0.0), dt_window=dt_window,
+                   float(main_dt) + float(camera.time_offset_s or 0.0), dt_window=dt_window, fix_dt=bag_clock,
                    prior_rot_deg=10.0, prior_trans_m=0.2, bound_rot_deg=12.0, bound_trans_m=0.4,
                    refine_translation=False)
     return body
@@ -766,8 +769,16 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
                 log(f'[!] Hand-eye start ({body.name}) failed: {exc}')
                 handeye[body.name] = {'error': str(exc)}
         report['handeye'] = handeye
+    main_cameras = [c.name for c in main.cameras]
+    if len(bodies) > 1 and not any(by_cam.get(name) for name in main_cameras):
+        # A capture without the main rig (only the scanner's own camera bags): the
+        # auxiliary cameras are refined on their own, the main rig stays as configured.
+        bodies = bodies[1:]
+        skipped.append({'camera': 'main', 'reason': 'no frames from the main rig'})
+        log('[*] No main rig frames: refining the auxiliary cameras on their own')
     problem = RigProblem(dataset, bodies, fit_names, **common)
-    if sum(n.split('/')[0] in [c.name for c in main.cameras] for n in problem.names) < 8:
+    anchor = main_cameras if bodies[0] is main else [c.name for b in bodies for c in b.cameras]
+    if sum(n.split('/')[0] in anchor for n in problem.names) < 8:
         raise ValueError(f'Too few frames inside the trajectory for rig refinement ({len(problem.names)})')
 
     if coarse_orientation and 'error' not in handeye.get('main', {'error': True}):

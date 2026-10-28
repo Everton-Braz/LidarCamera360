@@ -100,22 +100,50 @@ def cloud_payload(msg, time_field='timestamp', time_unit='seconds', time_origin=
     return out.tobytes(),len(a)
 
 
-def image_payload(msg):
+def rotate_image(img, rotation_deg):
+    """Rotate a decoded frame clockwise by 0, 90, 180 or 270 degrees."""
     import cv2
-    if hasattr(msg,'format'):
-        return bytes(msg.data)
-    enc=msg.encoding.lower()
-    channels={'bgr8':3,'rgb8':3,'mono8':1,'bgra8':4,'rgba8':4}.get(enc)
-    if not channels:
-        raise ValueError(f'Unsupported image encoding {enc!r}')
-    if len(msg.data)<msg.step*msg.height:
-        raise ValueError('Truncated image')
-    img=np.ndarray((msg.height,msg.width,channels),dtype=np.uint8,buffer=msg.data,
-                   strides=(msg.step,channels,1))
-    if enc=='rgb8': img=cv2.cvtColor(img,cv2.COLOR_RGB2BGR)
-    elif enc=='rgba8': img=cv2.cvtColor(img,cv2.COLOR_RGBA2BGRA)
-    # PNG is lossless; do not introduce JPEG artifacts into photometric estimation.
-    ok,encoded=cv2.imencode('.png',img,[cv2.IMWRITE_PNG_COMPRESSION,1])
+    rotation_deg = int(rotation_deg or 0) % 360
+    codes = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    if rotation_deg and rotation_deg not in codes:
+        raise ValueError(f'Image rotation must be a multiple of 90 degrees, got {rotation_deg}')
+    return cv2.rotate(img, codes[rotation_deg]) if rotation_deg else img
+
+
+def image_payload(msg, rotation_deg=0, max_side=1200, scale=0.25):
+    """Encode an image message for the VIO engine, rotated and downscaled like its camera model.
+
+    Frames wider than ``max_side`` are reduced by ``scale``: prepare_fastlivo_config
+    scales the camera model the same way, which keeps the C++ VIO within memory.
+    """
+    import cv2
+    if hasattr(msg, 'format'):
+        data = bytes(msg.data)
+        img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError('Image decoding failed')
+        if not rotation_deg and max(img.shape[:2]) <= max_side:
+            return data
+    else:
+        enc = msg.encoding.lower()
+        channels = {'bgr8': 3, 'rgb8': 3, 'mono8': 1, 'bgra8': 4, 'rgba8': 4}.get(enc)
+        if not channels:
+            raise ValueError(f'Unsupported image encoding {enc!r}')
+        if len(msg.data) < msg.step * msg.height:
+            raise ValueError('Truncated image')
+        img = np.ndarray((msg.height, msg.width, channels), dtype=np.uint8, buffer=msg.data,
+                         strides=(msg.step, channels, 1))
+        if enc == 'rgb8': img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        elif enc == 'rgba8': img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGRA)
+    img = rotate_image(img, rotation_deg)
+    if max(img.shape[:2]) > max_side:
+        img = cv2.resize(img, (int(round(img.shape[1] * scale)), int(round(img.shape[0] * scale))),
+                         interpolation=cv2.INTER_AREA)
+    if hasattr(msg, 'format'):
+        ok, encoded = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    else:
+        # PNG is lossless; do not introduce JPEG artifacts into photometric estimation.
+        ok, encoded = cv2.imencode('.png', img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     if not ok: raise ValueError('Image encoding failed')
     return encoded.tobytes()
 
@@ -179,7 +207,7 @@ def detect_bag_topics(paths, default_lidar=None, default_imu=None, default_cam=N
 
 def export_bags(paths, stream, *, lidar_topic=None, imu_topic=None,
                 image_topic=None, lio=False, time_field='timestamp',
-                time_unit='seconds', time_origin='first-point'):
+                time_unit='seconds', time_origin='first-point', image_rotation_deg=0):
     from rosbags.highlevel import AnyReader
     import math
     last={}
@@ -222,7 +250,7 @@ def export_bags(paths, stream, *, lidar_topic=None, imu_topic=None,
             elif kind == 2:
                 data, n = cloud_payload(msg, time_field, time_unit, time_origin, raw=raw, msgtype=c.msgtype)
             else:
-                data = image_payload(msg)
+                data = image_payload(msg, image_rotation_deg)
                 n = len(data)
             stream.write(HEADER.pack(kind, t, n))
             stream.write(data)
@@ -290,6 +318,22 @@ def discover_bag_image_topics(bag_path: Union[str, Path]) -> List[Dict[str, Any]
     except Exception:
         pass
     return results
+
+
+def first_image_size(bag_path: Union[str, Path], topic: Optional[str] = None) -> Optional[Tuple[int, int]]:
+    """(width, height) of the first decoded frame of an image topic, as stored in the bag."""
+    import cv2
+    from rosbags.highlevel import AnyReader
+    with AnyReader([Path(bag_path)]) as reader:
+        conns = [c for c in reader.connections
+                 if (c.topic == topic if topic else 'Image' in c.msgtype)]
+        for c, _, raw in reader.messages(connections=conns):
+            msg = reader.deserialize(raw, c.msgtype)
+            if hasattr(msg, 'format'):
+                img = cv2.imdecode(np.frombuffer(bytes(msg.data), dtype=np.uint8), cv2.IMREAD_COLOR)
+                return (int(img.shape[1]), int(img.shape[0])) if img is not None else None
+            return int(msg.width), int(msg.height)
+    return None
 
 
 def get_bag_start_time(bag_path: Union[str, Path], topic: Optional[str] = None) -> Optional[float]:
@@ -439,6 +483,7 @@ def extract_bag_auxiliary_frames(
     fps = float(config.fps if target_fps is None else target_fps)
     if fps <= 0:
         fps = 2.0
+    rotation_deg = int(getattr(config, 'image_rotation_deg', 0) or 0) % 360
 
     source_stat = source_p.stat()
     aux_sig_key = f"signature_{config.camera_name}"
@@ -448,7 +493,8 @@ def extract_bag_auxiliary_frames(
         "mtime_ns": source_stat.st_mtime_ns,
         "fps": fps,
         "camera_name": config.camera_name,
-        "version": 1,
+        "rotation_deg": rotation_deg,
+        "version": 2,
     }
 
     manifest_path = images_root / "frames.json"
@@ -536,6 +582,7 @@ def extract_bag_auxiliary_frames(
 
             frame_filename = f"frame_{frame_idx:06d}.jpg"
             frame_path = cam_dir / frame_filename
+            img = rotate_image(img, rotation_deg)
             cv2.imwrite(str(frame_path), img, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
             rel_name = f"{config.camera_name}/{frame_filename}"
             t_val = (t - ref_start_time) if ref_start_time is not None else (t - first_t)
@@ -546,6 +593,29 @@ def extract_bag_auxiliary_frames(
     existing_timestamps.update(timestamps)
     existing_data[aux_sig_key] = curr_sig
     existing_data["timestamps"] = existing_timestamps
+    existing_data.setdefault("time_sources", {})[config.camera_name] = "bag"
+    # Frame times count from this bag-clock instant; the workflow turns it into the exact
+    # offset against the SLAM trajectory (see bag_time_origin).
+    origin = ref_start_time if ref_start_time is not None else first_t
+    if origin is not None:
+        existing_data.setdefault("time_origins", {})[config.camera_name] = float(origin)
     manifest_path.write_text(json.dumps(existing_data, indent=2), encoding="utf-8")
     return extracted, timestamps
 
+
+def bag_time_origin(dataset_dir, camera_name):
+    """Absolute bag-clock time (s) that ``camera_name``'s frame times in frames.json count from.
+
+    Older manifests only kept the first frame's absolute stamp; the origin is then
+    recovered from that frame's relative time.
+    """
+    import json
+    manifest = json.loads((Path(dataset_dir) / 'images' / 'frames.json').read_text(encoding='utf-8'))
+    origin = (manifest.get('time_origins') or {}).get(camera_name)
+    if origin is not None:
+        return float(origin)
+    first = manifest.get('first_timestamp_sec')
+    times = [t for name, t in (manifest.get('timestamps') or {}).items() if name.startswith(f'{camera_name}/')]
+    if first is None or not times:
+        raise ValueError(f'frames.json has no bag time origin for {camera_name}; re-extract its frames')
+    return float(first) - min(times)
