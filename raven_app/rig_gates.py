@@ -78,7 +78,9 @@ def rig_gate_failures(candidate, reference=None, limits=None):
                            f'(limit {limits["max_rotation_delta_deg"]:.0f}°)')
         if translation > limits['max_translation_delta_cm']:
             reasons.append(f'{name} position differs from the profile by {translation:.1f} cm '
-                           f'(limit {limits["max_translation_delta_cm"]:.0f} cm)')
+                           f'(lever arm {np.linalg.norm(T[:3, 3]) * 100:.1f} cm vs '
+                           f'{np.linalg.norm(R[:3, 3]) * 100:.1f} cm in the profile; '
+                           f'limit {limits["max_translation_delta_cm"]:.0f} cm)')
     if T1 is not None and R1 is not None:
         baseline = float(np.linalg.norm(T0[:3, 3] - T1[:3, 3]) * 100.0)
         reference_baseline = float(np.linalg.norm(R0[:3, 3] - R1[:3, 3]) * 100.0)

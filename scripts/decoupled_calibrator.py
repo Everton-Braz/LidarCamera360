@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Robust Decoupled LiDAR-Camera Calibrator (Argon Formulation)
+Robust Decoupled LiDAR-Camera Calibrator
 Zero-hardcode, drift-immune multi-tier estimator:
   Tier 1: Boresight SO(3) + temporal refinement dt_sync (scale & translation invariant)
   Tier 2: Lever-arm (translation) via high-rotational excitation segments (Fisher Information)

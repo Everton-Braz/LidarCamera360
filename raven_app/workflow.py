@@ -1761,6 +1761,54 @@ def _clear_colmap_image_observations(sparse_dir):
     path.write_text('\n'.join(output) + '\n', encoding='utf-8')
 
 
+def refine_colmap_3dgs_poses(colmap_dir: Path, tracks_dir: Path, update_export_report: bool = False,
+                             **settings) -> Dict[str, Any]:
+    """Bundle-adjust the direct rig poses of a 3DGS export against SfM feature tracks.
+
+    The LiDAR pose prior keeps the metric frame; images.txt/.bin are rewritten only when
+    the adjustment is accepted, and the direct poses are kept in images_direct.txt.
+    """
+    from raven_app.pose_ba import refine_poses, write_report
+    colmap_dir = Path(colmap_dir)
+    sparse_dir = colmap_dir / 'sparse' / '0'
+    backup = colmap_dir / 'images_direct.txt'
+    if backup.is_file():
+        # A rerun starts again from the direct poses, never from an earlier adjustment.
+        direct = {line.split()[9]: line for line in backup.read_text(encoding='utf-8').splitlines()
+                  if len(line.split()) == 10 and not line.startswith('#')}
+        lines = (sparse_dir / 'images.txt').read_text(encoding='utf-8').splitlines()
+        lines = [direct.get(line.split()[9], line) if len(line.split()) == 10 and not line.startswith('#')
+                 else line for line in lines]
+        (sparse_dir / 'images.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    print(f"  [*] Bundle-adjusting direct poses against the SfM tracks in {tracks_dir}...")
+    try:
+        report = refine_poses(sparse_dir, tracks_dir, backup_path=colmap_dir / 'images_direct.txt',
+                              **settings)
+    except Exception as error:
+        report = {'status': 'failed', 'reason': str(error)}
+        print(f"  [!] Pose adjustment failed, keeping the direct poses: {error}")
+    if report['status'] == 'skipped':
+        print(f"  [*] Pose adjustment skipped: {report.get('reason')}")
+    write_report(colmap_dir / 'pose_ba_report.json', report)
+    if report['status'] == 'accepted':
+        _sync_colmap_text_binary(sparse_dir)
+        for name in ('images.txt', 'images.bin'):
+            # setup_sparse_compatibility's sparse/ copies, when the filesystem refused a hard link
+            mirror = sparse_dir.parent / name
+            if mirror.is_file() and not os.path.samefile(mirror, sparse_dir / name):
+                shutil.copy2(sparse_dir / name, mirror)
+    export_report = colmap_dir / 'colmap_export_report.json'
+    if update_export_report and export_report.is_file():
+        data = json.loads(export_report.read_text(encoding='utf-8'))
+        if report['status'] == 'accepted':
+            data['pose_source'] = 'ba'
+        data['pose_adjustment'] = {key: report.get(key) for key in
+                                   ('status', 'reason', 'before', 'after', 'pose_shift_cm',
+                                    'pose_rotation_deg') if key in report}
+        export_report.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    return report
+
+
 def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0,
                        max_points: Optional[int] = None, masks_dir: Optional[Path] = None,
                        third_camera: Optional[Any] = None, seed_percent: float = 100.0,
@@ -1815,8 +1863,8 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
     dataset_dir = Path(dataset_dir)
     out_dir = Path(out_dir)
     pose_source = str(pose_source).strip().lower()
-    if pose_source not in ('auto', 'direct', 'sfm'):
-        raise ValueError("pose_source must be 'auto', 'direct', or 'sfm'")
+    if pose_source not in ('auto', 'direct', 'sfm', 'ba'):
+        raise ValueError("pose_source must be 'auto', 'direct', 'sfm', or 'ba'")
     images_out = out_dir / "images"
     sparse_out = out_dir / "sparse" / "0"
     images_out.mkdir(parents=True, exist_ok=True)
@@ -1849,12 +1897,12 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
         pose_source = 'sfm' if has_sfm else 'direct'
     if pose_source == 'sfm':
         if not has_sfm:
-            print("[ARGON GUARD] SfM alignment is missing or rejected. Falling back to direct trajectory for 3DGS.")
+            print("[QUALITY GATE] SfM alignment is missing or rejected. Falling back to direct trajectory for 3DGS.")
             pose_source = 'direct'
         else:
             alignment = json.loads(align_json.read_text(encoding='utf-8'))
             if alignment.get('quality_status') == 'rejected' or alignment.get('valid') is False:
-                print("[ARGON GUARD] SfM alignment is REJECTED. Falling back to direct trajectory for 3DGS.")
+                print("[QUALITY GATE] SfM alignment is REJECTED. Falling back to direct trajectory for 3DGS.")
                 pose_source = 'direct'
 
     from scripts.pipeline_auto_calibrator_and_colorizer import get_slam_trajectory_path
@@ -1875,6 +1923,7 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
 
     direct_calib = None
     alignment = None
+    pose_adjustment = None
     sync_for_export = float(dt_sync)
     source_image_records = []
     allowed_names = set()
@@ -2126,11 +2175,13 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
                     )
                     image_id += 1
         print(f"  [+] Written direct images.txt with {image_id - 1} camera poses")
+        if pose_source == 'ba':
+            pose_adjustment = refine_colmap_3dgs_poses(out_dir, sfm_sparse)
 
     # Seed 3DGS point cloud exclusively with true metric LiDAR points (full raw points)
     lidar_xyz, lidar_rgb = load_lidar_seed_points(
         dataset_dir, max_points=max_points, seed_percent=seed_percent,
-        preferred_method=pose_source)
+        preferred_method='direct' if pose_source == 'ba' else pose_source)
     if lidar_xyz is not None and len(lidar_xyz) > 0:
         # If previous SfM points existed from reconstruction, preserve them as points3D_sfm_sparse
         if (sparse_out / "points3D.bin").is_file() and not (sparse_out / "points3D_sfm_sparse.bin").is_file():
@@ -2152,7 +2203,7 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
     else:
         print("  [*] Using existing sparse points3D as 3DGS seed (no LiDAR cloud available).")
 
-    if pose_source == 'direct' and third_cameras:
+    if pose_source in ('direct', 'ba') and third_cameras:
         from raven_app.third_camera import synthesize_third_camera_poses, inject_third_camera_into_colmap
         for camera_index, camera in enumerate(third_cameras, start=3):
             if not _aux_camera_calibration_ready(camera):
@@ -2204,6 +2255,11 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
         'auxiliary_cameras': auxiliary_decisions,
         'lidar_seed_percent': seed_percent,
     }
+    if pose_adjustment is not None:
+        report['pose_adjustment'] = {key: pose_adjustment.get(key) for key in
+                                     ('status', 'reason', 'before', 'after', 'pose_shift_cm',
+                                      'pose_rotation_deg')
+                                     if key in pose_adjustment}
     (out_dir / 'colmap_export_report.json').write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
 
@@ -3267,7 +3323,7 @@ def execute_unified_workflow(
     cloud_state_before = {p: p.stat().st_mtime_ns for p in deliverables_dir.iterdir()
                           if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}}
     
-    # Argon Gatekeeper: evaluate SfM alignment and rig calibration
+    # Quality gate: evaluate SfM alignment and rig calibration
     align_file = output_dir / "colmap_to_lidar_alignment.json"
     alignment_valid = True
     if align_file.is_file():
@@ -3276,8 +3332,8 @@ def execute_unified_workflow(
                 al_data = json.load(f)
             if al_data.get("quality_status") == "rejected" or al_data.get("valid") is False:
                 rmse_cm = float(al_data.get("trajectory_rmse_cm", al_data.get("trajectory_rmse_m", 0.0) * 100.0))
-                print(f"[ARGON GATEKEEPER] SfM Sim(3) Alignment is REJECTED (RMSE = {rmse_cm:.1f} cm; status={al_data.get('quality_status')}).")
-                print("[ARGON GATEKEEPER] Aborting SfM color projection and falling back to Direct Rigid colorization with the validated calibration or hardware profile...")
+                print(f"[QUALITY GATE] SfM alignment is rejected ({al_data.get('rejection_reason') or f'RMSE = {rmse_cm:.1f} cm'}).")
+                print("[QUALITY GATE] Colorizing with the direct rigid method and the validated calibration or hardware profile instead of the SfM poses...")
                 alignment_valid = False
         except Exception as e:
             print(f"[!] Warning checking alignment gate: {e}")
@@ -3386,7 +3442,7 @@ def execute_unified_workflow(
         export_colmap_3dgs(output_dir, calib, fps=fps, dt_sync=dt_sync,
                            masks_dir=active_masks_dir, third_camera=third_cfgs,
                            seed_percent=seed_percent,
-                           pose_source='direct' if method == 'direct' else 'sfm',
+                           pose_source='direct' if method == 'direct' else 'ba',
                            export_path=colmap_export_dir)
 
     print("\n[+] Deliverables currently in folder:")

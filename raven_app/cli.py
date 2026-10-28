@@ -220,6 +220,13 @@ def parse(argv=None):
     cal.add_argument('--save-profile',metavar='NAME',default=None,help='Save an accepted result as a new rig profile with this name')
     cal.add_argument('--report',type=Path,default=None,help='Also write the JSON summary to this file')
     add_rig_refine_option(cal)
+    pba=sub.add_parser('refine-3dgs-poses',help='Bundle-adjust the direct poses of a COLMAP/3DGS export against the SfM tracks, held to the LiDAR trajectory')
+    pba.add_argument('--dataset',type=Path,required=True,help='Processed output folder (holds sparse/0 from the SfM stage)')
+    pba.add_argument('--colmap',type=Path,default=None,help='COLMAP/3DGS export to adjust (default: <dataset>/colmap_3dgs)')
+    pba.add_argument('--tracks',type=Path,default=None,help='SfM model with the feature tracks (default: <dataset>/sparse/0)')
+    pba.add_argument('--prior-pos-cm',type=finite,default=3.0,help='LiDAR pose prior, position sigma in cm (default: 3)')
+    pba.add_argument('--prior-rot-deg',type=finite,default=0.5,help='LiDAR pose prior, rotation sigma in degrees (default: 0.5)')
+    pba.add_argument('--max-error-px',type=finite,default=4.0,help='Final inlier reprojection error in pixels (default: 4)')
     prof=sub.add_parser('profile',help='List, inspect, create and validate hardware rig profiles')
     prof_sub=prof.add_subparsers(dest='profile_command',required=True)
     prof_sub.add_parser('list',help='Bundled and user profiles (the default first)')
@@ -572,6 +579,18 @@ def run(a):
                 try:child.wait(timeout=30)
                 except subprocess.TimeoutExpired:child.terminate();child.wait()
                 raise
+    if a.command=='refine-3dgs-poses':
+        from raven_app.workflow import refine_colmap_3dgs_poses
+        dataset = a.dataset.resolve()
+        colmap = (a.colmap or dataset / 'colmap_3dgs').resolve()
+        if not (colmap / 'sparse' / '0' / 'images.txt').is_file():
+            raise FileNotFoundError(f'No COLMAP export at {colmap}')
+        report = refine_colmap_3dgs_poses(
+            colmap, (a.tracks or dataset / 'sparse' / '0').resolve(), update_export_report=True,
+            prior_pos_m=a.prior_pos_cm / 100.0, prior_rot_deg=a.prior_rot_deg, max_error_px=a.max_error_px)
+        print(json.dumps({key: report.get(key) for key in ('status', 'reason', 'before', 'after',
+                                                         'pose_shift_cm', 'pose_rotation_deg') if key in report}, indent=2))
+        return 0 if report['status'] in ('accepted', 'skipped') else 1
     if a.command=='calibrate':
         from raven_app.profile_manager import resolve_profile
         from raven_app.photometric_rig import refine_rig

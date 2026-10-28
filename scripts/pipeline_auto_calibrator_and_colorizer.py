@@ -828,7 +828,7 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
     path_length_m = float(np.sum(np.linalg.norm(np.diff(pos_slam, axis=0), axis=1))) if len(pos_slam) > 1 else 1.0
     rel_drift_pct = (best_rmse / max(path_length_m, 1.0)) * 100.0
 
-    # Multi-Tier Argon Gatekeeper:
+    # Multi-tier quality gate:
     # 1. Absolute Trajectory RMSE <= 40cm (short / medium sequences),
     # 2. Trimmed ICP Tie-point RMSE <= 35cm (high-confidence metric cloud lock),
     # 3. Relative Trajectory Drift <= 6.5% (unlooped visual odometry across hundreds of meters)
@@ -848,7 +848,7 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
     if is_accepted:
         print(f"[+] Sim(3) Alignment ACCEPTED: Trajectory RMSE={trj_rmse_cm:.2f} cm (RelDrift={rel_drift_pct:.2f}%), ICP RMSE={icp_rmse_cm:.2f} cm, Scale={s_comp:.4f}")
     else:
-        print(f"[ARGON GUARD - REJECTED] Sim(3) Alignment failed physical validation: {rejection_reason}")
+        print(f"[QUALITY GATE - REJECTED] Sim(3) alignment failed physical validation: {rejection_reason}")
 
     effective_rmse_cm = min(trj_rmse_cm, icp_rmse_cm) if (use_icp and icp_rmse_cm <= MAX_ICP_RMSE_CM) else trj_rmse_cm
 
@@ -1282,7 +1282,7 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
     al = alignment if alignment is not None else current_alignment(dataset_dir, fps)
     rmse_cm = float(al.get("trajectory_rmse_cm", al.get("trajectory_rmse_m", 0.0) * 100.0))
     if al.get("quality_status") == "rejected" or al.get("valid") is False or rmse_cm > 40.0:
-        print(f"[ARGON GUARD] Aborting SfM rig recalibration: Sim(3) alignment is REJECTED (RMSE = {rmse_cm:.1f} cm > 40 cm).")
+        print(f"[QUALITY GATE] Aborting SfM rig recalibration: Sim(3) alignment is REJECTED (RMSE = {rmse_cm:.1f} cm > 40 cm).")
         stale_calib = dataset_dir / "rig_calibration.json"
         if stale_calib.exists():
             try:
@@ -1455,7 +1455,7 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
         load_reference(reference_profile), {'max_lever_arm_cm': MAX_LEVER_ARM_CM})
     if gate_reasons:
         reason = "Implausible SfM rig: " + "; ".join(gate_reasons)
-        print(f"[ARGON GUARD - REJECTED] {reason}")
+        print(f"[QUALITY GATE - REJECTED] {reason}")
         print("[*] Quarantining spurious calibration to: rig_calibration.rejected.json")
         print(f"[*] Falling back to the hardware profile ({Path(reference_profile).name if reference_profile else 'factory calibration'})")
 
