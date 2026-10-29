@@ -84,7 +84,7 @@ class RavenMainWindow(FluentWindow):
         self.addSubInterface(self.slam_view, FluentIcon.SPEED_HIGH, tr("FAST-LIVO2 SLAM"))
         self.addSubInterface(self.colorize_view, FluentIcon.PALETTE, tr("Colorize Cloud"))
         self.addSubInterface(self.inspect_view, FluentIcon.FOLDER, tr("Bag Inspector"))
-        self.addSubInterface(self.calib_view, FluentIcon.TILES, tr("Rig Calibration"))
+        self.addSubInterface(self.calib_view, FluentIcon.TILES, tr("Rig Profiles"))
         self.addSubInterface(self.doctor_view, FluentIcon.HEART, tr("System Doctor"))
         self.navigationInterface.addItem(
             "PointCloudViewer", FluentIcon.VIEW, tr("3D Viewer"),
@@ -126,7 +126,7 @@ class RavenMainWindow(FluentWindow):
             self.slam_view.objectName(): tr("FAST-LIVO2 SLAM"),
             self.colorize_view.objectName(): tr("Colorize Cloud"),
             self.inspect_view.objectName(): tr("Bag Inspector"),
-            self.calib_view.objectName(): tr("Rig Calibration"),
+            self.calib_view.objectName(): tr("Rig Profiles"),
             self.doctor_view.objectName(): tr("System Doctor"),
             "PointCloudViewer": tr("3D Viewer"),
             self.settings_view.objectName(): tr("Settings"),

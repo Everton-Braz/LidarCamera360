@@ -12,7 +12,7 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 [![Vulkan](https://img.shields.io/badge/GPU-Vulkan%20Compute-red.svg)](https://www.vulkan.org/)
 [![PyQt6 Fluent](https://img.shields.io/badge/UI-PyQt6%20Fluent%20Widgets-teal.svg)](https://github.com/zhiyiYo/PyQt-Fluent-Widgets)
 [![Tests](https://img.shields.io/badge/Tests-270%20passed-success.svg)](tests/)
-[![License](https://img.shields.io/badge/License-Dual%20MIT%20%2F%20GPLv3-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/Source-MIT-green.svg)](LICENSE) [![App](https://img.shields.io/badge/Desktop%20app-GPL--3.0-blue.svg)](THIRD_PARTY_NOTICES.md)
 
 <br/>
 
@@ -266,7 +266,7 @@ LidarCamera360/
 │   └── package_app.py                      # Standalone PyInstaller packager
 ├── lidarcamera360.py                       # Primary application entry point
 ├── raven.py                                # Backward-compatible entry alias
-├── LICENSE                                 # Dual-licensing terms
+├── LICENSE                                 # MIT terms for the original project source
 ├── THIRD_PARTY_NOTICES.md                  # Detailed third-party license audit
 └── requirements.txt                        # Python dependencies
 ```
@@ -275,11 +275,20 @@ LidarCamera360/
 
 ## 📜 Open Source Licensing & Compliance
 
-LidarCamera360 embraces an open, transparent licensing architecture:
+Two layers, each with its own terms:
 
-- **Original Project Code**: Independently authored Python orchestration, mathematical routines, and Vulkan compute shaders (`colorizer.comp`) are released under the permissive **MIT License** in [LICENSE](LICENSE).
-- **Packaged Application Suite & Desktop Binary**: To comply with upstream open-source copyleft licenses—notably **FAST-LIVO2** (GPL-2.0-only), **Spirula Studio** (GPL-3.0), and the **PyQt6 / PyQt6-Fluent-Widgets** runtime (GPL-3.0 / GPLv3)—the combined desktop application distribution is provided under the terms of the **GNU General Public License v3 (GPLv3)**.
-- For complete dependency licenses, notices, and source distribution conditions, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+| What | License |
+| --- | --- |
+| Original LidarCamera360 source in this repository (Python app and pipeline, Vulkan colorizer, MOLA-style optimizer, docs) | **MIT**, see [LICENSE](LICENSE) |
+| The desktop app (`LidarCamera360.exe` and its Python runtime), which links PyQt6 and PyQt6-Fluent-Widgets | **GPL-3.0** as a whole |
+| `bin/fastlivo2.exe`, built from the vendored [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2) source | **GPL-2.0-only** (a separate program; the app runs it as a subprocess) |
+| `bin/spirula.exe` ([Spirula Studio](https://github.com/harry7557558/spirula-studio)) | **GPL-3.0** (a separate program) |
+| `bin/rfdetr-masker.exe` | **GPL-3.0**, see `native/rfdetr_masker/LICENSE` |
+
+The release package is an aggregate of these programs: each keeps its own license, and the
+licenses and source locations ship in its `licenses/` folder. Contributions are accepted under
+the MIT license (see [CONTRIBUTING.md](CONTRIBUTING.md)). The full audit, with versions and the
+conditions for each dependency, is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 

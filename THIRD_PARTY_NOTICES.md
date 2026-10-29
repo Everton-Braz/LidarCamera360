@@ -7,7 +7,7 @@ The MIT license in `LICENSE` applies only to original LidarCamera360 material in
 | FAST-LIVO2 | LiDAR-inertial-visual estimator and native adaptation | GPL-2.0-only; `FAST-LIVO2/LICENSE`; [upstream repository](https://github.com/hku-mars/FAST-LIVO2) | Preserve the GPL notice and provide corresponding source, including the build adaptation, for a covered binary. The upstream README requests a separate commercial license discussion for commercial use. |
 | Spirula Studio | Optional headless SfM/reconstruction executable; bundled v2026.9.30, commit `1943eda`; official Windows Vulkan x86_64 archive SHA-256 `79515ab186fc704af6eac22d65365d236a94afde9fa016511cfef2a234e154a9` | GPL-3.0; [release](https://github.com/harry7557558/spirula-studio/releases/tag/v2026.9.30), [pinned source](https://github.com/harry7557558/spirula-studio/tree/1943eda), [license](https://github.com/harry7557558/spirula-studio/blob/1943eda/LICENSE) | Preserve this release's license and source/provenance materials when publishing a package containing `spirula.exe`. Review upstream patent notices for optional patented codecs. |
 | RootSLAM | Algorithmic formulation for square-root bundle adjustment & pose-graph loop refinement (`raven_app/rootslam.py`) | Independent implementation based on academic paper arXiv:2610.15157 (Santucci et al., Oct 2026) | Cite publication in academic and technical documentation. |
-| MOLA / MRPT | Modular localization & mapping architecture reference and native tools (`native/mola_tools/`, `docs/mola_integration_plan.md`) | GPL-3.0 / BSD-3-Clause; [MOLAorg](https://github.com/MOLAorg) | Preserve upstream notices and project citations. |
+| MOLA / MRPT | Design reference for the pose-graph tools; `native/mola_tools/` is an independent implementation that links only Eigen and contains no MOLA/MRPT source | Reference only. MOLA is GPL-3.0, MRPT is BSD-3-Clause; [MOLAorg](https://github.com/MOLAorg) | Cite the projects. Copying MOLA source into this repository would make that part GPL-3.0. |
 | Sophus | Native math dependency | Upstream license retained with the pinned source | Preserve upstream notices in build or release materials. |
 | Vikit | Camera/math dependency used by FAST-LIVO2 | Upstream license retained with the pinned source | Preserve upstream notices in build or release materials. |
 | PCL, Eigen, OpenCV, yaml-cpp, OpenMP, Vulkan SDK | Native build/runtime dependencies | Their own upstream licenses; generated notices under `dist/LidarCamera360/_internal/licenses/` when present | Keep generated notices with redistributed binaries and verify exact versions for each release. |
@@ -17,6 +17,31 @@ The MIT license in `LICENSE` applies only to original LidarCamera360 material in
 | PyQt6-sip 13.11.0 | PyQt6 binding support | BSD-2-Clause (`licenses/PyQt6-sip-13.11.0-BSD-2-Clause.txt`) | Preserve the BSD notice. |
 | PyQt6-Fluent-Widgets 1.11.3 | GUI widgets | GPLv3 in package metadata; exact SPDX variant is not declared (`licenses/PyQt6-Fluent-Widgets-1.11.3-GPLv3.txt`) | Treat the GUI distribution as GPLv3-covered unless a compatible commercial or other license is obtained from the upstream author. |
 | PyQt6-Frameless-Window 0.8.2 | Frameless window controls | GPLv3 in package metadata; exact SPDX variant is not declared (`licenses/PyQt6-Frameless-Window-0.8.2-GPLv3.txt`) | Preserve the license and source/notice obligations for the GUI distribution. |
+
+## How a release is put together
+
+A portable release is an aggregate of separate programs that talk through files and command lines:
+
+| Program | Built from | License of the program |
+| --- | --- | --- |
+| `LidarCamera360.exe` + `_internal/` | MIT project source, PyQt6, Qt, PyQt6-Fluent-Widgets, Python packages | GPL-3.0 (PyQt6 is GPL-3.0-only) |
+| `bin/fastlivo2.exe` | `native/main.cpp` (MIT) + the FAST-LIVO2 port, Sophus, Vikit, PCL, OpenCV | GPL-2.0-only |
+| `bin/spirula.exe` | Spirula Studio v2026.9.30, unmodified official binary | GPL-3.0 |
+| `bin/rfdetr-masker.exe` | `native/rfdetr_masker/` | GPL-3.0 |
+| `bin/vulkan_colorizer.exe`, `bin/mola_optimizer.exe` | Project source | MIT |
+
+`fastlivo2.exe` cannot be relicensed under GPL-3.0 (FAST-LIVO2 is GPL-2.0-only), so it stays a
+separate executable and is never imported or linked by the GPL-3.0 app. `tools/package_app.py`
+copies every license text, these notices and `SOURCE.md` into `licenses/` of the package.
+Corresponding source for each GPL program is this repository at the release tag (FAST-LIVO2 port,
+native build files and Python source) and the pinned upstream commits linked above.
+
+## Commercial use
+
+The GPL allows selling copies and services. The FAST-LIVO2 README additionally asks commercial users
+to contact its authors; do that before selling anything built around `fastlivo2.exe`. A separate,
+proprietary product can reuse the MIT project source, but not the GPL components, and must not link
+PyQt6 or the Fluent widgets without commercial licenses (PySide6, LGPL, is the usual alternative).
 
 ## Audit status
 

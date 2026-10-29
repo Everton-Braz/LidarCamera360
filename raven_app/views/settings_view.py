@@ -16,7 +16,7 @@ from qfluentwidgets import (
 from raven_app import __version__
 from raven_app.branding import APP_NAME, APP_DESCRIPTION
 from raven_app.config import load_config, save_config
-from raven_app.i18n import available_languages, get_language, set_language, tr
+from raven_app.i18n import available_languages, get_language, set_language, tr, tr_button
 from raven_app.updater import check_for_updates, download_update, stage_windows_update
 from raven_app.views.feedback_dialog import FeedbackDialog
 
@@ -136,7 +136,7 @@ class SettingsView(QWidget):
         engines_layout.addWidget(self.engines_title)
 
         self.engines_desc = CaptionLabel(
-            tr("All SLAM, SfM, and GPU colorization engines are fully built into the application bundle.")
+            tr("Processing engines found by this installation. Open Doctor for versions and details.")
         )
         engines_layout.addWidget(self.engines_desc)
 
@@ -145,20 +145,16 @@ class SettingsView(QWidget):
         engines_grid.setVerticalSpacing(10)
 
         self.eng_slam_title = StrongBodyLabel("FAST-LIVO2 SLAM:")
-        self.eng_slam_status = CaptionLabel("✓ " + tr("Bundled & Ready (Native MSVC C++17)"))
-        self.eng_slam_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.eng_slam_status = CaptionLabel("")
 
         self.eng_sfm_title = StrongBodyLabel("Spirula Studio SfM:")
-        self.eng_sfm_status = CaptionLabel("✓ " + tr("Bundled & Ready (Vulkan GPU Accelerated)"))
-        self.eng_sfm_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.eng_sfm_status = CaptionLabel("")
 
         self.eng_vulkan_title = StrongBodyLabel("Vulkan Cloud Colorizer:")
-        self.eng_vulkan_status = CaptionLabel("✓ " + tr("Bundled & Ready (Compute Shader SPIR-V)"))
-        self.eng_vulkan_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.eng_vulkan_status = CaptionLabel("")
 
         self.eng_video_title = StrongBodyLabel("INSV Video & Telemetry:")
-        self.eng_video_status = CaptionLabel("✓ " + tr("Bundled & Ready (PyAV SIMD Hardware Accelerated)"))
-        self.eng_video_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.eng_video_status = CaptionLabel("")
 
         engines_grid.addWidget(self.eng_slam_title, 0, 0)
         engines_grid.addWidget(self.eng_slam_status, 0, 1)
@@ -170,6 +166,7 @@ class SettingsView(QWidget):
         engines_grid.addWidget(self.eng_video_status, 3, 1)
 
         engines_layout.addLayout(engines_grid)
+        self._refresh_engine_status()
         layout.addWidget(self.engines_card)
 
         # 4. Updates & Maintenance Card
@@ -198,7 +195,7 @@ class SettingsView(QWidget):
 
         self.download_row = QHBoxLayout()
         self.download_row.setSpacing(12)
-        self.download_btn = PrimaryPushButton(tr("Download & Install Update"))
+        self.download_btn = PrimaryPushButton(tr_button("Download & Install Update"))
         self.download_btn.setIcon(FluentIcon.DOWNLOAD)
         self.download_btn.setMinimumHeight(32)
         self.download_btn.setVisible(False)
@@ -246,9 +243,9 @@ class SettingsView(QWidget):
         self.about_version = StrongBodyLabel(f"{APP_NAME} v{__version__}")
         self.about_desc = CaptionLabel(
             f"{tr(APP_DESCRIPTION)}\n"
-            f"{tr('Hardware:')} 3DMakerPro Raven LiDAR + Insta360 X4 ({tr('Modular & Generic Rig Compatible')})\n"
+            f"{tr('Hardware:')} {tr('3DMakerPro Raven and Eagle LiDAR, Insta360 and Raven cameras, and custom rigs')}\n"
             f"{tr('UI Framework:')} PyQt6 with Fluent Widgets\n"
-            f"{tr('License:')} Dual MIT / GPLv3 Open-Source Architecture"
+            f"{tr('License:')} GPL-3.0-or-later ({tr('third-party notices in THIRD_PARTY_NOTICES.md')})"
         )
         about_layout.addWidget(self.about_title)
         about_layout.addWidget(self.about_version)
@@ -358,6 +355,28 @@ class SettingsView(QWidget):
         dlg = FeedbackDialog(parent=self.window() or self)
         dlg.exec()
 
+    def _refresh_engine_status(self):
+        """Show whether each processing engine is actually present in this installation."""
+        from raven_app.cli import engine
+        from raven_app.config import get_spirula_bin
+        from raven_app.vulkan_engine import get_vulkan_bin
+        try:
+            import av  # noqa: F401
+            has_av = True
+        except ImportError:
+            has_av = False
+        checks = ((self.eng_slam_status, engine().is_file(), tr("Native FAST-LIVO2 engine")),
+                  (self.eng_sfm_status, get_spirula_bin().is_file(), tr("Spirula photogrammetry, optional")),
+                  (self.eng_vulkan_status, get_vulkan_bin().is_file(), tr("Vulkan compute colorizer")),
+                  (self.eng_video_status, has_av, tr("PyAV video decoder")))
+        for label, found, detail in checks:
+            if found:
+                label.setText("✓ " + tr("Found") + f" ({detail})")
+                label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            else:
+                label.setText("✗ " + tr("Not found") + f" ({detail}) - " + tr("see Doctor"))
+                label.setStyleSheet("color: #E0A030; font-weight: bold;")
+
     def retranslate_ui(self):
         """Update all text elements when the language changes at runtime."""
         self.title_label.setText(tr("Settings & Personalization"))
@@ -388,27 +407,24 @@ class SettingsView(QWidget):
         # Engines status card
         self.engines_title.setText(tr("Embedded Processing Engines"))
         self.engines_desc.setText(
-            tr("All SLAM, SfM, and GPU colorization engines are fully built into the application bundle.")
+            tr("Processing engines found by this installation. Open Doctor for versions and details.")
         )
-        self.eng_slam_status.setText("✓ " + tr("Bundled & Ready (Native MSVC C++17)"))
-        self.eng_sfm_status.setText("✓ " + tr("Bundled & Ready (Vulkan GPU Accelerated)"))
-        self.eng_vulkan_status.setText("✓ " + tr("Bundled & Ready (Compute Shader SPIR-V)"))
-        self.eng_video_status.setText("✓ " + tr("Bundled & Ready (PyAV SIMD Hardware Accelerated)"))
+        self._refresh_engine_status()
 
         # About card
         self.about_title.setText(tr("About {app_name}", app_name=APP_NAME))
         self.about_desc.setText(
             f"{tr(APP_DESCRIPTION)}\n"
-            f"{tr('Hardware:')} 3DMakerPro Raven LiDAR + Insta360 X4 ({tr('Modular & Generic Rig Compatible')})\n"
+            f"{tr('Hardware:')} {tr('3DMakerPro Raven and Eagle LiDAR, Insta360 and Raven cameras, and custom rigs')}\n"
             f"{tr('UI Framework:')} PyQt6 with Fluent Widgets\n"
-            f"{tr('License:')} Dual MIT / GPLv3 Open-Source Architecture"
+            f"{tr('License:')} GPL-3.0-or-later ({tr('third-party notices in THIRD_PARTY_NOTICES.md')})"
         )
 
         # Updates card
         self.updates_title.setText(tr("Software Updates"))
         self.updates_ver_label.setText(f"{tr('Current Version:')} v{__version__}")
         self.check_update_btn.setText(tr("Check for Updates"))
-        self.download_btn.setText(tr("Download & Install Update"))
+        self.download_btn.setText(tr_button("Download & Install Update"))
 
         # Feedback card
         self.feedback_title.setText(tr("Feedback & Bug Reporting"))

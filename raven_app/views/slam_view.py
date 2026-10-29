@@ -12,7 +12,7 @@ from qfluentwidgets import (
 )
 from raven_app.process_runner import ProcessRunner
 from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag
-from raven_app.i18n import tr
+from raven_app.i18n import tr, tr_button
 
 
 class SlamView(QWidget):
@@ -120,6 +120,8 @@ class SlamView(QWidget):
         # LIO mode switch
         toggle_row = QHBoxLayout()
         self.lio_switch = SwitchButton(text=tr("LiDAR + IMU mode (camera fusion disabled)"))
+        self.lio_switch.setOnText(tr("LiDAR + IMU (LIO)"))
+        self.lio_switch.setOffText(tr("LiDAR + camera + IMU (VIO)"))
         self.lio_switch.setChecked(True)
         self.lio_switch.checkedChanged.connect(self._toggle_lio)
         toggle_row.addWidget(self.lio_switch)
@@ -174,7 +176,7 @@ class SlamView(QWidget):
 
         self.btn_run = PrimaryPushButton(tr("Start Mapping"), icon=FluentIcon.PLAY)
         self.btn_run.clicked.connect(self._start_mapping)
-        self.btn_cancel = PushButton(tr("Cancel & Save"), icon=FluentIcon.CLOSE)
+        self.btn_cancel = PushButton(tr_button("Cancel & Save"), icon=FluentIcon.CLOSE)
         self.btn_cancel.clicked.connect(self._cancel_mapping)
         self.btn_cancel.setEnabled(False)
 
@@ -409,13 +411,14 @@ class SlamView(QWidget):
         self.out_input.setPlaceholderText(tr("Select output folder for deliverables, SLAM, and images..."))
         self.out_browse.setText(tr("Browse"))
         self.scanner_label.setText(tr("Scanner Hardware Preset:"))
-        self.lio_switch.setText(tr("LiDAR + IMU mode (camera fusion disabled)"))
+        self.lio_switch.setOnText(tr("LiDAR + IMU (LIO)"))
+        self.lio_switch.setOffText(tr("LiDAR + camera + IMU (VIO)"))
         self.threads_label.setText(tr("CPU Threads:"))
         self.lidar_label.setText(tr("LiDAR Topic:"))
         self.imu_label.setText(tr("IMU Topic:"))
         self.cam_label.setText(tr("Camera Topic:"))
         self.btn_run.setText(tr("Start Mapping"))
-        self.btn_cancel.setText(tr("Cancel & Save"))
+        self.btn_cancel.setText(tr_button("Cancel & Save"))
         self.log_title.setText(tr("Live Execution Console"))
         self.btn_clear_log.setToolTip(tr("Clear console"))
 

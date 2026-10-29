@@ -371,6 +371,8 @@ class CalibrationView(QWidget):
         self.scanner_combo.setCurrentIndex(max(index, 0))
         self.scanner_model_edit.setText(str(profile.scanner.get('model', '')))
         self.description_edit.setText(profile.description)
+        self.description_edit.setCursorPosition(0)
+        self.description_edit.setToolTip(profile.description)
         self._fill_table(profile)
         self._refresh_status()
         self.json_edit.setPlainText(json.dumps(profile.to_dict(), indent=2))
@@ -388,7 +390,9 @@ class CalibrationView(QWidget):
                     combo.setCurrentText(str(value))
                     self.camera_table.setCellWidget(r, c, combo)
                     continue
-                text = value if isinstance(value, str) else (f'{value:.0f}' if c in (3, 4) else f'{value:.3f}')
+                # Three decimals, without trailing zeros, so the table fits without scrolling.
+                text = value if isinstance(value, str) else (f'{value:.0f}' if c in (3, 4)
+                                                             else f'{value:.3f}'.rstrip('0').rstrip('.'))
                 item = QTableWidgetItem(text)
                 if c < 2:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)

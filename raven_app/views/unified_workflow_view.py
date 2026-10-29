@@ -24,7 +24,7 @@ from raven_app.mask_download import MaskResourceDownload
 from raven_app.mask_resources import resource_status, resources_ready
 from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag
 from raven_app.seed_export import dataset_seed_point_count, seed_point_count
-from raven_app.i18n import tr
+from raven_app.i18n import tr, tr_button
 
 RIG_REFINE_CHOICES = (
     ("Photometric (recommended)", "photometric"),
@@ -90,7 +90,7 @@ class UnifiedWorkflowView(QWidget):
         self.header_title = TitleLabel(tr("Unified LiDAR-Camera Studio"))
         self.header_subtitle = CaptionLabel(
             tr("Automated end-to-end pipeline: Inputs Selection → FAST-LIVO2 SLAM → "
-               "Gyro Auto-Sync → Point Cloud Colorization → 3DGS Deliverables")
+               "Time Sync → Point Cloud Colorization → 3DGS Deliverables")
         )
         header_layout.addWidget(self.header_title)
         header_layout.addWidget(self.header_subtitle)
@@ -129,11 +129,13 @@ class UnifiedWorkflowView(QWidget):
         self.image_bag_input.textChanged.connect(self._on_image_bag_changed)
         self.btn_browse_image_bag = PushButton(tr("Browse"), icon=FluentIcon.FOLDER)
         self.btn_browse_image_bag.clicked.connect(self._browse_image_bag)
-        self.use_bag_images_chk = CheckBox(tr("Use Bag images in Colorization & 3DGS"))
+        self.use_bag_images_chk = CheckBox(tr_button("Use Bag images in Colorization & 3DGS"))
         self.use_bag_images_chk.setChecked(False)
         self.use_bag_images_chk.setToolTip(tr("Extract and use frames from the image bag for point cloud colorization and 3DGS dataset export."))
         self.bag_camera_info_label = CaptionLabel("")
         self.bag_camera_info_label.setStyleSheet("color: #888888;")
+        self.bag_camera_info_label.setIndent(170 + inputs_layout.spacing())
+        self.bag_camera_info_label.setVisible(False)
         image_bag_row.addWidget(self.image_bag_label)
         image_bag_row.addWidget(self.image_bag_input)
         image_bag_row.addWidget(self.btn_browse_image_bag)
@@ -290,8 +292,10 @@ class UnifiedWorkflowView(QWidget):
         self.lidar_caption = CaptionLabel(tr("LiDAR Topic:"))
         self.lidar_topic = LineEdit()
         self.lidar_topic.setText("/vanjee_722z")
+        topics_layout.setSpacing(10)
         topics_layout.addWidget(self.lidar_caption)
         topics_layout.addWidget(self.lidar_topic)
+        topics_layout.addSpacing(14)
         self.imu_caption = CaptionLabel(tr("IMU Topic:"))
         self.imu_topic = LineEdit()
         self.imu_topic.setText("/vanjee_imu_packets")
@@ -315,8 +319,8 @@ class UnifiedWorkflowView(QWidget):
 
         self.dt_caption = CaptionLabel(tr("Manual Δt (s):"))
         self.dt_input = LineEdit()
-        self.dt_input.setPlaceholderText("Optional (e.g. 1.892)")
-        self.dt_input.setFixedWidth(120)
+        self.dt_input.setPlaceholderText(tr("e.g. 1.892"))
+        self.dt_input.setFixedWidth(130)
         self.dt_input.setEnabled(False)
         sync_row.addWidget(self.dt_caption)
         sync_row.addWidget(self.dt_input)
@@ -335,9 +339,10 @@ class UnifiedWorkflowView(QWidget):
 
         # Dataset Trimming & Chunking Controls
         trim_row = QHBoxLayout()
-        self.trim_chk = CheckBox(tr("Trim Dataset (Temporal Cut)"))
+        self.trim_chk = CheckBox(tr("Trim dataset"))
         self.trim_chk.setToolTip(tr("Trim seconds from beginning and end of dataset synchronously for both bag and video."))
         self.trim_chk.stateChanged.connect(self._toggle_trim_controls)
+        self.trim_chk.setMinimumWidth(self.trim_chk.sizeHint().width() + 24)
         trim_row.addWidget(self.trim_chk)
         trim_row.addSpacing(15)
 
@@ -347,6 +352,7 @@ class UnifiedWorkflowView(QWidget):
         self.trim_start_spin.setValue(0.0)
         self.trim_start_spin.setSingleStep(1.0)
         self.trim_start_spin.setEnabled(False)
+        self.trim_start_spin.setFixedWidth(130)
         trim_row.addWidget(self.trim_start_label)
         trim_row.addWidget(self.trim_start_spin)
         trim_row.addSpacing(10)
@@ -357,6 +363,7 @@ class UnifiedWorkflowView(QWidget):
         self.trim_end_spin.setValue(0.0)
         self.trim_end_spin.setSingleStep(1.0)
         self.trim_end_spin.setEnabled(False)
+        self.trim_end_spin.setFixedWidth(130)
         trim_row.addWidget(self.trim_end_label)
         trim_row.addWidget(self.trim_end_spin)
         trim_row.addSpacing(15)
@@ -375,7 +382,7 @@ class UnifiedWorkflowView(QWidget):
 
         # Colorization & Recalibration Method
         method_row = QHBoxLayout()
-        self.method_label = BodyLabel(tr("Colorization & Recalibration:"))
+        self.method_label = CaptionLabel(tr("Colorization & Recalibration:"))
         method_row.addWidget(self.method_label)
         self.method_combo = ComboBox()
         self.method_combo.addItems([
@@ -592,7 +599,7 @@ class UnifiedWorkflowView(QWidget):
 
         status_box = QVBoxLayout()
         self.status_title = StrongBodyLabel(tr("Status: Ready"))
-        self.status_desc = CaptionLabel(tr("Select Bag and INSV files, then click 'Start Unified Workflow'."))
+        self.status_desc = CaptionLabel(tr("Select a LiDAR bag plus a camera source (INSV video or image bag), then click 'Start Unified Workflow'."))
         status_box.addWidget(self.status_title)
         status_box.addWidget(self.status_desc)
         action_header.addLayout(status_box)
@@ -600,7 +607,7 @@ class UnifiedWorkflowView(QWidget):
 
         self.btn_run = PrimaryPushButton(tr("Start Unified Workflow"), icon=FluentIcon.PLAY)
         self.btn_run.clicked.connect(self._start_workflow)
-        self.btn_cancel = PushButton(tr("Cancel & Save"), icon=FluentIcon.CLOSE)
+        self.btn_cancel = PushButton(tr_button("Cancel & Save"), icon=FluentIcon.CLOSE)
         self.btn_cancel.clicked.connect(self._cancel_workflow)
         self.btn_cancel.setEnabled(False)
 
@@ -869,6 +876,7 @@ class UnifiedWorkflowView(QWidget):
                 self.bag_camera_info_label.setText(tr("No image topics found in this bag."))
         else:
             self.bag_camera_info_label.setText("")
+        self.bag_camera_info_label.setVisible(bool(self.bag_camera_info_label.text()))
 
     def _browse_image_bag(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1096,7 +1104,7 @@ class UnifiedWorkflowView(QWidget):
             InfoBar.success(title=tr('RF-DETR is ready'), content=tr('The model and {backend} mask resources are verified.').format(backend=label), parent=self)
             return
         if resource_status(backend) == 'executor-missing':
-            InfoBar.error(title=tr('Mask backend unavailable'), content=tr('This app build is missing the selected RF-DETR executor. Rebuild or update the app.'), parent=self)
+            InfoBar.error(title=tr('Mask backend unavailable'), content=tr('This build has no executor for the selected mask backend. Choose the other backend, or install a release that bundles it.'), parent=self)
             return
         if backend == 'vulkan':
             prompt = tr('Verify or download the 139 MB RF-DETR model and prepare its Vulkan cache (~130 MB). This uses Vulkan and does not download TensorRT. Resources stay outside the portable app.')
@@ -1158,7 +1166,8 @@ class UnifiedWorkflowView(QWidget):
             return
         backend = self.mask_backend_combo.currentData()
         status = resource_status(backend)
-        self.mask_model_btn.setEnabled(status != 'executor-missing')
+        # Stays clickable when the executor is missing, so the click explains what to do.
+        self.mask_model_btn.setEnabled(True)
         if status == 'ready':
             label = tr('Vulkan') if backend == 'vulkan' else tr('TensorRT')
             self.mask_model_btn.setText(tr('RF-DETR ready ({backend})').format(backend=label))
@@ -1179,7 +1188,8 @@ class UnifiedWorkflowView(QWidget):
         else:
             self.mask_model_btn.setText(tr('Mask executor missing'))
             self.mask_model_btn.setIcon(FluentIcon.INFO)
-            self.mask_model_btn.setToolTip(tr('Update or rebuild the app with the selected RF-DETR executor.'))
+            self.mask_model_btn.setToolTip(tr('This build has no executor for the selected mask backend. '
+                                              'Choose the other backend, or install a release that bundles it.'))
 
     def _open_mask_settings(self):
         from raven_app.mask_settings_dialog import MaskSettingsDialog
@@ -1647,7 +1657,7 @@ class UnifiedWorkflowView(QWidget):
         self.header_title.setText(tr("Unified LiDAR-Camera Studio"))
         self.header_subtitle.setText(
             tr("Automated end-to-end pipeline: Inputs Selection → FAST-LIVO2 SLAM → "
-               "Gyro Auto-Sync → Point Cloud Colorization → 3DGS Deliverables")
+               "Time Sync → Point Cloud Colorization → 3DGS Deliverables")
         )
         self.inputs_title.setText(tr("1. Input Datasets & Destination"))
         self.bag_label.setText(tr("LiDAR ROS Bag (.bag):"))
@@ -1744,7 +1754,7 @@ class UnifiedWorkflowView(QWidget):
         self.chk_gps_gpx.setText(tr("GPX"))
         self.chk_gps_csv.setText(tr("CSV"))
         self.btn_run.setText(tr("Start Unified Workflow"))
-        self.btn_cancel.setText(tr("Cancel & Save"))
+        self.btn_cancel.setText(tr_button("Cancel & Save"))
         for index, name in enumerate(STAGE_NAMES):
             self.step_progress_labels[index].setText(f"{index + 1}. {tr(name)}")
         self.log_title.setText(tr("Live Workflow Execution Console"))
@@ -1753,4 +1763,4 @@ class UnifiedWorkflowView(QWidget):
 
         if not self.runner.is_busy:
             self.status_title.setText(tr("Status: Ready"))
-            self.status_desc.setText(tr("Select Bag and INSV files, then click 'Start Unified Workflow'."))
+            self.status_desc.setText(tr("Select a LiDAR bag plus a camera source (INSV video or image bag), then click 'Start Unified Workflow'."))

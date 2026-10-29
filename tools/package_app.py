@@ -47,6 +47,12 @@ def main():
     licenses.mkdir(parents=True, exist_ok=True)
     if (ROOT / 'FAST-LIVO2/LICENSE').is_file():
         shutil.copy2(ROOT / 'FAST-LIVO2/LICENSE', licenses / 'FAST-LIVO2.txt')
+    # The project's own terms, the audit and the source locations of every GPL program.
+    shutil.copy2(ROOT / 'LICENSE', licenses / 'LidarCamera360-MIT.txt')
+    shutil.copy2(ROOT / 'THIRD_PARTY_NOTICES.md', licenses / 'THIRD_PARTY_NOTICES.md')
+    for f in (ROOT / 'licenses').glob('*'):
+        if f.is_file() and f.name != 'FAST-LIVO2-LICENSE.txt':
+            shutil.copy2(f, licenses / f.name)
 
     for project in ('Sophus', 'rpg_vikit'):
         proj_dir = ROOT / 'build/deps-src' / project

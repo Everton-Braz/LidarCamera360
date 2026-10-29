@@ -22,7 +22,7 @@ from qfluentwidgets import (
 from raven_app.georeference import run_georeference, apply_transform_adjustment, export_geojson, georeference_pointcloud, georeference_colmap
 from raven_app.orthophoto import generate_orthophoto
 from raven_app.views.map_widget import TileMapWidget
-from raven_app.i18n import tr
+from raven_app.i18n import tr, tr_button
 
 
 class GeoreferenceWorker(QThread):
@@ -281,7 +281,7 @@ class GeoreferenceView(QWidget):
         adj_layout.addLayout(coord_grid)
 
         # Apply adjusted georeference button
-        self.apply_adjustment_btn = PushButton(tr("Apply & Save Georeference to Deliverables"), icon=FluentIcon.SYNC)
+        self.apply_adjustment_btn = PushButton(tr_button("Apply & Save Georeference to Deliverables"), icon=FluentIcon.SYNC)
         self.apply_adjustment_btn.clicked.connect(self._on_apply_adjustment)
         adj_layout.addWidget(self.apply_adjustment_btn)
 

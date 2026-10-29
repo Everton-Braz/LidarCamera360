@@ -95,5 +95,10 @@ def tr(source: str, **values: Any) -> str:
         return translated
 
 
+def tr_button(source: str, **values: Any) -> str:
+    """Translate text for a button or check box, where Qt reads a single '&' as a mnemonic."""
+    return tr(source, **values).replace("&", "&&")
+
+
 set_language("en")
 
