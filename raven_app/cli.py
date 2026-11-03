@@ -301,6 +301,11 @@ def parse(argv=None):
     wf.add_argument('--no-recalibrate',action='store_false',dest='recalibrate')
     wf.add_argument('--revisit-refinement',action='store_true',default=False,help='Enable global pose graph SLAM / revisit optimization (Loop Closure)')
     wf.add_argument('--no-revisit-refinement',action='store_false',dest='revisit_refinement')
+    wf.add_argument('--rebuild',nargs='+',choices=('slam','sfm'),default=(),
+                    help='Recompute these stages even when cached outputs exist (extracted frames are always reused)')
+    wf.add_argument('--densify',choices=('off','roma'),default='off',
+                    help='roma: RoMa v2 dense matching on the 3DGS export, added only in LiDAR gaps (colmap_3dgs/dense)')
+    wf.add_argument('--densify-preset',choices=('fast','balanced','high'),default='balanced')
     wf.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from beginning of dataset')
     wf.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end of dataset')
     wf.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for camera frame extraction')
@@ -796,6 +801,9 @@ def run(a):
             image_bag_path=getattr(a, 'image_bag_path', None),
             use_image_bag=getattr(a, 'use_image_bag', False),
             revisit_refinement=getattr(a, 'revisit_refinement', False),
+            rebuild=tuple(getattr(a, 'rebuild', ()) or ()),
+            densify=getattr(a, 'densify', 'off'),
+            densify_preset=getattr(a, 'densify_preset', 'balanced'),
             profile=a.profile,
             time_window=a.time_window,
             rig_refine=a.rig_refine,

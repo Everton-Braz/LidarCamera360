@@ -1809,6 +1809,20 @@ def refine_colmap_3dgs_poses(colmap_dir: Path, tracks_dir: Path, update_export_r
     return report
 
 
+def _replace_dir(source, target, attempts=8, first_delay_s=0.5):
+    """os.replace for a directory, retried: Windows refuses to rename a folder while any file inside is
+    open, and antivirus or the indexer opens freshly written files for a few seconds (a 30 M point seed)."""
+    delay = first_delay_s
+    for attempt in range(attempts):
+        try:
+            return os.replace(source, target)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+
+
 def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0,
                        max_points: Optional[int] = None, masks_dir: Optional[Path] = None,
                        third_camera: Optional[Any] = None, seed_percent: float = 100.0,
@@ -1833,9 +1847,9 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
             while backup_dir.exists():
                 backup_dir = target_dir.with_name(f'{target_dir.name}.previous-{stamp}-{suffix}')
                 suffix += 1
-            os.replace(target_dir, backup_dir)
+            _replace_dir(target_dir, backup_dir)
         try:
-            os.replace(stage_dir, target_dir)
+            _replace_dir(stage_dir, target_dir)
         except Exception:
             if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
                 os.replace(backup_dir, target_dir)
@@ -2098,6 +2112,14 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
         else:
             if not allowed_names:
                 raise ValueError('No auxiliary images overlap the SLAM trajectory time window')
+
+    # Motion-blurred rig frames teach a splat model blur; their sharper neighbours cover the same view.
+    from raven_app.frame_quality import blurred_frames
+    blurred = blurred_frames(dataset_dir, names=[n for n, _ in selected_images if n.startswith(('cam0/', 'cam1/'))])
+    if blurred:
+        selected_images = [(n, p) for n, p in selected_images if n not in blurred]
+        allowed_names -= blurred
+        print(f"  [*] Left out {len(blurred)} motion-blurred image(s) (sharpness < half of their neighbours')")
 
     camera_files = []
     for name, source in selected_images:
@@ -2719,6 +2741,9 @@ def execute_unified_workflow(
     use_image_bag: bool = False,
     colmap_export_dir: Optional[Path] = None,
     revisit_refinement: bool = False,
+    rebuild=(),
+    densify: str = 'off',
+    densify_preset: str = 'balanced',
     profile: Optional[str] = None,
     time_window: float = DEFAULT_TIME_WINDOW_S,
     rig_refine: str = DEFAULT_RIG_REFINE,
@@ -2987,7 +3012,11 @@ def execute_unified_workflow(
         except (OSError, ValueError):
             profile_matches = False
 
-    if raw_pcd.is_file() and raw_trj.is_file() and (
+    rebuild = set(rebuild or ())
+    run_record['rebuild'] = sorted(rebuild)
+    if 'slam' in rebuild and raw_pcd.is_file():
+        print("[*] --rebuild slam: recomputing the SLAM although a cached result exists.")
+    if raw_pcd.is_file() and raw_trj.is_file() and 'slam' not in rebuild and (
             not timelapse_raven_profile or profile_matches):
         print(f"[*] Existing SLAM trajectory ({raw_trj.name}) and PCD found. Re-using output.")
     else:
@@ -3117,11 +3146,6 @@ def execute_unified_workflow(
             raw_pcd = Path(refinement['output_pcd'])
             raw_trj = Path(refinement['output_trajectory'])
             print('[+] Global SLAM correction accepted by independent geometry validation.')
-        elif refinement.get('closure_improved') and Path(refinement.get('output_pcd', '')).is_file():
-            slam_out = refinement_dir
-            raw_pcd = Path(refinement['output_pcd'])
-            raw_trj = Path(refinement['output_trajectory'])
-            print('[+] Global SLAM correction accepted based on pose graph closure improvement.')
         elif refinement.get('status') == 'no_supported_revisits':
             print('[*] No validated revisit correction; retaining raw SLAM geometry.')
         else:
@@ -3189,11 +3213,29 @@ def execute_unified_workflow(
     print(f"[*] Hardware rig profile: {reference_profile.name if reference_profile else 'none'}")
     calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json, profile=profile)
 
-    if (method in ("sfm", "all") or run_spirula or (frames_changed and sparse_bin.is_file())) and (not sparse_bin.is_file() or frames_changed):
+    rebuild_sfm = 'sfm' in rebuild
+    if rebuild_sfm and (output_dir / 'sparse').is_dir():
+        # Moved, not deleted: a failed rebuild must not fall back to the stale model silently.
+        previous = output_dir / f"sparse.previous_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        (output_dir / 'sparse').rename(previous)
+        sparse_bin = output_dir / "sparse" / "0" / "points3D.bin"
+        print(f"[*] --rebuild sfm: previous SfM model moved to {previous.name}")
+    if (method in ("sfm", "all") or run_spirula or rebuild_sfm or (frames_changed and sparse_bin.is_file())) and (
+            not sparse_bin.is_file() or frames_changed):
         print("[*] Running Spirula SfM (Vulkan GPU Headless)...")
+        sfm_masks = Path(masks_dir).resolve() if masks_dir is not None else None
+        if mask_persons:
+            # The operator walks with the rig: matched as a static object, they split and bend the
+            # reconstruction. Stage 5 reuses these masks from their manifest.
+            print("[*] Generating person masks before SfM so no keypoint lands on the operator...")
+            from raven_app.person_masks import generate_person_masks
+            sfm_masks = generate_person_masks(
+                output_dir, model_path=mask_model, threshold=mask_threshold, margin=mask_margin,
+                mask_config=mask_config, backend=mask_backend)
         try:
             rebuilt = pipeline.run_spirula_sfm_auto(
-                output_dir, auxiliary_cameras=third_cfgs, force_rebuild=frames_changed)
+                output_dir, auxiliary_cameras=third_cfgs, force_rebuild=frames_changed or rebuild_sfm,
+                masks_dir=sfm_masks)
             if frames_changed and not rebuilt:
                 raise RuntimeError("SfM rebuild failed after video frames changed")
         except Exception as e:
@@ -3586,6 +3628,16 @@ def execute_unified_workflow(
                            seed_percent=seed_percent,
                            pose_source='direct' if method == 'direct' else 'ba',
                            export_path=colmap_export_dir)
+        if densify == 'roma':
+            from raven_app.config import get_spirula_bin
+            from raven_app.dense_fusion import densify_colmap_export
+            colmap_dir = Path(colmap_export_dir) if colmap_export_dir else output_dir / 'colmap_3dgs'
+            try:
+                run_record['densification'] = densify_colmap_export(colmap_dir, get_spirula_bin(), preset=densify_preset)
+            except Exception as exc:
+                run_record['densification'] = {'status': 'failed', 'reason': str(exc)}
+                print(f"[!] RoMa v2 densification failed ({exc}); the LiDAR seed is unchanged.")
+            _persist_workflow_run(output_dir, run_record)
 
     print("\n[+] Deliverables currently in folder:")
     for deliv_item in sorted(deliverables_dir.iterdir()):

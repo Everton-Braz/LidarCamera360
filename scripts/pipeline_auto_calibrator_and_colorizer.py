@@ -21,6 +21,8 @@ import struct
 import json
 import math
 import argparse
+import functools
+import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -545,9 +547,25 @@ def _spirula_auxiliary_flags(dataset_dir, auxiliary_cameras=None):
     return flags
 
 
+@functools.lru_cache(maxsize=8)
+def _spirula_sfm_auto_flags(spirula_bin):
+    """The options `sfm auto` accepts, read from its own --help (newer flags are passed only when known)."""
+    try:
+        from raven_app.subprocess_utils import hidden_window_options
+        out = subprocess.run([str(spirula_bin), 'sfm', 'auto', '--help', '--lang', 'en'], capture_output=True,
+                             text=True, encoding='utf-8', errors='replace', timeout=60, **hidden_window_options())
+        return frozenset(re.findall(r'(--[a-z][a-z0-9-]+)', out.stdout + out.stderr))
+    except (OSError, subprocess.SubprocessError, ImportError):
+        return frozenset()
+
+
 def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None,
-                         force_rebuild=False, allow_partial_calibration=False):
-    """Executa o Spirula Studio via CLI se a pasta sparse/0 não existir"""
+                         force_rebuild=False, allow_partial_calibration=False, masks_dir=None):
+    """Executa o Spirula Studio via CLI se a pasta sparse/0 não existir.
+
+    `masks_dir` (white keep, black ignore; `<image>.png`) keeps keypoints off the operator, who moves with
+    the rig and would otherwise be matched as a static object. Dark captures get `--image-exposure auto`
+    when the Spirula build supports it: only the detectors see the lift, point colours keep the files'."""
     dataset_dir = Path(dataset_dir)
     auxiliary_flags = _spirula_auxiliary_flags(dataset_dir, auxiliary_cameras)
     img_dir = dataset_dir / "images"
@@ -614,6 +632,12 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None,
         ]
     cmd.extend(auxiliary_flags)
     cmd.extend(["--decode-threads", "4", "--decode-budget", "512"])
+    supported = _spirula_sfm_auto_flags(str(spirula_bin))
+    if masks_dir is not None and Path(masks_dir).is_dir():
+        cmd.extend(["--masks", str(masks_dir)])
+        print(f" Masks:      {masks_dir}")
+    if '--image-exposure' in supported:
+        cmd.extend(["--image-exposure", "auto"])
     if force_rebuild:
         cmd.append('--no-resume')
     if vulkan_dev >= 0:
@@ -1314,6 +1338,9 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
     slerp = Slerp(t_slam, rot_slam)
     images = load_colmap_images(sparse_dir / "images.bin")
 
+    # an INSV-timelapse alignment carries the lever arm in its Sim(3) (raven_app/timelapse_calibration.py)
+    lever_aware = al.get('frame_time_source') == 'insv_timelapse' and 'initial_camera_lever_body_m' in al
+
     def get_fn(name):
         return int("".join(filter(str.isdigit, Path(name).stem)))
 
@@ -1324,26 +1351,35 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
             cam_imgs = [im for im in cam_imgs if im['name'] in accepted]
         cam_imgs.sort(key=lambda x: get_fn(x["name"]))
 
-        # Initial low-drift window (first 25-40 matched frames) isolates physical mounting
-        # extrinsics from long-term unlooped odometry drift over hundreds of meters
-        window_size = min(len(cam_imgs), 35)
-        sub_imgs = cam_imgs[:window_size] if window_size >= 10 else cam_imgs
-
-        # Compute window-local Sim(3) alignment to lock local origin without accumulated drift
-        X_win, Y_win = [], []
-        for im in sub_imgs:
-            t_vid = frame_time(dataset_dir, im["name"], fps)
-            t_q = t_slam[0] + (t_vid - dt_sync)
-            if t_slam[0] <= t_q <= t_slam[-1]:
-                idx = np.clip(np.searchsorted(t_slam, t_q), 1, len(t_slam) - 1)
-                w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
-                p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
-                X_win.append(im["C"])
-                Y_win.append(p_L)
-        if len(X_win) >= 8:
-            s_loc, R_loc, t_loc, rmse_loc = solve_umeyama_sim3(np.array(X_win), np.array(Y_win))
-        else:
+        if lever_aware:
+            # The timelapse alignment already solved camera centre = body + R_body @ lever arm. A local
+            # Sim(3) of camera centres onto bare body positions would absorb that arm: over a short,
+            # nearly straight window R_body barely changes, so R_body @ arm is a constant offset and the
+            # arm collapses to ~0 (CASA 374 Home3: 2.6 cm instead of 17 cm). Use the global fit and
+            # every accepted pose.
+            sub_imgs = cam_imgs
             s_loc, R_loc, t_loc = s_sim, R_sim, t_sim
+        else:
+            # Initial low-drift window (first 25-40 matched frames) isolates physical mounting
+            # extrinsics from long-term unlooped odometry drift over hundreds of meters
+            window_size = min(len(cam_imgs), 35)
+            sub_imgs = cam_imgs[:window_size] if window_size >= 10 else cam_imgs
+
+            # Compute window-local Sim(3) alignment to lock local origin without accumulated drift
+            X_win, Y_win = [], []
+            for im in sub_imgs:
+                t_vid = frame_time(dataset_dir, im["name"], fps)
+                t_q = t_slam[0] + (t_vid - dt_sync)
+                if t_slam[0] <= t_q <= t_slam[-1]:
+                    idx = np.clip(np.searchsorted(t_slam, t_q), 1, len(t_slam) - 1)
+                    w = (t_q - t_slam[idx - 1]) / (t_slam[idx] - t_slam[idx - 1])
+                    p_L = (1.0 - w) * pos_slam[idx - 1] + w * pos_slam[idx]
+                    X_win.append(im["C"])
+                    Y_win.append(p_L)
+            if len(X_win) >= 8:
+                s_loc, R_loc, t_loc, rmse_loc = solve_umeyama_sim3(np.array(X_win), np.array(Y_win))
+            else:
+                s_loc, R_loc, t_loc = s_sim, R_sim, t_sim
 
         R_list, t_list = [], []
         for im in sub_imgs:
@@ -1569,6 +1605,52 @@ def recalibrate_from_sfm(dataset_dir, fps=2.0, alignment=None, write_outputs=Tru
     return calib_dict
 
 
+def _with_unregistered_views(dataset_dir, images):
+    """Add the extracted frames of the model's lenses that the SfM model lacks, with that lens' camera.
+
+    Returns (images + additions, added names). Additions carry no SfM pose: callers supply one.
+    """
+    manifest = Path(dataset_dir) / 'images' / 'frames.json'
+    try:
+        names = list(json.loads(manifest.read_text(encoding='utf-8')).get('timestamps', {}))
+    except (OSError, ValueError):
+        return images, []
+    registered = {im['name'].replace('\\', '/') for im in images}
+    lens_camera = {}
+    for im in images:
+        lens_camera.setdefault(im['name'].replace('\\', '/').split('/')[0], im['cam_id'])
+    extra = [n for n in names if n not in registered and n.split('/')[0] in lens_camera
+             and (Path(dataset_dir) / 'images' / n).is_file()]
+    added = [{'name': n, 'cam_id': lens_camera[n.split('/')[0]], 'C': np.zeros(3), 'R_cw': np.eye(3)}
+             for n in extra]
+    return images + added, extra
+
+
+def _borrow_nearest_photometric(views, names):
+    """Give each unfitted image the photometric correction of the nearest-in-time fitted frame of its lens
+    (a timelapse's auto exposure drifts slowly), so registered and added views blend to one tone."""
+    def frame_number(name):
+        digits = ''.join(ch for ch in Path(name).stem if ch.isdigit())
+        return int(digits) if digits else None
+    by_lens = {}
+    for key in views:
+        number = frame_number(key)
+        if number is not None:
+            by_lens.setdefault(key.split('/')[0], []).append((number, key))
+    for lens in by_lens:
+        by_lens[lens].sort()
+    out = dict(views)
+    for name in names:
+        fitted, number = by_lens.get(name.split('/')[0]), frame_number(name)
+        if not fitted or number is None or name in out:
+            continue
+        numbers = [n for n, _ in fitted]
+        i = int(np.searchsorted(numbers, number))
+        candidates = [fitted[j] for j in (i - 1, i) if 0 <= j < len(fitted)]
+        out[name] = views[min(candidates, key=lambda c: abs(c[0] - number))[1]]
+    return out
+
+
 def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=None, operator_radius=0.0,
                            photometric='off', photometric_params=None, time_window=DEFAULT_TIME_WINDOW_S):
     """Executa a coloração de alta precisão projetando as poses alinhadas do SfM.
@@ -1602,8 +1684,25 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         is_equirect_cam = False
     pose_overrides = {}
     if al.get('frame_time_source') == 'insv_timelapse':
-        from raven_app.timelapse_calibration import rejected_pose_overrides
-        pose_overrides = rejected_pose_overrides(dataset_dir, al, images)
+        from raven_app.timelapse_calibration import direct_poses, rejected_pose_overrides
+        rig = dataset_dir / 'rig_calibration.json'
+        rig = rig if rig.is_file() else None
+        pose_overrides = rejected_pose_overrides(dataset_dir, al, images, rig)
+        images, extra = _with_unregistered_views(dataset_dir, images)
+        if extra:
+            # A dark or fragmented capture leaves most frames outside sparse/0 (CASA 374 Home3: 711 of 1,824),
+            # and the rooms only they saw would stay grey. Their poses come from the SLAM trajectory and the
+            # calibrated rig, the same poses the 3DGS export uses.
+            pose_overrides.update(direct_poses(dataset_dir, al, extra, rig))
+            if photo_views is not None:
+                photo_views = _borrow_nearest_photometric(photo_views, extra)
+            print(f"[*] {len(extra)} image(s) the SfM did not register are colorized from the SLAM "
+                  "trajectory + calibrated rig")
+        from raven_app.frame_quality import blurred_frames
+        blurred = blurred_frames(dataset_dir, names=[im['name'].replace('\\', '/') for im in images])
+        if blurred:
+            images = [im for im in images if im['name'].replace('\\', '/') not in blurred]
+            print(f"[*] Left out {len(blurred)} motion-blurred image(s) (sharpness < half of their neighbours')")
     pts_lidar, finite_mask = load_pcd(slam_pcd, return_mask=True)
     n_pts = len(pts_lidar)
     point_times = (point_scan_times(active_slam_dir(dataset_dir), finite_mask)

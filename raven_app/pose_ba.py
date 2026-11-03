@@ -22,6 +22,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
 THIN_PRISM_PARAMS = 12
+#: Observations outside this camera-point distance are dropped: nearer is the rig or the operator, and a point
+#: triangulated from nearly parallel rays lands absurdly far, where skew(X - C) swamps the frame equations.
+MIN_RANGE_M, MAX_RANGE_M = 0.15, 100.0
 
 
 def read_colmap_observations(images_bin):
@@ -222,8 +225,21 @@ def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_
         e = np.linalg.norm(r, axis=1)
         return np.where(e <= huber_px, 1.0, huber_px / np.maximum(e, 1e-12))
 
+    def in_range(X, active):
+        """Observations usable in the normal equations: finite point within MIN/MAX_RANGE_M of its camera.
+
+        A Gauss-Newton point step can throw an ill-conditioned point far away after the last prune; its
+        skew(X - C) put 1e19-1e23 into a frame's equations (CASA 374 Home3), read as a singular matrix."""
+        R_cw, C = poses()
+        i = obs_img[active]
+        d = np.linalg.norm(X[obs_pt[active]] - C[i], axis=1)
+        use = active.copy()
+        use[active] = np.isfinite(d) & (d > MIN_RANGE_M) & (d < MAX_RANGE_M)
+        return use
+
     def point_step(X, active, n_steps=2):
         for _ in range(n_steps):
+            active = in_range(X, active)
             r, v, u, norm, _ = residuals(X, active)
             R_cw, _ = poses()
             J = jac_v(active, u, norm) @ R_cw[obs_img[active]]
@@ -237,6 +253,7 @@ def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_
 
     def frame_step(X, active):
         nonlocal D, T
+        active = in_range(X, active)
         r, v, u, norm, _ = residuals(X, active)
         R_cw, C = poses()
         i = obs_img[active]
@@ -257,6 +274,7 @@ def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_
 
     def rig_step(X, active):
         nonlocal Q
+        active = in_range(X, active)
         r, v, u, norm, _ = residuals(X, active)
         i = obs_img[active]
         J = jac_v(active, u, norm) @ (-_skew(v))
@@ -276,9 +294,12 @@ def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_
                 'points': int(len(np.unique(obs_pt[active])))}
 
     def prune(X, active, threshold):
-        r, _, _, _, front = residuals(X, active)
+        r, _, _, norm, front = residuals(X, active)
         keep = active.copy()
-        keep[active] = (np.linalg.norm(r, axis=1) <= threshold) & front & np.isfinite(r).all(1)
+        # out-of-range points put 1e19-1e23 into a frame's normal equations (CASA 374 Home3), which
+        # np.linalg.solve then reports as singular
+        keep[active] = ((np.linalg.norm(r, axis=1) <= threshold) & front & np.isfinite(r).all(1)
+                        & (norm > MIN_RANGE_M) & (norm < MAX_RANGE_M))
         count = np.bincount(obs_pt[keep], minlength=n_points)
         return keep & (count[obs_pt] >= 2)
 
@@ -302,14 +323,20 @@ def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_
         X = point_step(X, active, 2)
         active = prune(X, active, threshold)
         if k == 7:   # re-triangulate once the poses moved, then keep refining
-            X = point_step(triangulate(active), active, 3)
+            X = triangulate(active)
+            # nearly parallel rays leave a point NaN (det(A) <= 1e-9); its observations would put NaN
+            # into the frame normal equations and np.linalg.solve fails with "Singular matrix"
+            active &= np.isfinite(X[obs_pt]).all(1)
+            X = point_step(X, active, 3)
     X = point_step(X, active, 3)
     active = prune(X, active, max_error_px)
     after = stats(X, active)
     # The direct poses judged on the same observations, with points triangulated for them.
     saved = D, T, Q
     D, T, Q = np.repeat(np.eye(3)[None], n_frames, 0), np.zeros((n_frames, 3)), np.repeat(np.eye(3)[None], n_lenses, 0)
-    direct_same = stats(point_step(triangulate(active), active, 6), active)
+    X_direct = triangulate(active)
+    same = active & np.isfinite(X_direct[obs_pt]).all(1)
+    direct_same = stats(point_step(X_direct, same, 6), same)
     D, T, Q = saved
     log(f"  [BA] adjusted poses: {after['median_px']:.2f} px median reprojection vs "
         f"{direct_same['median_px']:.2f} px for the direct poses on the same "

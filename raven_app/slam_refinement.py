@@ -131,6 +131,25 @@ def solve(nodes, loops, point_jac, point_errors, method='rootslam', config=None)
     return result.x, edges, report
 
 
+#: A closure-only acceptance may cost at most this fraction of local surface precision (validation noise).
+MAX_SURFACE_LOSS = 0.05
+
+
+def accept_refinement(quality, closure_improved):
+    """Whether a refined trajectory may replace the raw SLAM.
+
+    The independent surface validation decides. A better loop closure alone proves little: the optimizer
+    minimizes that same residual, so it nearly always "improves", and moving whole submaps barely changes
+    surface normals. It may only carry a candidate whose surfaces are no worse than the raw ones
+    (CASA 374 Home3: closure improved, normals 99.5 % consistent, surfaces 9.9 -> 19.2 mm RMSE, accepted).
+    """
+    if quality.get('improved'):
+        return True
+    reduction = quality.get('relative_rmse_reduction')
+    not_worse = reduction is not None and np.isfinite(reduction) and reduction >= -MAX_SURFACE_LOSS
+    return bool(closure_improved and quality.get('normals_consistent', False) and not_worse)
+
+
 def refine(slam_dir: Path, output: Path, log=print):
     """Return a report; accepted outputs include both cloud and trajectory paths."""
     slam_dir, output = Path(slam_dir).resolve(), Path(output).resolve()
@@ -149,6 +168,15 @@ def refine(slam_dir: Path, output: Path, log=print):
                 'no_supported_revisits', 'accepted', 'rejected_geometry'}:
             if cached['status'] != 'accepted':
                 log(f"Reusing SLAM revisit audit: {cached['status']}.")
+                return cached
+            if not accept_refinement(cached.get('validation') or {}, cached.get('closure_improved', False)):
+                # accepted under an older, looser rule: judge it again, keep the evidence
+                v = cached.get('validation') or {}
+                cached.update(status='rejected_geometry', failure_reason=(
+                    f"surfaces {v.get('reference_rmse_mm', float('nan')):.1f} -> "
+                    f"{v.get('candidate_rmse_mm', float('nan')):.1f} mm RMSE; loop closure alone does not justify it"))
+                report_path.write_text(json.dumps(cached, indent=2), encoding='utf-8')
+                log(f"Cached SLAM refinement re-judged: {cached['failure_reason']}.")
                 return cached
             generated = {name: Path(cached[f'output_{name}']) for name in ('pcd', 'trajectory', 'scan_ranges')}
             if cached.get('output_signature') == source_signature(generated):
@@ -216,7 +244,7 @@ def refine(slam_dir: Path, output: Path, log=print):
             if output.is_dir():
                 shutil.rmtree(output)
             raise
-        is_accepted = bool(quality['improved'] or (closure_improved and quality.get('normals_consistent', False)))
+        is_accepted = accept_refinement(quality, closure_improved)
         report.update(status='accepted' if is_accepted else 'rejected_geometry',
                       validation=quality, plane_constraints=planes, graph=graph,
                       closure_improved=bool(closure_improved),

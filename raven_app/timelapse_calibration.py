@@ -502,6 +502,14 @@ def align_dataset(dataset_dir, dt_hint=None, output_path=None, validate_refineme
 
 def rejected_pose_overrides(dataset_dir, alignment, images, calibration=None):
     """Replace rejected SfM poses with calibrated camera poses on the LiDAR path."""
+    rejected = set(alignment['rejected_image_names'])
+    return direct_poses(dataset_dir, alignment, [im['name'] for im in images if im['name'] in rejected],
+                        calibration)
+
+
+def direct_poses(dataset_dir, alignment, names, calibration=None):
+    """Camera poses (R_cw, centre) in the LiDAR frame from the SLAM body pose at each image's capture time and
+    the calibrated rig; None outside the trajectory. Also for images the SfM never registered."""
     from scripts import pipeline_auto_calibrator_and_colorizer as pipeline
     root = Path(dataset_dir)
     if calibration is None:
@@ -512,11 +520,9 @@ def rejected_pose_overrides(dataset_dir, alignment, images, calibration=None):
         cfg = calibration
     ts, positions, rotations = pipeline.load_trajectory(pipeline.get_slam_trajectory_path(root))
     interpolate = Slerp(ts-ts[0], rotations)
-    rejected = set(alignment['rejected_image_names'])
     result = {}
-    for im in images:
-        if im['name'] not in rejected:
-            continue
+    for name in names:
+        im = {'name': name}
         query = pipeline.frame_time(root, im['name'])-alignment['dt_sync_seconds']
         if not 0 <= query <= ts[-1]-ts[0]:
             result[im['name']] = None

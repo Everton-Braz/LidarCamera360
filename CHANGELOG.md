@@ -8,6 +8,30 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### 🏠 Timelapse captures end to end (CASA 374 Home3)
+- **Rig recalibration from SfM** no longer collapses the lever arm on timelapse captures: the 35-frame window-local
+  Sim(3) absorbed R_body @ arm on a straight walk (2.6 cm instead of 17 cm → "implausible camera lever arm").
+  A lever-aware timelapse alignment now supplies the fit and every accepted pose (18.4 / 18.3 cm on Home3).
+- **SLAM revisit refinement** is accepted only when the independent surface check does not get worse. A better
+  loop closure alone accepted candidates whose surfaces went 9.9 → 19.2 mm RMSE (trajectory moved up to 7.8 m),
+  which also broke the SfM alignment (26 cm RMSE). The workflow no longer uses a rejected refinement, and
+  cached reports accepted under the old rule are judged again.
+- **Colorization covers the whole capture**: SfM colorization adds the frames sparse/0 never registered, with
+  SLAM + calibrated-rig poses and the nearest fitted frame's PPISP/bilateral correction (Home3: uncoloured
+  points 60.7 % → 4.4 %).
+- **Motion-blurred frames are left out** of colorization and the 3DGS export (sharpness below half of the
+  same-lens neighbours' median; `raven_app/frame_quality.py`, cached in `images/sharpness.json`).
+- **3DGS pose adjustment** no longer fails with "Singular matrix": observations of points out of 0.15–100 m range
+  are dropped before each normal-equation step (Home3: 1.97 → 0.88 px median reprojection).
+- **Spirula Studio v2026.10.30**: person masks are generated before SfM and passed to it (the operator walks with
+  the rig), and dark captures get `--image-exposure auto` when the build supports it.
+- `workflow --rebuild slam sfm` recomputes those stages while reusing the extracted frames; the previous
+  `sparse/` is moved to `sparse.previous_<time>`.
+- `workflow --densify roma`: RoMa v2 dense matching (`spirula dense`) on the 3DGS export, added to the LiDAR seed
+  only in its gaps (`colmap_3dgs/dense/lidar_plus_roma.ply`; `raven_app/dense_fusion.py`). The LiDAR is never
+  replaced.
+- The COLMAP export retries its final folder swap, which Windows can refuse while freshly written files are open.
+
 ### 🧰 Rig profiles v2, new-rig calibration and a faster refinement (Phases 3–5)
 - **Profile v2**: one file describes any setup — scanner plus bodies of cameras (main camera `cam0` [+ `cam1`], auxiliary cameras with their own clock), each with its model, intrinsics and mount (`raven_app/rig_profile.py`).
   - v1 files (every existing calibration JSON) migrate on load. Saved v2 files keep the v1 keys, so every colorizer reads them unchanged. The bundled Raven + X4 and Eagle profiles are now v2; their transforms and intrinsics are identical.

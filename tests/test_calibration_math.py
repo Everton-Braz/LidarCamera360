@@ -61,6 +61,41 @@ class CalibrationMathTests(unittest.TestCase):
             self.assertEqual(result["cam1_rear_intrinsics"]["fx"], 200.0)
             self.assertEqual(result["cam0_front_intrinsics"]["sx1"], 110.0)
 
+    def test_timelapse_recalibration_keeps_the_lever_arm_on_a_straight_walk(self):
+        # Constant heading along +X: a window-local Sim(3) of camera centres onto body positions would
+        # absorb R_body @ arm as a translation and return a ~0 lever arm (CASA 374 Home3 regression).
+        arm0, arm1 = np.array([0.017, 0.150, 0.107]), np.array([-0.011, 0.150, 0.107])
+        r0 = Rot.from_euler("xyz", [-90, -32, -90], degrees=True)                # body <- camera, as the X4 rig
+        r1 = Rot.from_euler("z", 180, degrees=True) * r0                            # rear lens: 180 degrees apart
+        n = 60
+        times = np.arange(n, dtype=float)
+        positions = np.column_stack([0.5 * times, np.zeros(n), np.full(n, 1.5)])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sparse" / "0").mkdir(parents=True)
+            (root / "deliverables").mkdir()
+            (root / "colmap_to_lidar_alignment.json").write_text(json.dumps({
+                "calibration_version": pipeline.CALIBRATION_VERSION, "timelapse_calibration_version": 3,
+                "frame_time_source": "insv_timelapse", "initial_camera_lever_body_m": arm0.tolist(),
+                "scale": 1.0, "R": np.eye(3).tolist(), "t": [0, 0, 0], "dt_sync_seconds": 0.0,
+                "quality_status": "accepted", "trajectory_rmse_cm": 1.0}))
+            images = []
+            for i, p in enumerate(positions[1:-1], start=1):
+                images.append({"name": f"cam0/frame_{i:06d}.jpg", "C": p + arm0, "R_cw": r0.inv().as_matrix(), "cam_id": 1})
+                images.append({"name": f"cam1/frame_{i:06d}.jpg", "C": p + arm1, "R_cw": r1.inv().as_matrix(), "cam_id": 2})
+            cameras = {
+                1: {"model_id": 10, "params": tuple(np.arange(12, dtype=float) + 100), "width": 3840, "height": 3840},
+                2: {"model_id": 10, "params": tuple(np.arange(12, dtype=float) + 200), "width": 3840, "height": 3840},
+            }
+            with patch.object(pipeline, "load_trajectory", return_value=(times, positions, Rot.identity(n))), \
+                 patch.object(pipeline, "load_colmap_images", return_value=images), \
+                 patch.object(pipeline, "load_colmap_cameras", return_value=cameras), \
+                 patch.object(pipeline, "frame_time", side_effect=lambda _root, name, *_a: float(name[-10:-4])), \
+                 patch("raven_app.profile_manager.resolve_profile", return_value=None):
+                result = pipeline.recalibrate_from_sfm(root, fps=1.0, write_outputs=False)
+            np.testing.assert_allclose([result["T_lidar_to_cam0_rigid_4x4"][i][3] for i in range(3)], arm0, atol=1e-9)
+            np.testing.assert_allclose([result["T_lidar_to_cam1_rigid_4x4"][i][3] for i in range(3)], arm1, atol=1e-9)
+
     def test_depth_visibility_accepts_equal_foreground_samples(self):
         distances = np.array([5.0, 5.02], dtype=float)
         flat = np.array([0, 1])
