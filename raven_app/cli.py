@@ -304,7 +304,7 @@ def parse(argv=None):
     wf.add_argument('--rebuild',nargs='+',choices=('slam','sfm'),default=(),
                     help='Recompute these stages even when cached outputs exist (extracted frames are always reused)')
     wf.add_argument('--densify',choices=('off','roma'),default='off',
-                    help='roma: RoMa v2 dense matching on the 3DGS export, added only in LiDAR gaps (colmap_3dgs/dense)')
+                    help='roma: RoMa v2 dense matching on the 3DGS export, added to its seed only in LiDAR gaps (colmap_3dgs/densify)')
     wf.add_argument('--densify-preset',choices=('fast','balanced','high'),default='balanced')
     wf.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from beginning of dataset')
     wf.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end of dataset')

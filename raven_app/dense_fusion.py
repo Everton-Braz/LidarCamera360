@@ -2,7 +2,8 @@
 
 Spirula's `dense` command matches the registered images of a COLMAP dataset with RoMa v2 at fixed poses
 and writes dense/roma.ply. Run on the 3DGS export, whose poses are the metric SLAM + rig ones, its points
-are already in the LiDAR frame. They never replace the LiDAR cloud:
+are already in the LiDAR frame. They never replace the LiDAR cloud (the fused cloud becomes the
+dataset's seed, sparse/0/points3D.*; the LiDAR-only seed is kept beside it):
 
 * additive: every LiDAR point is kept; RoMa points are only appended;
 * adaptive: a RoMa point is added only where the LiDAR is locally sparser than it, i.e. its nearest LiDAR
@@ -116,26 +117,45 @@ def run_roma_dense(colmap_dir, spirula_bin, preset='balanced', log=print):
     return output
 
 
+LIDAR_ONLY = 'points3D_lidar_only'
+
+
 def densify_colmap_export(colmap_dir, spirula_bin, preset='balanced', log=print, **fusion):
-    """RoMa v2 on the 3DGS export, then additive fusion. Writes dense/roma_additions.ply (only the added
-    points), dense/lidar_plus_roma.ply (LiDAR seed + additions, a Spirula `--seed-pointcloud`) and
-    dense/additive_fusion.json. The LiDAR seed files in sparse/0 are left as they are."""
+    """RoMa v2 on the 3DGS export, then additive fusion into the dataset's own seed.
+
+    sparse/0/points3D.{ply,bin,txt} become LiDAR + RoMa additions, so any trainer that starts from the
+    dataset's points gets the fused cloud. The LiDAR-only seed is kept as points3D_lidar_only.* and is
+    the fusion source on a rerun. Spirula's run moves from dense/ to densify/roma_run/: Spirula would
+    otherwise pick its dense/roma.ply (RoMa alone, 49 k points on CASA 374) over the 30 M point seed.
+    densify/ also holds roma_additions.ply (only what was added) and additive_fusion.json.
+    """
+    from raven_app.workflow import write_colmap_points3d
     colmap_dir = Path(colmap_dir)
-    roma = colmap_dir / 'dense' / 'roma.ply'
-    if not roma.is_file():
+    sparse, out = colmap_dir / 'sparse' / '0', colmap_dir / 'densify'
+    roma = next((p for p in (out / 'roma_run' / 'roma.ply', colmap_dir / 'dense' / 'roma.ply') if p.is_file()), None)
+    if roma is None:
         roma = run_roma_dense(colmap_dir, spirula_bin, preset, log)
-    seed = colmap_dir / 'sparse' / '0' / 'points3D.ply'
-    lidar_xyz, lidar_rgb = read_ply(seed)
+    if roma.parent == colmap_dir / 'dense':
+        out.mkdir(parents=True, exist_ok=True)
+        (colmap_dir / 'dense').rename(out / 'roma_run')
+        roma = out / 'roma_run' / 'roma.ply'
+    lidar_only = sparse / f'{LIDAR_ONLY}.ply'
+    if not lidar_only.is_file():
+        for suffix in ('.ply', '.bin', '.txt'):
+            if (sparse / f'points3D{suffix}').is_file():
+                (sparse / f'points3D{suffix}').rename(sparse / f'{LIDAR_ONLY}{suffix}')
+    lidar_xyz, lidar_rgb = read_ply(lidar_only)
     dense_xyz, dense_rgb = read_ply(roma)
     if dense_rgb is None:
         raise ValueError(f'{roma} has no colours')
     t0 = time.time()
     keep, report = additive_fusion(lidar_xyz, dense_xyz, **fusion)
-    write_ply(colmap_dir / 'dense' / 'roma_additions.ply', dense_xyz[keep], dense_rgb[keep])
-    fused = write_ply(colmap_dir / 'dense' / 'lidar_plus_roma.ply', np.vstack([lidar_xyz, dense_xyz[keep]]),
-                      np.vstack([lidar_rgb, dense_rgb[keep]]))
-    report.update(roma=str(roma), seed=str(seed), fused=str(fused), seconds=round(time.time() - t0, 1))
-    (colmap_dir / 'dense' / 'additive_fusion.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+    write_ply(out / 'roma_additions.ply', dense_xyz[keep], dense_rgb[keep])
+    write_colmap_points3d(sparse, np.vstack([lidar_xyz, dense_xyz[keep]]), np.vstack([lidar_rgb, dense_rgb[keep]]))
+    report.update(roma=str(roma), lidar_seed=str(lidar_only), fused_seed=str(sparse / 'points3D.ply'),
+                  seconds=round(time.time() - t0, 1))
+    (out / 'additive_fusion.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     log(f"[+] Additive densification: +{report['added']:,} RoMa points in LiDAR gaps "
-        f"({report['dense_points']:,} dense, {report['within_max_gap']:,} near the scan) -> {fused.name}")
+        f"({report['dense_points']:,} dense, {report['within_max_gap']:,} near the scan); "
+        f"seed is now {len(lidar_xyz) + report['added']:,} points in sparse/0")
     return report

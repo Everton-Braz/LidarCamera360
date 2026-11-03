@@ -33,3 +33,24 @@ def test_ply_round_trip(tmp_path):
     got_xyz, got_rgb = read_ply(path)
     np.testing.assert_allclose(got_xyz, xyz.astype(np.float32), atol=1e-6)
     np.testing.assert_array_equal(got_rgb, rgb)
+
+
+def test_densify_export_makes_the_fused_cloud_the_seed_and_moves_roma_out_of_dense(tmp_path):
+    from raven_app.dense_fusion import densify_colmap_export
+    from raven_app.workflow import write_colmap_points3d
+    lidar = _wall(0.01, hole=((0.8, 1.2), (0.8, 1.2)))
+    sparse = tmp_path / 'sparse' / '0'
+    write_colmap_points3d(sparse, lidar, np.full((len(lidar), 3), 100, np.uint8))
+    dense = _wall(0.005) + [0.002, 0, 0]
+    write_ply(tmp_path / 'dense' / 'roma.ply', dense, np.full((len(dense), 3), 200, np.uint8))
+    report = densify_colmap_export(tmp_path, spirula_bin=None, query_voxel_m=0, log=lambda *_: None)
+    assert not (tmp_path / 'dense').exists(), 'Spirula must not find RoMa alone as the dense seed'
+    assert (tmp_path / 'densify' / 'roma_run' / 'roma.ply').is_file()
+    seed_xyz, seed_rgb = read_ply(sparse / 'points3D.ply')
+    assert len(seed_xyz) == len(lidar) + report['added'] and report['added'] > 0
+    assert (seed_rgb[:len(lidar)] == 100).all() and (seed_rgb[len(lidar):] == 200).all()
+    assert len(read_ply(sparse / 'points3D_lidar_only.ply')[0]) == len(lidar)
+    assert (sparse / 'points3D.bin').is_file() and (sparse / 'points3D_lidar_only.bin').is_file()
+    again = densify_colmap_export(tmp_path, spirula_bin=None, query_voxel_m=0, log=lambda *_: None)
+    assert again['added'] == report['added'], 'a rerun fuses from the LiDAR-only seed, not the fused one'
+    assert len(read_ply(sparse / 'points3D.ply')[0]) == len(lidar) + report['added']

@@ -28,8 +28,9 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - `workflow --rebuild slam sfm` recomputes those stages while reusing the extracted frames; the previous
   `sparse/` is moved to `sparse.previous_<time>`.
 - `workflow --densify roma`: RoMa v2 dense matching (`spirula dense`) on the 3DGS export, added to the LiDAR seed
-  only in its gaps (`colmap_3dgs/dense/lidar_plus_roma.ply`; `raven_app/dense_fusion.py`). The LiDAR is never
-  replaced.
+  only in its gaps (`raven_app/dense_fusion.py`). The fused cloud becomes the export's seed
+  (`sparse/0/points3D.*`, LiDAR-only seed kept as `points3D_lidar_only.*`), and Spirula's RoMa run moves to
+  `densify/roma_run/` so its auto-detected `dense/roma.ply` (RoMa alone) cannot replace the 30 M point seed.
 - The COLMAP export retries its final folder swap, which Windows can refuse while freshly written files are open.
 
 ### 🧰 Rig profiles v2, new-rig calibration and a faster refinement (Phases 3–5)
