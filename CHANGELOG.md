@@ -31,6 +31,9 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   only in its gaps (`raven_app/dense_fusion.py`). The fused cloud becomes the export's seed
   (`sparse/0/points3D.*`, LiDAR-only seed kept as `points3D_lidar_only.*`), and Spirula's RoMa run moves to
   `densify/roma_run/` so its auto-detected `dense/roma.ply` (RoMa alone) cannot replace the 30 M point seed.
+  A dense point is added only on the LiDAR surface around it (within 1 cm of the plane of its LiDAR neighbours
+  within 20 cm): without that test, Home3's RoMa points (a median 11 cm off the walls) formed a loose shell.
+  On that dark capture only 330 of 48,937 RoMa points qualify, so densification stays off by default.
 - The COLMAP export retries its final folder swap, which Windows can refuse while freshly written files are open.
 
 ### 🧰 Rig profiles v2, new-rig calibration and a faster refinement (Phases 3–5)

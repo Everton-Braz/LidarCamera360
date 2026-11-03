@@ -77,11 +77,16 @@ def _voxel_thin(xyz, size):
 
 
 def additive_fusion(lidar_xyz, dense_xyz, *, gap_factor=1.5, min_gap_m=0.015, max_gap_m=0.30,
-                    voxel_m=0.01, spacing_k=4, query_voxel_m=0.01):
+                    voxel_m=0.01, spacing_k=4, query_voxel_m=0.01, plane_radius_m=0.20, plane_tol_m=0.01,
+                    plane_min_points=20):
     """Indices of the dense points to append to the LiDAR cloud, and a report.
 
-    The LiDAR is thinned to `query_voxel_m` for the neighbour queries (its spacing there is the k-th
-    neighbour distance), which keeps a 30 M point cloud tractable without changing where it has gaps.
+    A candidate must lie in a LiDAR gap AND on the LiDAR surface around it: within `plane_tol_m` of the
+    plane fitted to its LiDAR neighbours within `plane_radius_m`. Without that test a dense cloud with
+    depth errors adds a loose shell in front of the walls: on CASA 374 Home3 the RoMa additions sat a
+    median 11 cm off the local LiDAR plane and only 2 % within 1 cm. Points with no local plane are not
+    added. The LiDAR is thinned to `query_voxel_m` for the queries (its spacing there is the k-th neighbour
+    distance), which keeps a 30 M point cloud tractable without changing where it has gaps.
     """
     from scipy.spatial import cKDTree
     lidar = lidar_xyz[_voxel_thin(lidar_xyz, query_voxel_m)] if query_voxel_m else lidar_xyz
@@ -91,14 +96,27 @@ def additive_fusion(lidar_xyz, dense_xyz, *, gap_factor=1.5, min_gap_m=0.015, ma
     near = np.isfinite(gap)
     threshold = np.full(len(dense_xyz), np.inf)
     threshold[near] = np.maximum(min_gap_m, gap_factor * spacing[nearest[near]])
-    candidates = np.flatnonzero(near & (gap > threshold))
+    in_gap = np.flatnonzero(near & (gap > threshold))
+    plane_distance = np.full(len(in_gap), np.inf)
+    for i, neighbours in enumerate(tree.query_ball_point(dense_xyz[in_gap], plane_radius_m, workers=-1)):
+        if len(neighbours) >= plane_min_points:
+            patch = lidar[neighbours]
+            centre = patch.mean(0)
+            normal = np.linalg.svd(patch - centre, full_matrices=False)[2][2]
+            plane_distance[i] = abs((dense_xyz[in_gap[i]] - centre) @ normal)
+    candidates = in_gap[plane_distance <= plane_tol_m]
     keep = candidates[_voxel_thin(dense_xyz[candidates], voxel_m)] if len(candidates) else candidates
+    finite = np.isfinite(plane_distance)
     report = {'dense_points': int(len(dense_xyz)), 'lidar_points': int(len(lidar_xyz)),
               'lidar_query_points': int(len(lidar)), 'within_max_gap': int(near.sum()),
-              'in_lidar_gaps': int(len(candidates)), 'added': int(len(keep)),
+              'in_lidar_gaps': int(len(in_gap)), 'with_local_plane': int(finite.sum()),
+              'on_lidar_surface': int(len(candidates)), 'added': int(len(keep)),
+              'plane_distance_median_m': float(np.median(plane_distance[finite])) if finite.any() else None,
               'lidar_spacing_median_m': float(np.median(spacing)),
               'parameters': {'gap_factor': gap_factor, 'min_gap_m': min_gap_m, 'max_gap_m': max_gap_m,
-                             'voxel_m': voxel_m, 'spacing_k': spacing_k, 'query_voxel_m': query_voxel_m}}
+                             'voxel_m': voxel_m, 'spacing_k': spacing_k, 'query_voxel_m': query_voxel_m,
+                             'plane_radius_m': plane_radius_m, 'plane_tol_m': plane_tol_m,
+                             'plane_min_points': plane_min_points}}
     return keep, report
 
 

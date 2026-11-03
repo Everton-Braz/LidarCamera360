@@ -26,6 +26,15 @@ def test_roma_points_fill_only_the_lidar_gaps_and_never_float_free():
     assert len(added) <= 41 * 41
 
 
+def test_a_dense_shell_off_the_wall_is_not_added():
+    # CASA 374 Home3: RoMa points a median 11 cm in front of the walls showed up as a loose shell
+    lidar = _wall(0.01, hole=((0.8, 1.2), (0.8, 1.2)))
+    shell = _wall(0.005) + [0.08, 0, 0]                           # 8 cm off the wall, over the hole too
+    keep, report = additive_fusion(lidar, shell, query_voxel_m=0)
+    assert len(keep) == 0 and report['in_lidar_gaps'] > 0
+    assert report['plane_distance_median_m'] > 0.07
+
+
 def test_ply_round_trip(tmp_path):
     xyz = np.random.default_rng(1).normal(size=(50, 3))
     rgb = np.random.default_rng(2).integers(0, 255, (50, 3)).astype(np.uint8)
