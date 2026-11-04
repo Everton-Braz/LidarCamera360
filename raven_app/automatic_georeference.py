@@ -8,6 +8,7 @@ from pyproj import CRS
 from raven_app.cloud_io import load_cloud, CloudData
 from raven_app.georeference import calculate_insv_gps, fit_georeference, export_geojson
 from raven_app.cloud_export import save_cloud
+from raven_app.true_north import load_timed_trajectory, solve_north
 
 FORMATS = ('laz', 'las', 'ply', 'pcd', 'geojson')
 
@@ -16,38 +17,26 @@ def _horizontal_wkt(crs_info):
     return CRS.from_user_input(crs_info['horizontal_crs']).to_wkt()
 
 
-def build_automatic_transform(gps_info, trajectory_xyz=None):
+def build_automatic_transform(gps_info, trajectory_xyz=None, north=None):
     """Fit yaw/origin while retaining local elevation and metric scale."""
-    result = fit_georeference(gps_info, trajectory_xyz=trajectory_xyz)
-    matrix = np.asarray(result['matrix_4x4'], dtype=np.float64)
-    matrix[2, 3] = 0.0
-    gps_span = float(np.linalg.norm(np.asarray(gps_info['utm_coords'])[-1, :2] - np.asarray(gps_info['utm_coords'])[0, :2])) if len(gps_info.get('utm_coords', [])) > 1 else 0.0
-    estimated_track = trajectory_xyz is not None and len(trajectory_xyz) >= 2 and gps_span >= 1.0 and result.get('yaw_estimation_method') == 'trajectory_pca_alignment'
+    result = fit_georeference(gps_info, trajectory_xyz=trajectory_xyz, north=north)
     result.update({
-        'matrix_4x4': matrix.tolist(), 'translation_utm_m': matrix[:3, 3].tolist(),
-        'scale': 1.0, 'quality': 'estimated' if estimated_track else 'location_anchor_only',
-        'validation': 'not_survey_validated', 'vertical_transform': 'none_local_Z_retained',
-        'horizontal_only': True,
+        'scale': 1.0, 'quality': 'location_anchor_only' if result['north_status'] == 'unresolved' else 'estimated',
+        'validation': 'not_survey_validated', 'horizontal_only': True,
+        'altitude_datum': 'unspecified; local Z retained',
     })
-    result.pop('target_vertical_crs', None)
-    result.pop('target_compound_crs', None)
-    result['altitude_datum'] = 'unspecified; local Z retained'
     return result
 
 
-def _trajectory_xyz(path):
-    if not path or not Path(path).is_file():
-        return None
-    try:
-        arr = np.loadtxt(path, ndmin=2)
-        return arr[:, 1:4] if arr.shape[1] >= 4 else None
-    except (OSError, ValueError):
-        return None
+def _largest_cloud_points(sources):
+    """The most complete scan among the outputs, for the north solve to read its walls from."""
+    return load_cloud(max(sources, key=lambda p: p.stat().st_size)).points if sources else None
 
 
 def automatic_georeference(insv_path, deliverables_dir, candidate_clouds=None,
                            formats=('laz', 'geojson'), trajectory_path=None,
-                           trajectory_xyz=None, gps_info=None):
+                           trajectory_xyz=None, gps_info=None, dt_sync=None, capture_origin_s=None,
+                           street_bearing_deg=None, allow_network=True):
     """Transform the explicitly produced clouds and write a reviewable report."""
     out = Path(deliverables_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -59,12 +48,15 @@ def automatic_georeference(insv_path, deliverables_dir, candidate_clouds=None,
         report = {'status': 'skipped', 'reason': 'no_valid_gps', 'quality': 'location_anchor_only', 'outputs': []}
         (out / 'automatic_georeference_report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
         return report
-    trajectory_xyz = trajectory_xyz if trajectory_xyz is not None else _trajectory_xyz(trajectory_path)
-    transform = build_automatic_transform(gps, trajectory_xyz)
-    R = np.asarray(transform['matrix_4x4'], dtype=np.float64)[:3, :3]
-    t = np.asarray(transform['matrix_4x4'], dtype=np.float64)[:3, 3]
     sources = [Path(p) for p in (candidate_clouds or [])]
     sources = [p for p in sources if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}]
+    north = solve_north(gps, points=_largest_cloud_points(sources), trajectory=load_timed_trajectory(trajectory_path),
+                        local_xy=None if trajectory_xyz is None else np.asarray(trajectory_xyz)[:, :2],
+                        dt_sync=dt_sync, capture_origin_s=capture_origin_s, street_bearing_deg=street_bearing_deg,
+                        allow_network=allow_network, output_dir=out)
+    transform = build_automatic_transform(gps, north=north)
+    R = np.asarray(transform['matrix_4x4'], dtype=np.float64)[:3, :3]
+    t = np.asarray(transform['matrix_4x4'], dtype=np.float64)[:3, 3]
     geo_dir = out / 'georeferenced'
     geo_dir.mkdir(exist_ok=True)
     exported = []
@@ -102,8 +94,8 @@ def automatic_georeference(insv_path, deliverables_dir, candidate_clouds=None,
     geojson = export_geojson(geo_dir, gps_records=gps['records'], cloud_bounds_utm=bounds, crs_info=horizontal_crs_info) if 'geojson' in selected else {}
     gps_summary = {k: gps[k] for k in ('source_insv', 'total_fixes', 'duration_seconds', 'total_distance_m',
                                        'mean_wgs84', 'bounding_box_wgs84') if k in gps}
-    report = {'status': 'complete', 'quality': transform['quality'], 'validation': transform['validation'],
-              'source_insv': str(Path(insv_path).resolve()), 'transform': transform,
+    report = {'status': 'complete', 'quality': transform['quality'], 'north_status': transform['north_status'],
+              'validation': transform['validation'], 'north': north, 'source_insv': str(Path(insv_path).resolve()), 'transform': transform,
               'outputs': exported, 'geojson': geojson, 'gps_summary': gps_summary}
     (out / 'automatic_georeference_report.json').write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + '\n', encoding='utf-8')
     return report

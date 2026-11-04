@@ -173,12 +173,16 @@ class GeoReferenceTests(unittest.TestCase):
                 encoding="ascii"
             )
 
-            report = run_georeference(insv, root / "deliverables", cloud=cloud)
+            report = run_georeference(insv, root / "deliverables", cloud=cloud, yaw_deg=20.0, allow_network=False)
             self.assertEqual(report["status"], "accepted")
             self.assertIn("gps_trajectory_geojson", report["deliverables"]["geojson_files"])
             self.assertIn("pointcloud_extent_geojson", report["deliverables"]["geojson_files"])
             self.assertIn("georeferenced_scene_geojson", report["deliverables"]["geojson_files"])
             self.assertTrue(Path(report["deliverables"]["cloud_export"]["laz_path"]).is_file())
+
+            without_north = run_georeference(insv, root / "unknown", cloud=cloud, allow_network=False)
+            self.assertEqual(without_north["status"], "location_only")
+            self.assertEqual(without_north["transform"]["north_status"], "unresolved")
 
     def test_georeference_cli(self):
         with tempfile.TemporaryDirectory() as d:
@@ -188,7 +192,9 @@ class GeoReferenceTests(unittest.TestCase):
             write_insv(insv, fixes)
 
             from raven_app.cli import main
-            code = main(["--headless", "georeference", "--insv", str(insv), "--output", str(root / "out")])
+            args = ["--headless", "georeference", "--insv", str(insv), "--offline"]
+            self.assertEqual(main([*args, "--output", str(root / "unknown")]), 2)
+            code = main([*args, "--output", str(root / "out"), "--yaw-deg", "20"])
             self.assertEqual(code, 0)
             self.assertTrue((root / "out" / "gps_trajectory.geojson").is_file())
             self.assertTrue((root / "out" / "georeference_report.json").is_file())

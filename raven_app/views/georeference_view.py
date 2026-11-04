@@ -19,7 +19,8 @@ from qfluentwidgets import (
     FluentIcon, InfoBar, InfoBarPosition, ProgressBar, ComboBox, ToolButton,
 )
 
-from raven_app.georeference import run_georeference, apply_transform_adjustment, export_geojson, georeference_pointcloud, georeference_colmap
+from raven_app.georeference import (REPORT_STATUS, run_georeference, apply_transform_adjustment, export_geojson,
+                                    georeference_pointcloud, georeference_colmap)
 from raven_app.orthophoto import generate_orthophoto
 from raven_app.views.map_widget import TileMapWidget
 from raven_app.i18n import tr, tr_button
@@ -54,13 +55,11 @@ def _export_adjustment(transform, output, cloud, colmap_dir, export_cloud, expor
     if colmap_result:
         deliverables['colmap_export'] = colmap_result
     if export_json:
-        crs_info = {'horizontal_crs': transform['target_horizontal_crs'],
-                    'vertical_crs': transform['target_vertical_crs'],
-                    'compound_crs': transform['target_compound_crs'], 'crs_name': transform['crs_name']}
+        crs_info = {'horizontal_crs': transform['target_horizontal_crs'], 'crs_name': transform['crs_name']}
         deliverables['geojson_files'] = export_geojson(out_dir,
             colmap_cameras=colmap_result['cameras'] if colmap_result else None,
             cloud_bounds_utm=cloud_result['bounds_utm'] if cloud_result else None, crs_info=crs_info)
-    report.update(transform=transform, deliverables=deliverables)
+    report.update(transform=transform, deliverables=deliverables, status=REPORT_STATUS[transform['north_status']])
     (out_dir / 'local_to_geographic.json').write_text(json.dumps(transform, indent=2), encoding='utf-8')
     (out_dir / 'georeference_report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     return report
@@ -104,6 +103,7 @@ class GeoreferenceView(QWidget):
         self._latest_transform = None
         self._cloud_local_corners = None
         self._transformer = None
+        self._yaw_chosen = False
         self._init_ui()
 
     def _init_ui(self):
@@ -196,6 +196,12 @@ class GeoreferenceView(QWidget):
         opt_layout.addWidget(self.crs_label, 1, 0)
         opt_layout.addWidget(self.crs_input, 1, 1, 1, 2)
 
+        self.street_label = BodyLabel(tr("Street bearing (optional):"))
+        self.street_input = LineEdit()
+        self.street_input.setPlaceholderText(tr("Bearing of a street in the scan, measured on a map (0-360, from true north)"))
+        opt_layout.addWidget(self.street_label, 5, 0)
+        opt_layout.addWidget(self.street_input, 5, 1, 1, 2)
+
         self.export_geojson_check = CheckBox(tr("Export GeoJSON (GPS track, COLMAP cameras, Point cloud footprint)"))
         self.export_geojson_check.setChecked(True)
         opt_layout.addWidget(self.export_geojson_check, 2, 0, 1, 3)
@@ -239,14 +245,14 @@ class GeoreferenceView(QWidget):
         coord_grid.setHorizontalSpacing(8)
         coord_grid.setVerticalSpacing(6)
 
-        coord_grid.addWidget(BodyLabel(tr("True North Yaw:")), 0, 0)
+        coord_grid.addWidget(BodyLabel(tr("Yaw, local to grid (CCW):")), 0, 0)
         self.yaw_spin = QDoubleSpinBox()
         self.yaw_spin.setRange(-360.0, 360.0)
         self.yaw_spin.setDecimals(2)
         self.yaw_spin.setSingleStep(1.0)
         self.yaw_spin.setValue(0.0)
         self.yaw_spin.setSuffix("°")
-        self.yaw_spin.valueChanged.connect(self._on_adjustment_changed)
+        self.yaw_spin.valueChanged.connect(self._on_yaw_changed)
         coord_grid.addWidget(self.yaw_spin, 0, 1)
 
         coord_grid.addWidget(BodyLabel(tr("Δ Easting (m):")), 1, 0)
@@ -276,6 +282,7 @@ class GeoreferenceView(QWidget):
         self.shift_z_spin.setSingleStep(0.5)
         self.shift_z_spin.setValue(0.0)
         self.shift_z_spin.setSuffix(" m")
+        self.shift_z_spin.valueChanged.connect(self._on_adjustment_changed)
         coord_grid.addWidget(self.shift_z_spin, 3, 1)
 
         adj_layout.addLayout(coord_grid)
@@ -299,9 +306,9 @@ class GeoreferenceView(QWidget):
         ortho_controls = QHBoxLayout()
         ortho_controls.addWidget(BodyLabel(tr("Resolution (GSD):")))
         self.gsd_combo = ComboBox()
-        self.gsd_combo.addItem("0.02 m/px (2 cm - Ultra High)", 0.02)
-        self.gsd_combo.addItem("0.05 m/px (5 cm - Standard)", 0.05)
-        self.gsd_combo.addItem("0.10 m/px (10 cm - Fast)", 0.10)
+        self.gsd_combo.addItem("0.02 m/px (2 cm - Ultra High)", userData=0.02)
+        self.gsd_combo.addItem("0.05 m/px (5 cm - Standard)", userData=0.05)
+        self.gsd_combo.addItem("0.10 m/px (10 cm - Fast)", userData=0.10)
         self.gsd_combo.setCurrentIndex(1)
         ortho_controls.addWidget(self.gsd_combo)
 
@@ -453,18 +460,28 @@ class GeoreferenceView(QWidget):
         new_val = (cur + 180.0) % 360.0
         self.yaw_spin.setValue(new_val)
 
+    def _on_yaw_changed(self):
+        self._yaw_chosen = True
+        self._on_adjustment_changed()
+
+    def _adjusted(self, transform):
+        """`transform` with the controls applied. Shifts are relative to it; rotation turns about the scan."""
+        corners = self._cloud_local_corners
+        return apply_transform_adjustment(
+            transform,
+            absolute_yaw_deg=self.yaw_spin.value(),
+            delta_easting_m=self.shift_e_spin.value(),
+            delta_northing_m=self.shift_n_spin.value(),
+            delta_elevation_m=self.shift_z_spin.value(),
+            reference_centroid_local=None if corners is None else corners.mean(axis=0),
+        )
+
     def _on_adjustment_changed(self):
         """Live update of footprint on map as yaw or coordinate nudges change."""
         if self._latest_transform is None or self._transformer is None:
             return
 
-        adj_tf = apply_transform_adjustment(
-            self._latest_transform,
-            absolute_yaw_deg=self.yaw_spin.value(),
-            delta_easting_m=self.shift_e_spin.value(),
-            delta_northing_m=self.shift_n_spin.value(),
-            delta_elevation_m=self.shift_z_spin.value(),
-        )
+        adj_tf = self._adjusted(self._latest_transform)
 
         R_2d = np.array(adj_tf["rotation_matrix"])[:2, :2]
         t_2d = np.array(adj_tf["translation_utm_m"])[:2]
@@ -475,7 +492,7 @@ class GeoreferenceView(QWidget):
             for cu in corners_utm:
                 lon, lat = self._transformer.transform(cu[0], cu[1])
                 latlons.append((lat, lon))
-            self.map_widget.set_footprint(latlons, heading_deg=adj_tf["yaw_heading_deg"])
+            self.map_widget.set_footprint(latlons, heading_deg=adj_tf["local_y_true_bearing_deg"])
 
     def _on_map_center_moved(self, lat: float, lon: float):
         """Update center coordinates if user double-clicked on map."""
@@ -497,13 +514,7 @@ class GeoreferenceView(QWidget):
             return
 
         cur_tf = json.loads(tf_json_path.read_text(encoding="utf-8"))
-        adj_tf = apply_transform_adjustment(
-            cur_tf,
-            absolute_yaw_deg=self.yaw_spin.value(),
-            delta_easting_m=self.shift_e_spin.value(),
-            delta_northing_m=self.shift_n_spin.value(),
-            delta_elevation_m=self.shift_z_spin.value(),
-        )
+        adj_tf = self._adjusted(cur_tf)
 
         cloud = self.cloud_input.text().strip()
         colmap_dir = self.colmap_input.text().strip()
@@ -596,7 +607,13 @@ class GeoreferenceView(QWidget):
         colmap_dir = self.colmap_input.text().strip() or None
         trajectory = self.traj_input.text().strip() or None
         crs = self.crs_input.text().strip() or None
-        yaw = self.yaw_spin.value()
+        yaw = self.yaw_spin.value() if self._yaw_chosen else None
+        try:
+            street_text = self.street_input.text().strip().replace(",", ".")
+            street_bearing = float(street_text) if street_text else None
+        except ValueError:
+            InfoBar.error(title=tr("Invalid street bearing"), content=tr("Enter a bearing in degrees, such as 16.5."), parent=self)
+            return
 
         params = {
             "insv": insv,
@@ -606,6 +623,7 @@ class GeoreferenceView(QWidget):
             "trajectory": trajectory,
             "crs": crs,
             "yaw_deg": yaw,
+            "street_bearing_deg": street_bearing,
             "delta_easting_m": self.shift_e_spin.value(),
             "delta_northing_m": self.shift_n_spin.value(),
             "delta_elevation_m": self.shift_z_spin.value(),
@@ -645,9 +663,14 @@ class GeoreferenceView(QWidget):
         deliv = report.get("deliverables", {})
 
         yaw_val = float(tf.get("yaw_heading_deg", 0.0))
-        self.yaw_spin.blockSignals(True)
-        self.yaw_spin.setValue(yaw_val)
-        self.yaw_spin.blockSignals(False)
+        # The controls are deltas on this result, which already includes the last ones.
+        for spin, value in ((self.yaw_spin, yaw_val), (self.shift_e_spin, 0.0), (self.shift_n_spin, 0.0),
+                            (self.shift_z_spin, 0.0)):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+        self._yaw_chosen = False
+        bearing = float(tf.get("local_y_true_bearing_deg", 0.0))
 
         # Setup coordinate transformer for map preview
         h_crs = tf.get("target_horizontal_crs", "EPSG:3857")
@@ -665,7 +688,10 @@ class GeoreferenceView(QWidget):
             if self._transformer:
                 corners_utm = [(min_e, min_n), (max_e, min_n), (max_e, max_n), (min_e, max_n)]
                 latlons = [self._transformer.transform(e, n)[::-1] for e, n in corners_utm]
-                self.map_widget.set_footprint(latlons, heading_deg=yaw_val)
+                self.map_widget.set_footprint(latlons, heading_deg=bearing)
+            R_2d = np.array(tf["rotation_matrix"])[:2, :2]
+            t_2d = np.array(tf["translation_utm_m"])[:2]
+            self._cloud_local_corners = (np.array(corners_utm) - t_2d) @ R_2d
 
         # Load cameras on map
         colmap_deliv = deliv.get("colmap_export")
@@ -674,12 +700,30 @@ class GeoreferenceView(QWidget):
 
         # Update report display
         self.report_text.setPlainText(json.dumps(report, indent=2, ensure_ascii=False))
-        InfoBar.success(
-            title=tr("Georeference Completed!"),
-            content=tr("Deliverables, orthophoto, and interactive satellite map saved successfully."),
-            duration=6000,
-            parent=self,
-        )
+        status = report.get("status")
+        if status == "review_required":
+            InfoBar.warning(
+                title=tr("Check the north before using this result"),
+                content=tr("The heading comes from aerial imagery alone. Open north_alignment_review.jpg in the output "
+                           "folder, then correct it here or run again with a street bearing."),
+                duration=-1,
+                parent=self,
+            )
+        elif status == "location_only":
+            InfoBar.warning(
+                title=tr("North could not be determined"),
+                content=tr("The scan is placed at its GPS location, but its rotation is arbitrary. Enter a street "
+                           "bearing or set the yaw by hand."),
+                duration=-1,
+                parent=self,
+            )
+        else:
+            InfoBar.success(
+                title=tr("Georeference Completed!"),
+                content=tr("Deliverables, orthophoto, and interactive satellite map saved successfully."),
+                duration=6000,
+                parent=self,
+            )
 
     def _on_error(self, error):
         self.report_text.setPlainText(f"Error:\n{error}")

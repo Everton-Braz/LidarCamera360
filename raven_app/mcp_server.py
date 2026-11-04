@@ -145,7 +145,10 @@ class LidarCameraMcpServer:
                         "colmap_dir": {"type": "string", "description": "Optional COLMAP dataset directory."},
                         "trajectory_path": {"type": "string", "description": "Optional trajectory file (.txt)."},
                         "crs": {"type": "string", "description": "Target projected CRS (e.g. EPSG:31984, EPSG:32724)."},
-                        "yaw_deg": {"type": "number", "description": "Optional manual True North yaw angle in degrees."},
+                        "yaw_deg": {"type": "number", "description": "Known rotation from local XY to grid E/N, counter-clockwise, in degrees."},
+                        "street_bearing_deg": {"type": "number", "description": "True bearing of a street or long wall in the scan, measured on a map."},
+                        "dt_sync": {"type": "number", "description": "Time offset, t_video = t_lidar + dt; lets GPS fixes be matched to the trajectory."},
+                        "offline": {"type": "boolean", "default": False, "description": "Do not download aerial imagery."},
                         "orthophoto": {"type": "boolean", "default": False, "description": "Generate high-resolution georeferenced orthophoto."}
                     },
                     "required": ["insv_path", "output_dir"]
@@ -401,6 +404,9 @@ class LidarCameraMcpServer:
                 trajectory=traj,
                 crs=crs,
                 yaw_deg=yaw_deg,
+                street_bearing_deg=arguments.get("street_bearing_deg"),
+                dt_sync=arguments.get("dt_sync"),
+                allow_network=not arguments.get("offline", False),
                 generate_orthophoto_file=ortho
             )
 

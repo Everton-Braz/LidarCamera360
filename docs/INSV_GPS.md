@@ -27,40 +27,53 @@ layouts and invalid bounds are rejected. No video-to-GPS time offset is guessed.
 
 ## Georeferencing
 
-`georeference` assesses a timed TUM trajectory against INSV GPS and writes
-`georeference_report.json`. With `--cloud`, it exports a `.laz` only after the
-assessment is accepted:
-
-The command below runs the same assessment headlessly. The desktop workflow
-exposes this through its main automatic GPS option; there is no separate
-georeferencing tab in the 3D viewer.
+`georeference` places a scan on a projected CRS (SIRGAS 2000 UTM in Brazil, WGS84
+UTM elsewhere, or `--crs`). The fit is yaw and XY translation at scale `1.0`. Z
+stays the local SLAM height: recorded GPS altitude has neither the accuracy nor a
+known datum to anchor it, so use `--shift-z` when the site's elevation is known.
 
 ```powershell
 python lidarcamera360.py georeference --insv capture.insv `
-  --trajectory slam.txt --output assessment `
-  --time-offset 0.0 --confirm-time-sync --gravity-aligned `
-  --cloud all_raw_points.pcd
+  --trajectory slam.txt --cloud colored.ply --output georeferenced `
+  --dt-sync 3.107 --street-bearing 16
 ```
 
-The transform is horizontal only: WGS84 UTM by default (or an explicitly
-supplied projected CRS), in metres, with scale `1.0`. Z remains the local SLAM
-height; recorded GPS altitude is retained as evidence but is never applied and
-no vertical datum is inferred. The fit solves yaw and XY translation only.
-`--time-offset` means `GPS UTC = trajectory timestamp + offset`; it must come
-from independently verified clock synchronization. `--confirm-time-sync` and
-`--gravity-aligned` are explicit declarations, not estimates. Supply
-`--lever-arm X Y Z` for the body-frame trajectory-origin to GPS-antenna offset.
-No fit result guarantees GPS accuracy beyond the supplied residual and coverage
-checks. Exported LAS/LAZ files embed the valid CRS WKT; PLY/PCD files carry a
-`.geo.json` sidecar with the CRS and coordinate-frame metadata. The 3D viewer
+North comes from the strongest evidence the capture offers:
+
+| Source | How | Status |
+| --- | --- | --- |
+| `--yaw-deg` | Known rotation from local XY to grid E/N, counter-clockwise | `resolved` |
+| `--street-bearing` | True bearing of a street or long wall, measured on a map, matched to the scan's wall directions | `resolved` |
+| GPS fixes matched by time | Needs `--dt-sync`, at least 6 fixes and 10 m of baseline | `resolved` |
+| Aerial imagery | The scan's walls registered against Esri World Imagery | `needs_review` |
+| Imagery and GPS within 10° | Both of the above, independently | `resolved` |
+| None of these | The scan is placed on the GPS anchor, its rotation arbitrary | `unresolved` |
+
+Imagery cannot certify itself. In a negative control on `trimtest`, the same walls
+were registered against imagery of 12 wrong places 250-1800 m away, and 7 passed the
+same score gates, because a street grid fits other street grids. The run therefore
+writes `north_alignment_review.jpg`, the scan drawn over the imagery, for a person to
+check. Imagery also leaves position loose along a straight street, where GPS decides
+it, and the imagery may carry its own offset. None of this is survey grade.
+
+The imagery request reveals the site's location to the tile provider, so `--offline`
+is there to skip it. The desktop workflow's automatic stage uses imagery too.
+
+The report's `status` is `accepted`, `review_required` or `location_only`. The CLI
+exits 0 for the first two and 2 for the last, which still writes its deliverables
+but with an arbitrary rotation. `yaw_heading_deg` is relative to grid north;
+`yaw_true_deg` and `local_y_true_bearing_deg` include the grid convergence, as do
+the headings written to camera EXIF and CSV. EXIF altitude is left out, since local
+Z is not an elevation.
+
+Trimming a video drops its INSV trailer, so `trim` keeps the fixes in
+`<video>.gps.json` with the trimmed clip's start in the capture. A clip trimmed
+before this existed has no sidecar: pass the original INSV with `--capture-origin`
+set to the `origin_capture_sec` of its `.timelapse.json`.
+
+LAS/LAZ files embed the CRS WKT, and PCD stores float64 coordinates. The 3D viewer
 can load the resulting cloud, edit/save it, generate an orthophoto, and show an
 optional satellite/street map layer under the cloud.
-
-Every rejected assessment still writes its report and exits with status 2; no
-cloud is exported. Repeated fixes or poor horizontal coverage cannot determine
-heading. Reject extrapolation and long trajectory gaps. Keep a local model plus
-its geographic transform where large projected coordinates could reduce numeric
-precision.
 
 ### SESSION-01 evidence
 

@@ -192,7 +192,11 @@ def parse(argv=None):
     geo.add_argument('--colmap-dir', type=Path, help='Optional COLMAP dataset directory containing sparse/ and images/')
     geo.add_argument('--trajectory', type=Path, help='Optional SLAM or TUM trajectory file (.txt)')
     geo.add_argument('--crs', help='Projected target CRS (e.g. EPSG:31984, EPSG:32724; default auto-detected UTM/SIRGAS 2000)')
-    geo.add_argument('--yaw-deg', type=float, help='Optional manual True North Yaw angle in degrees (default: auto-fit from trajectory/motion vector)')
+    geo.add_argument('--yaw-deg', type=float, help='Known rotation from local XY to grid E/N, counter-clockwise, in degrees (default: solved from the capture)')
+    geo.add_argument('--street-bearing', type=float, help='True bearing of a street or long wall in the scan, measured on a map, in degrees clockwise from north; confirms the heading')
+    geo.add_argument('--dt-sync', type=float, help='Time offset of this dataset, t_video = t_lidar + dt; lets GPS fixes be matched to the trajectory')
+    geo.add_argument('--capture-origin', type=float, help='Seconds into the original capture where a trimmed video starts, when --insv is the untrimmed file (see the .timelapse.json beside the trimmed video)')
+    geo.add_argument('--offline', action='store_true', help='Do not download aerial imagery (the request reveals the site location to the imagery provider)')
     geo.add_argument('--shift-e', type=float, default=0.0, help='Delta Easting shift in meters')
     geo.add_argument('--shift-n', type=float, default=0.0, help='Delta Northing shift in meters')
     geo.add_argument('--shift-z', type=float, default=0.0, help='Delta Elevation shift in meters')
@@ -520,6 +524,10 @@ def run(a):
             trajectory=a.trajectory,
             crs=a.crs,
             yaw_deg=a.yaw_deg,
+            street_bearing_deg=a.street_bearing,
+            dt_sync=a.dt_sync,
+            capture_origin_s=a.capture_origin,
+            allow_network=not a.offline,
             delta_easting_m=a.shift_e,
             delta_northing_m=a.shift_n,
             delta_elevation_m=a.shift_z,
@@ -530,7 +538,7 @@ def run(a):
             export_colmap_files=not a.no_colmap,
         )
         print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
-        return 0 if report.get('status') == 'accepted' else 2
+        return 2 if report.get('status') == 'location_only' else 0
     if a.command=='inspect-bag':
         from raven_app.bag_io import inspect_bags
         print(json.dumps(inspect_bags(a.bag),indent=2));return 0

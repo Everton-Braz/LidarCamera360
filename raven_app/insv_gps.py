@@ -15,6 +15,7 @@ import struct
 import xml.etree.ElementTree as ET
 
 MAGIC = b"8db42d694ccc418790edff439fe026bf"
+GPS_SIDECAR_SUFFIX = ".gps.json"
 GPS_RECORD = struct.Struct("<IIHcdcdcddd")
 FIELDS = ("record_index", "timestamp_utc", "timestamp_epoch", "latitude_deg",
           "longitude_deg", "altitude_m", "speed_mps", "track_deg", "status",
@@ -190,3 +191,28 @@ def export_gps(path, output, formats=None):
     report['output_files'] = files
     (output / "gps_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return report
+
+
+def read_gps_sidecar(video: str | Path):
+    """(fixes, capture_origin_s) kept beside a trimmed video, or None if it has none."""
+    sidecar = Path(str(video) + GPS_SIDECAR_SUFFIX)
+    if not sidecar.is_file():
+        return None
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    return data["fixes"], float(data["capture_origin_s"])
+
+
+def write_gps_sidecar(source_video: str | Path, output_video: str | Path, start_sec: float) -> Path | None:
+    """Keep a video's GPS with a trimmed copy whose t=0 is `start_sec` into the source.
+
+    Trimming drops the INSV trailer. A source without GPS is ordinary, so it just leaves no sidecar.
+    """
+    try:
+        fixes, origin = read_gps_sidecar(source_video) or (extract_gps(source_video)[1], 0.0)
+    except (OSError, ValueError):
+        return None
+    if not fixes:
+        return None
+    sidecar = Path(str(output_video) + GPS_SIDECAR_SUFFIX)
+    sidecar.write_text(json.dumps({"fixes": fixes, "capture_origin_s": origin + float(start_sec)}), encoding="utf-8")
+    return sidecar

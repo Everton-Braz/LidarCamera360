@@ -24,6 +24,8 @@ from typing import Callable, Sequence
 import numpy as np
 from rosbags.rosbag1 import Reader, Writer
 
+from raven_app.insv_gps import write_gps_sidecar
+
 
 @dataclass
 class DatasetInterval:
@@ -281,6 +283,7 @@ def trim_dataset_synchronized(
         duration_sec=video_slice_dur,
         ffmpeg_bin=ffmpeg_bin,
     )
+    write_gps_sidecar(video_path, out_video, video_slice_start)
 
     if progress_callback:
         progress_callback("Trim complete", 1.0)
@@ -429,6 +432,7 @@ def split_dataset_into_chunks(
             duration_sec=c_dur,
             ffmpeg_bin=ffmpeg_bin,
         )
+        write_gps_sidecar(video_path, chunk_video, c_start_video)
 
         item = {
             "name": cname,

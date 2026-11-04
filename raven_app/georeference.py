@@ -2,7 +2,9 @@
 
 Computes gravity-preserving horizontal (Yaw) rigid transformation between local LiDAR/COLMAP
 metric coordinates and UTM/SIRGAS 2000 coordinates, and exports LAZ/LAS/PCD deliverables,
-geotagged image metadata, and standard RFC 7946 GeoJSON layers.
+geotagged image metadata, and standard RFC 7946 GeoJSON layers. Heading and position come
+from raven_app.true_north, which reports how far each can be trusted. Local Z is retained:
+a consumer camera's GPS altitude has neither the accuracy nor a known datum to anchor it.
 """
 from __future__ import annotations
 
@@ -20,12 +22,17 @@ import pyproj
 from scipy.spatial.transform import Rotation as R
 
 from raven_app.cloud_io import load_cloud
-from raven_app.insv_gps import extract_gps
+from raven_app.insv_gps import extract_gps, read_gps_sidecar
+from raven_app.true_north import load_timed_trajectory, rotation_2d, solve_north, true_bearing_of_axis
 
 try:
     import piexif
 except ImportError:
     piexif = None
+
+
+# What a georeferencing run can claim, by how far its north could be established.
+REPORT_STATUS = {"resolved": "accepted", "needs_review": "review_required", "unresolved": "location_only"}
 
 
 def auto_detect_utm_crs(mean_lat: float, mean_lon: float, prefer_sirgas: bool = True) -> Dict[str, Any]:
@@ -61,7 +68,12 @@ def calculate_insv_gps(insv_path: str | Path, target_crs: Optional[str] = None) 
     if not path.is_file():
         raise FileNotFoundError(f"INSV file not found: {path}")
 
-    _, fixes, report = extract_gps(path)
+    capture_origin_s = 0.0
+    trimmed = read_gps_sidecar(path)
+    if trimmed:
+        fixes, capture_origin_s = trimmed
+    else:
+        _, fixes, _ = extract_gps(path)
     if not fixes:
         raise ValueError(f"No valid GPS fixes could be extracted from: {path.name}")
 
@@ -116,6 +128,7 @@ def calculate_insv_gps(insv_path: str | Path, target_crs: Optional[str] = None) 
 
     return {
         "source_insv": str(path),
+        "capture_origin_s": capture_origin_s,
         "total_fixes": len(gps_records),
         "duration_seconds": duration_s,
         "total_distance_m": dist_m,
@@ -184,6 +197,16 @@ def parse_colmap_images_txt(images_txt_path: str | Path) -> List[Dict[str, Any]]
     return frames
 
 
+def _north_fields(yaw_grid_deg: float, convergence_deg: float) -> Dict[str, float]:
+    """The heading in the forms people use: grid rotation, true rotation, and a compass bearing."""
+    return {
+        "yaw_heading_deg": float(yaw_grid_deg),
+        "grid_convergence_deg": float(convergence_deg),
+        "yaw_true_deg": float((yaw_grid_deg - convergence_deg) % 360.0),
+        "local_y_true_bearing_deg": true_bearing_of_axis(90.0, yaw_grid_deg, convergence_deg),
+    }
+
+
 def fit_georeference(
     gps_info: Dict[str, Any],
     colmap_frames: Optional[List[Dict[str, Any]]] = None,
@@ -192,90 +215,30 @@ def fit_georeference(
     delta_easting_m: float = 0.0,
     delta_northing_m: float = 0.0,
     delta_elevation_m: float = 0.0,
+    north: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Compute the optimal gravity-preserving rigid transformation (Yaw + UTM shift)."""
-    gps_utm = gps_info["utm_coords"]
+    """Build the gravity-preserving rigid transform (yaw + UTM shift) from a north solution.
+
+    Without `north`, only what the arguments here can support is used: a manual heading,
+    placed on the GPS anchor. Local Z is retained; `delta_elevation_m` shifts it.
+    """
     crs_info = gps_info["crs_info"]
-    mean_lat = gps_info["mean_wgs84"]["latitude_deg"]
-    mean_lon = gps_info["mean_wgs84"]["longitude_deg"]
-    mean_alt = gps_info["mean_wgs84"]["altitude_m"]
+    origin = gps_info["mean_wgs84"]
+    if north is None:
+        local_xyz = None
+        if colmap_frames:
+            local_xyz = np.array([cf["xyz"] for cf in colmap_frames], dtype=np.float64)
+        elif trajectory_xyz is not None and len(trajectory_xyz) > 0:
+            local_xyz = np.asarray(trajectory_xyz, dtype=np.float64)
+        north = solve_north(gps_info, local_xy=None if local_xyz is None else local_xyz[:, :2],
+                            manual_yaw_deg=manual_yaw_deg, allow_network=False)
 
-    # 1. Determine local XYZ trajectory from COLMAP or SLAM trajectory
-    local_xyz = None
-    if colmap_frames:
-        local_xyz = np.array([cf["xyz"] for cf in colmap_frames], dtype=np.float64)
-    elif trajectory_xyz is not None and len(trajectory_xyz) > 0:
-        local_xyz = np.asarray(trajectory_xyz, dtype=np.float64)
-
-    # 2. Determine True North Yaw
-    if manual_yaw_deg is not None:
-        yaw_deg = float(manual_yaw_deg)
-        yaw_method = "manual_user_specified"
-    elif local_xyz is not None and len(local_xyz) >= 2 and len(gps_utm) >= 2:
-        # Compute principal orientation of local trajectory vs GPS UTM trajectory via PCA
-        cov_loc = np.cov(local_xyz[:, :2].T)
-        eigvals_l, eigvecs_l = np.linalg.eigh(cov_loc)
-        v_loc = eigvecs_l[:, 1]
-        ang_loc = float(np.degrees(np.arctan2(v_loc[1], v_loc[0])))
-
-        cov_gps = np.cov(gps_utm[:, :2].T)
-        eigvals_g, eigvecs_g = np.linalg.eigh(cov_gps)
-        v_gps = eigvecs_g[:, 1]
-        ang_gps = float(np.degrees(np.arctan2(v_gps[1], v_gps[0])))
-
-        candidate_1 = (ang_gps - ang_loc + 360.0) % 360.0
-        candidate_2 = (ang_gps - ang_loc + 180.0 + 360.0) % 360.0
-
-        # Disambiguate forward direction using start-to-end vector correlation
-        d_loc = local_xyz[-1, :2] - local_xyz[0, :2]
-        d_gps = gps_utm[-1, :2] - gps_utm[0, :2]
-        if np.linalg.norm(d_loc) > 1.0 and np.linalg.norm(d_gps) > 1.0:
-            ang_d_loc = float(np.degrees(np.arctan2(d_loc[1], d_loc[0])))
-            ang_d_gps = float(np.degrees(np.arctan2(d_gps[1], d_gps[0])))
-            motion_yaw = (ang_d_gps - ang_d_loc + 360.0) % 360.0
-            # Pick candidate closest to motion_yaw
-            diff1 = abs((candidate_1 - motion_yaw + 180.0) % 360.0 - 180.0)
-            diff2 = abs((candidate_2 - motion_yaw + 180.0) % 360.0 - 180.0)
-            yaw_deg = candidate_1 if diff1 <= diff2 else candidate_2
-        else:
-            yaw_deg = candidate_1
-        yaw_method = "trajectory_pca_alignment"
-    else:
-        # Fallback to GPS track heading or initial displacement
-        diffs = gps_utm[-1, :2] - gps_utm[0, :2] if len(gps_utm) > 1 else np.array([0.0, 1.0])
-        if np.linalg.norm(diffs) > 0.5:
-            yaw_deg = float((np.degrees(np.arctan2(diffs[1], diffs[0])) + 360.0) % 360.0)
-        else:
-            valid_tracks = [r["track_deg"] for r in gps_info["records"] if r.get("track_deg", 0) > 0]
-            yaw_deg = float(np.median(valid_tracks)) if valid_tracks else 0.0
-        yaw_method = "gps_motion_vector_heading"
-
-    # 3. Construct 2D rotation matrix
-    rad = np.radians(yaw_deg)
-    R_2d = np.array([
-        [np.cos(rad), -np.sin(rad)],
-        [np.sin(rad),  np.cos(rad)],
-    ], dtype=np.float64)
-
-    # 4. Compute translation shift
-    if local_xyz is not None and len(local_xyz) > 0:
-        loc_xy_rot = (R_2d @ local_xyz[:, :2].T).T
-        t_2d = np.mean(gps_utm[:, :2], axis=0) - np.mean(loc_xy_rot, axis=0)
-        t_z = float(mean_alt - np.mean(local_xyz[:, 2]))
-    else:
-        t_2d = np.mean(gps_utm[:, :2], axis=0)
-        t_z = float(mean_alt)
-
-    # Apply user-specified delta translation nudges
-    t_3d = np.array([
-        t_2d[0] + delta_easting_m,
-        t_2d[1] + delta_northing_m,
-        t_z + delta_elevation_m,
-    ], dtype=np.float64)
-
+    yaw_deg = float(north["yaw_grid_deg"])
+    t_3d = np.array([north["translation_en"][0] + delta_easting_m,
+                     north["translation_en"][1] + delta_northing_m,
+                     delta_elevation_m], dtype=np.float64)
     R_3d = np.eye(3, dtype=np.float64)
-    R_3d[:2, :2] = R_2d
-
+    R_3d[:2, :2] = rotation_2d(yaw_deg)
     T_4x4 = np.eye(4, dtype=np.float64)
     T_4x4[:3, :3] = R_3d
     T_4x4[:3, 3] = t_3d
@@ -284,20 +247,21 @@ def fit_georeference(
         "status": "success",
         "source_frame": "local_metric",
         "target_horizontal_crs": crs_info["horizontal_crs"],
-        "target_vertical_crs": crs_info["vertical_crs"],
-        "target_compound_crs": crs_info["compound_crs"],
         "crs_name": crs_info["crs_name"],
         "reference_origin_wgs84": {
-            "latitude_deg": mean_lat,
-            "longitude_deg": mean_lon,
-            "altitude_m": mean_alt,
+            "latitude_deg": origin["latitude_deg"],
+            "longitude_deg": origin["longitude_deg"],
         },
-        "yaw_heading_deg": float(yaw_deg),
-        "yaw_estimation_method": yaw_method,
+        **_north_fields(yaw_deg, north["grid_convergence_deg"]),
+        "yaw_estimation_method": north["method"],
+        "north_status": north["status"],
+        "yaw_sigma_deg": north["yaw_sigma_deg"],
+        "position_sigma_m": north["position_sigma_m"],
         "rotation_matrix": R_3d.tolist(),
         "translation_utm_m": t_3d.tolist(),
         "matrix_4x4": T_4x4.tolist(),
         "scale": 1.0,
+        "vertical_transform": "none_local_Z_retained",
         "gravity_alignment": "100% Upright (Pitch=0.00°, Roll=0.00°)",
     }
 
@@ -319,12 +283,7 @@ def apply_transform_adjustment(
     updated = dict(current_transform)
     old_yaw = float(current_transform.get("yaw_heading_deg", 0.0))
     new_yaw = float(absolute_yaw_deg) if absolute_yaw_deg is not None else float((old_yaw + delta_yaw_deg) % 360.0)
-
-    rad_new = np.radians(new_yaw)
-    R_new_2d = np.array([
-        [np.cos(rad_new), -np.sin(rad_new)],
-        [np.sin(rad_new),  np.cos(rad_new)],
-    ], dtype=np.float64)
+    R_new_2d = rotation_2d(new_yaw)
 
     R_new_3d = np.eye(3, dtype=np.float64)
     R_new_3d[:2, :2] = R_new_2d
@@ -346,8 +305,11 @@ def apply_transform_adjustment(
     T_4x4[:3, :3] = R_new_3d
     T_4x4[:3, 3] = new_t
 
-    updated["yaw_heading_deg"] = new_yaw
-    updated["yaw_estimation_method"] = "interactive_user_adjustment"
+    updated.update(_north_fields(new_yaw, float(current_transform.get("grid_convergence_deg", 0.0))))
+    if abs((new_yaw - old_yaw + 180.0) % 360.0 - 180.0) > 1e-6:
+        # Someone chose this heading, which is what the review was waiting for.
+        updated["yaw_estimation_method"] = "interactive_user_adjustment"
+        updated["north_status"] = "resolved"
     updated["rotation_matrix"] = R_new_3d.tolist()
     updated["translation_utm_m"] = new_t.tolist()
     updated["matrix_4x4"] = T_4x4.tolist()
@@ -362,6 +324,7 @@ def export_interactive_html_map(
     cameras: Optional[List[Dict[str, Any]]] = None,
     gps_records: Optional[List[Dict[str, Any]]] = None,
     heading_deg: float = 0.0,
+    north_status: str = "",
     title: str = "LidarCamera360 - Georeferenced Scene Map",
 ) -> str:
     """Export a standalone interactive Leaflet HTML map using free satellite and street basemaps."""
@@ -408,7 +371,8 @@ def export_interactive_html_map(
     <h4>Georeferenced Scene</h4>
     <div class="metric"><span>Center Lat:</span> <b>{center_lat:.6f}°</b></div>
     <div class="metric"><span>Center Lon:</span> <b>{center_lon:.6f}°</b></div>
-    <div class="metric"><span>True North Yaw:</span> <b>{heading_deg:.2f}°</b></div>
+    <div class="metric"><span>Scene +Y bearing (true):</span> <b>{heading_deg:.2f}°</b></div>
+    <div class="metric"><span>North:</span> <b>{north_status or "not stated"}</b></div>
     <div class="metric"><span>Cameras Loaded:</span> <b>{len(cameras or [])}</b></div>
     <div class="badge">ArcGIS Satellite Aerial Active</div>
   </div>
@@ -439,7 +403,7 @@ def export_interactive_html_map(
     if (footprint.length > 0) {{
       const poly = L.polygon(footprint, {{
         color: '#00f0ff', fillColor: '#00f0ff', fillOpacity: 0.35, weight: 3
-      }}).addTo(map).bindPopup("<b>Point Cloud Footprint</b><br>True North Yaw: {heading_deg:.2f}°");
+      }}).addTo(map).bindPopup("<b>Point Cloud Footprint</b><br>Scene +Y bearing (true): {heading_deg:.2f}°");
       map.fitBounds(poly.getBounds(), {{ padding: [40, 40] }});
     }}
 
@@ -656,8 +620,8 @@ def georeference_pointcloud(
         "num_points": num_pts,
     }
 
-    compound_crs_str = transform_dict.get("target_compound_crs", "EPSG:31984+3855")
-    crs_compound = pyproj.CRS.from_string(compound_crs_str)
+    target_crs = pyproj.CRS.from_string(transform_dict.get("target_compound_crs")
+                                        or transform_dict["target_horizontal_crs"])
 
     # 1. Export Compressed LAZ
     out_laz = out_dir / "colorized_lidar_georeferenced_utm.laz"
@@ -670,7 +634,7 @@ def georeference_pointcloud(
         float(np.floor(bounds["min_altitude_m"])),
     ]
     header.scales = [0.001, 0.001, 0.001]
-    header.add_crs(crs_compound, keep_compatibility=False)
+    header.add_crs(target_crs, keep_compatibility=False)
 
     las_data = laspy.LasData(header)
     las_data.x = xyz_utm[:, 0]
@@ -688,24 +652,25 @@ def georeference_pointcloud(
 
     # 2. Export ESRI PRJ Definition
     out_prj = out_dir / "colorized_lidar_georeferenced_utm.prj"
-    out_prj.write_text(crs_compound.to_wkt(), encoding="utf-8")
+    out_prj.write_text(target_crs.to_wkt(), encoding="utf-8")
 
     # 3. Export Binary PCD
     out_pcd = out_dir / "colorized_lidar_georeferenced_utm.pcd"
     rgb_uint8 = (cloud.colors * 255.0).astype(np.uint8) if cloud.has_rgb else np.full((num_pts, 3), 200, dtype=np.uint8)
     rgb_packed = (rgb_uint8[:, 0].astype(np.uint32) << 16) | (rgb_uint8[:, 1].astype(np.uint32) << 8) | rgb_uint8[:, 2].astype(np.uint32)
-    dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgb", "<u4")])
+    # UTM northings need float64: float32 would round them to a whole metre.
+    dt = np.dtype([("x", "<f8"), ("y", "<f8"), ("z", "<f8"), ("rgb", "<u4")])
     pcd_arr = np.zeros(num_pts, dtype=dt)
-    pcd_arr["x"] = xyz_utm[:, 0].astype(np.float32)
-    pcd_arr["y"] = xyz_utm[:, 1].astype(np.float32)
-    pcd_arr["z"] = xyz_utm[:, 2].astype(np.float32)
+    pcd_arr["x"] = xyz_utm[:, 0]
+    pcd_arr["y"] = xyz_utm[:, 1]
+    pcd_arr["z"] = xyz_utm[:, 2]
     pcd_arr["rgb"] = rgb_packed
 
     header_str = (
         f"# .PCD v0.7 - Point Cloud Data\n"
         f"VERSION 0.7\n"
         f"FIELDS x y z rgb\n"
-        f"SIZE 4 4 4 4\n"
+        f"SIZE 8 8 8 4\n"
         f"TYPE F F F U\n"
         f"COUNT 1 1 1 1\n"
         f"WIDTH {num_pts}\n"
@@ -753,6 +718,9 @@ def georeference_colmap(
     transformer_to_wgs84 = pyproj.Transformer.from_crs(h_crs, "EPSG:4326", always_xy=True)
     R_mat = np.array(transform_dict["rotation_matrix"], dtype=np.float64)
     t_vec = np.array(transform_dict["translation_utm_m"], dtype=np.float64)
+    convergence = float(transform_dict.get("grid_convergence_deg", 0.0))
+    # Local Z is not an elevation, so it must not reach a photo's GPS altitude tag.
+    has_elevation = "vertical_transform" not in transform_dict
 
     geotagged_cameras = []
     colmap_images_dir = base_dir / "images"
@@ -765,7 +733,7 @@ def georeference_colmap(
 
         forward_loc = f["R_w2c"].T @ np.array([0, 0, 1])
         forward_utm = R_mat @ forward_loc
-        heading_deg = float((np.degrees(np.arctan2(forward_utm[0], forward_utm[1])) + 360.0) % 360.0)
+        heading_deg = float((np.degrees(np.arctan2(forward_utm[0], forward_utm[1])) + convergence) % 360.0)
 
         cam_rec = {
             "name": f["name"],
@@ -795,11 +763,12 @@ def georeference_colmap(
                         piexif.GPSIFD.GPSLatitude: ((d_lat, 1), (m_lat, 1), (s_lat, 1000)),
                         piexif.GPSIFD.GPSLongitudeRef: "W" if lon < 0 else "E",
                         piexif.GPSIFD.GPSLongitude: ((d_lon, 1), (m_lon, 1), (s_lon, 1000)),
-                        piexif.GPSIFD.GPSAltitudeRef: 0 if alt >= 0 else 1,
-                        piexif.GPSIFD.GPSAltitude: (int(abs(alt) * 100), 100),
                         piexif.GPSIFD.GPSImgDirectionRef: "T",
                         piexif.GPSIFD.GPSImgDirection: (int(heading_deg * 100), 100),
                     }
+                    if has_elevation:
+                        gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
+                        gps_ifd[piexif.GPSIFD.GPSAltitude] = (int(abs(alt) * 100), 100)
                     exif_dict = piexif.load(str(img_path))
                     exif_dict["GPS"] = gps_ifd
                     piexif.insert(piexif.dump(exif_dict), str(img_path))
@@ -836,6 +805,10 @@ def run_georeference(
     trajectory: Optional[str | Path] = None,
     crs: Optional[str] = None,
     yaw_deg: Optional[float] = None,
+    street_bearing_deg: Optional[float] = None,
+    dt_sync: Optional[float] = None,
+    capture_origin_s: Optional[float] = None,
+    allow_network: bool = True,
     delta_easting_m: float = 0.0,
     delta_northing_m: float = 0.0,
     delta_elevation_m: float = 0.0,
@@ -864,25 +837,22 @@ def run_georeference(
         if imgs_txt.is_file():
             colmap_frames = parse_colmap_images_txt(imgs_txt)
 
-    # 3. Parse SLAM trajectory if available
-    traj_xyz = None
-    if trajectory and Path(trajectory).is_file():
-        try:
-            arr = np.loadtxt(str(trajectory), ndmin=2)
-            if arr.shape[1] >= 4:
-                traj_xyz = arr[:, 1:4]
-        except Exception:
-            pass
+    # 3. Establish north and position from everything the capture offers
+    timed_trajectory = load_timed_trajectory(trajectory)
+    local_xy = np.array([cf["xyz"][:2] for cf in colmap_frames]) if colmap_frames else None
+    scan_points = load_cloud(cloud).points if cloud and Path(cloud).is_file() else None
+    north = solve_north(gps_info, points=scan_points, trajectory=timed_trajectory, local_xy=local_xy,
+                        dt_sync=dt_sync, capture_origin_s=capture_origin_s, manual_yaw_deg=yaw_deg,
+                        street_bearing_deg=street_bearing_deg, allow_network=allow_network, output_dir=out_dir)
+    del scan_points
 
     # 4. Fit Georeferencing Transformation
     transform_dict = fit_georeference(
         gps_info,
-        colmap_frames=colmap_frames,
-        trajectory_xyz=traj_xyz,
-        manual_yaw_deg=yaw_deg,
         delta_easting_m=delta_easting_m,
         delta_northing_m=delta_northing_m,
         delta_elevation_m=delta_elevation_m,
+        north=north,
     )
 
     # 5. Georeference Point Cloud if provided
@@ -954,7 +924,8 @@ def run_georeference(
             footprint_latlons=footprint_pts,
             cameras=colmap_cameras,
             gps_records=gps_info["records"],
-            heading_deg=transform_dict["yaw_heading_deg"],
+            heading_deg=transform_dict["local_y_true_bearing_deg"],
+            north_status=transform_dict["north_status"],
         )
     except Exception:
         pass
@@ -964,7 +935,7 @@ def run_georeference(
     transform_json_path.write_text(json.dumps(transform_dict, indent=2), encoding="utf-8")
 
     report = {
-        "status": "accepted",
+        "status": REPORT_STATUS[north["status"]],
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "source_insv": str(Path(insv).resolve()),
         "gps_summary": {
@@ -975,7 +946,9 @@ def run_georeference(
             "crs_info": gps_info["crs_info"],
         },
         "transform": transform_dict,
+        "north": north,
         "deliverables": {
+            "review_image": north.get("review_image"),
             "transform_json": str(transform_json_path),
             "geojson_files": geojson_files,
             "cloud_export": cloud_result,

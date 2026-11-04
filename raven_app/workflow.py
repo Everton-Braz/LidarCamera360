@@ -3657,7 +3657,7 @@ def execute_unified_workflow(
             except ValueError:
                 gps_info = {'records': []}
             automatic_georeference(insv_path, deliverables_dir, candidate_clouds=produced,
-                                   formats=geo_formats, trajectory_path=raw_trj, gps_info=gps_info)
+                                   formats=geo_formats, trajectory_path=raw_trj, gps_info=gps_info, dt_sync=dt_sync)
         except ImportError as e:
             print(f"[!] Automatic georeferencing skipped: dependency missing ({e}). Install with 'pip install -r requirements.txt'.")
         except Exception as e:

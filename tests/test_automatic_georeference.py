@@ -16,7 +16,7 @@ class AutomaticGeoreferenceTests(unittest.TestCase):
         result = build_automatic_transform(gps, np.array([[0., 0., 4.], [10., 0., 8.]]))
         matrix = np.asarray(result['matrix_4x4'])
         self.assertEqual(result['scale'], 1.0)
-        self.assertEqual(result['quality'], 'estimated')
+        self.assertEqual(result['quality'], 'location_anchor_only')
         self.assertEqual(matrix[2, 3], 0.0)
         self.assertNotIn('target_compound_crs', result)
 
