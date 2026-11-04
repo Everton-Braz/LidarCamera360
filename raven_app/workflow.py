@@ -37,6 +37,15 @@ from raven_app.slam_source import active_slam_dir
 from raven_app.time_gating import DEFAULT_TIME_WINDOW_S
 from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, find_partner_insv, normalize_dual_insv_pair, frame_time
 
+#: FAST-LIVO2 settings for Raven timelapse captures (LIO). `classic` holds the settings of the 27/09/2026 build that
+#: produced the CASA 374 Home3 trajectory the Revit model was built on. With the current engine those settings are
+#: NOT better on that capture (1.05 % of points 3+ cm off planar patches vs 0.39 % for `timelapse`, 0.23 % for the
+#: 27/09 output): the old build's quality came with the old engine too. To reuse such an output, see --slam-dir.
+TIMELAPSE_SLAM_PROFILES = {
+    'timelapse': {'name': 'raven_timelapse_stable_v1', 'filter_size_surf_m': 0.06, 'voxel_size_m': 0.20},
+    'classic': {'name': 'raven_classic_20260927', 'filter_size_surf_m': 0.10, 'voxel_size_m': 0.60, 'max_layer': 2},
+}
+
 for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, 'reconfigure'):
         try:
@@ -1809,6 +1818,31 @@ def refine_colmap_3dgs_poses(colmap_dir: Path, tracks_dir: Path, update_export_r
     return report
 
 
+def _import_slam_dir(source: Path, output_dir: Path):
+    """Bring an existing SLAM output (pcd/all_raw_points.pcd + result/*.txt) into the dataset as
+    slam_imported_<key>, by hard links where the volume allows (no 1 GB copy). Returns (dir, pcd, trajectory)."""
+    source = Path(source).resolve()
+    pcd = source / 'pcd' / 'all_raw_points.pcd'
+    trajectories = sorted((source / 'result').glob('*.txt'))
+    if not pcd.is_file() or not trajectories:
+        raise FileNotFoundError(f'{source} is not a SLAM output: pcd/all_raw_points.pcd and result/*.txt are required')
+    stat = pcd.stat()
+    key = hashlib.sha256(f'{source}|{stat.st_size}|{stat.st_mtime_ns}'.encode()).hexdigest()[:12]
+    target = Path(output_dir) / f'slam_imported_{key}'
+    for path in source.rglob('*'):
+        if path.is_file():
+            dest = target / path.relative_to(source)
+            if dest.is_file() and dest.stat().st_size == path.stat().st_size:
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(path, dest)
+            except OSError:
+                shutil.copy2(path, dest)
+    (target / 'imported_from.json').write_text(json.dumps({'source': str(source)}, indent=2), encoding='utf-8')
+    return target, target / 'pcd' / 'all_raw_points.pcd', target / 'result' / trajectories[0].name
+
+
 def _replace_dir(source, target, attempts=8, first_delay_s=0.5):
     """os.replace for a directory, retried: Windows refuses to rename a folder while any file inside is
     open, and antivirus or the indexer opens freshly written files for a few seconds (a 30 M point seed)."""
@@ -2744,6 +2778,8 @@ def execute_unified_workflow(
     rebuild=(),
     densify: str = 'off',
     densify_preset: str = 'balanced',
+    slam_profile: str = 'timelapse',
+    slam_dir: Optional[Path] = None,
     profile: Optional[str] = None,
     time_window: float = DEFAULT_TIME_WINDOW_S,
     rig_refine: str = DEFAULT_RIG_REFINE,
@@ -2976,6 +3012,9 @@ def execute_unified_workflow(
     slam_out = output_dir / "slam_out"
     is_eagle = ('livox' in (lidar_topic or '').lower()) or ('eagle' in str(bag_path).lower()) or (lidar_topic == '/livox/lidar')
     timelapse_raven_profile = bool(is_timelapse and lio and not is_eagle)
+    if slam_profile not in TIMELAPSE_SLAM_PROFILES:
+        raise ValueError(f"slam_profile must be one of {sorted(TIMELAPSE_SLAM_PROFILES)}")
+    expected_profile = TIMELAPSE_SLAM_PROFILES[slam_profile]
     base_config = resources() / ('FAST-LIVO2/config/eagle.yaml' if is_eagle else 'FAST-LIVO2/config/raven.yaml')
     if not base_config.is_file():
         base_config = resources() / 'FAST-LIVO2/config/raven.yaml'
@@ -2983,7 +3022,10 @@ def execute_unified_workflow(
     slam_inputs = {'bag': str(Path(bag_path).resolve()), 'size': Path(bag_path).stat().st_size,
                    'mtime_ns': Path(bag_path).stat().st_mtime_ns, 'lio': bool(lio),
                    'lidar_topic': lidar_topic, 'imu_topic': imu_topic,
-                   'timelapse_profile': timelapse_raven_profile, 'provenance_version': 1,
+                   # the default profile keeps its historic key, so existing caches stay valid
+                   'timelapse_profile': (timelapse_raven_profile if slam_profile == 'timelapse' or not timelapse_raven_profile
+                                         else expected_profile['name']),
+                   'provenance_version': 1,
                    'config_sha256': hashlib.sha256(base_config.read_bytes()).hexdigest(),
                    'engine_sha256': hashlib.sha256(native_engine.read_bytes()).hexdigest()
                    if lio and native_engine.is_file() else 'not-used'}
@@ -3000,11 +3042,6 @@ def execute_unified_workflow(
             raw_trj = txts[0]
 
     profile_marker = slam_out / 'workflow_config.json'
-    expected_profile = {
-        'name': 'raven_timelapse_stable_v1',
-        'filter_size_surf_m': 0.06,
-        'voxel_size_m': 0.20,
-    }
     profile_matches = False
     if timelapse_raven_profile and profile_marker.is_file():
         try:
@@ -3016,9 +3053,16 @@ def execute_unified_workflow(
     run_record['rebuild'] = sorted(rebuild)
     if 'slam' in rebuild and raw_pcd.is_file():
         print("[*] --rebuild slam: recomputing the SLAM although a cached result exists.")
-    if raw_pcd.is_file() and raw_trj.is_file() and 'slam' not in rebuild and (
-            not timelapse_raven_profile or profile_matches):
-        print(f"[*] Existing SLAM trajectory ({raw_trj.name}) and PCD found. Re-using output.")
+    imported_slam = None
+    if slam_dir is not None:
+        slam_out, raw_pcd, raw_trj = _import_slam_dir(Path(slam_dir), output_dir)
+        imported_slam = str(Path(slam_dir).resolve())
+        run_record['slam_source'] = {'imported_from': imported_slam, 'directory': slam_out.name}
+        print(f"[*] Using the SLAM output imported from {imported_slam} (FAST-LIVO2 not run).")
+    if imported_slam or (raw_pcd.is_file() and raw_trj.is_file() and 'slam' not in rebuild and (
+            not timelapse_raven_profile or profile_matches)):
+        if not imported_slam:
+            print(f"[*] Existing SLAM trajectory ({raw_trj.name}) and PCD found. Re-using output.")
     else:
         eng = engine()
         if not eng.is_file():
@@ -3046,10 +3090,16 @@ def execute_unified_workflow(
         if timelapse_raven_profile or lio:
             config_text = config_path.read_text(encoding='utf-8')
             if timelapse_raven_profile:
-                config_text, n_surf = re.subn(r'filter_size_surf:\s*[\d\.]+', 'filter_size_surf: 0.06', config_text, count=1)
-                config_text, n_vox = re.subn(r'voxel_size:\s*[\d\.]+', 'voxel_size: 0.20', config_text, count=1)
-                if n_surf != 1 or n_vox != 1:
-                    raise RuntimeError('Cannot build the validated timelapse Raven profile: missing filter_size_surf or voxel_size')
+                config_text, n_surf = re.subn(r'filter_size_surf:\s*[\d\.]+',
+                                              f"filter_size_surf: {expected_profile['filter_size_surf_m']}", config_text, count=1)
+                config_text, n_vox = re.subn(r'voxel_size:\s*[\d\.]+',
+                                             f"voxel_size: {expected_profile['voxel_size_m']}", config_text, count=1)
+                n_layer = 1
+                if 'max_layer' in expected_profile:
+                    config_text, n_layer = re.subn(r'max_layer:\s*\d+', f"max_layer: {expected_profile['max_layer']}",
+                                                   config_text, count=1)
+                if n_surf != 1 or n_vox != 1 or n_layer != 1:
+                    raise RuntimeError('Cannot build the timelapse Raven profile: missing filter_size_surf, voxel_size or max_layer')
             if lio:
                 config_text, count = re.subn(r'(?m)^pcd_save:\s*$',
                                              'pcd_save:\n  scan_provenance_en: true', config_text, count=1)
@@ -3062,7 +3112,9 @@ def execute_unified_workflow(
             if raw_pcd.is_file() and raw_trj.is_file():
                 print('[*] Existing SLAM output has no matching timelapse profile; recomputing it.')
             if timelapse_raven_profile:
-                print('[*] Using tested timelapse LIO settings: surface filter 0.06 m, map voxel 0.20 m.')
+                print(f"[*] Timelapse LIO profile '{slam_profile}': surface filter {expected_profile['filter_size_surf_m']} m, "
+                      f"map voxel {expected_profile['voxel_size_m']} m"
+                      + (f", {expected_profile['max_layer']} map layers." if 'max_layer' in expected_profile else '.'))
 
         camera_path = slam_out / "camera_raven.yaml"
         if not camera_path.is_file():
@@ -3128,7 +3180,11 @@ def execute_unified_workflow(
             if txts:
                 raw_trj = txts[0]
 
-    if lio and revisit_refinement:
+    if lio and revisit_refinement and imported_slam and not (slam_out / 'scan_ranges.csv').is_file():
+        run_record['slam_refinement'] = {'status': 'skipped_imported',
+                                         'reason': 'the imported SLAM output has no scan provenance (scan_ranges.csv)'}
+        print('[*] Revisit refinement skipped: the imported SLAM has no scan_ranges.csv; colorization runs ungated.')
+    elif lio and revisit_refinement:
         from raven_app.slam_refinement import refine, VERSION
         if not (slam_out / 'scan_ranges.csv').is_file():
             raise RuntimeError('SLAM output lacks exact scan provenance; recompute the raw SLAM in a fresh output directory')

@@ -306,6 +306,11 @@ def parse(argv=None):
     wf.add_argument('--densify',choices=('off','roma'),default='off',
                     help='roma: RoMa v2 dense matching on the 3DGS export, added to its seed only in LiDAR gaps (colmap_3dgs/densify)')
     wf.add_argument('--densify-preset',choices=('fast','balanced','high'),default='balanced')
+    wf.add_argument('--slam-profile',choices=('timelapse','classic'),default='timelapse',
+                    help='FAST-LIVO2 settings for Raven timelapse captures: timelapse = surface 0.06 m / map 0.20 m; '
+                         'classic = 0.10 m / 0.60 m / 2 layers (the 27/09/2026 CASA 374 settings)')
+    wf.add_argument('--slam-dir',type=Path,default=None,
+                    help='use this existing SLAM output (pcd/all_raw_points.pcd + result/*.txt) instead of running FAST-LIVO2')
     wf.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from beginning of dataset')
     wf.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end of dataset')
     wf.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for camera frame extraction')
@@ -804,6 +809,8 @@ def run(a):
             rebuild=tuple(getattr(a, 'rebuild', ()) or ()),
             densify=getattr(a, 'densify', 'off'),
             densify_preset=getattr(a, 'densify_preset', 'balanced'),
+            slam_profile=getattr(a, 'slam_profile', 'timelapse'),
+            slam_dir=getattr(a, 'slam_dir', None),
             profile=a.profile,
             time_window=a.time_window,
             rig_refine=a.rig_refine,
