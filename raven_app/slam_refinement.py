@@ -13,14 +13,14 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import coo_matrix, vstack
-from scipy.spatial.transform import Rotation, Slerp
 
 from . import slam_refinement_geometry as geo
-from .slam_refinement_constraints import plane_constraints, validate_records
+from .slam_refinement_constraints import doubled_surfaces, plane_constraints, validate_records
 
-VERSION = 'revisit-plane-bundle-v2'
+VERSION = 'revisit-plane-bundle-v3'
 PARAMETERS = {'submap_seconds': 10., 'voxel_m': .08, 'max_submap_points': 40000,
-              'max_loops_per_node': 8, 'plane_radius_m': .35, 'plane_sigma_m': .015}
+              'max_loops_per_node': 8, 'plane_radius_m': .35, 'plane_sigma_m': .015,
+              'jump_threshold_m': .055, 'edge_sigmas': geo.EDGE_SIGMAS}
 
 
 def source_signature(paths):
@@ -71,45 +71,32 @@ def graph_jacobian(parameters, nodes, edges):
     return coo_matrix((values, (rows, cols)), shape=(len(base), len(parameters))).tocsr()
 
 
+def correction_limits(nodes):
+    """Largest believable correction, from the distance walked: drift, not a misplaced map."""
+    path = float(sum(np.linalg.norm(b.position-a.position) for a, b in zip(nodes, nodes[1:])))
+    return max(1., .01*path), max(5., .02*path)
+
+
+def loop_limits(nodes, i, j):
+    """Largest believable error of the odometry between two submaps; 2 % of the walk plus a margin."""
+    path = float(sum(np.linalg.norm(b.position-a.position) for a, b in zip(nodes[i:j], nodes[i+1:j+1])))
+    return .5+.02*path, 3.+.02*path
+
+
 def solve(nodes, loops, point_jac, point_errors, method='rootslam', config=None):
+    max_m, max_deg = correction_limits(nodes)
     if method == 'rootslam':
         try:
             from .rootslam import rootslam_solve, RootSLAMConfig
-            cfg = config or RootSLAMConfig(precision='float32')
+            cfg = config or RootSLAMConfig(precision='float64', max_translation_correction_m=max_m,
+                                           max_rotation_correction_deg=max_deg, use_analytical_jacobians=True)
             return rootslam_solve(nodes, loops, point_jac, point_errors, config=cfg)
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning(f"RootSLAM solver fallback to LSMR: {exc}")
 
-    edges = [(i, i+1, *geo.relative_pose(nodes[i], nodes[i+1]), 'odometry')
-             for i in range(len(nodes)-1)] + loops
-    anchors = []
-    for i, j, relative_r, relative_t, _ in loops:
-        early, late = nodes[i], nodes[j]
-        delta = early.rotation*relative_r.inv()*late.rotation.inv()
-        position = early.position-early.rotation.apply(relative_r.inv().apply(relative_t))
-        anchors.append((late.timestamp, delta, position-delta.apply(late.position)))
-    reference_time = min(nodes[i].timestamp for i, *_ in loops)
-    times, rotations, translations = [nodes[0].timestamp], [Rotation.identity()], [np.zeros(3)]
-    if reference_time > times[0]:
-        times.append(reference_time)
-        rotations.append(Rotation.identity())
-        translations.append(np.zeros(3))
-    for timestamp in sorted(set(a[0] for a in anchors)):
-        if timestamp <= times[-1]:
-            continue
-        group = [a for a in anchors if a[0] == timestamp]
-        times.append(timestamp)
-        rotations.append(Rotation.concatenate([a[1] for a in group]).mean())
-        translations.append(np.mean([a[2] for a in group], axis=0))
-    query = np.clip([n.timestamp for n in nodes], times[0], times[-1])
-    dr = Slerp(times, Rotation.concatenate(rotations))(query)
-    dt = np.column_stack([np.interp(query, times, np.asarray(translations)[:, k]) for k in range(3)])
-    initial = []
-    for node, rotation, translation in zip(nodes[1:], dr[1:], dt[1:]):
-        initial.extend((node.rotation.inv()*rotation*node.rotation).as_rotvec())
-        initial.extend(node.rotation.inv().apply(rotation.apply(node.position)+translation-node.position))
-    initial = np.asarray(initial)
+    edges = geo.odometry_edges(nodes) + loops
+    initial = np.zeros((len(nodes)-1)*6)
 
     def residual(x):
         return np.concatenate([geo.graph_residual(x, nodes, edges), point_errors+point_jac@x])
@@ -123,8 +110,9 @@ def solve(nodes, loops, point_jac, point_errors, method='rootslam', config=None)
     if not result.success or not np.isfinite(result.x).all():
         raise ValueError(f'Refinement did not converge: {result.message}')
     changes = np.vstack([np.zeros(6), result.x.reshape(-1, 6)])
-    if np.max(np.linalg.norm(changes[:, 3:], axis=1)) > 8. or np.max(np.linalg.norm(changes[:, :3], axis=1)) > np.deg2rad(20):
-        raise ValueError('Optimized correction exceeds 8 m or 20 degrees')
+    if np.max(np.linalg.norm(changes[:, 3:], axis=1)) > max_m or \
+            np.max(np.linalg.norm(changes[:, :3], axis=1)) > np.deg2rad(max_deg):
+        raise ValueError(f'Optimized correction exceeds {max_m:.1f} m or {max_deg:.1f} degrees')
     report = {'success': True, 'nfev': result.nfev, 'cost': float(result.cost),
               'optimality': float(result.optimality), 'message': result.message,
               'initial_cost': float(np.sum(residual(initial)**2)/2)}
@@ -143,6 +131,10 @@ def accept_refinement(quality, closure_improved):
     surface normals. It may only carry a candidate whose surfaces are no worse than the raw ones
     (CASA 374 Home3: closure improved, normals 99.5 % consistent, surfaces 9.9 -> 19.2 mm RMSE, accepted).
     """
+    before, after = (quality.get('doubled_surfaces') or {}), (quality.get('doubled_surfaces_after') or {})
+    if before.get('share_over_6cm') is not None and after.get('share_over_6cm') is not None and \
+            after['share_over_6cm'] > before['share_over_6cm']:
+        return False  # the whole point of closing loops; surfaces can stay flat while walls double
     if quality.get('improved'):
         return True
     reduction = quality.get('relative_rmse_reduction')
@@ -200,14 +192,18 @@ def refine(slam_dir: Path, output: Path, log=print):
             log(f'Stationary warm-up detected ({onset_time - scans[0].timestamp:.2f}s). Filtering pre-mission scans.')
             scans = valid_scans
 
-    nodes = geo.build_nodes(pcd, scans, trajectory, window_seconds=10., voxel_m=.08, maximum=40000)
+    jumps = geo.detect_pose_jumps(trajectory, slam_dir/'imu.txt', threshold_m=PARAMETERS['jump_threshold_m'])
+    jumps = jumps[jumps > scans[0].timestamp]
+    if len(jumps):
+        log(f'SLAM pose jumps found at {", ".join(f"{t-trajectory.times[0]:.1f}" for t in jumps)} s.')
+    nodes = geo.build_nodes(pcd, scans, trajectory, window_seconds=10., voxel_m=.08, maximum=40000, breaks=jumps)
     max_loops = int(PARAMETERS.get('max_loops_per_node', 8))
     selected, skipped, selection = geo.select_loop_pairs(nodes, max_neighbors=max_loops)
     loops, evidence, rejected = [], [], []
     log(f'Global SLAM refinement: {len(nodes)} submaps, {len(selected)} revisit candidates.')
     for number, (i, j, _, _) in enumerate(selected):
         try:
-            rotation, translation, row = geo.propose_loop(nodes[i], nodes[j], 42+31*i+j)
+            rotation, translation, row = geo.propose_loop(nodes[i], nodes[j], 42+31*i+j, *loop_limits(nodes, i, j))
             loops.append((i, j, rotation, translation, 'loop'))
             evidence.append(row)
         except ValueError as exc:
@@ -215,6 +211,7 @@ def refine(slam_dir: Path, output: Path, log=print):
         if number % 10 == 0:
             log(f'Revisit validation {number+1}/{len(selected)}; accepted {len(loops)}.')
     report = {'version': VERSION, 'source_signature': signature, 'accepted_loops': len(loops),
+              'pose_jumps_s': [float(t-trajectory.times[0]) for t in jumps],
               'selection': selection, 'rejected_candidates': rejected, 'skipped_by_degree_cap': skipped}
     if not loops:
         output.mkdir(parents=True)
@@ -238,6 +235,10 @@ def refine(slam_dir: Path, output: Path, log=print):
                                 graph, edges, evidence, selection, PARAMETERS)
             log('Validating corrected geometry on independent reference records.')
             quality = validate_records(pcd, geo.read_pcd(output/'pcd'/pcd.path.name))
+            quality['doubled_surfaces'] = doubled_surfaces(nodes)
+            quality['doubled_surfaces_after'] = doubled_surfaces(nodes, parameters)
+            log(f"Doubled surfaces over 6 cm: {quality['doubled_surfaces']['share_over_6cm']} -> "
+                f"{quality['doubled_surfaces_after']['share_over_6cm']}.")
         except Exception:
             # The directory was proven absent above and contains only this
             # incomplete candidate; never leave a cache-shaped partial result.

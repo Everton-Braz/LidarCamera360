@@ -47,6 +47,7 @@ class Node:
     position: np.ndarray
     points: np.ndarray
     scan_ids: tuple[int, ...]
+    segment: int = 0  # stretch between two pose jumps; corrections stay continuous inside one
 
 def read_pcd(path: Path) -> PCD:
     header_lines: list[bytes] = []
@@ -203,15 +204,68 @@ def voxel_downsample(points: np.ndarray, voxel_m: float, maximum: int) -> np.nda
         reduced = reduced[selected]
     return reduced
 
-def build_nodes(pcd: PCD, scans: list[Scan], traj: Trajectory,
-                window_seconds: float, voxel_m: float, maximum: int) -> list[Node]:
-    # Use temporal windows while preserving the exact contiguous scan order.
+def read_imu_world_acceleration(path: Path, traj: Trajectory):
+    """(times, world acceleration without gravity) of the SLAM's imu.txt, on the trajectory's clock.
+
+    imu.txt counts from the start of the recording, so the offset is found by matching rotation rates.
+    """
+    imu = np.loadtxt(path)
+    rate = np.linalg.norm((traj.rotations[:-1].inv() * traj.rotations[1:]).as_rotvec(), axis=1) / np.diff(traj.times)
+    elapsed = traj.times[:-1] - traj.times[0]
+    since_start = imu[:, 0] - imu[0, 0]
+    magnitude = np.linalg.norm(imu[:, 1:4], axis=1)
+    offsets = np.arange(-5., 5., .05)
+    scores = [np.corrcoef(rate, np.interp(elapsed + offset, since_start, magnitude))[0, 1] for offset in offsets]
+    times = since_start - offsets[int(np.argmax(scores))] + traj.times[0]
+    inside = (times > traj.times[0]) & (times < traj.times[-1])
+    world = traj.slerp(times[inside]).apply(imu[inside, 4:7])
+    return times[inside], world - world.mean(axis=0)
+
+
+def detect_pose_jumps(traj: Trajectory, imu_path: Path | None = None, threshold_m: float = .055, half: int = 6):
+    """Times where the SLAM pose steps instead of moving.
+
+    An EKF that re-locks onto its own map moves the pose by centimetres between two scans: everything mapped on
+    either side of that instant lands offset, which is a doubled wall (CASA 374: 14 cm at 469.5 s, undone at
+    494.9 s). No smooth correction can undo that. Fast handling also looks like a step in the positions alone,
+    so the IMU's double integral is subtracted first, and each side is extrapolated to the instant.
+    Each hit only allows a discontinuity: the jump itself is then measured by ICP, so a false hit costs little.
+    """
+    times, positions = traj.times, traj.positions
+    residual = positions - positions[0]
+    if imu_path is not None and Path(imu_path).exists():
+        imu_times, acceleration = read_imu_world_acceleration(Path(imu_path), traj)
+        step = np.gradient(imu_times)[:, None]
+        integral = np.cumsum(np.cumsum(acceleration * step, axis=0) * step, axis=0)
+        residual = residual - np.column_stack([np.interp(times, imu_times, integral[:, k]) for k in range(3)])
+    gaps = np.zeros(len(times))
+    for i in range(half + 1, len(times) - half - 1):
+        before, after = np.arange(i - half - 1, i), np.arange(i + 1, i + half + 2)
+        fit = [np.linalg.lstsq(np.vander(times[side] - times[i], 3), residual[side] - residual[i], rcond=None)[0][2]
+               for side in (before, after)]
+        gaps[i] = np.linalg.norm(fit[1] - fit[0])
+    jumps, taken = [], np.zeros(len(times), bool)
+    for i in np.argsort(-gaps):
+        if gaps[i] < threshold_m:
+            break
+        if not taken[max(0, i - 10):i + 11].any():  # one hit per second
+            taken[i] = True
+            jumps.append(float(times[i]))
+    return np.sort(np.asarray(jumps, dtype=np.float64))
+
+
+def build_nodes(pcd: PCD, scans: list[Scan], traj: Trajectory, window_seconds: float, voxel_m: float,
+                maximum: int, breaks=()) -> list[Node]:
+    # Use temporal windows while preserving the exact contiguous scan order. A window also ends at a pose jump.
+    breaks = np.asarray(breaks, dtype=np.float64)
     groups: list[list[int]] = []
     current: list[int] = []
     bucket = None
     origin = scans[0].timestamp
     for scan_id, scan in enumerate(scans):
-        this_bucket = int(math.floor((scan.timestamp - origin) / window_seconds))
+        segment = int(np.searchsorted(breaks, scan.timestamp, side='right'))
+        start = breaks[segment - 1] if segment else origin
+        this_bucket = (segment, int(math.floor((scan.timestamp - start) / window_seconds)))
         if current and this_bucket != bucket:
             groups.append(current)
             current = []
@@ -243,9 +297,12 @@ def build_nodes(pcd: PCD, scans: list[Scan], traj: Trajectory,
             raise ValueError(f"Submap {len(nodes)} has no finite points")
         downsampled = voxel_downsample(np.concatenate(chunks), voxel_m, maximum)
         if len(downsampled) < 200:
+            if nodes and len(breaks):
+                continue  # a sliver between two close jumps; its scans follow the nearest submap
             raise ValueError(f"Submap {len(nodes)} has only {len(downsampled)} points")
         nodes.append(Node(len(nodes), first.timestamp, last.timestamp, center_time,
-                          center_rotation, center_position, downsampled, tuple(scan_ids)))
+                          center_rotation, center_position, downsampled, tuple(scan_ids),
+                          int(np.searchsorted(breaks, first.timestamp, side='right'))))
     if len(nodes) < 2:
         raise ValueError("Need at least two temporal submaps")
     return nodes
@@ -334,8 +391,9 @@ def icp_point_to_plane(source: np.ndarray, target: np.ndarray,
         raise ValueError(f"Final ICP fitness {fitness:.3f} is below 0.50")
     plane_errors = np.einsum("ij,ij->i", normals[indices[valid]], moved[valid] - target[indices[valid]])
     plane_rms = float(np.sqrt(np.mean(plane_errors ** 2)))
-    if plane_rms >= 0.15 or rms >= 0.25:
-        raise ValueError(f"Final ICP surface RMS {plane_rms:.4f}m / nearest RMS {rms:.4f}m failed 0.15m / 0.25m gates")
+    # CASA 374: every loop off by metres had a plane RMS of 8 cm or more, true ones stayed under 5 cm
+    if plane_rms >= 0.05 or rms >= 0.25:
+        raise ValueError(f"Final ICP surface RMS {plane_rms:.4f}m / nearest RMS {rms:.4f}m failed 0.05m / 0.25m gates")
     return rotation, translation, {"fitness": fitness, "rms_m": rms, "plane_rms_m": plane_rms,
                                   "iterations": iterations, **normal_report}
 
@@ -357,7 +415,7 @@ def heldout_metrics(source: np.ndarray, target: np.ndarray,
                 None if forward["rms_inlier_m"] is None or reverse["rms_inlier_m"] is None else
                 0.5 * (forward["rms_inlier_m"] + reverse["rms_inlier_m"]))}
 
-def propose_loop(source_node: Node, target_node: Node, seed: int):
+def propose_loop(source_node: Node, target_node: Node, seed: int, max_m: float = 8., max_deg: float = 20.):
     initial_rotation, initial_translation = relative_pose(source_node, target_node)
     source, target = source_node.points, target_node.points
     rng = np.random.default_rng(seed)
@@ -402,7 +460,7 @@ def propose_loop(source_node: Node, target_node: Node, seed: int):
     delta_translation = translation - delta_rotation.apply(initial_translation)
     delta_degrees = float(np.degrees(delta_rotation.magnitude()))
     delta_m = float(np.linalg.norm(delta_translation))
-    if delta_m > 8.0 or delta_degrees > 20.0:
+    if delta_m > max_m or delta_degrees > max_deg:
         raise ValueError(f"Relative correction too large ({delta_m:.3f}m, {delta_degrees:.2f}deg)")
     return (rotation, translation, {
         "accepted": True, "source_node": source_node.index, "target_node": target_node.index,
@@ -425,7 +483,12 @@ def select_loop_pairs(nodes: list[Node], max_neighbors: int):
             if separation >= 25.0 and distance <= 16.0:
                 pairs.append((distance, -separation, i, j))
     pairs.sort()
+    # the two submaps around a pose jump are the only direct measurement of that jump
+    bridges = [(i, i + 1) for i in range(len(nodes) - 1) if nodes[i].segment != nodes[i + 1].segment]
     selected, degrees, skipped = [], [0] * len(nodes), []
+    for i, j in bridges:
+        selected.append((i, j, float(np.linalg.norm(nodes[j].position - nodes[i].position)),
+                         nodes[j].timestamp - nodes[i].timestamp))
     for distance, neg_sep, i, j in pairs:
         if degrees[i] >= max_neighbors or degrees[j] >= max_neighbors:
             skipped.append({"source_node": i, "target_node": j,
@@ -439,7 +502,7 @@ def select_loop_pairs(nodes: list[Node], max_neighbors: int):
         degrees[i] += 1
         degrees[j] += 1
     return selected, skipped, {"spatial_temporal_candidates": len(pairs),
-                               "selected_for_icp": len(selected),
+                               "selected_for_icp": len(selected), "jump_bridges": len(bridges),
                                "skipped_by_degree_cap": len(skipped)}
 
 def transform_from_correction(node: Node, correction: np.ndarray):
@@ -448,6 +511,20 @@ def transform_from_correction(node: Node, correction: np.ndarray):
     world_rotation = node.rotation * delta_rotation
     world_position = node.position + node.rotation.apply(correction[3:])
     return world_rotation, world_position
+
+#: (metres, degrees) of each edge kind. Ten seconds of LiDAR odometry are good to centimetres unless the pose jumped.
+EDGE_SIGMAS = {'odometry': (.03, .2), 'jump': (.30, 2.), 'loop': (.02, .2)}
+
+
+def edge_sigmas(kind):
+    translation, degrees = EDGE_SIGMAS[kind]
+    return translation, np.deg2rad(degrees)
+
+
+def odometry_edges(nodes):
+    return [(i, i + 1, *relative_pose(nodes[i], nodes[i + 1]),
+             'odometry' if nodes[i].segment == nodes[i + 1].segment else 'jump') for i in range(len(nodes) - 1)]
+
 
 def graph_residual(parameters, nodes, edges):
     corrected = [transform_from_correction(node, np.zeros(6) if i == 0 else
@@ -461,31 +538,47 @@ def graph_residual(parameters, nodes, edges):
         predicted_translation = rj.inv().apply(ti - tj)
         error_rotation = measured_rotation.inv() * predicted_rotation
         error_translation = measured_rotation.inv().apply(predicted_translation - measured_translation)
-        if kind == 'odometry':
-            trans_sigma, rot_sigma = (0.10, np.deg2rad(0.8))
-        else:
-            trans_sigma, rot_sigma = (0.02, np.deg2rad(0.2))
+        trans_sigma, rot_sigma = edge_sigmas(kind)
         chunks.extend((error_translation / trans_sigma).tolist())
         chunks.extend((error_rotation.as_rotvec() / rot_sigma).tolist())
     return np.asarray(chunks, dtype=np.float64)
 
 def correction_curve(nodes: list[Node], parameters: np.ndarray, query_times: np.ndarray):
+    """World corrections at any time, continuous inside a segment and free to step at a pose jump."""
     rotations, translations = [], []
     for index, node in enumerate(nodes):
         correction = np.zeros(6) if index == 0 else parameters[(index - 1) * 6:index * 6]
         corrected_rotation, corrected_position = transform_from_correction(node, correction)
         # World-left correction D = corrected pose * inverse(original pose).
         delta_rotation = corrected_rotation * node.rotation.inv()
-        delta_translation = corrected_position - delta_rotation.apply(node.position)
         rotations.append(delta_rotation)
-        translations.append(delta_translation)
-    node_times = np.asarray([node.timestamp for node in nodes])
-    clipped = np.clip(query_times, node_times[0], node_times[-1])
-    interpolator = Slerp(node_times, Rotation.concatenate(rotations))
-    d_rotations = interpolator(clipped)
-    d_translations = np.column_stack([
-        np.interp(clipped, node_times, np.asarray(translations)[:, axis]) for axis in range(3)])
-    return d_rotations, d_translations
+        translations.append(corrected_position - delta_rotation.apply(node.position))
+    rotations, translations = Rotation.concatenate(rotations), np.asarray(translations)
+    query_times = np.asarray(query_times, dtype=np.float64)
+    segments, firsts = segment_starts(nodes)
+    owner = np.clip(np.searchsorted(firsts, query_times, side='right') - 1, 0, len(segments) - 1)
+    quaternions, shifts = np.zeros((len(query_times), 4)), np.zeros((len(query_times), 3))
+    for number, members in enumerate(segments):
+        mask = owner == number
+        if not mask.any():
+            continue
+        if len(members) == 1:
+            quaternions[mask] = rotations[members[0]].as_quat()
+            shifts[mask] = translations[members[0]]
+            continue
+        knots = np.asarray([nodes[i].timestamp for i in members])
+        clipped = np.clip(query_times[mask], knots[0], knots[-1])
+        quaternions[mask] = Slerp(knots, rotations[members])(clipped).as_quat()
+        shifts[mask] = np.column_stack([np.interp(clipped, knots, translations[members, k]) for k in range(3)])
+    return Rotation.from_quat(quaternions), shifts
+
+
+def segment_starts(nodes: list[Node]):
+    """Node indices of each segment and the time each segment begins."""
+    ids = sorted({node.segment for node in nodes})
+    segments = [[node.index for node in nodes if node.segment == segment] for segment in ids]
+    return segments, np.asarray([nodes[members[0]].start_time for members in segments])
+
 
 def write_candidate(output: Path, pcd: PCD, scans: list[Scan], traj: Trajectory,
                     nodes: list[Node], parameters: np.ndarray, source_ranges: Path,

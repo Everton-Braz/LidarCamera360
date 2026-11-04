@@ -24,9 +24,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from scipy.sparse import coo_matrix, csr_matrix, eye as speye, vstack
-from scipy.sparse.linalg import lsqr
-from scipy.spatial.transform import Rotation, Slerp
+from scipy.sparse import coo_matrix, csr_matrix, diags, eye as speye, vstack
+from scipy.sparse.linalg import splu
 
 from . import slam_refinement_geometry as geo
 
@@ -129,6 +128,9 @@ class RootSLAMConfig:
     gtol: float = 1e-5
     max_translation_correction_m: float = 8.0
     max_rotation_correction_deg: float = 20.0
+    #: Graduated non-convexity on loops (Geman-McClure scale, in sigmas): wide first so true loops all pull,
+    #: then narrowing until a wrong one has no say. Plain least squares lets a single 6 m ICP loop bend the map.
+    robust_scales: Tuple[float, ...] = (32., 16., 8., 4., 2.)
     use_analytical_jacobians: bool = False
     enable_posegraph_regularizer: bool = True
 
@@ -159,10 +161,7 @@ def analytical_graph_residual_and_jacobian(
         ri, ti = corrected[i]
         rj, tj = corrected[j]
 
-        if kind == 'odometry':
-            trans_sigma, rot_sigma = 0.10, np.deg2rad(0.8)
-        else:
-            trans_sigma, rot_sigma = 0.02, np.deg2rad(0.2)
+        trans_sigma, rot_sigma = geo.edge_sigmas(kind)
 
         pred_rot = rj.inv() * ri
         pred_trans = rj.inv().apply(ti - tj)
@@ -242,20 +241,15 @@ class RootSLAMSolver:
             point_errors: Optional[np.ndarray] = None,
             initial_guess: Optional[np.ndarray] = None) -> Tuple[np.ndarray, List[Tuple], Dict[str, Any]]:
         """Execute Square Root Bundle Adjustment with Pose-Graph regularizer."""
-        edges = [(i, i + 1, *geo.relative_pose(nodes[i], nodes[i + 1]), 'odometry')
-                 for i in range(len(nodes) - 1)] + loops
+        edges = geo.odometry_edges(nodes) + loops
 
         num_nodes = len(nodes)
         num_params = (num_nodes - 1) * 6
         dtype = self.dtype
 
-        if initial_guess is None:
-            initial = self._compute_initial_anchors(nodes, loops)
-        else:
-            initial = initial_guess.astype(dtype)
-
-        current_x = initial.astype(dtype)
-        current_lambda = float(self.config.initial_lambda)
+        # The raw trajectory is the starting point: it is right to centimetres, and every outlier would pull a
+        # guess built from the loops themselves.
+        current_x = np.zeros(num_params, dtype=dtype) if initial_guess is None else initial_guess.astype(dtype)
 
         if point_jac is not None and point_errors is not None:
             p_jac = point_jac.astype(dtype)
@@ -264,75 +258,71 @@ class RootSLAMSolver:
             p_jac = csr_matrix((0, num_params), dtype=dtype)
             p_err = np.zeros(0, dtype=dtype)
 
-        def evaluate_residuals(x_vec: np.ndarray) -> Tuple[np.ndarray, csr_matrix]:
+        def evaluate_graph(x_vec: np.ndarray) -> Tuple[np.ndarray, csr_matrix]:
             x_f64 = x_vec.astype(np.float64)
             if self.config.use_analytical_jacobians:
-                pg_res, pg_jac = analytical_graph_residual_and_jacobian(x_f64, nodes, edges, dtype=dtype)
-            else:
-                from .slam_refinement import graph_jacobian
-                pg_res = geo.graph_residual(x_f64, nodes, edges).astype(dtype)
-                pg_jac = graph_jacobian(x_f64, nodes, edges).astype(dtype)
+                return analytical_graph_residual_and_jacobian(x_f64, nodes, edges, dtype=dtype)
+            from .slam_refinement import graph_jacobian
+            return geo.graph_residual(x_f64, nodes, edges).astype(dtype), graph_jacobian(x_f64, nodes, edges).astype(dtype)
 
+        def loop_weights(graph_residuals: np.ndarray, scale: float) -> np.ndarray:
+            weights = np.ones(len(edges), dtype=np.float64)
+            sizes = np.linalg.norm(graph_residuals.reshape(-1, 6), axis=1)[num_nodes - 1:]
+            weights[num_nodes - 1:] = (1. + (sizes / scale) ** 2) ** -2.
+            return weights
+
+        def evaluate_residuals(x_vec: np.ndarray, weights: np.ndarray) -> Tuple[np.ndarray, csr_matrix]:
+            pg_res, pg_jac = evaluate_graph(x_vec)
+            root = diags(np.repeat(np.sqrt(weights), 6).astype(dtype))
+            pg_res, pg_jac = root @ pg_res, root @ pg_jac
             if p_jac.shape[0] > 0:
-                all_res = np.concatenate([pg_res, p_err + p_jac @ x_vec])
-                all_jac = vstack([pg_jac, p_jac]).tocsr()
-            else:
-                all_res = pg_res
-                all_jac = pg_jac
-            return all_res, all_jac
+                return np.concatenate([pg_res, p_err + p_jac @ x_vec]), vstack([pg_jac, p_jac]).tocsr()
+            return pg_res, pg_jac.tocsr()
 
-        current_res, current_jac = evaluate_residuals(current_x)
-        current_cost = 0.5 * float(np.sum(current_res ** 2))
-        initial_cost = current_cost
-
-        logger.info(f"[RootSLAM] Starting Square Root BA (precision={self.config.precision}). Initial cost: {initial_cost:.4e}")
+        logger.info(f"[RootSLAM] Starting robust BA (precision={self.config.precision}).")
 
         iteration = 0
         converged = False
         history = []
+        initial_cost = None
+        weights = np.ones(len(edges))
+        current_cost = 0.
+        current_res, current_jac = None, None
 
-        while iteration < self.config.max_iterations:
-            iteration += 1
+        for scale in (*self.config.robust_scales, None):
+            # None is the final polish, with the last weights frozen
+            if scale is not None:
+                weights = loop_weights(evaluate_graph(current_x)[0], scale)
+            current_lambda = float(self.config.initial_lambda)
+            current_res, current_jac = evaluate_residuals(current_x, weights)
+            current_cost = 0.5 * float(np.sum(current_res ** 2))
+            initial_cost = current_cost if initial_cost is None else initial_cost
+            converged = False
+            for _ in range(self.config.max_iterations):
+                iteration += 1
+                normal = (current_jac.T @ current_jac).astype(np.float64).tocsc()
+                gradient = np.asarray(current_jac.T @ current_res, dtype=np.float64)
+                damped = (normal + current_lambda * speye(num_params, format='csc')).tocsc()
+                delta_x = splu(damped).solve(-gradient).astype(dtype)
+                step_norm = float(np.linalg.norm(delta_x))
 
-            damping_rows = np.sqrt(current_lambda) * speye(num_params, dtype=dtype, format='csr')
-            damped_jac = vstack([current_jac, damping_rows]).tocsr()
-            damped_rhs = np.concatenate([-current_res, np.zeros(num_params, dtype=dtype)])
+                candidate_x = current_x + delta_x
+                cand_res, cand_jac = evaluate_residuals(candidate_x, weights)
+                cand_cost = 0.5 * float(np.sum(cand_res ** 2))
+                actual_reduction = current_cost - cand_cost
 
-            sol = lsqr(damped_jac, damped_rhs, atol=1e-7, btol=1e-7, iter_lim=500)
-            delta_x = sol[0].astype(dtype)
-
-            step_norm = float(np.linalg.norm(delta_x))
-            max_step = 2.0
-            if step_norm > max_step:
-                delta_x = delta_x * (max_step / step_norm)
-                step_norm = max_step
-
-            candidate_x = current_x + delta_x
-
-            cand_res, cand_jac = evaluate_residuals(candidate_x)
-            cand_cost = 0.5 * float(np.sum(cand_res ** 2))
-
-            actual_reduction = current_cost - cand_cost
-            linear_pred = current_res + current_jac @ delta_x
-            pred_reduction = current_cost - 0.5 * float(np.sum(linear_pred ** 2))
-
-            if actual_reduction > 0:
-                current_x = candidate_x
-                current_res = cand_res
-                current_jac = cand_jac
-                current_cost = cand_cost
-
-                current_lambda = max(self.config.min_lambda, current_lambda / self.config.lambda_factor)
-                history.append({'iter': iteration, 'cost': current_cost, 'step_norm': step_norm, 'accepted': True})
-
-                if actual_reduction < self.config.ftol * current_cost or step_norm < self.config.xtol:
-                    converged = True
-                    break
-            else:
-                current_lambda = min(self.config.max_lambda, current_lambda * self.config.lambda_factor)
-                history.append({'iter': iteration, 'cost': current_cost, 'step_norm': step_norm, 'accepted': False})
-                if current_lambda >= self.config.max_lambda:
-                    break
+                if actual_reduction > 0:
+                    current_x, current_res, current_jac, current_cost = candidate_x, cand_res, cand_jac, cand_cost
+                    current_lambda = max(self.config.min_lambda, current_lambda / self.config.lambda_factor)
+                    history.append({'iter': iteration, 'cost': current_cost, 'step_norm': step_norm, 'accepted': True})
+                    if actual_reduction < self.config.ftol * current_cost or step_norm < self.config.xtol:
+                        converged = True
+                        break
+                else:
+                    current_lambda = min(self.config.max_lambda, current_lambda * self.config.lambda_factor)
+                    history.append({'iter': iteration, 'cost': current_cost, 'step_norm': step_norm, 'accepted': False})
+                    if current_lambda >= self.config.max_lambda:
+                        break
 
         changes = np.vstack([np.zeros(6, dtype=dtype), current_x.reshape(-1, 6)])
         max_trans = float(np.max(np.linalg.norm(changes[:, 3:], axis=1)))
@@ -355,6 +345,9 @@ class RootSLAMSolver:
             'initial_cost': float(initial_cost),
             'cost': float(current_cost),
             'cost_reduction_ratio': float((initial_cost - current_cost) / (initial_cost + 1e-12)),
+            'loops_kept': int(np.sum(weights[num_nodes - 1:] > .5)),
+            'loops_dropped': int(np.sum(weights[num_nodes - 1:] <= .5)),
+            'loop_weights': [round(float(value), 4) for value in weights[num_nodes - 1:]],
             'optimality': optimality,
             'max_translation_m': max_trans,
             'max_rotation_deg': max_rot_deg,
@@ -363,39 +356,6 @@ class RootSLAMSolver:
             'history': history
         }
         return current_x.astype(np.float64), edges, report
-
-    def _compute_initial_anchors(self, nodes: List[Any], loops: List[Tuple]) -> np.ndarray:
-        anchors = []
-        for i, j, relative_r, relative_t, _ in loops:
-            early, late = nodes[i], nodes[j]
-            delta = early.rotation * relative_r.inv() * late.rotation.inv()
-            position = early.position - early.rotation.apply(relative_r.inv().apply(relative_t))
-            anchors.append((late.timestamp, delta, position - delta.apply(late.position)))
-
-        reference_time = min(nodes[i].timestamp for i, *_ in loops)
-        times, rotations, translations = [nodes[0].timestamp], [Rotation.identity()], [np.zeros(3)]
-        if reference_time > times[0]:
-            times.append(reference_time)
-            rotations.append(Rotation.identity())
-            translations.append(np.zeros(3))
-
-        for timestamp in sorted(set(a[0] for a in anchors)):
-            if timestamp <= times[-1]:
-                continue
-            group = [a for a in anchors if a[0] == timestamp]
-            times.append(timestamp)
-            rotations.append(Rotation.concatenate([a[1] for a in group]).mean())
-            translations.append(np.mean([a[2] for a in group], axis=0))
-
-        query = np.clip([n.timestamp for n in nodes], times[0], times[-1])
-        dr = Slerp(times, Rotation.concatenate(rotations))(query)
-        dt = np.column_stack([np.interp(query, times, np.asarray(translations)[:, k]) for k in range(3)])
-
-        initial = []
-        for node, rotation, translation in zip(nodes[1:], dr[1:], dt[1:]):
-            initial.extend((node.rotation.inv() * rotation * node.rotation).as_rotvec())
-            initial.extend(node.rotation.inv().apply(rotation.apply(node.position) + translation - node.position))
-        return np.asarray(initial, dtype=self.dtype)
 
 
 def rootslam_solve(nodes, loops, point_jac, point_errors, config: Optional[RootSLAMConfig] = None):
