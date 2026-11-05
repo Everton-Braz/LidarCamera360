@@ -86,10 +86,12 @@ def main():
         '--collect-all', 'pyproj',
         '--collect-all', 'laspy',
         '--collect-all', 'lazrs',
+        '--collect-all', 'jsonschema',
         '--collect-all', 'tifffile',
         '--hidden-import', 'onnx',
         '--add-data', f'{ROOT / "FAST-LIVO2/config"};FAST-LIVO2/config',
         '--add-data', f'{ROOT / "calibracao_rigida_raven_insta360.json"};.',
+        '--add-data', f'{ROOT / "raven_app/schema"};raven_app/schema',
         '--add-data', f'{stage};.',
     ]
     if (ROOT / 'assets/app.ico').is_file():

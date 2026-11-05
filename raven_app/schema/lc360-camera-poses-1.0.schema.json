@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Everton-Braz/LidarCamera360/main/raven_app/schema/lc360-camera-poses-1.0.schema.json",
+  "title": "LidarCamera360 camera poses (lc360-camera-poses-1.0)",
+  "type": "object",
+  "required": ["lens_model", "intrinsics", "images"],
+  "properties": {
+    "lens_model": {"const": "THIN_PRISM_FISHEYE"},
+    "camera_axes": {"type": "string"},
+    "intrinsics": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["width", "height", "fx", "fy", "cx", "cy"],
+        "properties": {
+          "width": {"type": "integer", "minimum": 1},
+          "height": {"type": "integer", "minimum": 1},
+          "fx": {"type": "number"}, "fy": {"type": "number"},
+          "cx": {"type": "number"}, "cy": {"type": "number"},
+          "k1": {"type": "number"}, "k2": {"type": "number"}, "k3": {"type": "number"}, "k4": {"type": "number"},
+          "p1": {"type": "number"}, "p2": {"type": "number"},
+          "sx1": {"type": "number"}, "sy1": {"type": "number"}
+        }
+      }
+    },
+    "images": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["image", "cam", "frame", "t", "position", "q_world_cam", "forward", "yaw_deg", "pitch_deg"],
+        "properties": {
+          "image": {"type": "string", "minLength": 1},
+          "cam": {"type": "string"},
+          "frame": {"type": "integer"},
+          "t": {"type": "number"},
+          "position": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+          "q_world_cam": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+          "forward": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+          "yaw_deg": {"type": "number"},
+          "pitch_deg": {"type": "number"}
+        }
+      }
+    }
+  }
+}
