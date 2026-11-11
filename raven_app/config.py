@@ -6,6 +6,9 @@ import shutil
 import subprocess
 import sys
 
+# Operator removal radius (m) around the trajectory, applied when person masks exist.
+DEFAULT_OPERATOR_RADIUS_M = 1.0
+
 
 def get_config_dir() -> Path:
     """Returns the persistent configuration directory across platforms."""

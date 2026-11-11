@@ -25,6 +25,7 @@ from raven_app.mask_resources import resource_status, resources_ready
 from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag
 from raven_app.seed_export import dataset_seed_point_count, seed_point_count
 from raven_app.i18n import tr, tr_button
+from raven_app.config import DEFAULT_OPERATOR_RADIUS_M
 
 RIG_REFINE_CHOICES = (
     ("Photometric (recommended)", "photometric"),
@@ -482,10 +483,12 @@ class UnifiedWorkflowView(QWidget):
         self.operator_radius_spin.setRange(0.0, 5.0)
         self.operator_radius_spin.setDecimals(2)
         self.operator_radius_spin.setSingleStep(0.10)
-        self.operator_radius_spin.setValue(0.0)
+        self.operator_radius_spin.setValue(DEFAULT_OPERATOR_RADIUS_M)
         self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
         self.operator_radius_spin.valueChanged.connect(lambda value: self.mask_persons_chk.setChecked(True) if value > 0 else None)
-        self.mask_persons_chk.toggled.connect(lambda checked: self.operator_radius_spin.setValue(0.0) if not checked else None)
+        # The radius only acts with person masks; keep its value while masks are off.
+        self.mask_persons_chk.toggled.connect(self.operator_radius_spin.setEnabled)
+        self.operator_radius_spin.setEnabled(self.mask_persons_chk.isChecked())
         mask_row.addWidget(self.mask_persons_chk)
         mask_row.addWidget(self.mask_backend_label)
         mask_row.addWidget(self.mask_backend_combo)
@@ -1216,6 +1219,9 @@ class UnifiedWorkflowView(QWidget):
                 InfoBar.error(title=tr('Invalid mask settings'), content=str(exc),
                               position=InfoBarPosition.TOP, parent=self)
                 return
+        if config is None:
+            from raven_app.person_masks import profile_mask_defaults
+            config = profile_mask_defaults(self.rig_profile_combo.currentData())
         sec_insv = None
         if hasattr(self, 'dual_insv_chk') and self.dual_insv_chk.isChecked():
             sec_text = self.secondary_insv_input.text().strip()
@@ -1403,7 +1409,7 @@ class UnifiedWorkflowView(QWidget):
             if settings_path.is_file():
                 args.extend(['--mask-config', str(settings_path)])
 
-        if self.operator_radius_spin.value() > 0:
+        if self.mask_persons_chk.isChecked():
             args.extend(["--operator-radius", str(self.operator_radius_spin.value())])
 
         if self.lio_switch.isChecked():

@@ -15,6 +15,7 @@ from raven_app.process_runner import ProcessRunner, make_run_log_path
 from raven_app.mask_download import MaskResourceDownload
 from raven_app.mask_resources import resource_status, resources_ready
 from raven_app.i18n import tr
+from raven_app.config import DEFAULT_OPERATOR_RADIUS_M
 
 
 class ColorizeView(QWidget):
@@ -249,11 +250,13 @@ class ColorizeView(QWidget):
         self.operator_radius_spin.setRange(0.0, 5.0)
         self.operator_radius_spin.setDecimals(2)
         self.operator_radius_spin.setSingleStep(0.10)
-        self.operator_radius_spin.setValue(0.0)
+        self.operator_radius_spin.setValue(DEFAULT_OPERATOR_RADIUS_M)
         self.operator_radius_spin.setFixedWidth(110)
         self.operator_radius_spin.setToolTip(tr("0 disables geometry removal. A positive radius enables person masks and protects dense planar surfaces such as doors and walls."))
         self.operator_radius_spin.valueChanged.connect(lambda value: self.chk_mask_persons.setChecked(True) if value > 0 else None)
-        self.chk_mask_persons.toggled.connect(lambda checked: self.operator_radius_spin.setValue(0.0) if not checked else None)
+        # The radius only acts with person masks; keep its value while masks are off.
+        self.chk_mask_persons.toggled.connect(self.operator_radius_spin.setEnabled)
+        self.operator_radius_spin.setEnabled(self.chk_mask_persons.isChecked())
 
         mask_controls_row.addWidget(self.btn_mask_model)
         mask_controls_row.addWidget(self.btn_mask_settings)
@@ -569,6 +572,9 @@ class ColorizeView(QWidget):
                 InfoBar.error(title=tr('Invalid mask settings'), content=str(exc),
                               position=InfoBarPosition.TOP, parent=self)
                 return
+        if config is None:
+            from raven_app.person_masks import profile_mask_defaults
+            config = profile_mask_defaults(None)
         dialog = MaskSettingsDialog(dataset, config, self,
                                     backend=self.mask_backend_combo.currentData(),
                                     camera_names=self._configured_aux_camera_names(),
@@ -660,7 +666,7 @@ class ColorizeView(QWidget):
             if settings_path.is_file():
                 args.extend(['--mask-config', str(settings_path)])
 
-        if self.operator_radius_spin.value() > 0:
+        if self.chk_mask_persons.isChecked():
             args.extend(['--operator-radius', str(self.operator_radius_spin.value())])
 
         log_path = make_run_log_path(ds, f'{Path(ds).name}_colorization')

@@ -173,6 +173,38 @@ def read_mask_config(config=None):
     return normalize_mask_config(config)
 
 
+def profile_mask_config(profile=None, is_eagle=False):
+    """Mask settings stored under ``mask_settings`` in a rig profile, or None.
+
+    The rig mount (fisheye border, scanner body at the image bottom) is the same in
+    every capture with that hardware, so the profile carries it as the default.
+    """
+    from raven_app.profile_manager import resolve_profile
+    path = resolve_profile(profile, is_eagle=is_eagle)
+    if path is None:
+        return None
+    settings = json.loads(Path(path).read_text(encoding='utf-8')).get('mask_settings')
+    return normalize_mask_config(settings) if settings else None
+
+
+def resolve_mask_config(mask_config=None, profile=None, is_eagle=False):
+    """Explicit mask settings win; otherwise the rig profile's; otherwise none."""
+    if mask_config is not None:
+        return mask_config
+    config = profile_mask_config(profile, is_eagle=is_eagle)
+    if config is not None:
+        print('[*] Mask settings from the rig profile (fisheye border and scanner body)')
+    return config
+
+
+def profile_mask_defaults(profile=None):
+    """Profile mask settings to prefill the editor; None when unavailable."""
+    try:
+        return profile_mask_config(profile)
+    except (OSError, ValueError):
+        return None
+
+
 def fisheye_cutoff_radius(shape, percent):
     """Radius of a centered circle excluding approximately `percent` of pixels.
 

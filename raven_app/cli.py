@@ -15,6 +15,7 @@ if str(_project_root) not in sys.path:
 
 from raven_app import __version__
 from raven_app.branding import APP_NAME, APP_DESCRIPTION
+from raven_app.config import DEFAULT_OPERATOR_RADIUS_M
 
 
 def resources():
@@ -95,8 +96,9 @@ def add_mask_options(p):
                    help='Person mask expansion as a fraction of each detection box size (default: 0.03)')
     p.add_argument('--mask-config', type=Path,
                    help='JSON mask settings: fisheye border cutoff and per-camera rectangles')
-    p.add_argument('--operator-radius', type=nonnegative, default=0.0,
-                   help='Operator removal radius in meters; requires --mask-persons or --masks-dir (default: off)')
+    p.add_argument('--operator-radius', type=nonnegative, default=None,
+                   help='Operator removal radius in meters; needs --mask-persons or --masks-dir '
+                        f'(default: {DEFAULT_OPERATOR_RADIUS_M:g} with person masks, off without; 0 disables)')
 
 
 def add_photometric_options(p):
@@ -176,7 +178,11 @@ def parse(argv=None):
                        help='Optional RF-DETR ONNX/engine model path (otherwise auto-discovered)')
     masks.add_argument('--threshold', type=unit_interval, default=0.5)
     masks.add_argument('--margin', type=ratio, default=0.03)
-    masks.add_argument('--mask-config', type=Path)
+    masks.add_argument('--mask-config', type=Path,
+                       help='JSON mask settings (default: the rig profile mask_settings, if any)')
+    masks.add_argument('--profile', default=None,
+                       help='Rig profile id or JSON path whose mask_settings apply without --mask-config '
+                            '(default: the profile marked is_default)')
     masks.add_argument('--backend', choices=('vulkan', 'tensorrt'), default='vulkan')
     photometric_fit = sub.add_parser('photometric-fit',
                    help='Fit per-camera photometric compensation parameters from a dataset')
@@ -395,8 +401,11 @@ def parse(argv=None):
         p.error('--mask-persons and --masks-dir are mutually exclusive')
     if getattr(a, 'mask_config', None) and getattr(a, 'command', None) in ('colorize', 'workflow') and not a.mask_persons:
         p.error('--mask-config requires --mask-persons; existing masks use settings stored in their manifest')
-    if getattr(a, 'operator_radius', 0) > 0 and not (getattr(a, 'mask_persons', False) or getattr(a, 'masks_dir', None)):
+    has_masks = getattr(a, 'mask_persons', False) or getattr(a, 'masks_dir', None)
+    if (getattr(a, 'operator_radius', None) or 0) > 0 and not has_masks:
         p.error('--operator-radius requires --mask-persons or --masks-dir; removing a trajectory corridor can erase fixed objects')
+    if hasattr(a, 'operator_radius') and a.operator_radius is None:
+        a.operator_radius = DEFAULT_OPERATOR_RADIUS_M if has_masks else 0.0
     if getattr(a, 'photometric_params', None) is not None and getattr(a, 'photometric', 'off') == 'off':
         p.error('--photometric-params requires --photometric to be enabled')
     if getattr(a, 'command', None) == 'workflow':
@@ -502,10 +511,10 @@ def run(a):
         print(json.dumps(reports, indent=2, ensure_ascii=False))
         return 0 if all(r['valid_records'] for r in reports) else 2
     if a.command=='mask-persons':
-        from raven_app.person_masks import generate_person_masks
+        from raven_app.person_masks import generate_person_masks, resolve_mask_config
         masks_dir = generate_person_masks(
             a.dataset, model_path=a.model, threshold=a.threshold, margin=a.margin,
-            mask_config=a.mask_config, backend=a.backend
+            mask_config=resolve_mask_config(a.mask_config, a.profile), backend=a.backend
         )
         print(json.dumps({'masks_dir': str(masks_dir)}, ensure_ascii=False))
         return 0
@@ -713,11 +722,11 @@ def run(a):
         if a.recalibrate_from_sfm:pipeline.recalibrate_from_sfm(dataset,fps=a.fps,reference_profile=reference_profile)
         masks_dir = a.masks_dir
         if a.mask_persons:
-            from raven_app.person_masks import generate_person_masks
+            from raven_app.person_masks import generate_person_masks, resolve_mask_config
             masks_dir = generate_person_masks(
                 dataset, model_path=a.mask_model,
                 threshold=a.mask_threshold, margin=a.mask_margin,
-                mask_config=a.mask_config, backend=a.mask_backend
+                mask_config=resolve_mask_config(a.mask_config, a.profile), backend=a.mask_backend
             )
         if a.remove_dynamic:
             from raven_app.dynamic_filter import run_dynamic_filter

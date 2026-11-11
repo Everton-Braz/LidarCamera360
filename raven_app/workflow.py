@@ -3268,6 +3268,9 @@ def execute_unified_workflow(
     reference_profile = resolve_profile(profile, is_eagle=is_eagle)
     run_record['rig_profile'] = str(reference_profile) if reference_profile else None
     print(f"[*] Hardware rig profile: {reference_profile.name if reference_profile else 'none'}")
+    if mask_persons:
+        from raven_app.person_masks import resolve_mask_config
+        mask_config = resolve_mask_config(mask_config, profile, is_eagle=is_eagle)
     calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json, profile=profile)
 
     rebuild_sfm = 'sfm' in rebuild
