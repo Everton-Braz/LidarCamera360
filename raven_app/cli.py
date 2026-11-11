@@ -114,6 +114,10 @@ def add_rig_options(p):
     p.add_argument('--time-window', type=float, default=DEFAULT_TIME_WINDOW_S,
                    help='Colour each LiDAR point only from frames within ±seconds of its scan time, '
                         f'so cars/people that moved between passes do not ghost (default: {DEFAULT_TIME_WINDOW_S:g}; 0 disables)')
+    p.add_argument('--remove-dynamic', action='store_true',
+                   help='Delete moving objects from the SLAM cloud before colorization (ray carving: scans '
+                        'that saw through a spot remove what was there) and, with person masks, people '
+                        'standing still (removed where most unoccluded views mask them)')
     add_rig_refine_option(p)
 
 
@@ -715,12 +719,15 @@ def run(a):
                 threshold=a.mask_threshold, margin=a.mask_margin,
                 mask_config=a.mask_config, backend=a.mask_backend
             )
+        if a.remove_dynamic:
+            from raven_app.dynamic_filter import run_dynamic_filter
+            run_dynamic_filter(dataset)
         if a.method in ('sfm','all'):
             pipeline.colorize_via_spirula_sfm(
                 dataset, fps=a.fps, use_vulkan=not a.no_vulkan,
                 masks_dir=masks_dir, operator_radius=a.operator_radius,
                 photometric=a.photometric, photometric_params=a.photometric_params,
-                time_window=a.time_window
+                time_window=a.time_window, remove_dynamic=a.remove_dynamic
             )
         third_cfgs = None
         if getattr(a, 'third_camera', None):
@@ -754,7 +761,8 @@ def run(a):
                 use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
                 operator_radius=a.operator_radius,
                 photometric=a.photometric, photometric_params=a.photometric_params,
-                third_camera=third_cfgs, time_window=a.time_window
+                third_camera=third_cfgs, time_window=a.time_window,
+                remove_dynamic=a.remove_dynamic
             )
         return 0
     if a.command=='workflow':
@@ -821,6 +829,7 @@ def run(a):
             slam_dir=getattr(a, 'slam_dir', None),
             profile=a.profile,
             time_window=a.time_window,
+            remove_dynamic=a.remove_dynamic,
             rig_refine=a.rig_refine,
         )
     if a.command == 'mcp':

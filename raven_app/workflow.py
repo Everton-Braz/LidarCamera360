@@ -2783,6 +2783,7 @@ def execute_unified_workflow(
     profile: Optional[str] = None,
     time_window: float = DEFAULT_TIME_WINDOW_S,
     rig_refine: str = DEFAULT_RIG_REFINE,
+    remove_dynamic: bool = False,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -3550,6 +3551,17 @@ def execute_unified_workflow(
         print(f"[*] Person masks: {active_masks_dir}")
     if operator_radius > 0:
         print(f"[*] Operator removal radius: {operator_radius:.3f} m (person-mask agreement with planar-surface protection)")
+    if remove_dynamic:
+        # Runs on the SLAM cloud alone, before any colorizer loads it, so every
+        # exported cloud (deliverables and the 3DGS seed taken from them) is clean.
+        print("[*] Removing moving objects from the SLAM cloud (ray carving)...")
+        from raven_app.dynamic_filter import run_dynamic_filter
+        try:
+            run_dynamic_filter(output_dir)
+        except (OSError, ValueError) as exc:
+            print(f"[!] Moving-object removal skipped: {exc}")
+        if active_masks_dir is None:
+            print("[!] People standing still need person masks (--mask-persons); only moving objects are removed")
 
     # --------------------------------------------------------------------------
     # STAGE 6: Point Cloud Colorization
@@ -3585,7 +3597,7 @@ def execute_unified_workflow(
                 output_dir, fps=fps, use_vulkan=use_vulkan,
                 masks_dir=active_masks_dir, operator_radius=operator_radius,
                 photometric=photometric, photometric_params=photometric_params,
-                time_window=time_window
+                time_window=time_window, remove_dynamic=remove_dynamic
             )
             sfm_done = True
         except Exception as e:
@@ -3626,7 +3638,8 @@ def execute_unified_workflow(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
             masks_dir=active_masks_dir, operator_radius=operator_radius,
             photometric=photometric, photometric_params=photometric_params,
-            third_camera=calibrated_cameras, time_window=time_window
+            third_camera=calibrated_cameras, time_window=time_window,
+            remove_dynamic=remove_dynamic
         )
 
     # --------------------------------------------------------------------------

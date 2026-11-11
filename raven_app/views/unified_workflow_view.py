@@ -457,6 +457,11 @@ class UnifiedWorkflowView(QWidget):
         self.revisit_refinement_chk.setToolTip(tr("Eliminates duplicate walls, ghosting, and trajectory drift by optimizing revisit loops with pose-graph SLAM. Optional; adds processing time."))
         config_layout.addWidget(self.revisit_refinement_chk)
 
+        self.remove_dynamic_chk = CheckBox(tr("Remove moving objects and people from the point cloud"))
+        self.remove_dynamic_chk.setChecked(False)
+        self._update_rig_tooltips()
+        config_layout.addWidget(self.remove_dynamic_chk)
+
         mask_row = QHBoxLayout()
         self.mask_persons_chk = CheckBox(tr("Generate masks"))
         self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
@@ -1079,10 +1084,17 @@ class UnifiedWorkflowView(QWidget):
         self.time_window_spin.setToolTip(tr(
             "Each LiDAR point is coloured only from frames taken within this many seconds of its "
             "scan, so cars or people that moved between passes do not leave ghost colours. 0 disables."))
+        if hasattr(self, 'remove_dynamic_chk'):
+            self.remove_dynamic_chk.setToolTip(tr(
+                "Deletes what moved during the capture before colorization: spots that other scans saw "
+                "through are carved out. With person masks, people standing still are also removed where "
+                "most views mask them. All exported clouds and the 3DGS seed come out clean."))
 
     def _rig_args(self):
         args = ["--rig-refine", str(self.rig_refine_combo.currentData()),
                 "--time-window", f"{float(self.time_window_spin.value()):g}"]
+        if self.remove_dynamic_chk.isChecked():
+            args.append("--remove-dynamic")
         profile = self.rig_profile_combo.currentData()
         if profile:
             args.extend(["--profile", str(profile)])
@@ -1722,6 +1734,7 @@ class UnifiedWorkflowView(QWidget):
         for index, (text, _mode) in enumerate(RIG_REFINE_CHOICES):
             self.rig_refine_combo.setItemText(index, tr(text))
         self.time_window_label.setText(tr("Time window (s):"))
+        self.remove_dynamic_chk.setText(tr("Remove moving objects and people from the point cloud"))
         self._update_rig_tooltips()
         self.mask_persons_chk.setText(tr("Generate masks"))
         self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
