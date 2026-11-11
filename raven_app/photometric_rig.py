@@ -167,6 +167,27 @@ def equirectangular_dataset(dataset):
     return bool(width) and abs(width - 2 * height) <= 2
 
 
+def calibration_frame_mismatch(calib, dataset):
+    """Why ``calib``'s fisheye intrinsics do not describe the dataset's frames ('' when they do).
+
+    A hardware profile is solved at one recording resolution (e.g. 3840 px per lens);
+    a capture recorded in another mode (e.g. 2880 px) needs intrinsics solved at that
+    size.  Scaling is not enough: the modes crop/bin the sensor differently.
+    """
+    for key, camera in (('cam0_front_intrinsics', 'cam0'), ('cam1_rear_intrinsics', 'cam1')):
+        intr = (calib or {}).get(key)
+        if not isinstance(intr, dict) or str(intr.get('camera_model', '')).upper() == 'EQUIRECTANGULAR':
+            continue
+        frame = _image_size(dataset, camera)
+        if not frame[0]:
+            continue
+        size = (int(float(intr.get('width') or 0)), int(float(intr.get('height') or 0)))
+        if size != tuple(frame):
+            return (f'{camera} intrinsics are for {size[0]}x{size[1]} images '
+                    f'but the frames are {frame[0]}x{frame[1]}')
+    return ''
+
+
 def _image_size(dataset, camera):
     from PIL import Image
     first = next(iter(sorted((Path(dataset) / 'images' / camera).glob('*.jpg'))), None)
@@ -717,6 +738,10 @@ def refine_rig(dataset, init_calibration, dt_init, *, masks_dir=None, mode='phot
         main = RigBody('main', [RigCamera('cam0', CameraModel('EQUIRECTANGULAR', width, height), main.cameras[0].T)],
                        main.dt, dt_window=main.dt_window, fix_dt=main.fix_dt)
         coarse_orientation = True
+    else:
+        mismatch = calibration_frame_mismatch(init, dataset)
+        if mismatch:
+            raise ValueError(f'{Path(init_calibration).name}: {mismatch}')
     if fix_dt and mode == 'dt' and not aux_cameras:
         raise ValueError('Nothing to refine: mode "dt" with a fixed dt')
     aux_cameras = [c for c in (aux_cameras or []) if getattr(c, 'enabled', True)]

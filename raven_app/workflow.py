@@ -2496,6 +2496,24 @@ def _refinable_aux_camera(camera):
     return getattr(camera, 'enabled', True) and status in ('sfm_calibrated', 'calibrated', 'verified')
 
 
+def _init_matching_frames(output_dir, init_calibration, calib, mismatch_of):
+    """The refinement start: ``init_calibration`` unless its intrinsics are for another
+    frame size (profile solved at another recording mode); then the resolved per-dataset
+    calibration when that one matches the frames."""
+    def mismatch(path):
+        try:
+            return mismatch_of(json.loads(Path(path).read_text(encoding='utf-8')), output_dir)
+        except (OSError, ValueError, TypeError):
+            return 'unreadable'
+    reason = mismatch(init_calibration) if init_calibration else ''
+    if not reason:
+        return init_calibration
+    if calib and Path(calib) != Path(init_calibration) and not mismatch(calib):
+        print(f"[!] {Path(init_calibration).name}: {reason}; refining from {Path(calib).name} instead")
+        return Path(calib)
+    return init_calibration
+
+
 def _refine_rig_for_colorization(output_dir, calib, dt_sync, run_record, *, mode, init_calibration,
                                  fix_dt, masks_dir, reference_profile, aux_cameras=()):
     """Run the photometric rig/clock refinement; return (calibration, dt, auxiliary cameras).
@@ -2506,9 +2524,10 @@ def _refine_rig_for_colorization(output_dir, calib, dt_sync, run_record, *, mode
     (marked calibrated only when their own held-out check passed); unsupported
     cameras are skipped.
     """
-    from raven_app.photometric_rig import refine_rig
+    from raven_app.photometric_rig import calibration_frame_mismatch, refine_rig
     from raven_app.third_camera import ThirdCameraConfig
     aux_cameras = [camera for camera in aux_cameras if _refinable_aux_camera(camera)]
+    init_calibration = _init_matching_frames(output_dir, init_calibration, calib, calibration_frame_mismatch)
     print(f"\n[*] Rig refinement ({mode}) from {Path(init_calibration).name}, Δt = {dt_sync:.4f}s"
           + (" (fixed)" if fix_dt else "")
           + (f", auxiliary: {', '.join(c.camera_name for c in aux_cameras)}" if aux_cameras else ""))
@@ -2585,6 +2604,13 @@ def resolve_calibration_file(output_dir: Path, is_eagle: bool = False, calib_jso
         p = output_dir / name
         if p.is_file():
             reasons = calibration_gate_failures(p, reference_profile=reference)
+            if not reasons:
+                from raven_app.photometric_rig import calibration_frame_mismatch
+                try:
+                    mismatch = calibration_frame_mismatch(json.loads(p.read_text(encoding='utf-8')), output_dir)
+                except (OSError, ValueError):
+                    mismatch = 'unreadable'
+                reasons = [mismatch] if mismatch else []
             if not reasons:
                 return p
             print(f"[!] Ignoring {name}: {'; '.join(reasons)}")
