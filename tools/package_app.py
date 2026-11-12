@@ -32,7 +32,7 @@ def main():
     # Validate required runtime modules are installed
     for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets',
                    'onnx',
-                   'pyproj', 'laspy', 'lazrs', 'piexif', 'tifffile'):
+                   'pyproj', 'laspy', 'lazrs', 'piexif', 'tifffile', 'jsonschema'):
         spec = importlib.util.find_spec(module)
         if spec is None or not spec.origin:
             raise SystemExit(f'{module} must be installed. Check requirements.txt.')
