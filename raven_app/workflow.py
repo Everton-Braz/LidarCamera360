@@ -1897,6 +1897,35 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
     return target_dir
 
 
+def timelapse_alignment_dt(dataset_dir, alignment=None):
+    """Return the clock offset calibrated for timelapse frames, or None.
+
+    Timelapse frame timestamps run on the camera capture clock, not the video
+    clock the gyro offset is measured on, so their offset to the SLAM clock is
+    solved by the timelapse calibration. It applies only when the alignment is
+    accepted, current, and the frames manifest is still a timelapse one.
+    """
+    dataset_dir = Path(dataset_dir)
+    try:
+        if alignment is None:
+            alignment = json.loads((dataset_dir / 'colmap_to_lidar_alignment.json').read_text(encoding='utf-8'))
+        manifest = json.loads((dataset_dir / 'images' / 'frames.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    from raven_app.timelapse_calibration import VERSION as TIMELAPSE_VERSION
+    if (manifest.get('time_source') != 'insv_timelapse'
+            or alignment.get('frame_time_source') != 'insv_timelapse'
+            or alignment.get('quality_status') != 'accepted'
+            or alignment.get('valid') is False
+            or alignment.get('timelapse_calibration_version') != TIMELAPSE_VERSION):
+        return None
+    try:
+        dt = float(alignment['dt_sync_seconds'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return dt if np.isfinite(dt) else None
+
+
 def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points,
                               masks_dir, third_camera, seed_percent, pose_source, out_dir):
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
@@ -1978,6 +2007,12 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
     selected_images = []
     auxiliary_decisions = {}
     auxiliary_pose_records = {}
+    if pose_source in ('direct', 'ba'):
+        timelapse_dt = timelapse_alignment_dt(dataset_dir)
+        if timelapse_dt is not None and abs(timelapse_dt - sync_for_export) > 1e-6:
+            print(f"[*] Timelapse frames: using the calibrated capture-clock offset "
+                  f"Δt = {timelapse_dt:.4f}s (requested {sync_for_export:.4f}s)")
+            sync_for_export = timelapse_dt
     if pose_source == 'sfm':
         alignment = json.loads(align_json.read_text(encoding='utf-8'))
         if alignment.get('quality_status') not in (None, 'accepted'):
@@ -3357,7 +3392,15 @@ def execute_unified_workflow(
                 align_data.get('quality_status') != 'rejected'
                 and align_data.get('valid') is not False
             )
-            if alignment_valid and not dt_locked:
+            timelapse_dt = (timelapse_alignment_dt(output_dir, align_data)
+                            if alignment_valid and dt_override is None else None)
+            if timelapse_dt is not None:
+                # Timelapse frames carry capture-clock times; the gyro offset belongs to the video clock.
+                print(f"[*] Timelapse frames: using the calibrated capture-clock offset Δt = {timelapse_dt:.4f}s "
+                      f"(gyro/IMU Δt = {dt_sync:.4f}s kept for reference)")
+                run_record['imu_dt_sync_seconds'] = float(dt_sync)
+                dt_sync = timelapse_dt
+            elif alignment_valid and not dt_locked:
                 dt_sync = float(align_data.get("dt_sync_seconds", dt_sync))
             elif alignment_valid:
                 print(f"[*] Sim(3) alignment solved at the locked time offset Δt = {dt_sync:.4f}s")
