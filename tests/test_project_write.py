@@ -41,3 +41,28 @@ def test_invalid_manifest_leaves_the_old_file_untouched(tmp_path):
         write_project(root)
     assert {f.code for f in err.value.findings} == {'E_PATH_ESCAPE'}
     assert (root / 'project.json').read_bytes() == before
+
+
+def test_an_outside_rig_profile_is_copied_into_the_package(tmp_path):
+    (tmp_path / 'pkg').mkdir()
+    root = _project(tmp_path / 'pkg')
+    bundled = tmp_path / '_MEI123' / 'configs' / 'profiles' / 'raven_x4_montagem_1.json'
+    bundled.parent.mkdir(parents=True)
+    bundled.write_text('{"name": "raven"}')
+    manifest = write_project(root, rig_profile=str(bundled))
+    assert manifest['capture']['rig_profile'] == 'rig_profile/raven_x4_montagem_1.json'
+    assert (root / 'rig_profile' / 'raven_x4_montagem_1.json').read_text() == '{"name": "raven"}'
+    bundled.unlink()
+    again = write_project(root, rig_profile=str(bundled))
+    assert again['capture']['rig_profile'] == 'rig_profile/raven_x4_montagem_1.json'
+
+
+def test_a_rig_profile_inside_the_package_stays_relative(tmp_path):
+    root = _project(tmp_path)
+    (root / 'calib.json').write_text('{}')
+    assert write_project(root, rig_profile=str(root / 'calib.json'))['capture']['rig_profile'] == 'calib.json'
+
+
+def test_a_missing_rig_profile_is_left_out(tmp_path):
+    root = _project(tmp_path)
+    assert 'rig_profile' not in write_project(root, rig_profile='C:/nowhere/p.json')['capture']

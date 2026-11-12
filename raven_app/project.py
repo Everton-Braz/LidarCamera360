@@ -124,6 +124,31 @@ def poses_from_colmap(colmap_dir: Path, frames_json: Path | None = None, dt_sync
                 time='epoch seconds (LiDAR clock)' if epoch0 is not None else 'video seconds', images=images)
 
 
+def _package_rig_profile(root: Path, rig_profile) -> str:
+    """Return a package-relative path for the rig profile, copying an outside profile into the package.
+
+    Callers pass whatever profile the run used, often an absolute path in the app's resources (a PyInstaller temp
+    folder in the portable build). The manifest may only hold paths inside the package, so the file is copied to
+    `rig_profile/<name>`. A profile that cannot be found is left out rather than failing the whole manifest.
+    """
+    if not rig_profile:
+        return ''
+    src = Path(rig_profile)
+    if not src.is_absolute():
+        src = root / src
+    if not src.is_file():
+        return ''
+    try:
+        return _rel(root, src)
+    except ValueError:
+        pass
+    dest = root / 'rig_profile' / src.name
+    dest.parent.mkdir(exist_ok=True)
+    if not (dest.is_file() and dest.read_bytes() == src.read_bytes()):
+        shutil.copyfile(src, dest)
+    return _rel(root, dest)
+
+
 def write_project(project_dir, *, dt_sync: float = 0.0, scanner: str = '', rig_profile: str = '', insv: str = '',
                   run: dict | None = None, app_version: str = '') -> dict:
     """Create or refresh `project.json` in the output folder; returns the manifest."""
@@ -154,6 +179,7 @@ def write_project(project_dir, *, dt_sync: float = 0.0, scanner: str = '', rig_p
         assets['camera_poses'] = _rel(root, poses)
     if (colmap / 'points3D.ply').is_file():
         assets['gaussian_seed'] = _rel(root, colmap / 'points3D.ply')
+    rig_profile = _package_rig_profile(root, rig_profile) or (old.get('capture') or {}).get('rig_profile', '')
     runs = list(old.get('runs', []))
     if run:
         runs = [r for r in runs if r.get('run_id') != run.get('run_id')] + [run]
