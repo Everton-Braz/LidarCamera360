@@ -1,7 +1,7 @@
 """The LidarCamera360 project: one per dataset, kept in the output folder, updated by every run.
 
 A run produces *deliverables* (by default only the coloured PLY and the 3DGS/COLMAP dataset). The project is what stays
-behind: `project.json` (schema `lc360-project` 1.x, the same file LidarCamera360 Pro opens), the camera poses derived
+behind: `project.json` (schema `lc360-project` 1.x, documented in `spec/SPEC.md` so other readers can open it), the camera poses derived
 from the COLMAP export, and a list of the runs. Every other format (PCD, LAZ/LAS, GeoJSON, GPS tracks, trajectories) is
 exported from the project afterwards with `export_from_project`, so a run never has to guess what the user will want.
 """
@@ -72,7 +72,7 @@ def find_colored_cloud(project_dir: Path) -> Path | None:
 
 def poses_from_colmap(colmap_dir: Path, frames_json: Path | None = None, dt_sync: float = 0.0,
                       trajectory: Path | None = None) -> dict:
-    """Pro's `camera_poses` document from a COLMAP text model (cameras.txt + images.txt)."""
+    """The `camera_poses` document from a COLMAP text model (cameras.txt + images.txt)."""
     from scipy.spatial.transform import Rotation
     colmap_dir = Path(colmap_dir)
     cameras = {}

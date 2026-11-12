@@ -1,13 +1,13 @@
 """Validate a `.lc360` v1 package: a folder with `project.json` that names the files inside it.
 
-One validator, two readers. LidarCamera360 (open) calls it before it writes a manifest; LidarCamera360 Pro calls a
-copy of this file (made by `scripts/sync_spec.py`) before it opens a package. The set of codes is part of the v1
+One validator for writers and readers. LidarCamera360 calls it before it writes a manifest; any other reader can
+vendor a copy of this file and call it before it opens a package. The set of codes is part of the v1
 contract (`spec/SPEC.md`); a new code needs a new conformance example under `spec/conformance/`.
 
 Level 1 (schema):     E_JSON, E_SCHEMA, E_VERSION
 Level 2 (structural): E_PATH_ESCAPE, E_MISSING_ASSET, E_POSES, and the warning W_NO_ID
                       Level 2 runs only when level 1 found no error.
-Warning W_DUP_ID (two folders with one id) needs two packages, so Pro's sidecar code raises it, not this module.
+Warning W_DUP_ID (two folders with one id) needs two packages, so a reader raises it, not this module.
 
 This file depends only on the standard library and `jsonschema`, and finds its schemas next to itself, so the same
 file works in both repositories.

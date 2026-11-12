@@ -1,7 +1,7 @@
 # `.lc360` project package, version 1
 
 A package is a folder. Its `project.json` names the files inside it. The open exporter writes packages; any reader
-(including the paid Pro app) opens them. A reader never writes into a package: what it generates goes somewhere else.
+(any application that implements this contract) opens them. A reader never writes into a package: what it generates goes somewhere else.
 
 The machine-readable parts of this contract are:
 

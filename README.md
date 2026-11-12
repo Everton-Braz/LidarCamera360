@@ -6,7 +6,7 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 
 **Unified LiDAR-Inertial SLAM, 360° Camera Telemetry, Rig Calibration, and 3D Colorization Suite**
 
-[![Release](https://img.shields.io/badge/Release-v0.3.0-brightgreen.svg)](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.3.0)
+[![Release](https://img.shields.io/badge/Release-v0.4.0-brightgreen.svg)](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.4.0)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![C++17 MSVC](https://img.shields.io/badge/C%2B%2B-17%20MSVC-orange.svg)](https://visualstudio.microsoft.com/)
 [![Vulkan](https://img.shields.io/badge/GPU-Vulkan%20Compute-red.svg)](https://www.vulkan.org/)
@@ -145,8 +145,8 @@ python lidarcamera360.py
 
 ### Running the Standalone Windows Executable (No Python Required)
 
-Pre-compiled standalone packages and portable executables are available on [GitHub Releases](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.3.0):
-- 📥 **Direct Portable Download:** [LidarCamera360_portable.exe (v0.3.0)](https://github.com/Everton-Braz/LidarCamera360/releases/download/v0.3.0/LidarCamera360_portable.exe)
+Pre-compiled standalone packages and portable executables are available on [GitHub Releases](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.4.0):
+- 📥 **Direct Portable Download:** [LidarCamera360_portable.exe (v0.4.0)](https://github.com/Everton-Braz/LidarCamera360/releases/download/v0.4.0/LidarCamera360_portable.exe)
 
 When using the portable executable or directory bundle:
 

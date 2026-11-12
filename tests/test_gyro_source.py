@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import pytest
 
 from raven_app.workflow import gyro_telemetry_source
 
@@ -16,6 +17,7 @@ def _video(path, frames):
 
 
 def test_exported_mp4_uses_the_sibling_insv_with_the_same_duration(tmp_path):
+    pytest.importorskip('av')  # without PyAV the duration check fails and the mp4 is returned unchanged
     mp4 = _video(tmp_path / 'VID_20260821_105436_00_269.mp4', 40)
     insv = _video(tmp_path / 'VID_20260821_105436_00_269.insv', 40)
     assert gyro_telemetry_source(mp4) == insv

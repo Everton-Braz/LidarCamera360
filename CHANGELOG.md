@@ -8,6 +8,42 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+---
+
+## [v0.4.0] - 2026-11-12
+
+### 📦 Project package, people removal and georeferencing
+- **`.lc360` v1 project package**: each dataset keeps a `project.json` (schema `lc360-project`) that names its cloud,
+  images, camera poses and trajectory. `spec/SPEC.md` defines the contract; `raven_app/project_validate.py` checks
+  a package in two levels (`E_JSON`, `E_SCHEMA`, `E_VERSION`, `E_PATH_ESCAPE`, `E_MISSING_ASSET`, `E_POSES`,
+  `W_NO_ID`) and `write_project` refuses to write a manifest with an error. Conformance examples are in
+  `spec/conformance/`. `jsonschema` is now a dependency and the packager refuses to build without it.
+- **`export` subcommand** writes extra formats (PCD, LAZ/LAS, GeoJSON, GPS tracks, trajectories) from a project
+  after the run, so a run no longer guesses which formats are wanted. A rig profile outside the package is copied
+  under `rig_profile/` instead of failing with `E_PATH_ESCAPE`.
+- **`--remove-dynamic`** removes moving and standing people from exported clouds: LiDAR points that later scans see
+  through are carved, then points the person masks vote as a person across views are dropped. Facades, planar
+  structure and points high above the floor are kept. Available in the CLI, workflow, GUI and MCP server.
+- **Operator removal radius defaults to 1 m** whenever person masks are used (0 still disables it).
+- **Per-profile mask settings**: rig profiles can carry `mask_settings` (fisheye border cutoff, fixed shapes such as
+  the scanner body); they apply when no `--mask-config` or dataset `mask_settings.json` is given and prefill the
+  mask dialog. `mask-persons` takes `--profile`.
+- **Georeferencing solves north from evidence** and reports how far to trust the result. Imagery-derived north
+  still needs a manual check; do not accept it unreviewed.
+- **SLAM loop closure** survives pose jumps and rejects wrong ICP loops.
+
+### 🧭 Timelapse and rig safety
+- The workflow and the COLMAP export use the **calibrated timelapse clock offset**; timelapse frames carry capture
+  times, so the video clock's gyro offset does not apply. The IMU offset stays in the run record.
+- **Rig calibrations made for another frame size are refused**: the refinement now starts from a calibration that
+  matches the frames (for example 2880 px against a 3840 px profile) and skips mismatched files in later stages.
+- `--slam-dir` imports an existing SLAM and `--slam-profile` picks the timelapse settings.
+
+### 🛠 Workflow options
+- `--trim-end-at` and `--chunks` for datasets, and `--sfm-matcher` (`sift` or `aliked-lightglue`).
+- The initial time offset is read from existing calibration files.
+- Raven One RS rig profile and rig bootstrap gates.
+
 ### 🏠 Timelapse captures end to end (CASA 374 Home3)
 - **Rig recalibration from SfM** no longer collapses the lever arm on timelapse captures: the 35-frame window-local
   Sim(3) absorbed R_body @ arm on a straight walk (2.6 cm instead of 17 cm → "implausible camera lever arm").
