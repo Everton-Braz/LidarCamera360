@@ -1,0 +1,39 @@
+{
+  "lens_model": "THIN_PRISM_FISHEYE",
+  "intrinsics": {
+    "cam0": {
+      "width": 2880,
+      "height": 2880,
+      "fx": 792.9,
+      "fy": 793.1,
+      "cx": 1440.0,
+      "cy": 1440.0
+    }
+  },
+  "images": [
+    {
+      "image": "cam0/frame_000001.jpg",
+      "cam": "cam0",
+      "frame": 1,
+      "t": 1.5,
+      "position": [
+        0,
+        0,
+        1
+      ],
+      "q_world_cam": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "forward": [
+        0,
+        1,
+        0
+      ],
+      "yaw_deg": 0.0,
+      "pitch_deg": 0.0
+    }
+  ]
+}

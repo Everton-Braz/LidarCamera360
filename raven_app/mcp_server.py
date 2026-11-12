@@ -21,13 +21,15 @@ _CLI_OPTIONS = {
                   'coarse': '--coarse', 'coarse_dt_window': '--coarse-dt-window', 'save_profile': '--save-profile'},
     'workflow': {'bag': '--bag', 'insv': '--insv', 'output': '--output', 'method': '--method', 'fps': '--fps',
                  'profile': '--profile', 'rig_refine': '--rig-refine', 'time_window': '--time-window',
+                 'remove_dynamic': '--remove-dynamic',
                  'revisit_refinement': '--revisit-refinement', 'dt': '--dt', 'calib': '--calib',
                  'mask_persons': '--mask-persons', 'mask_backend': '--mask-backend', 'mask_config': '--mask-config',
                  'masks_dir': '--masks-dir', 'operator_radius': '--operator-radius', 'third_camera': '--third-camera',
                  'export_ply': '--export-ply', 'export_pcd': '--export-pcd'},
     'colorize': {'dataset': '--dataset', 'method': '--method', 'calib': '--calib', 'profile': '--profile',
                  'dt': '--dt', 'masks_dir': '--masks-dir', 'operator_radius': '--operator-radius',
-                 'rig_refine': '--rig-refine', 'time_window': '--time-window'},
+                 'rig_refine': '--rig-refine', 'time_window': '--time-window',
+                 'remove_dynamic': '--remove-dynamic'},
 }
 
 
@@ -263,6 +265,7 @@ class LidarCameraMcpServer:
                         "profile": {"type": "string"},
                         "rig_refine": {"type": "string", "enum": ["photometric", "dt", "none"], "default": "photometric"},
                         "time_window": {"type": "number", "default": 6.0},
+                        "remove_dynamic": {"type": "boolean", "default": False, "description": "Delete moving objects (ray carving) and, with person masks, standing people from the cloud before colorization."},
                         "revisit_refinement": {"type": "boolean", "default": False, "description": "Loop closure."},
                         "dt": {"type": "number"},
                         "calib": {"type": "string"},
@@ -289,7 +292,8 @@ class LidarCameraMcpServer:
                         "calib": {"type": "string"}, "profile": {"type": "string"}, "dt": {"type": "number"},
                         "masks_dir": {"type": "string"}, "operator_radius": {"type": "number"},
                         "rig_refine": {"type": "string", "enum": ["photometric", "dt", "none"], "default": "photometric"},
-                        "time_window": {"type": "number", "default": 6.0}
+                        "time_window": {"type": "number", "default": 6.0},
+                        "remove_dynamic": {"type": "boolean", "default": False}
                     },
                     "required": ["dataset"]
                 }

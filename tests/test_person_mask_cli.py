@@ -26,6 +26,11 @@ class PersonMaskCliTests(unittest.TestCase):
         self.assertEqual(args.masks_dir, Path("dataset/masks"))
         self.assertEqual(args.mask_threshold, 0.5)
         self.assertEqual(args.mask_margin, 0.03)
+        self.assertEqual(args.operator_radius, 1.0)
+
+    def test_operator_radius_defaults_off_without_masks_and_explicit_zero_wins(self):
+        self.assertEqual(parse(["colorize", "--dataset", "dataset"]).operator_radius, 0.0)
+        args = parse(["colorize", "--dataset", "dataset", "--mask-persons", "--operator-radius", "0"])
         self.assertEqual(args.operator_radius, 0.0)
 
     def test_standalone_mask_command_is_headless_and_defaults(self):
@@ -35,6 +40,7 @@ class PersonMaskCliTests(unittest.TestCase):
         self.assertEqual(args.threshold, 0.5)
         self.assertEqual(args.margin, 0.03)
         self.assertIsNone(args.mask_config)
+        self.assertIsNone(args.profile)
 
     def test_config_requires_mask_generation(self):
         with self.assertRaises(SystemExit) as ctx:

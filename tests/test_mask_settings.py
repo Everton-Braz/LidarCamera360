@@ -129,5 +129,30 @@ class MaskSettingsTests(unittest.TestCase):
         # Fixed shapes (rectangle) still apply properly
         self.assertEqual(int(mask[500, 1000]), 0)
 
+
+class ProfileMaskSettingsTests(unittest.TestCase):
+    def test_bundled_raven_x4_profile_carries_border_and_scanner_shapes(self):
+        from raven_app.person_masks import profile_mask_config
+        config = profile_mask_config('raven_x4_montagem_1')
+        self.assertEqual(config['fisheye_border_percent_by_camera'], {'cam0': 20.0, 'cam1': 20.0})
+        self.assertEqual(len(config['polygons']['cam0']), 1)
+        self.assertEqual(len(config['polygons']['cam1']), 1)
+
+    def test_explicit_settings_win_over_profile(self):
+        from raven_app.person_masks import resolve_mask_config
+        self.assertEqual(resolve_mask_config('custom.json', 'raven_x4_montagem_1'), 'custom.json')
+        self.assertIsNotNone(resolve_mask_config(None, 'raven_x4_montagem_1'))
+
+    def test_profile_without_mask_settings_gives_none(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from raven_app.person_masks import profile_mask_config, profile_mask_defaults
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'bare.json'
+            path.write_text(json.dumps({'name': 'bare'}), encoding='utf-8')
+            self.assertIsNone(profile_mask_config(str(path)))
+        self.assertIsNone(profile_mask_defaults('no_such_profile'))
+
 if __name__ == '__main__':
     unittest.main()

@@ -159,3 +159,27 @@ def test_main_body_accepts_any_supported_model_and_refuses_incomplete_calibratio
     assert [c.name for c in main_body_from_calibration(equirect, 0.0).cameras] == ['cam0']
     assert main_body_from_calibration({'lens_model': 'EQUIRECTANGULAR'}, 0.0) is None
     assert main_body_from_calibration({**calib, 'cam0_front_intrinsics': {**pinhole, 'camera_model': 'KANNALA'}}, 0.0) is None
+
+
+def test_calibration_for_another_frame_size_is_refused_and_replaced(tmp_path):
+    from raven_app.photometric_rig import calibration_frame_mismatch
+    from raven_app.workflow import _init_matching_frames
+    for cam in ('cam0', 'cam1'):
+        (tmp_path / 'images' / cam).mkdir(parents=True)
+        cv2.imwrite(str(tmp_path / 'images' / cam / 'frame_000001.jpg'), np.zeros((288, 288), np.uint8))
+
+    def calib(size):
+        intr = {'camera_model': 'THIN_PRISM_FISHEYE', 'width': size, 'height': size,
+                'fx': size / 3.6, 'fy': size / 3.6, 'cx': size / 2, 'cy': size / 2}
+        return {'cam0_front_intrinsics': intr, 'cam1_rear_intrinsics': dict(intr),
+                'T_lidar_to_cam0_rigid_4x4': np.eye(4).tolist(), 'T_lidar_to_cam1_rigid_4x4': np.eye(4).tolist()}
+
+    assert calibration_frame_mismatch(calib(288), tmp_path) == ''
+    assert '384x384' in calibration_frame_mismatch(calib(384), tmp_path)
+    profile, dataset_calib = tmp_path / 'profile.json', tmp_path / 'rig_calibration.json'
+    profile.write_text(json.dumps(calib(384)))
+    dataset_calib.write_text(json.dumps(calib(288)))
+    assert _init_matching_frames(tmp_path, profile, dataset_calib, calibration_frame_mismatch) == dataset_calib
+    assert _init_matching_frames(tmp_path, dataset_calib, profile, calibration_frame_mismatch) == dataset_calib
+    with pytest.raises(ValueError, match='frames are 288x288'):
+        refine_rig(tmp_path, profile, 0.0)

@@ -1897,6 +1897,35 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
     return target_dir
 
 
+def timelapse_alignment_dt(dataset_dir, alignment=None):
+    """Return the clock offset calibrated for timelapse frames, or None.
+
+    Timelapse frame timestamps run on the camera capture clock, not the video
+    clock the gyro offset is measured on, so their offset to the SLAM clock is
+    solved by the timelapse calibration. It applies only when the alignment is
+    accepted, current, and the frames manifest is still a timelapse one.
+    """
+    dataset_dir = Path(dataset_dir)
+    try:
+        if alignment is None:
+            alignment = json.loads((dataset_dir / 'colmap_to_lidar_alignment.json').read_text(encoding='utf-8'))
+        manifest = json.loads((dataset_dir / 'images' / 'frames.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    from raven_app.timelapse_calibration import VERSION as TIMELAPSE_VERSION
+    if (manifest.get('time_source') != 'insv_timelapse'
+            or alignment.get('frame_time_source') != 'insv_timelapse'
+            or alignment.get('quality_status') != 'accepted'
+            or alignment.get('valid') is False
+            or alignment.get('timelapse_calibration_version') != TIMELAPSE_VERSION):
+        return None
+    try:
+        dt = float(alignment['dt_sync_seconds'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return dt if np.isfinite(dt) else None
+
+
 def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points,
                               masks_dir, third_camera, seed_percent, pose_source, out_dir):
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
@@ -1978,6 +2007,12 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
     selected_images = []
     auxiliary_decisions = {}
     auxiliary_pose_records = {}
+    if pose_source in ('direct', 'ba'):
+        timelapse_dt = timelapse_alignment_dt(dataset_dir)
+        if timelapse_dt is not None and abs(timelapse_dt - sync_for_export) > 1e-6:
+            print(f"[*] Timelapse frames: using the calibrated capture-clock offset "
+                  f"Δt = {timelapse_dt:.4f}s (requested {sync_for_export:.4f}s)")
+            sync_for_export = timelapse_dt
     if pose_source == 'sfm':
         alignment = json.loads(align_json.read_text(encoding='utf-8'))
         if alignment.get('quality_status') not in (None, 'accepted'):
@@ -2496,6 +2531,24 @@ def _refinable_aux_camera(camera):
     return getattr(camera, 'enabled', True) and status in ('sfm_calibrated', 'calibrated', 'verified')
 
 
+def _init_matching_frames(output_dir, init_calibration, calib, mismatch_of):
+    """The refinement start: ``init_calibration`` unless its intrinsics are for another
+    frame size (profile solved at another recording mode); then the resolved per-dataset
+    calibration when that one matches the frames."""
+    def mismatch(path):
+        try:
+            return mismatch_of(json.loads(Path(path).read_text(encoding='utf-8')), output_dir)
+        except (OSError, ValueError, TypeError):
+            return 'unreadable'
+    reason = mismatch(init_calibration) if init_calibration else ''
+    if not reason:
+        return init_calibration
+    if calib and Path(calib) != Path(init_calibration) and not mismatch(calib):
+        print(f"[!] {Path(init_calibration).name}: {reason}; refining from {Path(calib).name} instead")
+        return Path(calib)
+    return init_calibration
+
+
 def _refine_rig_for_colorization(output_dir, calib, dt_sync, run_record, *, mode, init_calibration,
                                  fix_dt, masks_dir, reference_profile, aux_cameras=()):
     """Run the photometric rig/clock refinement; return (calibration, dt, auxiliary cameras).
@@ -2506,9 +2559,10 @@ def _refine_rig_for_colorization(output_dir, calib, dt_sync, run_record, *, mode
     (marked calibrated only when their own held-out check passed); unsupported
     cameras are skipped.
     """
-    from raven_app.photometric_rig import refine_rig
+    from raven_app.photometric_rig import calibration_frame_mismatch, refine_rig
     from raven_app.third_camera import ThirdCameraConfig
     aux_cameras = [camera for camera in aux_cameras if _refinable_aux_camera(camera)]
+    init_calibration = _init_matching_frames(output_dir, init_calibration, calib, calibration_frame_mismatch)
     print(f"\n[*] Rig refinement ({mode}) from {Path(init_calibration).name}, Δt = {dt_sync:.4f}s"
           + (" (fixed)" if fix_dt else "")
           + (f", auxiliary: {', '.join(c.camera_name for c in aux_cameras)}" if aux_cameras else ""))
@@ -2585,6 +2639,13 @@ def resolve_calibration_file(output_dir: Path, is_eagle: bool = False, calib_jso
         p = output_dir / name
         if p.is_file():
             reasons = calibration_gate_failures(p, reference_profile=reference)
+            if not reasons:
+                from raven_app.photometric_rig import calibration_frame_mismatch
+                try:
+                    mismatch = calibration_frame_mismatch(json.loads(p.read_text(encoding='utf-8')), output_dir)
+                except (OSError, ValueError):
+                    mismatch = 'unreadable'
+                reasons = [mismatch] if mismatch else []
             if not reasons:
                 return p
             print(f"[!] Ignoring {name}: {'; '.join(reasons)}")
@@ -2792,6 +2853,7 @@ def execute_unified_workflow(
     profile: Optional[str] = None,
     time_window: float = DEFAULT_TIME_WINDOW_S,
     rig_refine: str = DEFAULT_RIG_REFINE,
+    remove_dynamic: bool = False,
 ) -> int:
     """Run end-to-end unified workflow: Extract -> SLAM -> Sync -> SfM/Recalibrate -> Colorize -> Deliverables."""
     t_start = time.time()
@@ -3311,6 +3373,9 @@ def execute_unified_workflow(
     reference_profile = resolve_profile(profile, is_eagle=is_eagle)
     run_record['rig_profile'] = str(reference_profile) if reference_profile else None
     print(f"[*] Hardware rig profile: {reference_profile.name if reference_profile else 'none'}")
+    if mask_persons:
+        from raven_app.person_masks import resolve_mask_config
+        mask_config = resolve_mask_config(mask_config, profile, is_eagle=is_eagle)
     calib = resolve_calibration_file(output_dir, is_eagle=is_eagle, calib_json=calib_json, profile=profile)
 
     rebuild_sfm = 'sfm' in rebuild
@@ -3371,7 +3436,15 @@ def execute_unified_workflow(
                 align_data.get('quality_status') != 'rejected'
                 and align_data.get('valid') is not False
             )
-            if alignment_valid and not dt_locked:
+            timelapse_dt = (timelapse_alignment_dt(output_dir, align_data)
+                            if alignment_valid and dt_override is None else None)
+            if timelapse_dt is not None:
+                # Timelapse frames carry capture-clock times; the gyro offset belongs to the video clock.
+                print(f"[*] Timelapse frames: using the calibrated capture-clock offset Δt = {timelapse_dt:.4f}s "
+                      f"(gyro/IMU Δt = {dt_sync:.4f}s kept for reference)")
+                run_record['imu_dt_sync_seconds'] = float(dt_sync)
+                dt_sync = timelapse_dt
+            elif alignment_valid and not dt_locked:
                 dt_sync = float(align_data.get("dt_sync_seconds", dt_sync))
             elif alignment_valid:
                 print(f"[*] Sim(3) alignment solved at the locked time offset Δt = {dt_sync:.4f}s")
@@ -3594,6 +3667,17 @@ def execute_unified_workflow(
         print(f"[*] Person masks: {active_masks_dir}")
     if operator_radius > 0:
         print(f"[*] Operator removal radius: {operator_radius:.3f} m (person-mask agreement with planar-surface protection)")
+    if remove_dynamic:
+        # Runs on the SLAM cloud alone, before any colorizer loads it, so every
+        # exported cloud (deliverables and the 3DGS seed taken from them) is clean.
+        print("[*] Removing moving objects from the SLAM cloud (ray carving)...")
+        from raven_app.dynamic_filter import run_dynamic_filter
+        try:
+            run_dynamic_filter(output_dir)
+        except (OSError, ValueError) as exc:
+            print(f"[!] Moving-object removal skipped: {exc}")
+        if active_masks_dir is None:
+            print("[!] People standing still need person masks (--mask-persons); only moving objects are removed")
 
     # --------------------------------------------------------------------------
     # STAGE 6: Point Cloud Colorization
@@ -3629,7 +3713,7 @@ def execute_unified_workflow(
                 output_dir, fps=fps, use_vulkan=use_vulkan,
                 masks_dir=active_masks_dir, operator_radius=operator_radius,
                 photometric=photometric, photometric_params=photometric_params,
-                time_window=time_window
+                time_window=time_window, remove_dynamic=remove_dynamic
             )
             sfm_done = True
         except Exception as e:
@@ -3670,7 +3754,8 @@ def execute_unified_workflow(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
             masks_dir=active_masks_dir, operator_radius=operator_radius,
             photometric=photometric, photometric_params=photometric_params,
-            third_camera=calibrated_cameras, time_window=time_window
+            third_camera=calibrated_cameras, time_window=time_window,
+            remove_dynamic=remove_dynamic
         )
 
     # --------------------------------------------------------------------------

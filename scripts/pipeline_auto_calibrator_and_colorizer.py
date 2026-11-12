@@ -38,6 +38,7 @@ from raven_app.slam_source import active_slam_dir
 from raven_app.person_masks import check_masks_match_frames, load_keep_mask, keep_samples, masked_operator_keep
 from raven_app.vulkan_engine import get_vulkan_bin, colorize_views
 from raven_app.time_gating import DEFAULT_TIME_WINDOW_S, point_scan_times, window_slice
+from raven_app.dynamic_filter import load_static_keep, person_vote_keep, removal_fringe_keep
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -117,6 +118,40 @@ def load_pcd(path, return_mask=False):
         xyz = xyz[mask]
     print(f"    Loaded points: {len(xyz):,}")
     return (xyz, mask) if return_mask else xyz
+
+
+def _load_slam_points(dataset_dir, slam_pcd, time_window, remove_dynamic=False):
+    """SLAM points (minus moving objects when requested), their scan times or None,
+    and the removed points."""
+    pts, finite_mask = load_pcd(slam_pcd, return_mask=True)
+    times = (point_scan_times(active_slam_dir(dataset_dir), finite_mask)
+             if time_window and time_window > 0 else None)
+    removed = np.empty((0, 3))
+    if remove_dynamic:
+        keep = load_static_keep(dataset_dir, finite_mask)
+        if keep is not None:
+            removed = pts[~keep]
+            pts = pts[keep]
+            times = times[keep] if times is not None else None
+    return pts, times, removed
+
+
+def _remove_people(pts_lidar, colors, removed, operator_views, dataset_dir, masks_dir, operator_radius,
+                   remove_dynamic, project):
+    """Operator, standing-person and stranded-point removal on the coloured cloud."""
+    removed = [removed]
+    if operator_radius and masks_dir is not None:
+        keep = masked_operator_keep(pts_lidar, operator_views, dataset_dir / "images", masks_dir, operator_radius, project)
+        removed.append(pts_lidar[~keep])
+        pts_lidar, colors = pts_lidar[keep], colors[keep]
+    if remove_dynamic and masks_dir is not None and operator_views:
+        keep = person_vote_keep(pts_lidar, operator_views, dataset_dir / "images", masks_dir, project)
+        removed.append(pts_lidar[~keep])
+        pts_lidar, colors = pts_lidar[keep], colors[keep]
+    if remove_dynamic:
+        keep = removal_fringe_keep(pts_lidar, np.concatenate(removed))
+        pts_lidar, colors = pts_lidar[keep], colors[keep]
+    return pts_lidar, colors
 
 
 def get_slam_trajectory_path(dataset_dir):
@@ -1658,7 +1693,8 @@ def _borrow_nearest_photometric(views, names):
 
 
 def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=None, operator_radius=0.0,
-                           photometric='off', photometric_params=None, time_window=DEFAULT_TIME_WINDOW_S):
+                           photometric='off', photometric_params=None, time_window=DEFAULT_TIME_WINDOW_S,
+                           remove_dynamic=False):
     """Executa a coloração de alta precisão projetando as poses alinhadas do SfM.
 
     With ``time_window`` > 0 each SfM view only colours (and occludes with) points
@@ -1709,10 +1745,8 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         if blurred:
             images = [im for im in images if im['name'].replace('\\', '/') not in blurred]
             print(f"[*] Left out {len(blurred)} motion-blurred image(s) (sharpness < half of their neighbours')")
-    pts_lidar, finite_mask = load_pcd(slam_pcd, return_mask=True)
+    pts_lidar, point_times, carved_points = _load_slam_points(dataset_dir, slam_pcd, time_window, remove_dynamic)
     n_pts = len(pts_lidar)
-    point_times = (point_scan_times(active_slam_dir(dataset_dir), finite_mask)
-                   if time_window and time_window > 0 else None)
     t_slam_start, dt_align = None, al.get('dt_sync_seconds')
     if point_times is not None and dt_align is None:
         print("[!] Time gating disabled: the SfM alignment has no dt_sync_seconds")
@@ -1763,7 +1797,7 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
                 continue
             R_cw_lidar, C_lidar = pose_overrides[im['name']]
 
-        if operator_radius and masks_dir is not None:
+        if (operator_radius or remove_dynamic) and masks_dir is not None and not is_equirect_cam:
             operator_views.append((img_path, R_cw_lidar, C_lidar, view_params))
         view_time = view_time_of(im['name'])
         if gpu_views is not None and not is_equirect_cam:
@@ -1874,7 +1908,8 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
         if colors is None:
             return colorize_via_spirula_sfm(dataset_dir, fps=fps, use_vulkan=False, masks_dir=masks_dir,
                                            operator_radius=operator_radius, photometric=photometric,
-                                           photometric_params=photometric_params, time_window=time_window)
+                                           photometric_params=photometric_params, time_window=time_window,
+                                           remove_dynamic=remove_dynamic)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)
@@ -1924,9 +1959,8 @@ def colorize_via_spirula_sfm(dataset_dir, fps=2.0, use_vulkan=True, masks_dir=No
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_ply = deliv_dir / f"lidar_colored_sfm_consensus_{ts}.ply"
     out_pcd = deliv_dir / f"lidar_colored_sfm_consensus_{ts}.pcd"
-    if operator_radius and masks_dir is not None:
-        keep = masked_operator_keep(pts_lidar, operator_views, dataset_dir / "images", masks_dir, operator_radius, project_thin_prism)
-        pts_lidar, colors = pts_lidar[keep], colors[keep]
+    pts_lidar, colors = _remove_people(pts_lidar, colors, carved_points, operator_views, dataset_dir, masks_dir,
+                                       operator_radius, remove_dynamic, project_thin_prism)
     write_ply(out_ply, pts_lidar, colors)
     write_pcd(out_pcd, pts_lidar, colors)
 
@@ -1960,7 +1994,7 @@ def _prepare_direct_photometric(dataset_dir, mode, params, masks_dir):
 
 def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_override=None, use_vulkan=True, masks_dir=None, operator_radius=0.0,
                             photometric='off', photometric_params=None, third_camera=None,
-                            time_window=DEFAULT_TIME_WINDOW_S):
+                            time_window=DEFAULT_TIME_WINDOW_S, remove_dynamic=False):
     """Executa a coloração direta rápida usando matriz rígida e tempo calibrado.
 
     Poses come only from the SLAM trajectory and the rigid calibration. With
@@ -2075,10 +2109,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     else:
         print(f"[*] Active time synchronization: Δt = {dt_sync:.4f}s")
 
-    pts_lidar, finite_mask = load_pcd(slam_pcd, return_mask=True)
+    pts_lidar, point_times, carved_points = _load_slam_points(dataset_dir, slam_pcd, time_window, remove_dynamic)
     n_pts = len(pts_lidar)
-    point_times = (point_scan_times(active_slam_dir(dataset_dir), finite_mask)
-                   if time_window and time_window > 0 else None)
     if point_times is not None:
         print(f"[*] Time-gated colorization: each view sees points scanned within ±{time_window:.1f}s")
 
@@ -2220,7 +2252,7 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
             R_L = slerp(t_query).as_matrix()
             p_cam = p_L + R_L @ t_LC
             R_cw = (R_L @ R_LC).T
-        if operator_radius and masks_dir is not None:
+        if (operator_radius or remove_dynamic) and masks_dir is not None:
             operator_views.append((img_path, R_cw, p_cam, params))
         if gpu_views is not None:
             gpu_views.append((img_path, R_cw, p_cam, params))
@@ -2308,7 +2340,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
             return colorize_via_direct_rigid(dataset_dir, calib_json_path, fps=fps, dt_override=dt_sync, use_vulkan=False,
                                              masks_dir=masks_dir, operator_radius=operator_radius,
                                              photometric=photometric, photometric_params=photometric_params,
-                                             third_camera=third_camera, time_window=time_window)
+                                             third_camera=third_camera, time_window=time_window,
+                                             remove_dynamic=remove_dynamic)
     else:
         colors = np.full((n_pts, 3), 180, dtype=np.uint8)
         n_obs = np.count_nonzero(top_scores > 0, axis=1)
@@ -2358,9 +2391,8 @@ def colorize_via_direct_rigid(dataset_dir, calib_json_path=None, fps=2.0, dt_ove
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_ply = deliv_dir / f"lidar_colored_direct_rigid_{ts}.ply"
     out_pcd = deliv_dir / f"lidar_colored_direct_rigid_{ts}.pcd"
-    if operator_radius and masks_dir is not None:
-        keep = masked_operator_keep(pts_lidar, operator_views, dataset_dir / "images", masks_dir, operator_radius, project_thin_prism)
-        pts_lidar, colors = pts_lidar[keep], colors[keep]
+    pts_lidar, colors = _remove_people(pts_lidar, colors, carved_points, operator_views, dataset_dir, masks_dir,
+                                       operator_radius, remove_dynamic, project_thin_prism)
     write_ply(out_ply, pts_lidar, colors)
     write_pcd(out_pcd, pts_lidar, colors)
 

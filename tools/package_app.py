@@ -32,7 +32,7 @@ def main():
     # Validate required runtime modules are installed
     for module in ('PyQt6', 'numpy', 'scipy', 'cv2', 'av', 'qfluentwidgets',
                    'onnx',
-                   'pyproj', 'laspy', 'lazrs', 'piexif', 'tifffile'):
+                   'pyproj', 'laspy', 'lazrs', 'piexif', 'tifffile', 'jsonschema'):
         spec = importlib.util.find_spec(module)
         if spec is None or not spec.origin:
             raise SystemExit(f'{module} must be installed. Check requirements.txt.')
@@ -86,10 +86,12 @@ def main():
         '--collect-all', 'pyproj',
         '--collect-all', 'laspy',
         '--collect-all', 'lazrs',
+        '--collect-all', 'jsonschema',
         '--collect-all', 'tifffile',
         '--hidden-import', 'onnx',
         '--add-data', f'{ROOT / "FAST-LIVO2/config"};FAST-LIVO2/config',
         '--add-data', f'{ROOT / "calibracao_rigida_raven_insta360.json"};.',
+        '--add-data', f'{ROOT / "raven_app/schema"};raven_app/schema',
         '--add-data', f'{stage};.',
     ]
     if (ROOT / 'assets/app.ico').is_file():

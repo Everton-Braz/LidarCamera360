@@ -36,6 +36,11 @@ def test_workflow_passes_selected_profile_refinement_and_time_window(tmp_path):
         default_profile = view.rig_profile_combo.itemData(0)
         assert default_profile.endswith("raven_x4_montagem_1.json")
         assert args[args.index("--profile") + 1] == default_profile
+        assert "--remove-dynamic" not in args
+
+        runner.start_job.reset_mock()
+        view.remove_dynamic_chk.setChecked(True)
+        assert "--remove-dynamic" in _workflow_args(view, runner)
 
         # Buttons to create and manage profiles exist
         assert hasattr(view, "btn_new_rig")

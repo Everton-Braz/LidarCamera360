@@ -1,0 +1,18 @@
+{
+  "schema": "lc360-project",
+  "version": "1.0",
+  "created_by": {
+    "app": "example",
+    "version": "1"
+  },
+  "units": "m",
+  "frame": {
+    "name": "world",
+    "up": "+Z"
+  },
+  "assets": {
+    "cloud": "cloud/colored.laz",
+    "images": "images"
+  },
+  "id": "3f2b8c1e-5d4a-4b7e-9c60-1a2b3c4d5e6f"
+}

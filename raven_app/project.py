@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+
+from raven_app.project_validate import validate_project
 
 SCHEMA = 'lc360-project'
 VERSION = '1.0'
@@ -23,6 +27,17 @@ EXPORT_LABELS = {
     'pcd': 'Coloured cloud (.PCD)', 'laz': 'Coloured cloud (.LAZ)', 'las': 'Coloured cloud (.LAS)',
     'georef': 'Georeferenced cloud (LAZ + GeoJSON, needs INSV GPS)', 'gps': 'GPS track (GeoJSON, GPX, CSV)',
     'trajectory': 'SLAM trajectory (TUM + CSV)'}
+
+
+_UUID4 = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+
+
+class ManifestError(ValueError):
+    """The manifest would not pass the v1 validator; nothing was written. `.findings` lists the findings."""
+
+    def __init__(self, findings):
+        self.findings = list(findings)
+        super().__init__('project.json not written: ' + '; '.join(f'{f.code} {f.path}' for f in self.findings))
 
 
 def _rel(root: Path, path: Path) -> str:
@@ -109,6 +124,31 @@ def poses_from_colmap(colmap_dir: Path, frames_json: Path | None = None, dt_sync
                 time='epoch seconds (LiDAR clock)' if epoch0 is not None else 'video seconds', images=images)
 
 
+def _package_rig_profile(root: Path, rig_profile) -> str:
+    """Return a package-relative path for the rig profile, copying an outside profile into the package.
+
+    Callers pass whatever profile the run used, often an absolute path in the app's resources (a PyInstaller temp
+    folder in the portable build). The manifest may only hold paths inside the package, so the file is copied to
+    `rig_profile/<name>`. A profile that cannot be found is left out rather than failing the whole manifest.
+    """
+    if not rig_profile:
+        return ''
+    src = Path(rig_profile)
+    if not src.is_absolute():
+        src = root / src
+    if not src.is_file():
+        return ''
+    try:
+        return _rel(root, src)
+    except ValueError:
+        pass
+    dest = root / 'rig_profile' / src.name
+    dest.parent.mkdir(exist_ok=True)
+    if not (dest.is_file() and dest.read_bytes() == src.read_bytes()):
+        shutil.copyfile(src, dest)
+    return _rel(root, dest)
+
+
 def write_project(project_dir, *, dt_sync: float = 0.0, scanner: str = '', rig_profile: str = '', insv: str = '',
                   run: dict | None = None, app_version: str = '') -> dict:
     """Create or refresh `project.json` in the output folder; returns the manifest."""
@@ -139,11 +179,14 @@ def write_project(project_dir, *, dt_sync: float = 0.0, scanner: str = '', rig_p
         assets['camera_poses'] = _rel(root, poses)
     if (colmap / 'points3D.ply').is_file():
         assets['gaussian_seed'] = _rel(root, colmap / 'points3D.ply')
+    rig_profile = _package_rig_profile(root, rig_profile) or (old.get('capture') or {}).get('rig_profile', '')
     runs = list(old.get('runs', []))
     if run:
         runs = [r for r in runs if r.get('run_id') != run.get('run_id')] + [run]
+    old_id = old.get('id')
     manifest = {
         'schema': SCHEMA, 'version': VERSION,
+        'id': old_id if isinstance(old_id, str) and _UUID4.match(old_id) else str(uuid.uuid4()),
         'created_by': {'app': 'LidarCamera360', 'version': app_version or 'dev'},
         'units': 'm', 'frame': old.get('frame') or {'name': 'lidar_slam_world', 'up': '+Z'},
         'capture': {k: v for k, v in {'scanner': scanner, 'rig_profile': rig_profile, 'insv': str(insv) if insv else
@@ -154,6 +197,9 @@ def write_project(project_dir, *, dt_sync: float = 0.0, scanner: str = '', rig_p
     for key in ('crs', 'quality'):
         if key in old:
             manifest[key] = old[key]
+    errors = validate_project(root, manifest).errors
+    if errors:
+        raise ManifestError(errors)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     return manifest
 

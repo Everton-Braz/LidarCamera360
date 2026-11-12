@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Everton-Braz/LidarCamera360/main/raven_app/schema/lc360-project.schema.json",
+  "title": "LidarCamera360 project package manifest (v1)",
+  "type": "object",
+  "required": ["schema", "version", "created_by", "units", "frame", "assets"],
+  "properties": {
+    "schema": {"const": "lc360-project"},
+    "version": {"type": "string", "pattern": "^1[.][0-9]+$"},
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "updated_utc": {"type": "string"},
+    "created_by": {
+      "type": "object",
+      "required": ["app", "version"],
+      "properties": {"app": {"type": "string"}, "version": {"type": "string"}}
+    },
+    "units": {"const": "m"},
+    "frame": {
+      "type": "object",
+      "required": ["name", "up"],
+      "properties": {"name": {"type": "string"}, "up": {"enum": ["+Z", "+Y"]}}
+    },
+    "crs": {
+      "type": "object",
+      "properties": {"epsg": {"type": "integer"}, "transform": {"type": "string"}}
+    },
+    "capture": {
+      "type": "object",
+      "properties": {
+        "scanner": {"type": "string"},
+        "rig_profile": {"type": "string"},
+        "insv": {"type": "string"},
+        "start_time": {"type": "string"},
+        "duration_s": {"type": "number", "minimum": 0}
+      }
+    },
+    "assets": {
+      "type": "object",
+      "required": ["cloud"],
+      "properties": {
+        "cloud": {"type": "string", "minLength": 1},
+        "images": {"type": "string"},
+        "camera_poses": {"type": "string"},
+        "trajectory": {"type": "string"},
+        "gaussian_seed": {"type": "string"}
+      },
+      "additionalProperties": {"type": "string"}
+    },
+    "dt_sync_seconds": {"type": "number"},
+    "runs": {"type": "array"},
+    "quality": {"type": "string"}
+  }
+}

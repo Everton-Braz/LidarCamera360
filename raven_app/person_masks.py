@@ -173,6 +173,38 @@ def read_mask_config(config=None):
     return normalize_mask_config(config)
 
 
+def profile_mask_config(profile=None, is_eagle=False):
+    """Mask settings stored under ``mask_settings`` in a rig profile, or None.
+
+    The rig mount (fisheye border, scanner body at the image bottom) is the same in
+    every capture with that hardware, so the profile carries it as the default.
+    """
+    from raven_app.profile_manager import resolve_profile
+    path = resolve_profile(profile, is_eagle=is_eagle)
+    if path is None:
+        return None
+    settings = json.loads(Path(path).read_text(encoding='utf-8')).get('mask_settings')
+    return normalize_mask_config(settings) if settings else None
+
+
+def resolve_mask_config(mask_config=None, profile=None, is_eagle=False):
+    """Explicit mask settings win; otherwise the rig profile's; otherwise none."""
+    if mask_config is not None:
+        return mask_config
+    config = profile_mask_config(profile, is_eagle=is_eagle)
+    if config is not None:
+        print('[*] Mask settings from the rig profile (fisheye border and scanner body)')
+    return config
+
+
+def profile_mask_defaults(profile=None):
+    """Profile mask settings to prefill the editor; None when unavailable."""
+    try:
+        return profile_mask_config(profile)
+    except (OSError, ValueError):
+        return None
+
+
 def fisheye_cutoff_radius(shape, percent):
     """Radius of a centered circle excluding approximately `percent` of pixels.
 
@@ -284,6 +316,66 @@ def fixed_keep_samples(shape, u, v, camera, config):
     return keep
 
 
+def mask_evidence(masks_dir):
+    """Directory holding person evidence and the fixed-exclusion config of a mask set."""
+    person_dir = Path(masks_dir) / 'persons'
+    manifest = Path(masks_dir) / 'manifest.json'
+    metadata = json.loads(manifest.read_text(encoding='utf-8')) if manifest.is_file() else {}
+    if metadata.get('schema') == 2 and not person_dir.is_dir():
+        raise ValueError('Legacy combined masks need their person-only layer for geometry removal')
+    evidence_dir = person_dir if metadata.get('schema') != 3 and person_dir.is_dir() else masks_dir
+    # Schema 3 and 4 masks bake fixed exclusions into the PNG; exclude those regions from votes.
+    config = (normalize_mask_config(metadata.get('mask_config'))
+              if metadata.get('schema') in (3, 4) else None)
+    return evidence_dir, config
+
+
+def protect_planar(points, tree, candidates):
+    """True for candidate points lying on a locally supported plane (door, wall, floor).
+
+    A person mask labels image pixels, not the depth of the object at that
+    pixel, so mask-voted points on planes are kept.
+    """
+    planar = np.zeros(len(candidates), dtype=bool)
+    for reach, minimum in ((.10, 16), (.30, 12)):
+        pending = np.flatnonzero(~planar)
+        if not len(pending):
+            break
+        neighbors = tree.query(points[candidates[pending]], k=32,
+                               distance_upper_bound=reach, workers=-1)[1]
+        for i, ids in enumerate(neighbors):
+            local = points[ids[ids < len(points)]]
+            if len(local) < minimum:
+                continue
+            center = local.mean(axis=0)
+            centered = local - center
+            eigenvalues, eigenvectors = np.linalg.eigh(centered.T @ centered / len(local))
+            candidate = points[candidates[pending[i]]]
+            residual = abs((candidate - center) @ eigenvectors[:, 0])
+            if eigenvalues[1] > 0.000025 and eigenvalues[0] < .04 * eigenvalues[1] and residual < .025:
+                planar[pending[i]] = True
+                continue
+            # Trim isolated foreground returns before fitting the nearby
+            # fixed surface. A person in front of a sparse floor otherwise
+            # makes its covariance look non-planar.
+            for _ in range(2):
+                center = local.mean(axis=0)
+                centered = local - center
+                eigenvalues, eigenvectors = np.linalg.eigh(centered.T @ centered / len(local))
+                distances = np.abs(centered @ eigenvectors[:, 0])
+                local = local[distances <= np.quantile(distances, .8)]
+            center = local.mean(axis=0)
+            centered = local - center
+            eigenvalues, eigenvectors = np.linalg.eigh(centered.T @ centered / len(local))
+            # The queried point must lie on the plane. This stops a person
+            # standing in front of a door/floor from inheriting its support.
+            residual = abs((candidate - center) @ eigenvectors[:, 0])
+            planar[pending[i]] = (len(local) >= 8 and eigenvalues[1] > 0.000025
+                                  and eigenvalues[0] < .04 * eigenvalues[1]
+                                  and residual < .025)
+    return planar
+
+
 def masked_operator_keep(points, views, images_dir, masks_dir, radius, project):
     """Remove near-camera geometry only with repeated person-mask evidence.
 
@@ -295,13 +387,7 @@ def masked_operator_keep(points, views, images_dir, masks_dir, radius, project):
     if not math.isfinite(radius) or radius <= 0:
         raise ValueError('Operator radius must be finite and positive')
     from scipy.spatial import cKDTree
-    person_dir = Path(masks_dir) / 'persons'
-    manifest = Path(masks_dir) / 'manifest.json'
-    metadata = json.loads(manifest.read_text(encoding='utf-8')) if manifest.is_file() else {}
-    if metadata.get('schema') == 2 and not person_dir.is_dir():
-        raise ValueError('Legacy combined masks need their person-only layer for geometry removal')
-    evidence_dir = person_dir if metadata.get('schema') != 3 and person_dir.is_dir() else masks_dir
-    config = normalize_mask_config(metadata.get('mask_config')) if metadata.get('schema') == 3 else None
+    evidence_dir, config = mask_evidence(masks_dir)
     tree = cKDTree(points)
     person = np.zeros(len(points), dtype=np.uint32)
     observed = np.zeros(len(points), dtype=np.uint32)
@@ -332,43 +418,7 @@ def masked_operator_keep(points, views, images_dir, masks_dir, radius, project):
         # pixel. Protect locally supported planes such as doors and walls before
         # deleting any LiDAR return. Process only mask-voted points to keep this
         # inexpensive for multi-million-point clouds.
-        planar = np.zeros(len(candidates), dtype=bool)
-        for reach, minimum in ((.10, 16), (.30, 12)):
-            pending = np.flatnonzero(~planar)
-            if not len(pending):
-                break
-            neighbors = tree.query(points[candidates[pending]], k=32,
-                                   distance_upper_bound=reach, workers=-1)[1]
-            for i, ids in enumerate(neighbors):
-                local = points[ids[ids < len(points)]]
-                if len(local) < minimum:
-                    continue
-                center = local.mean(axis=0)
-                centered = local - center
-                eigenvalues, eigenvectors = np.linalg.eigh(centered.T @ centered / len(local))
-                candidate = points[candidates[pending[i]]]
-                residual = abs((candidate - center) @ eigenvectors[:, 0])
-                if eigenvalues[1] > 0.000025 and eigenvalues[0] < .04 * eigenvalues[1] and residual < .025:
-                    planar[pending[i]] = True
-                    continue
-                # Trim isolated foreground returns before fitting the nearby
-                # fixed surface. A person in front of a sparse floor otherwise
-                # makes its covariance look non-planar.
-                for _ in range(2):
-                    center = local.mean(axis=0)
-                    centered = local - center
-                    eigenvalues, eigenvectors = np.linalg.eigh(centered.T @ centered / len(local))
-                    distances = np.abs(centered @ eigenvectors[:, 0])
-                    local = local[distances <= np.quantile(distances, .8)]
-                center = local.mean(axis=0)
-                centered = local - center
-                eigenvalues, eigenvectors = np.linalg.eigh(centered.T @ centered / len(local))
-                # The queried point must lie on the plane. This stops a person
-                # standing in front of a door/floor from inheriting its support.
-                residual = abs((candidate - center) @ eigenvectors[:, 0])
-                planar[pending[i]] = (len(local) >= 8 and eigenvalues[1] > 0.000025
-                                      and eigenvalues[0] < .04 * eigenvalues[1]
-                                      and residual < .025)
+        planar = protect_planar(points, tree, candidates)
         remove[candidates[planar]] = False
         print(f'[*] Protected {int(planar.sum()):,} mask-voted points on planar surfaces (including floors)')
     print(f'[*] Mask-supported operator removal ({radius:g} m): {int(remove.sum()):,}/{len(points):,} points')
