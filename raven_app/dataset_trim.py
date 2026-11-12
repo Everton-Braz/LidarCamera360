@@ -34,6 +34,20 @@ class DatasetInterval:
     name: str = ""
 
 
+
+def _resolve_time_sync(bag_path, video_path):
+    """IMU-gyro offset of the clip inside the LiDAR recording; a guessed offset is never substituted."""
+    from .workflow import auto_sync_imu_gyro
+    try:
+        dt_sync = auto_sync_imu_gyro(bag_path, video_path)
+    except Exception as e:
+        print(f"[!] auto_sync_imu_gyro failed: {e}")
+        dt_sync = None
+    if dt_sync is None:
+        raise ValueError("Could not determine the LiDAR/video time offset automatically. "
+                         "Untick 'Auto IMU Gyro Cross-Correlation' and enter the Manual Δt (s), then try again.")
+    return dt_sync
+
 def get_bag_time_bounds(bag_path: Path | str) -> tuple[int, int, float]:
     """Return (start_time_ns, end_time_ns, duration_seconds) for a ROS bag."""
     bag_path = Path(bag_path)
@@ -57,6 +71,70 @@ def get_video_duration(video_path: Path | str) -> float:
     except Exception:
         pass
     return 0.0
+
+
+
+SIDECAR_SUFFIX = ".timelapse.json"
+
+
+def capture_times(video_path: Path | str):
+    """Per-frame capture seconds of a timelapse video (INSV trailer or our sidecar), else None.
+
+    A timelapse plays 15 min of capture in about a minute, so playback seconds are NOT capture seconds.
+    """
+    from .video import _timelapse_times
+    return _timelapse_times(Path(video_path))
+
+
+def _video_packets(video_path: Path | str):
+    import av
+    pts, key = [], []
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        for packet in container.demux(stream):
+            if packet.pts is None:
+                continue
+            pts.append(float(packet.pts * stream.time_base))
+            key.append(bool(packet.is_keyframe))
+    order = np.argsort(pts)
+    return np.asarray(pts)[order], np.asarray(key)[order]
+
+
+def slice_timelapse_video(src_video, dst_video, times, t_start, t_end, ffmpeg_bin="ffmpeg") -> dict:
+    """Cut a timelapse video by CAPTURE time. The cut starts on a keyframe so no frame is left without a timestamp,
+    and the capture times of the kept frames are written beside the output (rebased to its first frame)."""
+    pts, key = _video_packets(src_video)
+    if len(pts) > len(times):
+        raise RuntimeError(f"Video has {len(pts)} frames but its telemetry has only {len(times)} timestamps")
+    times = times[:len(pts)]  # the camera may log one more exposure than it encoded
+    wanted = np.nonzero((times >= t_start) & (times <= t_end))[0]
+    if not len(wanted):
+        raise ValueError(f"No video frame was captured between {t_start:.1f}s and {t_end:.1f}s "
+                         f"(the video covers 0 - {times[-1]:.1f}s)")
+    first = int(wanted[0])
+    last = int(wanted[-1])
+    first = int(np.nonzero(key[:first + 1])[0][-1])
+    step = float(np.median(np.diff(pts))) if len(pts) > 1 else 0.0
+    dur = (pts[last] - pts[first]) + step
+    out = Path(dst_video)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [ffmpeg_bin, "-y", "-ss", f"{pts[first]:.6f}", "-t", f"{dur:.6f}", "-i", str(src_video),
+           "-map", "0:v:0", "-map", "0:v:1", "-map", "0:a:0?", "-c", "copy", "-f", "mp4", str(out)]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        cmd = [ffmpeg_bin, "-y", "-ss", f"{pts[first]:.6f}", "-t", f"{dur:.6f}", "-i", str(src_video),
+               "-c", "copy", "-f", "mp4", str(out)]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"FFmpeg slicing failed: {res.stderr}")
+    n_out = len(_video_packets(out)[0])
+    if n_out < last - first + 1:
+        last = first + n_out - 1
+    kept = times[first:last + 1]
+    Path(str(out) + SIDECAR_SUFFIX).write_text(
+        json.dumps({"times": (kept - kept[0]).tolist(), "origin_capture_sec": float(kept[0])}))
+    return {"duration_seconds": float(kept[-1] - kept[0]), "output_path": str(out), "start_sec": float(kept[0]),
+            "frames": int(len(kept)), "timelapse": True}
 
 
 def slice_bag(
@@ -199,6 +277,7 @@ def trim_dataset_synchronized(
     dt_sync: float | None = None,
     ffmpeg_bin: str = "ffmpeg",
     progress_callback: Callable[[str, float], None] | None = None,
+    end_at_sec: float | None = None,
 ) -> dict:
     """Trim synchronized ROS bag and video from beginning and end.
 
@@ -208,6 +287,7 @@ def trim_dataset_synchronized(
         output_dir: Target directory for trimmed files
         trim_start_sec: Seconds to cut from the beginning
         trim_end_sec: Seconds to cut from the end
+        end_at_sec: Absolute end time (seconds from the bag start) to keep; overrides trim_end_sec when > 0
         dt_sync: Time sync offset (t_video = t_lidar + dt_sync). If None, auto-calculated.
         ffmpeg_bin: ffmpeg executable path
         progress_callback: Optional callback(stage, progress_float)
@@ -229,18 +309,16 @@ def trim_dataset_synchronized(
     if dt_sync is None:
         if progress_callback:
             progress_callback("Computing time synchronization...", 0.05)
-        from .workflow import auto_sync_imu_gyro, compute_time_sync_offset
-        try:
-            dt_sync = auto_sync_imu_gyro(bag_path, video_path)
-        except Exception as e:
-            print(f"[!] auto_sync_imu_gyro failed: {e}. Falling back to metadata offset.")
-            dt_sync = compute_time_sync_offset(bag_path, video_path)
+        dt_sync = _resolve_time_sync(bag_path, video_path)
 
     dt_sync = float(dt_sync or 0.0)
 
     # 2. Inspect source durations
     _, _, bag_dur = get_bag_time_bounds(bag_path)
-    video_dur = get_video_duration(video_path)
+    cap_times = capture_times(video_path)
+    video_dur = float(cap_times[-1]) if cap_times is not None else get_video_duration(video_path)
+    if cap_times is not None:
+        print(f"[trim] Timelapse video: {len(cap_times)} frames spanning {video_dur:.1f}s of capture time.")
 
     trim_start_sec = max(0.0, float(trim_start_sec))
     trim_end_sec = max(0.0, float(trim_end_sec))
@@ -248,6 +326,9 @@ def trim_dataset_synchronized(
     # Bag target interval
     bag_slice_start = trim_start_sec
     bag_slice_end = max(0.0, bag_dur - trim_end_sec)
+    if end_at_sec is not None and float(end_at_sec) > 0:
+        bag_slice_end = min(bag_dur, float(end_at_sec))
+        trim_end_sec = bag_dur - bag_slice_end
     if bag_slice_start >= bag_slice_end:
         raise ValueError(
             f"Trim settings exceed bag duration: start={trim_start_sec}s, end={trim_end_sec}s, bag={bag_dur:.2f}s"
@@ -257,7 +338,16 @@ def trim_dataset_synchronized(
     # Synchronized video interval:
     # t_video = t_lidar + dt_sync
     video_slice_start = max(0.0, bag_slice_start + dt_sync)
-    video_slice_dur = mission_dur
+    # The video can be shorter than the bag: colour only exists where both overlap.
+    video_slice_dur = min(mission_dur, max(0.0, video_dur - video_slice_start))
+    if video_slice_dur <= 0:
+        raise ValueError(f"The video ({video_dur:.1f}s) ends before the selected LiDAR interval starts "
+                         f"(video starts at {video_slice_start:.1f}s).")
+    if video_slice_dur < mission_dur - 0.5:
+        print(f"[trim] WARNING: video covers only {video_slice_dur:.1f}s of the {mission_dur:.1f}s LiDAR interval; "
+              "the rest will have no colour.")
+    # Stream copy makes the requested start the new t=0 of the video, so the offset between the
+    # trimmed files is what is left after both cuts, not the original dt_sync.
 
     out_bag = output_dir / f"{bag_path.stem}_trimmed{bag_path.suffix}"
     out_video = output_dir / f"{video_path.stem}_trimmed{video_path.suffix}"
@@ -276,13 +366,19 @@ def trim_dataset_synchronized(
     # 4. Slice video
     if progress_callback:
         progress_callback("Trimming 360 video...", 0.55)
-    video_res = slice_video(
-        video_path,
-        out_video,
-        start_sec=video_slice_start,
-        duration_sec=video_slice_dur,
-        ffmpeg_bin=ffmpeg_bin,
-    )
+    if cap_times is not None:
+        video_res = slice_timelapse_video(video_path, out_video, cap_times, video_slice_start,
+                                          video_slice_start + video_slice_dur, ffmpeg_bin)
+        video_slice_start = video_res["start_sec"]
+    else:
+        video_res = slice_video(
+            video_path,
+            out_video,
+            start_sec=video_slice_start,
+            duration_sec=video_slice_dur,
+            ffmpeg_bin=ffmpeg_bin,
+        )
+    dt_sync_trimmed = dt_sync - video_slice_start + bag_slice_start
     write_gps_sidecar(video_path, out_video, video_slice_start)
 
     if progress_callback:
@@ -292,6 +388,8 @@ def trim_dataset_synchronized(
         "bag_path": str(out_bag),
         "video_path": str(out_video),
         "dt_sync": dt_sync,
+        "dt_sync_trimmed": dt_sync_trimmed,
+        "video_covered_seconds": video_slice_dur,
         "trim_start_sec": trim_start_sec,
         "trim_end_sec": trim_end_sec,
         "bag_duration": bag_res["duration_seconds"],
@@ -357,6 +455,8 @@ def split_dataset_into_chunks(
     dt_sync: float | None = None,
     ffmpeg_bin: str = "ffmpeg",
     progress_callback: Callable[[str, float], None] | None = None,
+    end_at_sec: float | None = None,
+    num_chunks: int = 0,
 ) -> list[dict]:
     """Divide a dataset into overlapping chunks with synchronized bag and video.
 
@@ -371,6 +471,7 @@ def split_dataset_into_chunks(
         overlap_sec: Overlap duration shared between consecutive chunks (default 30.0s)
         trim_start_sec: Optional initial trim from mission start
         trim_end_sec: Optional final trim from mission end
+        num_chunks: If > 0, split into exactly this many chunks (chunk_duration_sec is derived from it)
         dt_sync: Time sync offset (auto-computed if None)
         ffmpeg_bin: ffmpeg binary
         progress_callback: Optional progress reporter
@@ -387,21 +488,23 @@ def split_dataset_into_chunks(
     if dt_sync is None:
         if progress_callback:
             progress_callback("Resolving time sync...", 0.05)
-        from .workflow import auto_sync_imu_gyro, compute_time_sync_offset
-        try:
-            dt_sync = auto_sync_imu_gyro(bag_path, video_path)
-        except Exception as e:
-            print(f"[!] auto_sync_imu_gyro failed: {e}")
-            dt_sync = compute_time_sync_offset(bag_path, video_path)
+        dt_sync = _resolve_time_sync(bag_path, video_path)
     dt_sync = float(dt_sync or 0.0)
 
     _, _, total_bag_dur = get_bag_time_bounds(bag_path)
     valid_start = max(0.0, float(trim_start_sec))
     valid_end = max(0.0, total_bag_dur - float(trim_end_sec))
+    if end_at_sec is not None and float(end_at_sec) > 0:
+        valid_end = min(total_bag_dur, float(end_at_sec))
     if valid_start >= valid_end:
         raise ValueError(f"Trim bounds exceed dataset duration: {valid_start}s -> {valid_end}s")
 
     mission_dur = valid_end - valid_start
+    cap_times = capture_times(video_path)
+    video_dur = float(cap_times[-1]) if cap_times is not None else get_video_duration(video_path)
+    if num_chunks:
+        n = max(1, int(num_chunks))
+        chunk_duration_sec = (mission_dur + (n - 1) * overlap_sec) / n
     raw_chunks = compute_overlapping_chunks(mission_dur, chunk_duration_sec, overlap_sec)
 
     chunk_results = []
@@ -413,6 +516,12 @@ def split_dataset_into_chunks(
         c_dur = c_end_bag - c_start_bag
 
         c_start_video = max(0.0, c_start_bag + dt_sync)
+        c_video_dur = min(c_dur, max(0.0, video_dur - c_start_video))
+        if c_video_dur <= 0:
+            print(f"[chunks] {cname}: the video ends before this chunk, skipped (no colour available).")
+            continue
+        if c_video_dur < c_dur - 0.5:
+            print(f"[chunks] WARNING {cname}: video covers only {c_video_dur:.1f}s of {c_dur:.1f}s.")
 
         chunk_dir = output_dir / cname
         chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -425,13 +534,18 @@ def split_dataset_into_chunks(
             progress_callback(msg, (i) / total_n)
 
         bag_res = slice_bag(bag_path, chunk_bag, start_sec=c_start_bag, end_sec=c_end_bag)
-        video_res = slice_video(
-            video_path,
-            chunk_video,
-            start_sec=c_start_video,
-            duration_sec=c_dur,
-            ffmpeg_bin=ffmpeg_bin,
-        )
+        if cap_times is not None:
+            video_res = slice_timelapse_video(video_path, chunk_video, cap_times, c_start_video,
+                                              c_start_video + c_video_dur, ffmpeg_bin)
+            c_start_video = video_res["start_sec"]
+        else:
+            video_res = slice_video(
+                video_path,
+                chunk_video,
+                start_sec=c_start_video,
+                duration_sec=c_video_dur,
+                ffmpeg_bin=ffmpeg_bin,
+            )
         write_gps_sidecar(video_path, chunk_video, c_start_video)
 
         item = {
@@ -448,6 +562,7 @@ def split_dataset_into_chunks(
             "video_duration": video_res["duration_seconds"],
             "overlap_sec": overlap_sec if i > 0 else 0.0,
             "dt_sync": dt_sync,
+            "dt_sync_trimmed": dt_sync - c_start_video + c_start_bag,
         }
         chunk_results.append(item)
 
@@ -457,7 +572,7 @@ def split_dataset_into_chunks(
         "dt_sync": dt_sync,
         "chunk_duration_sec": chunk_duration_sec,
         "overlap_sec": overlap_sec,
-        "total_chunks": total_n,
+        "total_chunks": len(chunk_results),
         "chunks": chunk_results,
     }
     (output_dir / "chunks_manifest.json").write_text(json.dumps(summary, indent=2))

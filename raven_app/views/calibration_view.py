@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QSizePolicy, QInputDialog,
     QTableWidgetItem, QHeaderView, QAbstractItemView
@@ -13,7 +13,7 @@ from qfluentwidgets import (
     CardWidget, TitleLabel, SubtitleLabel, BodyLabel, CaptionLabel, StrongBodyLabel,
     PushButton, PrimaryPushButton, ComboBox, LineEdit, DoubleSpinBox, SpinBox, CheckBox,
     PlainTextEdit, TableWidget, FluentIcon, InfoBar, InfoBarPosition, MessageBoxBase,
-    SmoothScrollArea
+    MessageBox, SmoothScrollArea
 )
 from scipy.spatial.transform import Rotation as Rot
 
@@ -148,6 +148,7 @@ class NewRigDialog(MessageBoxBase):
 
 class CalibrationView(QWidget):
     """WinUI Fluent view for hardware rig profiles (scanner + cameras + mount)."""
+    profiles_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -198,7 +199,9 @@ class CalibrationView(QWidget):
         self.btn_export.clicked.connect(self._export_profile)
         self.btn_default = PushButton(tr("Use as default"), icon=FluentIcon.ACCEPT)
         self.btn_default.clicked.connect(self._set_default)
-        for widget in (self.profile_combo, self.btn_new, self.btn_import, self.btn_export, self.btn_default):
+        self.btn_delete = PushButton(tr("Delete"), icon=FluentIcon.DELETE)
+        self.btn_delete.clicked.connect(self._delete_profile)
+        for widget in (self.profile_combo, self.btn_new, self.btn_import, self.btn_export, self.btn_default, self.btn_delete):
             actions.addWidget(widget)
         actions.addStretch()
         layout.addLayout(actions)
@@ -283,6 +286,7 @@ class CalibrationView(QWidget):
         row = QHBoxLayout()
         self.dataset_edit = LineEdit()
         self.dataset_edit.setPlaceholderText(tr("Processed output folder"))
+        self.dataset_edit.textChanged.connect(lambda text: self._auto_detect_dt(Path(text.strip())))
         self.btn_dataset = PushButton(tr("Browse..."), icon=FluentIcon.FOLDER)
         self.btn_dataset.clicked.connect(self._browse_dataset)
         self.coarse_check = CheckBox(tr("Coarse search (new rig)"))
@@ -378,6 +382,9 @@ class CalibrationView(QWidget):
         self.json_edit.setPlainText(json.dumps(profile.to_dict(), indent=2))
         bootstrap = (profile.extra.get('bootstrap') or {}).get('needs_coarse_calibration')
         self.coarse_check.setChecked(bool(bootstrap))
+        is_user = bool(self._profile_path and self._is_user_path(self._profile_path))
+        self.btn_delete.setEnabled(is_user)
+        self.btn_delete.setToolTip(tr("Delete this user profile") if is_user else tr("Bundled profiles cannot be deleted"))
 
     def _fill_table(self, profile):
         rows = camera_rows(profile)
@@ -478,6 +485,7 @@ class CalibrationView(QWidget):
             return
         self._populate_profiles_combo(path)
         self._show_profile(load_profile(path), path)
+        self.profiles_changed.emit()
         self._success(tr("Profile saved"), str(path))
 
     def _save_profile_as(self):
@@ -493,6 +501,7 @@ class CalibrationView(QWidget):
             return
         self._populate_profiles_combo(path)
         self._show_profile(load_profile(path), path)
+        self.profiles_changed.emit()
         self._success(tr("Profile saved"), str(path))
 
     def _new_rig(self):
@@ -507,6 +516,7 @@ class CalibrationView(QWidget):
             return
         self._populate_profiles_combo(path)
         self._show_profile(load_profile(path), path)
+        self.profiles_changed.emit()
         self._success(tr("Profile created"), tr(
             "Process a capture with this profile (rig refinement off), then calibrate it here with the coarse search."))
 
@@ -524,6 +534,7 @@ class CalibrationView(QWidget):
             return
         self._populate_profiles_combo(saved)
         self._show_profile(load_profile(saved), saved)
+        self.profiles_changed.emit()
         self._success(tr("Profile imported"), str(saved))
 
     def _export_profile(self):
@@ -551,7 +562,28 @@ class CalibrationView(QWidget):
                         tr("Another of your profiles is marked as default; save this one as your own copy first."))
             return
         self._populate_profiles_combo(self._profile_path)
+        self.profiles_changed.emit()
         self._success(tr("Default profile"), self._profile.name)
+
+    def _delete_profile(self):
+        if self._profile_path is None or not self._is_user_path(self._profile_path):
+            return
+        box = MessageBox(tr("Delete rig profile"),
+                         tr("Are you sure you want to delete profile '{name}'?\nThis cannot be undone.",
+                            name=self._profile.name),
+                         self.window())
+        if not box.exec():
+            return
+        try:
+            if self._profile_path.is_file():
+                self._profile_path.unlink()
+            self._success(tr("Profile deleted"), self._profile.name)
+        except OSError as exc:
+            self._error(tr("Could not delete profile"), str(exc))
+            return
+        self.profiles_changed.emit()
+        self._populate_profiles_combo()
+        self._on_profile_selected(0)
 
     def _add_aux_camera(self):
         try:
@@ -614,6 +646,22 @@ class CalibrationView(QWidget):
         path = QFileDialog.getExistingDirectory(self, tr("Processed output folder"))
         if path:
             self.dataset_edit.setText(path)
+            self._auto_detect_dt(Path(path))
+
+    def _auto_detect_dt(self, dataset: Path):
+        if not dataset.is_dir():
+            return
+        for name in ('colmap_to_lidar_alignment.json', 'rig_calibration.json', 'calibracao_rigida_auto.json'):
+            p = dataset / name
+            if p.is_file():
+                try:
+                    data = json.loads(p.read_text(encoding='utf-8'))
+                    if 'dt_sync_seconds' in data and data['dt_sync_seconds'] is not None:
+                        val = float(data['dt_sync_seconds'])
+                        self.dt_edit.setText(f"{val:.4f}")
+                        break
+                except Exception:
+                    pass
 
     def validation_args(self, profile_path, report_path):
         """CLI arguments of the calibrate job for the current form state."""
@@ -622,6 +670,18 @@ class CalibrationView(QWidget):
         dt = self.dt_edit.text().strip().replace(',', '.')
         if dt:
             args += ['--dt', str(float(dt))]
+        else:
+            dataset = Path(self.dataset_edit.text().strip())
+            for name in ('colmap_to_lidar_alignment.json', 'rig_calibration.json', 'calibracao_rigida_auto.json'):
+                p = dataset / name
+                if p.is_file():
+                    try:
+                        data = json.loads(p.read_text(encoding='utf-8'))
+                        if 'dt_sync_seconds' in data and data['dt_sync_seconds'] is not None:
+                            args += ['--dt', str(float(data['dt_sync_seconds']))]
+                            break
+                    except Exception:
+                        pass
         if self.coarse_check.isChecked():
             args.append('--coarse')
         return args
@@ -702,6 +762,7 @@ class CalibrationView(QWidget):
             return
         self._populate_profiles_combo(path)
         self._show_profile(load_profile(path), path)
+        self.profiles_changed.emit()
         self._success(tr("Profile saved"), str(path))
 
     # -- helpers -----------------------------------------------------------------
@@ -723,4 +784,5 @@ class CalibrationView(QWidget):
         self.title_cameras.setText(tr("Cameras and mount"))
         self.title_validate.setText(tr("Validate on a capture"))
         self.title_json.setText(tr("Advanced: profile JSON"))
+        self.btn_delete.setText(tr("Delete"))
         self.camera_table.setHorizontalHeaderLabels([tr(c) for c in COLUMNS])

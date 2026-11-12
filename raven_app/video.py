@@ -44,6 +44,12 @@ def _timelapse_times(path):
         # Generic MP4/MKV input (including test videos named .insv) has no trailer.
         if str(exc) not in ('Invalid INSV magic footer', 'INSV file is too short for a trailer'):
             raise
+        # Videos cut by Trim/Chunks keep their capture times in a sidecar, since the cut drops the trailer.
+        sidecar = Path(str(path) + '.timelapse.json')
+        if sidecar.is_file():
+            times = np.asarray(json.loads(sidecar.read_text(encoding='utf-8'))['times'], dtype=np.float64)
+            if len(times) and np.all(np.diff(times) > 0):
+                return times
         return None
     if raw is None:
         return None

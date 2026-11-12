@@ -91,3 +91,36 @@ def test_wizard_builds_a_profile_and_calibrate_uses_the_coarse_search(user_dir, 
         assert args[args.index('--report') + 1] == str(tmp_path / 'r.json')
     finally:
         view.close()
+
+
+def test_user_profile_deletion_and_signal(user_dir, monkeypatch):
+    view = CalibrationView()
+    try:
+        # Bundled profile cannot be deleted
+        assert not view.btn_delete.isEnabled()
+
+        signal_emitted = []
+        view.profiles_changed.connect(lambda: signal_emitted.append(True))
+
+        # Save as a user profile
+        view.name_edit.setText('Custom Test Rig')
+        view._save_profile_as_name = 'custom_test_rig'
+        monkeypatch.setattr('raven_app.views.calibration_view.QInputDialog.getText', lambda *a, **kw: ('Custom Test Rig', True))
+        view._save_profile_as()
+
+        saved = user_dir / 'custom_test_rig.json'
+        assert saved.is_file()
+        assert view.btn_delete.isEnabled()
+        assert len(signal_emitted) >= 1
+
+        # Delete with confirmed dialog
+        monkeypatch.setattr('raven_app.views.calibration_view.MessageBox.exec', lambda self: 1)
+        signal_emitted.clear()
+        view._delete_profile()
+
+        assert not saved.exists()
+        assert len(signal_emitted) == 1
+        assert not view.btn_delete.isEnabled()
+    finally:
+        view.close()
+

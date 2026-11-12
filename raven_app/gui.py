@@ -72,6 +72,7 @@ class RavenMainWindow(FluentWindow):
 
         # Wire up inter-view communication
         self.inspect_view.apply_to_slam_requested.connect(self._on_apply_topics_to_slam)
+        self.calib_view.profiles_changed.connect(self.workflow_view._populate_rig_profiles)
 
         # Setup Navigation Rail
         self._init_navigation()

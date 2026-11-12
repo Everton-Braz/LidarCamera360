@@ -252,7 +252,21 @@ def main():
     # parent bootloader's DLL directory or a system Visual C++ installation.
     if a.onefile:
         portable_target = dist_root / f'{APP_NAME}_portable.exe'
-        shutil.copy2(output / f'{APP_NAME}.exe', portable_target)
+        try:
+            shutil.copy2(output / f'{APP_NAME}.exe', portable_target)
+        except PermissionError:
+            old = dist_root / f'{APP_NAME}_portable.exe.old'
+            try:
+                if old.exists():
+                    old.unlink()
+            except Exception:
+                pass
+            try:
+                os.rename(portable_target, old)
+                shutil.copy2(output / f'{APP_NAME}.exe', portable_target)
+            except Exception as exc:
+                print(f"[!] Could not overwrite {portable_target.name} (app is running): {exc}")
+                print(f"[*] The new binary is available at: {output / f'{APP_NAME}.exe'}")
         print(f"[+] Portable executable saved to: {portable_target}")
     else:
         internal = output / '_internal'

@@ -6,14 +6,14 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QFrame, QDialog,
-    QMessageBox, QSlider
+    QMessageBox, QSlider, QSizePolicy
 )
 from qfluentwidgets import (
     CardWidget, ElevatedCardWidget, TitleLabel, SubtitleLabel, BodyLabel,
     CaptionLabel, StrongBodyLabel, PrimaryPushButton, PushButton, ToolButton,
     LineEdit, DoubleSpinBox, SpinBox, ComboBox, CheckBox, SwitchButton,
     ProgressBar, PlainTextEdit, FluentIcon, InfoBar, InfoBarPosition,
-    SmoothScrollArea
+    SmoothScrollArea, FlowLayout
 )
 from raven_app.process_runner import ProcessRunner, make_run_log_path
 from raven_app.workflow_progress import (
@@ -22,9 +22,10 @@ from raven_app.workflow_progress import (
 )
 from raven_app.mask_download import MaskResourceDownload
 from raven_app.mask_resources import resource_status, resources_ready
-from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag
+from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag, find_adjacent_lidar_bag
 from raven_app.seed_export import dataset_seed_point_count, seed_point_count
 from raven_app.i18n import tr, tr_button
+from raven_app.config import load_config
 
 RIG_REFINE_CHOICES = (
     ("Photometric (recommended)", "photometric"),
@@ -93,6 +94,7 @@ class UnifiedWorkflowView(QWidget):
                "Time Sync → Point Cloud Colorization → 3DGS Deliverables")
         )
         header_layout.addWidget(self.header_title)
+        self.header_subtitle.setWordWrap(True)
         header_layout.addWidget(self.header_subtitle)
         layout.addLayout(header_layout)
 
@@ -204,7 +206,7 @@ class UnifiedWorkflowView(QWidget):
         self.secondary_insv_input.textChanged.connect(self._on_secondary_insv_changed)
 
         # Row 2.5: Auxiliary image/video cameras
-        aux_row = QHBoxLayout()
+        aux_row = FlowLayout()
         self.aux_label = BodyLabel(tr("Auxiliary Camera:"))
         self.aux_label.setFixedWidth(170)
         self.aux_input = LineEdit()
@@ -253,12 +255,11 @@ class UnifiedWorkflowView(QWidget):
         self.config_title = SubtitleLabel(tr("2. Pipeline Processing Options"))
         config_layout.addWidget(self.config_title)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(24)
-        grid.setVerticalSpacing(10)
+        grid = QVBoxLayout()
+        grid.setSpacing(10)
 
         # Scanner Preset Selector
-        scanner_row = QHBoxLayout()
+        scanner_row = FlowLayout()
         self.scanner_label = CaptionLabel(tr("Scanner Hardware Preset:"))
         self.scanner_combo = ComboBox()
         self.scanner_combo.addItems([
@@ -269,39 +270,38 @@ class UnifiedWorkflowView(QWidget):
         self.scanner_combo.currentIndexChanged.connect(self._on_preset_changed)
         scanner_row.addWidget(self.scanner_label)
         scanner_row.addWidget(self.scanner_combo)
-        grid.addLayout(scanner_row, 0, 0)
+        grid.addLayout(scanner_row)
 
-        threads_layout = QHBoxLayout()
+        threads_layout = scanner_row
         self.threads_caption = CaptionLabel(tr("CPU Threads:"))
         self.threads_spin = SpinBox()
         self.threads_spin.setRange(1, 64)
         self.threads_spin.setValue(4)
         threads_layout.addWidget(self.threads_caption)
         threads_layout.addWidget(self.threads_spin)
-        grid.addLayout(threads_layout, 0, 1)
 
         # SLAM options
         self.lio_switch = SwitchButton(text=tr("Enable LiDAR + IMU Odometry (Fast LIO)"))
         self.lio_switch.setOnText(tr("LiDAR + IMU (LIO)"))
         self.lio_switch.setOffText(tr("LiDAR + camera + IMU (VIO)"))
         self.lio_switch.setChecked(True)
-        grid.addWidget(self.lio_switch, 1, 0, 1, 2)
+        grid.addWidget(self.lio_switch)
 
         # Topics
-        topics_layout = QHBoxLayout()
+        topics_layout = FlowLayout()
         self.lidar_caption = CaptionLabel(tr("LiDAR Topic:"))
         self.lidar_topic = LineEdit()
         self.lidar_topic.setText("/vanjee_722z")
-        topics_layout.setSpacing(10)
+        self.lidar_topic.setMinimumWidth(200)
         topics_layout.addWidget(self.lidar_caption)
         topics_layout.addWidget(self.lidar_topic)
-        topics_layout.addSpacing(14)
         self.imu_caption = CaptionLabel(tr("IMU Topic:"))
         self.imu_topic = LineEdit()
         self.imu_topic.setText("/vanjee_imu_packets")
+        self.imu_topic.setMinimumWidth(220)
         topics_layout.addWidget(self.imu_caption)
         topics_layout.addWidget(self.imu_topic)
-        grid.addLayout(topics_layout, 2, 0, 1, 2)
+        grid.addLayout(topics_layout)
 
         # Separator line
         sep = QFrame()
@@ -311,7 +311,7 @@ class UnifiedWorkflowView(QWidget):
         config_layout.addWidget(sep)
 
         # Sync & Colorization row
-        sync_row = QHBoxLayout()
+        sync_row = FlowLayout()
         self.auto_sync_chk = CheckBox(tr("Auto IMU Gyro Cross-Correlation"))
         self.auto_sync_chk.setChecked(True)
         self.auto_sync_chk.stateChanged.connect(self._toggle_auto_sync)
@@ -324,7 +324,6 @@ class UnifiedWorkflowView(QWidget):
         self.dt_input.setEnabled(False)
         sync_row.addWidget(self.dt_caption)
         sync_row.addWidget(self.dt_input)
-        sync_row.addStretch()
 
         self.fps_caption = CaptionLabel(tr("Extraction FPS:"))
         self.fps_spin = DoubleSpinBox()
@@ -338,15 +337,14 @@ class UnifiedWorkflowView(QWidget):
         config_layout.addLayout(sync_row)
 
         # Dataset Trimming & Chunking Controls
-        trim_row = QHBoxLayout()
+        trim_row = FlowLayout()
         self.trim_chk = CheckBox(tr("Trim dataset"))
         self.trim_chk.setToolTip(tr("Trim seconds from beginning and end of dataset synchronously for both bag and video."))
         self.trim_chk.stateChanged.connect(self._toggle_trim_controls)
         self.trim_chk.setMinimumWidth(self.trim_chk.sizeHint().width() + 24)
         trim_row.addWidget(self.trim_chk)
-        trim_row.addSpacing(15)
 
-        self.trim_start_label = CaptionLabel(tr("Trim Start (s):"))
+        self.trim_start_label = CaptionLabel(tr("Start at (s):"))
         self.trim_start_spin = DoubleSpinBox()
         self.trim_start_spin.setRange(0.0, 7200.0)
         self.trim_start_spin.setValue(0.0)
@@ -355,9 +353,8 @@ class UnifiedWorkflowView(QWidget):
         self.trim_start_spin.setFixedWidth(130)
         trim_row.addWidget(self.trim_start_label)
         trim_row.addWidget(self.trim_start_spin)
-        trim_row.addSpacing(10)
 
-        self.trim_end_label = CaptionLabel(tr("Trim End (s):"))
+        self.trim_end_label = CaptionLabel(tr("Keep until (s, 0 = end):"))
         self.trim_end_spin = DoubleSpinBox()
         self.trim_end_spin.setRange(0.0, 7200.0)
         self.trim_end_spin.setValue(0.0)
@@ -366,7 +363,6 @@ class UnifiedWorkflowView(QWidget):
         self.trim_end_spin.setFixedWidth(130)
         trim_row.addWidget(self.trim_end_label)
         trim_row.addWidget(self.trim_end_spin)
-        trim_row.addSpacing(15)
 
         self.btn_export_trim = PushButton(tr("Save Trimmed..."), icon=FluentIcon.CUT)
         self.btn_export_trim.setToolTip(tr("Export the trimmed Bag and Video to a standalone folder."))
@@ -376,12 +372,25 @@ class UnifiedWorkflowView(QWidget):
         self.btn_chunk_dataset = PushButton(tr("Divide in Chunks..."), icon=FluentIcon.TILES)
         self.btn_chunk_dataset.setToolTip(tr("Divide dataset into overlapping chunks with temporal interpolation."))
         self.btn_chunk_dataset.clicked.connect(self._action_open_chunk_dialog)
-        trim_row.addWidget(self.btn_chunk_dataset)
-        trim_row.addStretch()
         config_layout.addLayout(trim_row)
 
+        chunk_row = FlowLayout()
+        chunk_row.addWidget(self.btn_chunk_dataset)
+        chunk_row.addWidget(CaptionLabel(tr("Chunks:")))
+        self.chunk_count_spin = SpinBox()
+        self.chunk_count_spin.setRange(1, 99)
+        self.chunk_count_spin.setValue(4)
+        self.chunk_count_spin.setToolTip(tr("How many chunks to divide the (trimmed) dataset into."))
+        chunk_row.addWidget(self.chunk_count_spin)
+        chunk_row.addWidget(CaptionLabel(tr("Overlap (s):")))
+        self.chunk_overlap_spin = DoubleSpinBox()
+        self.chunk_overlap_spin.setRange(0.0, 600.0)
+        self.chunk_overlap_spin.setValue(30.0)
+        chunk_row.addWidget(self.chunk_overlap_spin)
+        config_layout.addLayout(chunk_row)
+
         # Colorization & Recalibration Method
-        method_row = QHBoxLayout()
+        method_row = FlowLayout()
         self.method_label = CaptionLabel(tr("Colorization & Recalibration:"))
         method_row.addWidget(self.method_label)
         self.method_combo = ComboBox()
@@ -392,10 +401,9 @@ class UnifiedWorkflowView(QWidget):
         ])
         self.method_combo.setCurrentIndex(0)
         method_row.addWidget(self.method_combo)
-        method_row.addStretch()
         config_layout.addLayout(method_row)
 
-        photometric_row = QHBoxLayout()
+        photometric_row = FlowLayout()
         self.photometric_caption = CaptionLabel(tr("Photometric compensation:"))
         self.photometric_combo = ComboBox()
         self.photometric_combo.addItem(tr("Off"), userData="off")
@@ -411,9 +419,9 @@ class UnifiedWorkflowView(QWidget):
         self.photometric_params_btn.clicked.connect(self._browse_photometric_params)
         photometric_row.addWidget(self.photometric_caption)
         photometric_row.addWidget(self.photometric_combo)
-        photometric_row.addSpacing(12)
         photometric_row.addWidget(self.photometric_params_caption)
-        photometric_row.addWidget(self.photometric_params_input, 1)
+        photometric_row.addWidget(self.photometric_params_input)
+        self.photometric_params_input.setMinimumWidth(240)
         photometric_row.addWidget(self.photometric_params_btn)
         config_layout.addLayout(photometric_row)
         self._update_photometric_controls()
@@ -425,10 +433,16 @@ class UnifiedWorkflowView(QWidget):
         recalib_row.addStretch()
         config_layout.addLayout(recalib_row)
 
-        rig_row = QHBoxLayout()
+        rig_row = FlowLayout()
         self.rig_profile_label = CaptionLabel(tr("Rig profile:"))
         self.rig_profile_combo = ComboBox()
         self.rig_profile_combo.setMinimumWidth(260)
+        self.btn_new_rig = PushButton(tr("New..."), icon=FluentIcon.ADD)
+        self.btn_new_rig.setToolTip(tr("Create a new hardware rig profile (wizard)"))
+        self.btn_new_rig.clicked.connect(self._on_new_rig)
+        self.btn_manage_rigs = PushButton(tr("Manage..."), icon=FluentIcon.TILES)
+        self.btn_manage_rigs.setToolTip(tr("Open the Rig Profiles manager to view, edit, or delete profiles"))
+        self.btn_manage_rigs.clicked.connect(self._on_manage_rigs)
         self._populate_rig_profiles()
         self.rig_refine_label = CaptionLabel(tr("Rig refinement:"))
         self.rig_refine_combo = ComboBox()
@@ -443,13 +457,12 @@ class UnifiedWorkflowView(QWidget):
         self._update_rig_tooltips()
         rig_row.addWidget(self.rig_profile_label)
         rig_row.addWidget(self.rig_profile_combo)
-        rig_row.addSpacing(12)
+        rig_row.addWidget(self.btn_new_rig)
+        rig_row.addWidget(self.btn_manage_rigs)
         rig_row.addWidget(self.rig_refine_label)
         rig_row.addWidget(self.rig_refine_combo)
-        rig_row.addSpacing(12)
         rig_row.addWidget(self.time_window_label)
         rig_row.addWidget(self.time_window_spin)
-        rig_row.addStretch()
         config_layout.addLayout(rig_row)
 
         self.revisit_refinement_chk = CheckBox(tr("Global Pose Graph SLAM Optimization (Loop Closure)"))
@@ -457,7 +470,7 @@ class UnifiedWorkflowView(QWidget):
         self.revisit_refinement_chk.setToolTip(tr("Eliminates duplicate walls, ghosting, and trajectory drift by optimizing revisit loops with pose-graph SLAM. Optional; adds processing time."))
         config_layout.addWidget(self.revisit_refinement_chk)
 
-        mask_row = QHBoxLayout()
+        mask_row = FlowLayout()
         self.mask_persons_chk = CheckBox(tr("Generate masks"))
         self.mask_persons_chk.setToolTip(tr("RF-DETR masks people; use Mask settings to mark your scanner or mount."))
         self.mask_model_btn = PushButton(tr("Download model RF-DETR"), icon=FluentIcon.DOWNLOAD)
@@ -484,16 +497,13 @@ class UnifiedWorkflowView(QWidget):
         mask_row.addWidget(self.mask_persons_chk)
         mask_row.addWidget(self.mask_backend_label)
         mask_row.addWidget(self.mask_backend_combo)
-        mask_row.addStretch()
         config_layout.addLayout(mask_row)
 
-        mask_controls_row = QHBoxLayout()
+        mask_controls_row = FlowLayout()
         mask_controls_row.addWidget(self.mask_model_btn)
         mask_controls_row.addWidget(self.mask_settings_btn)
-        mask_controls_row.addSpacing(12)
         mask_controls_row.addWidget(self.operator_radius_caption)
         mask_controls_row.addWidget(self.operator_radius_spin)
-        mask_controls_row.addStretch()
         config_layout.addLayout(mask_controls_row)
 
         self.vulkan_chk = CheckBox(tr("Use Vulkan for point-cloud colorization"))
@@ -516,9 +526,10 @@ class UnifiedWorkflowView(QWidget):
         output_layout.setContentsMargins(20, 18, 20, 18)
         output_layout.setSpacing(10)
 
-        self.output_title = SubtitleLabel(tr("3. Select Deliverables to Generate"))
-        self.output_subtitle = CaptionLabel(tr("Choose which output formats will be built in this run:"))
+        self.output_title = SubtitleLabel(tr("3. Deliverables of this run"))
+        self.output_subtitle = CaptionLabel(tr("The project (project.json) is kept in the output folder. Other formats are exported from it afterwards."))
         output_layout.addWidget(self.output_title)
+        self.output_subtitle.setWordWrap(True)
         output_layout.addWidget(self.output_subtitle)
 
         self.chk_ply = CheckBox(tr("Export Colored Point Cloud (.PLY)"))
@@ -526,7 +537,7 @@ class UnifiedWorkflowView(QWidget):
         output_layout.addWidget(self.chk_ply)
 
         self.chk_pcd = CheckBox(tr("Export Colored Point Cloud (.PCD)"))
-        self.chk_pcd.setChecked(True)
+        self.chk_pcd.setChecked(False)
         output_layout.addWidget(self.chk_pcd)
 
         self.chk_colmap = CheckBox(tr("Metric-Scaled 3DGS COLMAP Dataset"))
@@ -585,6 +596,19 @@ class UnifiedWorkflowView(QWidget):
         output_layout.addLayout(gps_formats_layout)
         self._toggle_gps_formats()
 
+        self._extra_widgets = [self.chk_pcd, self.georef_formats_label, self.chk_geo_laz, self.chk_geo_las,
+                               self.chk_geo_ply, self.chk_geo_pcd, self.chk_geo_geojson, self.gps_formats_label,
+                               self.chk_gps_geojson, self.chk_gps_gpx, self.chk_gps_csv, self.process_gps_chk]
+        show_extra = bool(load_config().get("show_extra_formats", False))
+        self.process_gps_chk.setChecked(show_extra)
+        for widget in self._extra_widgets:
+            widget.setVisible(show_extra)
+
+        self.btn_export_project = PushButton(tr("Export from project..."), icon=FluentIcon.SHARE)
+        self.btn_export_project.setToolTip(tr("Write PCD, LAZ/LAS, georeferenced cloud, GPS track or trajectory from an existing project."))
+        self.btn_export_project.clicked.connect(self._action_export_from_project)
+        output_layout.addWidget(self.btn_export_project)
+
         layout.addWidget(output_card)
 
         # ----------------------------------------------------------------------
@@ -595,15 +619,16 @@ class UnifiedWorkflowView(QWidget):
         action_layout.setContentsMargins(20, 14, 20, 14)
         action_layout.setSpacing(10)
 
-        action_header = QHBoxLayout()
+        action_header = QVBoxLayout()
+        action_buttons = FlowLayout()
 
         status_box = QVBoxLayout()
         self.status_title = StrongBodyLabel(tr("Status: Ready"))
         self.status_desc = CaptionLabel(tr("Select a LiDAR bag plus a camera source (INSV video or image bag), then click 'Start Unified Workflow'."))
+        self.status_desc.setWordWrap(True)
         status_box.addWidget(self.status_title)
         status_box.addWidget(self.status_desc)
         action_header.addLayout(status_box)
-        action_header.addStretch()
 
         self.btn_run = PrimaryPushButton(tr("Start Unified Workflow"), icon=FluentIcon.PLAY)
         self.btn_run.clicked.connect(self._start_workflow)
@@ -611,18 +636,20 @@ class UnifiedWorkflowView(QWidget):
         self.btn_cancel.clicked.connect(self._cancel_workflow)
         self.btn_cancel.setEnabled(False)
 
-        action_header.addWidget(self.btn_run)
-        action_header.addWidget(self.btn_cancel)
+        action_buttons.addWidget(self.btn_run)
+        action_buttons.addWidget(self.btn_cancel)
+        action_header.addLayout(action_buttons)
         action_layout.addLayout(action_header)
 
         overall_row = QHBoxLayout()
         self.overall_progress_label = BodyLabel(tr("Overall progress: 0%"))
-        self.overall_progress_label.setMinimumWidth(180)
+        self.overall_progress_label.setMinimumWidth(140)
         self.overall_progress_bar = ProgressBar()
         self.overall_progress_bar.setRange(0, 100)
         self.overall_progress_bar.setValue(0)
         self.eta_label = CaptionLabel(tr("Estimated time: waiting to start"))
-        self.eta_label.setMinimumWidth(260)
+        self.eta_label.setMinimumWidth(120)
+        self.eta_label.setWordWrap(True)
         overall_row.addWidget(self.overall_progress_label)
         overall_row.addWidget(self.overall_progress_bar, 1)
         overall_row.addWidget(self.eta_label)
@@ -639,10 +666,11 @@ class UnifiedWorkflowView(QWidget):
             column = (index % 2) * 2
             row = index // 2
             label = CaptionLabel(f"{index + 1}. {tr(name)}")
+            label.setWordWrap(True)
             bar = ProgressBar()
             bar.setRange(0, 100)
             bar.setValue(0)
-            bar.setMinimumWidth(120)
+            bar.setMinimumWidth(60)
             self.step_progress_labels.append(label)
             self.step_progress_bars.append(bar)
             steps_grid.addWidget(label, row, column)
@@ -675,6 +703,8 @@ class UnifiedWorkflowView(QWidget):
         self.log_console = PlainTextEdit()
         self.log_console.setReadOnly(True)
         self.log_console.setMinimumHeight(240)
+        self.log_console.setMinimumWidth(0)
+        self.log_console.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.log_console.setStyleSheet(
             "PlainTextEdit { background-color: #0c1219; color: #a9c7df; "
             "font-family: 'Consolas', 'Courier New'; font-size: 12px; border-radius: 6px; padding: 8px; }"
@@ -798,7 +828,7 @@ class UnifiedWorkflowView(QWidget):
             from raven_app.dataset_trim import trim_dataset_synchronized
             res = trim_dataset_synchronized(
                 bag_path=bag, video_path=insv, output_dir=out_dir,
-                trim_start_sec=trim_start, trim_end_sec=trim_end, dt_sync=dt_val,
+                trim_start_sec=trim_start, trim_end_sec=0.0, end_at_sec=trim_end, dt_sync=dt_val,
             )
             InfoBar.success(
                 title=tr("Dataset Trimmed Successfully"),
@@ -829,8 +859,9 @@ class UnifiedWorkflowView(QWidget):
             from raven_app.dataset_trim import split_dataset_into_chunks
             chunks = split_dataset_into_chunks(
                 bag_path=bag, video_path=insv, output_dir=out_dir,
-                chunk_duration_sec=300.0, overlap_sec=30.0,
-                trim_start_sec=trim_start, trim_end_sec=trim_end, dt_sync=dt_val,
+                chunk_duration_sec=300.0, overlap_sec=float(self.chunk_overlap_spin.value()),
+                num_chunks=int(self.chunk_count_spin.value()),
+                trim_start_sec=trim_start, trim_end_sec=0.0, end_at_sec=trim_end, dt_sync=dt_val,
             )
             InfoBar.success(
                 title=tr("Chunks Created Successfully"),
@@ -840,6 +871,47 @@ class UnifiedWorkflowView(QWidget):
             )
         except Exception as e:
             InfoBar.error(title=tr("Chunking Failed"), content=str(e), parent=self, duration=6000)
+
+    def _action_export_from_project(self):
+        from PyQt6.QtWidgets import QFileDialog, QDialog, QDialogButtonBox, QVBoxLayout as _V
+        from raven_app.project import EXPORT_FORMATS, EXPORT_LABELS, PROJECT_FILE, export_from_project
+        folder = QFileDialog.getExistingDirectory(self, tr("Project folder (contains project.json)"), "")
+        if not folder:
+            return
+        if not (Path(folder) / PROJECT_FILE).is_file():
+            InfoBar.error(title=tr("Not a project"), content=tr("project.json was not found in that folder."),
+                          parent=self, duration=5000)
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr("Export from project"))
+        box = _V(dialog)
+        checks = {}
+        for fmt in EXPORT_FORMATS:
+            checks[fmt] = CheckBox(tr(EXPORT_LABELS[fmt]))
+            box.addWidget(checks[fmt])
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        box.addWidget(buttons)
+        if not dialog.exec():
+            return
+        chosen = [f for f, c in checks.items() if c.isChecked()]
+        if not chosen:
+            return
+        dest = QFileDialog.getExistingDirectory(self, tr("Destination folder"), str(Path(folder) / 'exports'))
+        if not dest:
+            return
+        errors, written = [], 0
+        for fmt in chosen:
+            try:
+                written += sum(len(v) for v in export_from_project(folder, [fmt], dest).values())
+            except Exception as exc:
+                errors.append(f"{fmt}: {exc}")
+        if errors:
+            InfoBar.warning(title=tr("Some exports failed"), content="\n".join(errors), parent=self, duration=10000)
+        else:
+            InfoBar.success(title=tr("Export finished"), content=f"{written} " + tr("file(s) in") + f" {dest}",
+                            parent=self, duration=6000)
 
     def _toggle_gps_formats(self, state=None):
         enabled = self.process_gps_chk.isChecked()
@@ -853,14 +925,44 @@ class UnifiedWorkflowView(QWidget):
             self, "Select ROS Bag (.bag)", "", "ROS Bag files (*.bag);;All files (*.*)"
         )
         if path:
+            p = Path(path)
+            detected = detect_bag_topics([path])
+            if not detected.get('has_lidar'):
+                cand_lidar = find_adjacent_lidar_bag(p)
+                if cand_lidar and cand_lidar.is_file():
+                    self.bag_input.setText(str(cand_lidar))
+                    self._auto_detect_bag(str(cand_lidar))
+                    self.image_bag_input.setText(str(p))
+                    InfoBar.info(
+                        title=tr("Auto-Assigned LiDAR & Image Bags"),
+                        content=tr("'{img}' contains camera images. Automatically assigned '{lidar}' as LiDAR Bag and '{img}' as Front Camera Bag.").format(
+                            img=p.name, lidar=cand_lidar.name
+                        ),
+                        orient=Qt.Orientation.Horizontal,
+                        position=InfoBarPosition.TOP,
+                        duration=6000,
+                        parent=self
+                    )
+                    if not self.out_input.text().strip():
+                        self.out_input.setText(str(cand_lidar.parent / f"{cand_lidar.stem}_studio_output"))
+                    return
+                else:
+                    InfoBar.warning(
+                        title=tr("No LiDAR Points in Bag"),
+                        content=tr("The selected bag '{name}' does not contain LiDAR point cloud topics.").format(name=p.name),
+                        orient=Qt.Orientation.Horizontal,
+                        position=InfoBarPosition.TOP,
+                        duration=5000,
+                        parent=self
+                    )
+
             self.bag_input.setText(path)
             self._auto_detect_bag(path)
-            cand = find_adjacent_image_bag(Path(path))
+            cand = find_adjacent_image_bag(p)
             if cand and cand.is_file() and not self.image_bag_input.text().strip():
                 self.image_bag_input.setText(str(cand))
             # Auto-suggest output folder if empty
             if not self.out_input.text().strip():
-                p = Path(path)
                 self.out_input.setText(str(p.parent / f"{p.stem}_studio_output"))
 
     def _on_image_bag_changed(self, text: str):
@@ -1061,13 +1163,59 @@ class UnifiedWorkflowView(QWidget):
         if path:
             self.photometric_params_input.setText(path)
 
-    def _populate_rig_profiles(self):
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._populate_rig_profiles()
+
+    def _populate_rig_profiles(self, select_path=None):
         """Fill the hardware rig profile selector; the default profile comes first."""
         from raven_app.profile_manager import list_available_profiles
+        prev_selected = select_path or self.rig_profile_combo.currentData()
+        self.rig_profile_combo.blockSignals(True)
         self.rig_profile_combo.clear()
-        for profile in list_available_profiles():
+        profiles = list_available_profiles()
+        idx_to_select = 0
+        for i, profile in enumerate(profiles):
             label = profile['name'] + (f" ({tr('default')})" if profile.get('is_default') else '')
             self.rig_profile_combo.addItem(label, userData=profile['path'])
+            if prev_selected and Path(profile['path']) == Path(prev_selected):
+                idx_to_select = i
+        if self.rig_profile_combo.count() > 0:
+            self.rig_profile_combo.setCurrentIndex(idx_to_select)
+        self.rig_profile_combo.blockSignals(False)
+
+    def _on_new_rig(self):
+        """Open the New Rig Wizard directly from the workflow view."""
+        from raven_app.views.calibration_view import NewRigDialog
+        from raven_app.rig_profile import save_profile, user_profiles_dir
+        dialog = NewRigDialog(self.window())
+        if not dialog.exec():
+            return
+        try:
+            profile = dialog.build()
+            path = save_profile(profile, user_profiles_dir() / f'{profile.profile_id}.json')
+            self._populate_rig_profiles(select_path=path)
+            InfoBar.success(
+                title=tr("Profile created"),
+                content=tr("Rig profile '{name}' was created and selected.", name=profile.name),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=4000
+            )
+        except Exception as exc:
+            InfoBar.error(
+                title=tr("Error creating profile"),
+                content=str(exc),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000
+            )
+
+    def _on_manage_rigs(self):
+        """Navigate to the Rig Profiles view (CalibrationView)."""
+        main_win = self.window()
+        if hasattr(main_win, 'calib_view') and hasattr(main_win, 'switchTo'):
+            main_win.switchTo(main_win.calib_view)
 
     def _update_rig_tooltips(self):
         self.rig_profile_combo.setToolTip(tr(
@@ -1263,6 +1411,22 @@ class UnifiedWorkflowView(QWidget):
             )
             return
 
+        detected_bag = detect_bag_topics([bag])
+        if not detected_bag.get('has_lidar'):
+            cand_lidar = find_adjacent_lidar_bag(Path(bag))
+            hint = tr(" Did you mean '{cand}'?").format(cand=cand_lidar.name) if cand_lidar else ""
+            InfoBar.error(
+                title=tr("Invalid LiDAR Bag"),
+                content=tr("The selected bag '{name}' does not contain any LiDAR point clouds.{hint}").format(
+                    name=Path(bag).name, hint=hint
+                ),
+                orient=Qt.Orientation.Horizontal,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+                parent=self
+            )
+            return
+
         has_insv = bool(insv and Path(insv).is_file())
         has_aux = bool(self.third_camera_configs)
         has_bag_images = bool(self.use_bag_images_chk.isChecked() and Path(self.image_bag_input.text().strip()).is_file())
@@ -1369,7 +1533,7 @@ class UnifiedWorkflowView(QWidget):
             if self.trim_start_spin.value() > 0:
                 args.extend(["--trim-start", str(float(self.trim_start_spin.value()))])
             if self.trim_end_spin.value() > 0:
-                args.extend(["--trim-end", str(float(self.trim_end_spin.value()))])
+                args.extend(["--trim-end-at", str(float(self.trim_end_spin.value()))])
 
         if method_key in ("sfm", "all"):
             args.append("--run-spirula")
@@ -1718,6 +1882,8 @@ class UnifiedWorkflowView(QWidget):
 
         self.recalibrate_chk.setText(tr("Auto-Recalibrate Spatial Extrinsics from SfM Alignment"))
         self.rig_profile_label.setText(tr("Rig profile:"))
+        self.btn_new_rig.setText(tr("New..."))
+        self.btn_manage_rigs.setText(tr("Manage..."))
         self.rig_refine_label.setText(tr("Rig refinement:"))
         for index, (text, _mode) in enumerate(RIG_REFINE_CHOICES):
             self.rig_refine_combo.setItemText(index, tr(text))
@@ -1739,8 +1905,8 @@ class UnifiedWorkflowView(QWidget):
         self.vulkan_chk.setText(tr("Use Vulkan for point-cloud colorization"))
         self.vulkan_chk.setToolTip(tr("This setting accelerates point-cloud colorization. Choose the RF-DETR mask backend separately above."))
         self.process_gps_chk.setText(tr("Automatically georeference using INSV GPS (when available)"))
-        self.output_title.setText(tr("3. Select Deliverables to Generate"))
-        self.output_subtitle.setText(tr("Choose which output formats will be built in this run:"))
+        self.output_title.setText(tr("3. Deliverables of this run"))
+        self.output_subtitle.setText(tr("The project (project.json) is kept in the output folder. Other formats are exported from it afterwards."))
         self.chk_ply.setText(tr("Export Colored Point Cloud (.PLY)"))
         self.chk_pcd.setText(tr("Export Colored Point Cloud (.PCD)"))
         self.chk_colmap.setText(tr("Metric-Scaled 3DGS COLMAP Dataset"))

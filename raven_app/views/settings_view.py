@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 from qfluentwidgets import (
     CardWidget, TitleLabel, SubtitleLabel, BodyLabel,
     CaptionLabel, StrongBodyLabel, ComboBox,
-    PushButton, PrimaryPushButton, SwitchButton, ProgressBar,
+    PushButton, PrimaryPushButton, SwitchButton, ProgressBar, CheckBox,
     InfoBar, InfoBarPosition, FluentIcon, SmoothScrollArea,
     setTheme, Theme, isDarkTheme
 )
@@ -125,6 +125,24 @@ class SettingsView(QWidget):
         )
         theme_layout.addWidget(self.theme_desc)
         layout.addWidget(self.theme_card)
+
+        # Deliverables card: extra formats are exported from the project; this only brings them to the main screen
+        self.export_card = CardWidget(content)
+        export_layout = QVBoxLayout(self.export_card)
+        export_layout.setContentsMargins(24, 20, 24, 20)
+        export_layout.setSpacing(12)
+        self.export_title = SubtitleLabel(tr("Deliverables"))
+        export_layout.addWidget(self.export_title)
+        self.extra_formats_chk = CheckBox(tr("Offer extra formats on the workflow screen (PCD, georeferenced, GPS)"))
+        self.extra_formats_chk.setChecked(bool(self.cfg.get("show_extra_formats", False)))
+        self.extra_formats_chk.stateChanged.connect(self._on_extra_formats_changed)
+        export_layout.addWidget(self.extra_formats_chk)
+        self.export_desc = CaptionLabel(tr(
+            "By default a run delivers the coloured PLY and the 3DGS dataset. Everything else is exported "
+            "later from the project (Workflow > Export from project)."))
+        self.export_desc.setWordWrap(True)
+        export_layout.addWidget(self.export_desc)
+        layout.addWidget(self.export_card)
 
         # 3. Embedded Engines & Capabilities Card
         self.engines_card = CardWidget(content)
@@ -257,6 +275,12 @@ class SettingsView(QWidget):
         scroll.enableTransparentBackground()
         content.setAutoFillBackground(False)
         main_layout.addWidget(scroll)
+
+    def _on_extra_formats_changed(self, state=None):
+        self.cfg["show_extra_formats"] = self.extra_formats_chk.isChecked()
+        save_config(self.cfg)
+        InfoBar.info(title=tr("Saved"), content=tr("Takes effect the next time the workflow screen is opened."),
+                     position=InfoBarPosition.TOP, parent=self, duration=3000)
 
     def _on_language_changed(self, idx: int):
         if idx < 0 or idx >= len(self._language_codes):

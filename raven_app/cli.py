@@ -316,10 +316,12 @@ def parse(argv=None):
     wf.add_argument('--slam-dir',type=Path,default=None,
                     help='use this existing SLAM output (pcd/all_raw_points.pcd + result/*.txt) instead of running FAST-LIVO2')
     wf.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from beginning of dataset')
+    wf.add_argument('--trim-end-at', type=float, default=0.0, help='Keep the dataset only until this time (s from the start); overrides --trim-end')
     wf.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end of dataset')
     wf.add_argument('--image-bag',dest='image_bag_path',type=Path,default=None,help='Optional path to IMAGE_*.bag for camera frame extraction')
     wf.add_argument('--use-image-bag',action='store_true',default=False,help='Extract and include camera images from the ROS bag in colorization and 3DGS')
     wf.add_argument('--run-spirula',action='store_true',default=False,help='Run Spirula SfM if not already built')
+    wf.add_argument('--sfm-matcher',choices=('sift','aliked-lightglue'),default=None,help='SfM matcher (default sift)')
     wf.add_argument('--export-ply',action='store_true',default=False)
     wf.add_argument('--export-pcd',action='store_true',default=False)
     wf.add_argument('--export-colmap',action='store_true',default=False)
@@ -362,11 +364,16 @@ def parse(argv=None):
     feedback.add_argument('--export-bundle', type=Path, default=None, help='Export diagnostic zip bundle to file')
 
     # Dataset Trim (Temporal Cut)
+    exp = sub.add_parser('export', help='Export extra formats (PCD, LAZ/LAS, georeferenced, GPS, trajectory) from a project')
+    exp.add_argument('--project', type=Path, required=True, help='Output folder of a workflow run (contains project.json)')
+    exp.add_argument('--formats', nargs='+', required=True, help='pcd laz las georef gps trajectory')
+    exp.add_argument('--dest', type=Path, default=None, help='Destination folder (default: <project>/exports)')
     trim = sub.add_parser('trim', help='Trim synchronized ROS bag and 360 video from start and end')
     trim.add_argument('--bag', type=Path, required=True, help='Path to input ROS bag (.bag)')
     trim.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to input 360 video (.insv / .mp4)')
     trim.add_argument('--output', type=Path, required=True, help='Output directory for trimmed dataset')
     trim.add_argument('--trim-start', type=float, default=0.0, help='Seconds to trim from start (default: 0.0)')
+    trim.add_argument('--trim-end-at', type=float, default=0.0, help='Keep the dataset only until this time (s from the start); overrides --trim-end')
     trim.add_argument('--trim-end', type=float, default=0.0, help='Seconds to trim from end (default: 0.0)')
     trim.add_argument('--dt', dest='dt_sync', type=float, default=None, help='Manual time sync offset (seconds; auto-computed if omitted)')
 
@@ -376,8 +383,10 @@ def parse(argv=None):
     chunk.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to input 360 video (.insv / .mp4)')
     chunk.add_argument('--output', type=Path, required=True, help='Output directory for chunks')
     chunk.add_argument('--chunk-duration', type=float, default=300.0, help='Duration of each chunk in seconds (default: 300.0)')
+    chunk.add_argument('--chunks', dest='num_chunks', type=int, default=0, help='Number of chunks wanted (overrides --chunk-duration)')
     chunk.add_argument('--overlap', type=float, default=30.0, help='Overlap duration shared between consecutive chunks in seconds (default: 30.0)')
     chunk.add_argument('--trim-start', type=float, default=0.0, help='Optional initial seconds to cut before chunking')
+    chunk.add_argument('--trim-end-at', type=float, default=0.0, help='Keep the dataset only until this time (s from the start); overrides --trim-end')
     chunk.add_argument('--trim-end', type=float, default=0.0, help='Optional final seconds to cut before chunking')
     chunk.add_argument('--dt', dest='dt_sync', type=float, default=None, help='Manual time sync offset (seconds; auto-computed if omitted)')
 
@@ -515,6 +524,11 @@ def run(a):
         print(json.dumps({key: value for key, value in report.items() if key != 'views'},
                          indent=2, ensure_ascii=False, allow_nan=False))
         return 0
+    if a.command=='export':
+        from raven_app.project import export_from_project
+        made = export_from_project(a.project, a.formats, a.dest)
+        print(json.dumps(made, indent=2))
+        return 0
     if a.command=='georeference':
         from raven_app.georeference import run_georeference
         report = run_georeference(
@@ -634,6 +648,18 @@ def run(a):
         reference = resolve_profile(a.profile)
         init = a.calib or reference
         dt = a.dt if a.dt is not None else json.loads(Path(init).read_text(encoding='utf-8')).get('dt_sync_seconds')
+        if dt is None:
+            for name in ('colmap_to_lidar_alignment.json', 'rig_calibration.json', 'calibracao_rigida_auto.json'):
+                p = dataset / name
+                if p.is_file():
+                    try:
+                        data = json.loads(p.read_text(encoding='utf-8'))
+                        if 'dt_sync_seconds' in data and data['dt_sync_seconds'] is not None:
+                            dt = float(data['dt_sync_seconds'])
+                            print(f'[*] Initial time offset from {name}: {dt:+.4f} s')
+                            break
+                    except Exception:
+                        pass
         if dt is None and a.coarse:
             dt = 0.0
             print(f'[*] No initial time offset: the coarse scan searches ±{a.coarse_dt_window:g} s around 0')
@@ -700,7 +726,7 @@ def run(a):
         check_cams = ('cam0',) if is_equirect else ('cam0', 'cam1')
         for cam in check_cams:
             if not any((dataset/'images'/cam).glob('*.jpg')):raise ValueError(f'Missing extracted frames in images/{cam}')
-        if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset):raise RuntimeError('Spirula reconstruction failed')
+        if a.run_spirula and not pipeline.run_spirula_sfm_auto(dataset,matcher=getattr(a,'sfm_matcher',None)):raise RuntimeError('Spirula reconstruction failed')
         from raven_app.profile_manager import resolve_profile
         reference_profile = resolve_profile(a.profile)
         if a.masks_dir:
@@ -789,6 +815,7 @@ def run(a):
             dt_override=dt_val,
             trim_start=getattr(a, 'trim_start', 0.0),
             trim_end=getattr(a, 'trim_end', 0.0),
+            trim_end_at=getattr(a, 'trim_end_at', 0.0),
             recalibrate=a.recalibrate,
             run_spirula=a.run_spirula,
             use_vulkan=not a.no_vulkan,
@@ -898,6 +925,7 @@ def run(a):
             output_dir=a.output,
             trim_start_sec=a.trim_start,
             trim_end_sec=a.trim_end,
+            end_at_sec=a.trim_end_at,
             dt_sync=a.dt_sync,
             progress_callback=lambda stage, p: print(f"[{int(p*100):3d}%] {stage}"),
         )
@@ -915,8 +943,10 @@ def run(a):
             output_dir=a.output,
             chunk_duration_sec=a.chunk_duration,
             overlap_sec=a.overlap,
+            num_chunks=a.num_chunks,
             trim_start_sec=a.trim_start,
             trim_end_sec=a.trim_end,
+            end_at_sec=a.trim_end_at,
             dt_sync=a.dt_sync,
             progress_callback=lambda stage, p: print(f"[{int(p*100):3d}%] {stage}"),
         )

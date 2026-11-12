@@ -560,12 +560,15 @@ def _spirula_sfm_auto_flags(spirula_bin):
 
 
 def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None,
-                         force_rebuild=False, allow_partial_calibration=False, masks_dir=None):
+                         force_rebuild=False, allow_partial_calibration=False, masks_dir=None, matcher=None):
     """Executa o Spirula Studio via CLI se a pasta sparse/0 não existir.
 
     `masks_dir` (white keep, black ignore; `<image>.png`) keeps keypoints off the operator, who moves with
     the rig and would otherwise be matched as a static object. Dark captures get `--image-exposure auto`
     when the Spirula build supports it: only the detectors see the lift, point colours keep the files'."""
+    # Optional matcher: SIFT stays the default. 'aliked-lightglue' (or LIDARCAMERA360_SFM_MATCHER) registers about
+    # twice the images on CASA 374 and aligns better to the LiDAR, at the cost of a GPU model download and more time.
+    matcher = (matcher or os.environ.get('LIDARCAMERA360_SFM_MATCHER') or 'sift').lower()
     dataset_dir = Path(dataset_dir)
     auxiliary_flags = _spirula_auxiliary_flags(dataset_dir, auxiliary_cameras)
     img_dir = dataset_dir / "images"
@@ -631,6 +634,9 @@ def run_spirula_sfm_auto(dataset_dir, quality="medium", auxiliary_cameras=None,
             "--camera-model", "thin-prism-fisheye"
         ]
     cmd.extend(auxiliary_flags)
+    if matcher == 'aliked-lightglue':
+        cmd.extend(["--features", "aliked-n32", "--matcher", "lightglue"])
+        print(" Matcher:    ALIKED + LightGlue")
     cmd.extend(["--decode-threads", "4", "--decode-budget", "512"])
     supported = _spirula_sfm_auto_flags(str(spirula_bin))
     if masks_dir is not None and Path(masks_dir).is_dir():

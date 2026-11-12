@@ -35,9 +35,18 @@ _X4_FISHEYE = {'fx': 1080.0, 'fy': 1080.0, 'cx': 1920.0, 'cy': 1920.0, 'k1': 0.0
                'p1': 0.0, 'p2': 0.0, 'k3': 0.0109, 'k4': -0.00278, 'sx1': 0.0, 'sy1': 0.0}
 
 
-def _dual_fisheye(width, scale, baseline_cm):
-    intrinsics = {k: (v * scale if k in ('fx', 'fy', 'cx', 'cy') else v) for k, v in _X4_FISHEYE.items()}
-    return {'kind': 'dual_fisheye', 'model': 'THIN_PRISM_FISHEYE', 'width': width, 'height': width,
+def _dual_fisheye(width, scale, baseline_cm, height=None):
+    h = height if height is not None else width
+    scale_y = h / 3840.0
+    intrinsics = {}
+    for k, v in _X4_FISHEYE.items():
+        if k in ('fx', 'cx'):
+            intrinsics[k] = v * scale
+        elif k in ('fy', 'cy'):
+            intrinsics[k] = v * scale_y
+        else:
+            intrinsics[k] = v
+    return {'kind': 'dual_fisheye', 'model': 'THIN_PRISM_FISHEYE', 'width': width, 'height': h,
             'intrinsics': intrinsics, 'baseline_cm': baseline_cm, 'sync': 'gyro'}
 
 
@@ -48,6 +57,8 @@ CAMERA_CATALOGUE: Dict[str, Dict] = {
     'insta360_x4': {'label': 'Insta360 X4 (dual fisheye .insv)', **_dual_fisheye(3840, 1.0, 2.8)},
     'insta360_x3': {'label': 'Insta360 X3 (dual fisheye .insv)', **_dual_fisheye(2880, 0.75, 2.6)},
     'insta360_x5': {'label': 'Insta360 X5 (dual fisheye .insv)', **_dual_fisheye(3840, 1.0, 2.9)},
+    'insta360_one_rs': {'label': 'Insta360 ONE RS / ONE R (dual fisheye .insv)',
+                        **_dual_fisheye(2944, 2944 / 3840.0, 3.40, height=2880)},
     'insta360_one_rs_1inch': {'label': 'Insta360 ONE RS 1-inch 360 (dual fisheye .insv)',
                               **_dual_fisheye(3072, 0.8, 3.6)},
     'equirectangular_360': {'label': 'Any 360 camera, stitched equirectangular .mp4', 'kind': 'equirectangular',
@@ -92,8 +103,17 @@ def camera_intrinsics(entry: Dict, width: Optional[int] = None, height: Optional
     if entry['kind'] == 'equirectangular':
         return {}
     if entry['kind'] == 'dual_fisheye':
-        scale = width / entry['width']
-        return {k: (v * scale if k in ('fx', 'fy', 'cx', 'cy') else v) for k, v in entry['intrinsics'].items()}
+        scale_x = width / entry['width']
+        scale_y = height / entry.get('height', entry['width'])
+        intrinsics = {}
+        for k, v in entry['intrinsics'].items():
+            if k in ('fx', 'cx'):
+                intrinsics[k] = v * scale_x
+            elif k in ('fy', 'cy'):
+                intrinsics[k] = v * scale_y
+            else:
+                intrinsics[k] = v
+        return intrinsics
     half = np.deg2rad(entry['hfov_deg']) / 2.0
     if entry['kind'] == 'fisheye':
         f = (width / 2.0) / half          # equidistant: r = f * theta

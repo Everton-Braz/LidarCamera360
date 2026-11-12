@@ -2728,6 +2728,14 @@ def prepare_fastlivo_config(
             with open(cam_yaml_out, "w", encoding="utf-8") as cf:
                 yaml.dump(cam_dict, cf, default_flow_style=False)
 
+    # Bound active voxel map sliding window to prevent out-of-memory on long runs (> 5 min)
+    if "local_map" in loaded:
+        loaded["local_map"]["map_sliding_en"] = True
+        if loaded["local_map"].get("half_map_size", 500) > 150:
+            loaded["local_map"]["half_map_size"] = 150
+        if loaded["local_map"].get("sliding_thresh", 10) > 5:
+            loaded["local_map"]["sliding_thresh"] = 5
+
     out_target = output_dir / f"{base_config.stem}_prepared.yaml"
     with open(out_target, "w", encoding="utf-8") as f:
         yaml.dump(loaded, f, default_flow_style=False)
@@ -2750,11 +2758,12 @@ def execute_unified_workflow(
     dt_override: Optional[float] = None,
     trim_start: float = 0.0,
     trim_end: float = 0.0,
+    trim_end_at: float = 0.0,
     recalibrate: bool = True,
     run_spirula: bool = False,
     use_vulkan: bool = True,
     export_ply: bool = True,
-    export_pcd: bool = True,
+    export_pcd: bool = False,
     export_colmap: bool = True,
     seed_percent: float = 100.0,
     process_gps: bool = False,
@@ -2819,6 +2828,26 @@ def execute_unified_workflow(
     output_dir.mkdir(parents=True, exist_ok=True)
     deliverables_dir = output_dir / "deliverables"
     deliverables_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-flight bag validation: verify bag contains LiDAR point cloud topics
+    from raven_app.bag_io import detect_bag_topics, find_adjacent_lidar_bag
+    bag_detected = detect_bag_topics([bag_path], default_lidar=lidar_topic, default_imu=imu_topic)
+    if not bag_detected.get('has_lidar'):
+        cand = find_adjacent_lidar_bag(bag_path)
+        hint = f" (Did you mean to select '{cand.name}'?)" if cand else ""
+        raise ValueError(
+            f"Selected bag '{bag_path.name}' contains no LiDAR point cloud topics (expected '{lidar_topic}').{hint}"
+        )
+
+    if (trim_start > 0 or trim_end > 0 or trim_end_at > 0) and has_insv:
+        from raven_app.dataset_trim import trim_dataset_synchronized
+        print(f"[*] Trimming dataset before processing: start at {trim_start}s, "
+              f"{'keep until ' + str(trim_end_at) + 's' if trim_end_at > 0 else 'drop last ' + str(trim_end) + 's'}")
+        trimmed = trim_dataset_synchronized(
+            bag_path, insv_path, output_dir / 'trimmed_input', trim_start_sec=trim_start,
+            trim_end_sec=trim_end, end_at_sec=trim_end_at, dt_sync=dt_override)
+        bag_path, insv_path = Path(trimmed['bag_path']), Path(trimmed['video_path'])
+        dt_override = trimmed['dt_sync_trimmed']
 
     third_cfgs = []
     if third_camera:
@@ -2979,9 +3008,24 @@ def execute_unified_workflow(
         if dt_sync is None:
             print("[*] Searching for fallback/hint sync in existing calibration or defaulting to 0.0s for initial pose search...")
             dt_sync = 0.0
+            # A dataset made by Trim/Chunks carries the offset that is left between its cut files.
+            trimmed_dt = None
+            bag_dir = Path(bag_path).parent
+            try:
+                if (bag_dir / 'trim_manifest.json').is_file():
+                    trimmed_dt = json.loads((bag_dir / 'trim_manifest.json').read_text(encoding='utf-8')).get('dt_sync_trimmed')
+                elif (bag_dir.parent / 'chunks_manifest.json').is_file():
+                    for ch in json.loads((bag_dir.parent / 'chunks_manifest.json').read_text(encoding='utf-8')).get('chunks', []):
+                        if Path(ch.get('bag_path', '')).name == Path(bag_path).name:
+                            trimmed_dt = ch.get('dt_sync_trimmed')
+            except Exception:
+                trimmed_dt = None
+            if trimmed_dt is not None:
+                dt_sync = float(trimmed_dt)
+                print(f"[*] Trimmed dataset: residual offset Δt = {dt_sync:.4f}s from its manifest")
             # Check if reference calibration or existing alignment has a known offset
-            for cand_path in (output_dir / 'rig_calibration.json', output_dir / 'calibracao_rigida_auto.json',
-                              resources() / 'calibracao_rigida_raven_insta360.json'):
+            for cand_path in (() if trimmed_dt is not None else (output_dir / 'rig_calibration.json', output_dir / 'calibracao_rigida_auto.json',
+                              resources() / 'calibracao_rigida_raven_insta360.json')):
                 if cand_path.is_file():
                     try:
                         c_data = json.loads(cand_path.read_text(encoding='utf-8'))
@@ -3694,6 +3738,18 @@ def execute_unified_workflow(
                 run_record['densification'] = {'status': 'failed', 'reason': str(exc)}
                 print(f"[!] RoMa v2 densification failed ({exc}); the LiDAR seed is unchanged.")
             _persist_workflow_run(output_dir, run_record)
+
+    # One project per dataset, refreshed by every run; the run itself only leaves its deliverables.
+    try:
+        from raven_app.project import write_project
+        write_project(output_dir, dt_sync=float(dt_sync), scanner='',
+                      rig_profile=str(profile or ''), insv=str(insv_path or ''), run={
+                          'run_id': run_record.get('run_id') or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S'),
+                          'completed_utc': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                          'deliverables': [p.name for p in sorted(deliverables_dir.iterdir()) if p.is_file()]})
+        print(f"[+] Project updated: {output_dir / 'project.json'}")
+    except Exception as exc:
+        print(f"[!] Project file not written: {exc}")
 
     print("\n[+] Deliverables currently in folder:")
     for deliv_item in sorted(deliverables_dir.iterdir()):

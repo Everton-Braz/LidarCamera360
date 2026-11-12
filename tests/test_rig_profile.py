@@ -14,7 +14,9 @@ from raven_app.third_camera import ThirdCameraConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 V1_FILES = [ROOT / 'calibracao_rigida_raven_insta360.json', ROOT / 'configs' / 'rig_profile.json']
-BUNDLED = [ROOT / 'configs' / 'profiles' / 'raven_x4_montagem_1.json', ROOT / 'configs' / 'rig_profile_eagle.json']
+BUNDLED = [ROOT / 'configs' / 'profiles' / 'raven_x4_montagem_1.json',
+           ROOT / 'configs' / 'rig_profile_eagle.json',
+           ROOT / 'configs' / 'profiles' / 'raven_one_rs.json']
 
 
 def _angle(A, B):
@@ -133,3 +135,22 @@ def test_user_profiles_override_and_become_default(tmp_path, monkeypatch):
     assert profile_manager.list_available_profiles()[0]['profile_id'] == 'my_rig'
     profile_manager.set_default_profile('raven_x4_montagem_1')
     assert profile_manager.resolve_profile() == bundled / 'raven_x4_montagem_1.json'
+
+
+def test_insta360_one_rs_catalogue_and_profile():
+    entry = CAMERA_CATALOGUE['insta360_one_rs']
+    assert entry['width'] == 2944
+    assert entry['height'] == 2880
+    assert entry['baseline_cm'] == 3.40
+
+    intrinsics = camera_intrinsics(entry, width=2944, height=2880)
+    assert intrinsics['cx'] == pytest.approx(1472.0)
+    assert intrinsics['cy'] == pytest.approx(1440.0)
+
+    profile = build_profile('Raven One RS Test', camera='insta360_one_rs', scanner_preset='raven')
+    assert profile.profile_id == 'raven_one_rs_test'
+    assert len(profile.main.cameras) == 2
+    assert profile.main.cameras[0].width == 2944
+    assert profile.main.cameras[0].height == 2880
+    assert validate_profile(profile) == []
+

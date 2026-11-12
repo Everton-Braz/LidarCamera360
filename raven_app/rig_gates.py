@@ -51,6 +51,13 @@ def rig_gate_failures(candidate, reference=None, limits=None):
     capture checked against a dual-fisheye profile).
     """
     limits = {**LIMITS, **(limits or {})}
+    if reference is not None and isinstance(reference, dict):
+        prior = reference.get('mount_prior') or {}
+        user_limits = limits or {}
+        if 'max_rotation_delta_deg' not in user_limits and prior.get('rot_sigma_deg'):
+            limits['max_rotation_delta_deg'] = max(limits['max_rotation_delta_deg'], float(prior['rot_sigma_deg']) * 2.5)
+        if 'max_translation_delta_cm' not in user_limits and prior.get('trans_sigma_cm'):
+            limits['max_translation_delta_cm'] = max(limits['max_translation_delta_cm'], float(prior['trans_sigma_cm']) * 2.0)
     T0, T1 = rig_transforms(candidate)
     if T0 is None:
         return ['calibration has no lidar-to-camera transform']

@@ -25,7 +25,7 @@ def get_config_path() -> Path:
 
 def load_config() -> dict:
     """Loads persistent settings or returns default configuration."""
-    defaults = {"spirula_path": "", "theme": "dark"}
+    defaults = {"spirula_path": "", "theme": "dark", "show_extra_formats": False}
     try:
         cfg_path = get_config_path()
         if cfg_path.is_file():

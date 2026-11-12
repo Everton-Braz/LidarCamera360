@@ -61,8 +61,8 @@ lio:
 
 local_map:  
   map_sliding_en: true
-  half_map_size: 500
-  sliding_thresh: 10
+  half_map_size: 150
+  sliding_thresh: 5
 
 uav:
   imu_rate_odom: false

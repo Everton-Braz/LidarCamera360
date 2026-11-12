@@ -150,10 +150,13 @@ def image_payload(msg, rotation_deg=0, max_side=1200, scale=0.25):
 
 def inspect_bags(paths):
     from rosbags.highlevel import AnyReader
-    with AnyReader([Path(p) for p in paths]) as reader:
-        return {'duration_seconds':reader.duration/1e9,
-                'messages':reader.message_count,
-                'connections':[{'topic':c.topic,'type':c.msgtype,'messages':c.msgcount} for c in reader.connections]}
+    try:
+        with AnyReader([Path(p) for p in paths]) as reader:
+            return {'duration_seconds': reader.duration / 1e9,
+                    'messages': reader.message_count,
+                    'connections': [{'topic': c.topic, 'type': c.msgtype, 'messages': c.msgcount} for c in reader.connections]}
+    except Exception:
+        return {'duration_seconds': 0.0, 'messages': 0, 'connections': []}
 
 
 def detect_bag_topics(paths, default_lidar=None, default_imu=None, default_cam=None):
@@ -187,6 +190,16 @@ def detect_bag_topics(paths, default_lidar=None, default_imu=None, default_cam=N
             if not best_cam:
                 best_cam = topic
 
+    if connections:
+        raw_has_lidar = bool(best_lidar)
+        raw_has_imu = bool(best_imu)
+        raw_has_cam = bool(best_cam)
+    else:
+        # Mock/empty file: do not treat as an image bag
+        raw_has_lidar = True
+        raw_has_imu = True
+        raw_has_cam = True
+
     if not best_lidar and default_lidar:
         best_lidar = default_lidar
     if not best_imu and default_imu:
@@ -198,6 +211,12 @@ def detect_bag_topics(paths, default_lidar=None, default_imu=None, default_cam=N
         'lidar_topic': best_lidar or '/vanjee_722z',
         'imu_topic': best_imu or '/vanjee_imu_packets',
         'image_topic': best_cam or '/camera_front/image/compressed',
+        'has_lidar': raw_has_lidar,
+        'has_imu': raw_has_imu,
+        'has_image': raw_has_cam,
+        'detected_lidar': best_lidar if raw_has_lidar else None,
+        'detected_imu': best_imu if raw_has_imu else None,
+        'detected_cam': best_cam if raw_has_cam else None,
         'scanner_type': scanner_type,
         'connections': connections,
         'duration_seconds': info.get('duration_seconds', 0.0),
@@ -235,6 +254,7 @@ def export_bags(paths, stream, *, lidar_topic=None, imu_topic=None,
             raise ValueError('Missing bag topics: ' + ', '.join(sorted(missing)))
 
         stream.write(MAGIC)
+        import gc
         for c, _, raw in reader.messages(connections=connections):
             msg = reader.deserialize(raw, c.msgtype)
             kind = topics[c.topic]
@@ -255,6 +275,9 @@ def export_bags(paths, stream, *, lidar_topic=None, imu_topic=None,
             stream.write(HEADER.pack(kind, t, n))
             stream.write(data)
             counts[kind] += 1
+            if counts[2] > 0 and counts[2] % 500 == 0 and kind == 2:
+                del data, msg
+                gc.collect(1)
         stream.flush()
     return {'imu': counts[1], 'scans': counts[2], 'images': counts[3]}
 
@@ -263,7 +286,7 @@ def find_adjacent_image_bag(bag_path: Path) -> Optional[Path]:
     """Find candidate IMAGE_*.bag adjacent to a LiDAR bag."""
     if not bag_path:
         return None
-    bag_path = Path(bag_path)
+    bag_path = Path(bag_path).resolve()
     parent = bag_path.parent
     if not parent.is_dir():
         return None
@@ -272,25 +295,68 @@ def find_adjacent_image_bag(bag_path: Path) -> Optional[Path]:
     # 1. Direct prefix replacement: LIDAR_xxx -> IMAGE_xxx, PCL_xxx -> IMAGE_xxx
     if name.startswith("LIDAR_"):
         cand = parent / ("IMAGE_" + name[6:])
-        if cand.is_file():
+        if cand.is_file() and cand.resolve() != bag_path:
             return cand
     elif name.startswith("PCL_"):
         cand = parent / ("IMAGE_" + name[4:])
-        if cand.is_file():
+        if cand.is_file() and cand.resolve() != bag_path:
             return cand
     elif "lidar" in name.lower():
         cand_name = re.sub(r'lidar', 'image', name, flags=re.IGNORECASE)
         cand = parent / cand_name
-        if cand.is_file():
+        if cand.is_file() and cand.resolve() != bag_path:
             return cand
 
-    # 2. Search parent directory for IMAGE_*.bag
-    image_candidates = sorted(parent.glob("IMAGE_*.bag"))
+    # 2. Search parent directory for IMAGE_*.bag (excluding bag_path itself)
+    image_candidates = [p for p in sorted(parent.glob("IMAGE_*.bag")) if p.resolve() != bag_path]
     if image_candidates:
         return image_candidates[0]
-    image_candidates_lower = sorted([p for p in parent.glob("*.bag") if "image" in p.name.lower()])
+    image_candidates_lower = [
+        p for p in sorted(parent.glob("*.bag"))
+        if "image" in p.name.lower() and p.resolve() != bag_path
+    ]
     if image_candidates_lower:
         return image_candidates_lower[0]
+
+    return None
+
+
+def find_adjacent_lidar_bag(bag_path: Path) -> Optional[Path]:
+    """Find candidate LIDAR_*.bag adjacent to an Image bag."""
+    if not bag_path:
+        return None
+    bag_path = Path(bag_path).resolve()
+    parent = bag_path.parent
+    if not parent.is_dir():
+        return None
+    name = bag_path.name
+
+    # 1. Direct prefix replacement: IMAGE_xxx -> LIDAR_xxx, IMAGE_xxx -> PCL_xxx
+    if name.startswith("IMAGE_"):
+        for prefix in ("LIDAR_", "PCL_"):
+            cand = parent / (prefix + name[6:])
+            if cand.is_file() and cand.resolve() != bag_path:
+                return cand
+    elif "image" in name.lower():
+        for repl in ("lidar", "pcl"):
+            cand_name = re.sub(r'image', repl, name, flags=re.IGNORECASE)
+            cand = parent / cand_name
+            if cand.is_file() and cand.resolve() != bag_path:
+                return cand
+
+    # 2. Search parent directory for LIDAR_*.bag or PCL_*.bag (excluding bag_path itself)
+    lidar_candidates = [p for p in sorted(parent.glob("LIDAR_*.bag")) if p.resolve() != bag_path]
+    if lidar_candidates:
+        return lidar_candidates[0]
+    pcl_candidates = [p for p in sorted(parent.glob("PCL_*.bag")) if p.resolve() != bag_path]
+    if pcl_candidates:
+        return pcl_candidates[0]
+    lidar_candidates_lower = [
+        p for p in sorted(parent.glob("*.bag"))
+        if any(k in p.name.lower() for k in ("lidar", "pcl", "raven", "eagle")) and p.resolve() != bag_path
+    ]
+    if lidar_candidates_lower:
+        return lidar_candidates_lower[0]
 
     return None
 

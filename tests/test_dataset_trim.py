@@ -80,3 +80,30 @@ def test_trim_and_chunk_with_real_dataset(tmp_path):
         assert Path(c["video_path"]).exists()
         assert c["bag_duration"] > 0
         assert c["video_duration"] > 0
+
+
+def test_end_at_keeps_requested_seconds_and_residual_dt(tmp_path, monkeypatch):
+    from raven_app import dataset_trim as dt
+    calls = {}
+    monkeypatch.setattr(dt, "get_bag_time_bounds", lambda p: (0.0, 914.0, 914.0))
+    monkeypatch.setattr(dt, "get_video_duration", lambda p: 60.0)
+
+    def fake_bag(src, dst, start_sec, end_sec, progress_callback=None):
+        calls["bag"] = (start_sec, end_sec)
+        return {"duration_seconds": end_sec - start_sec, "messages": 1}
+
+    def fake_video(src, dst, start_sec, duration_sec, ffmpeg_bin="ffmpeg"):
+        calls["video"] = (start_sec, duration_sec)
+        return {"duration_seconds": duration_sec}
+
+    monkeypatch.setattr(dt, "slice_bag", fake_bag)
+    monkeypatch.setattr(dt, "slice_video", fake_video)
+    (tmp_path / "a.bag").write_bytes(b"x")
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    res = dt.trim_dataset_synchronized(tmp_path / "a.bag", tmp_path / "a.mp4", tmp_path / "o",
+                                       end_at_sec=240.0, dt_sync=2.81)
+    assert calls["bag"] == (0.0, 240.0)
+    assert calls["video"][0] == pytest.approx(2.81)
+    assert calls["video"][1] == pytest.approx(57.19)   # video is shorter than the LiDAR
+    assert res["dt_sync_trimmed"] == pytest.approx(0.0)
+    assert res["trim_end_sec"] == pytest.approx(674.0)
