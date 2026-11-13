@@ -812,6 +812,36 @@ class UnifiedWorkflowView(QWidget):
         self.trim_start_spin.setEnabled(enabled)
         self.trim_end_spin.setEnabled(enabled)
 
+    def _secondary_video_for_cut(self):
+        """The second lens file when dual-file INSV is on; None lets the cut find a _10_ partner itself."""
+        if self.dual_insv_chk.isChecked():
+            sec = self.secondary_insv_input.text().strip()
+            if sec and Path(sec).is_file():
+                return sec
+        return None
+
+    def _load_cut_dataset_aux_cameras(self, folder: Path):
+        """A chunk or trim folder holds the auxiliary cameras cut with it; load them in place of the current ones."""
+        from raven_app.dataset_trim import AUX_CONFIG_NAME
+        from raven_app.third_camera import load_third_camera_configs
+        folder = Path(folder)
+        cfg_path = folder / AUX_CONFIG_NAME
+        is_cut = (folder / "trim_manifest.json").is_file() or (folder.parent / "chunks_manifest.json").is_file()
+        if not (cfg_path.is_file() and is_cut):
+            return
+        try:
+            configs = load_third_camera_configs(cfg_path)
+        except Exception as exc:
+            InfoBar.warning(title=tr("Auxiliary cameras not loaded"), content=str(exc), parent=self, duration=5000)
+            return
+        self.third_camera_configs = list(configs)
+        self._refresh_aux_sources_ui()
+        InfoBar.info(
+            title=tr("Auxiliary cameras loaded"),
+            content=tr("{n} auxiliary camera(s) cut with this dataset were loaded from {name}.").format(
+                n=len(configs), name=AUX_CONFIG_NAME),
+            parent=self, duration=5000)
+
     def _action_export_trimmed_dataset(self):
         """Export trimmed bag and video directly to disk."""
         bag = self.bag_input.text().strip()
@@ -836,6 +866,8 @@ class UnifiedWorkflowView(QWidget):
             res = trim_dataset_synchronized(
                 bag_path=bag, video_path=insv, output_dir=out_dir,
                 trim_start_sec=trim_start, trim_end_sec=0.0, end_at_sec=trim_end, dt_sync=dt_val,
+                secondary_video_path=self._secondary_video_for_cut(),
+                auxiliary_cameras=self._active_aux_camera_configs(),
             )
             InfoBar.success(
                 title=tr("Dataset Trimmed Successfully"),
@@ -869,6 +901,8 @@ class UnifiedWorkflowView(QWidget):
                 chunk_duration_sec=300.0, overlap_sec=float(self.chunk_overlap_spin.value()),
                 num_chunks=int(self.chunk_count_spin.value()),
                 trim_start_sec=trim_start, trim_end_sec=0.0, end_at_sec=trim_end, dt_sync=dt_val,
+                secondary_video_path=self._secondary_video_for_cut(),
+                auxiliary_cameras=self._active_aux_camera_configs(),
             )
             InfoBar.success(
                 title=tr("Chunks Created Successfully"),
@@ -965,6 +999,7 @@ class UnifiedWorkflowView(QWidget):
 
             self.bag_input.setText(path)
             self._auto_detect_bag(path)
+            self._load_cut_dataset_aux_cameras(p.parent)
             cand = find_adjacent_image_bag(p)
             if cand and cand.is_file() and not self.image_bag_input.text().strip():
                 self.image_bag_input.setText(str(cand))

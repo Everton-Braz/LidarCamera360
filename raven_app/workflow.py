@@ -2907,9 +2907,14 @@ def execute_unified_workflow(
               f"{'keep until ' + str(trim_end_at) + 's' if trim_end_at > 0 else 'drop last ' + str(trim_end) + 's'}")
         trimmed = trim_dataset_synchronized(
             bag_path, insv_path, output_dir / 'trimmed_input', trim_start_sec=trim_start,
-            trim_end_sec=trim_end, end_at_sec=trim_end_at, dt_sync=dt_override)
+            trim_end_sec=trim_end, end_at_sec=trim_end_at, dt_sync=dt_override,
+            secondary_video_path=secondary_insv_path)
         bag_path, insv_path = Path(trimmed['bag_path']), Path(trimmed['video_path'])
+        if trimmed.get('secondary_video_path'):
+            secondary_insv_path = Path(trimmed['secondary_video_path'])
         dt_override = trimmed['dt_sync_trimmed']
+    else:
+        trimmed = None
 
     third_cfgs = []
     if third_camera:
@@ -2966,6 +2971,12 @@ def execute_unified_workflow(
         elif isinstance(third_camera, dict):
             third_cfgs = load_third_camera_configs(third_camera)
     third_cfgs = [cfg for cfg in third_cfgs if cfg.enabled and cfg.source_path]
+    if third_cfgs and trimmed:
+        # The bag and the 360 video were cut above; cut each auxiliary video to the same interval.
+        from raven_app.dataset_trim import cut_auxiliary_cameras
+        third_cfgs = cut_auxiliary_cameras(
+            third_cfgs, output_dir / 'trimmed_input', 'trimmed', trimmed['bag_start_sec'],
+            trimmed['bag_kept_sec'], trimmed['dt_sync'], trimmed['video_start_sec'])
     if third_cfgs:
         from raven_app.third_camera import expand_auxiliary_camera_configs
         third_cfgs = expand_auxiliary_camera_configs(third_cfgs)

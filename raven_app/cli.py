@@ -399,6 +399,11 @@ def parse(argv=None):
     chunk.add_argument('--trim-end-at', type=float, default=0.0, help='Keep the dataset only until this time (s from the start); overrides --trim-end')
     chunk.add_argument('--trim-end', type=float, default=0.0, help='Optional final seconds to cut before chunking')
     chunk.add_argument('--dt', dest='dt_sync', type=float, default=None, help='Manual time sync offset (seconds; auto-computed if omitted)')
+    for cut_parser in (trim, chunk):
+        cut_parser.add_argument('--secondary-insv', type=Path, default=None,
+                                help='Rear-lens file of a dual-file camera (ONE RS / ONE R); a _10_ sibling of a _00_ file is found automatically')
+        cut_parser.add_argument('--third-camera', type=Path, default=None,
+                                help='Auxiliary camera JSON; each auxiliary video is cut too and a shifted third_camera.json is written next to the cut files')
 
     for command_parser in (color, wf):
         command_parser.add_argument('--no-vulkan', action='store_true', help='Use CPU colorization')
@@ -946,6 +951,8 @@ def run(a):
             end_at_sec=a.trim_end_at,
             dt_sync=a.dt_sync,
             progress_callback=lambda stage, p: print(f"[{int(p*100):3d}%] {stage}"),
+            secondary_video_path=a.secondary_insv,
+            auxiliary_cameras=_cut_aux_cameras(a.third_camera),
         )
         print(f"\nDataset trimmed successfully:")
         print(f"  Bag:   {res['bag_path']} ({res['bag_duration']:.2f}s, {res['bag_messages']} msgs)")
@@ -967,12 +974,24 @@ def run(a):
             end_at_sec=a.trim_end_at,
             dt_sync=a.dt_sync,
             progress_callback=lambda stage, p: print(f"[{int(p*100):3d}%] {stage}"),
+            secondary_video_path=a.secondary_insv,
+            auxiliary_cameras=_cut_aux_cameras(a.third_camera),
         )
         print(f"\nDivided dataset into {len(chunks)} overlapping chunks in {a.output}:")
         for c in chunks:
             print(f"  [{c['name']}] Bag: {c['bag_duration']:.1f}s | Video: {c['video_duration']:.1f}s | Overlap: {c['overlap_sec']:.1f}s")
         return 0
     raise ValueError('Unknown command')
+
+
+def _cut_aux_cameras(path):
+    """Auxiliary cameras as configured (not INSV-expanded), for trim and chunk."""
+    if not path:
+        return None
+    from raven_app.third_camera import ThirdCameraConfig
+    data = json.loads(Path(path).read_text(encoding='utf-8'))
+    cameras = data['cameras'] if isinstance(data, dict) and 'cameras' in data else (data if isinstance(data, list) else [data])
+    return [ThirdCameraConfig.from_dict(camera) for camera in cameras]
 
 
 def _profile_aux_cameras(configs, reference, dataset):
