@@ -1,0 +1,34 @@
+{
+  "headline": [
+    "Any rig.",
+    "Calibrated per capture."
+  ],
+  "subline": [
+    "Rig profiles for any scanner and camera setup,",
+    "cleaner clouds and a portable project package."
+  ],
+  "chips": [
+    "Rig profiles v2",
+    "Insta360 ONE RS dual-INSV",
+    "Per-capture calibration",
+    "People removal",
+    ".lc360 projects",
+    "LAZ / GeoJSON export"
+  ],
+  "ui": "captures/dark_05_rig_profiles.png",
+  "ui_crop": [
+    170,
+    740,
+    2140,
+    1430
+  ],
+  "ui_caption": "Rig Profiles in v0.4.0: every camera, model and mount in one file",
+  "hero": "footage/hero.png",
+  "footer": "Free for Windows  ·  github.com/Everton-Braz/LidarCamera360",
+  "ui_crop_portrait": [
+    150,
+    96,
+    2160,
+    1440
+  ]
+}
