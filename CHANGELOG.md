@@ -6,7 +6,7 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
-## [Unreleased]
+## [v0.4.0] - 2026-11-23
 
 ### 🧍 Person masks
 - **Passers-by are masked, not only the operator.** The detector now sees every frame upright and in overlapping
@@ -15,12 +15,16 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Existing masks are generated again on the next run. A run takes longer: about 0.3 s per frame with TensorRT and
   1 s with Vulkan. The mask preview uses the same steps as the run.
 
----
-
-## [v0.4.0] - 2026-11-12
+### 🧱 SLAM, dataset and speed
+- **Recordings that start mid-walk are leveled to gravity** instead of starting tilted. Diverged SLAM runs are
+  detected, and the map voxel adapts for the default profile.
+- **Upside-down lenses are turned upright in the 3DGS export**: images, masks, intrinsics and poses together.
+- Pose adjustment: frames beyond the limits follow their neighbours instead of rejecting every other correction.
+- **Trim and chunks cut the second lens file and auxiliary videos** with the same interval.
+- The dynamic filter's person votes run on worker threads; stage time estimates learn from earlier runs.
 
 ### 📦 Project package, people removal and georeferencing
-- **`.lc360` v1 project package**: each dataset keeps a `project.json` (schema `lc360-project`) that names its cloud,
+- **Project folder (`.lc360` v1)**: each output folder keeps a `project.json` (schema `lc360-project`) that names its cloud,
   images, camera poses and trajectory. `spec/SPEC.md` defines the contract; `raven_app/project_validate.py` checks
   a package in two levels (`E_JSON`, `E_SCHEMA`, `E_VERSION`, `E_PATH_ESCAPE`, `E_MISSING_ASSET`, `E_POSES`,
   `W_NO_ID`) and `write_project` refuses to write a manifest with an error. Conformance examples are in

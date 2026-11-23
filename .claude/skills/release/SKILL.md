@@ -12,8 +12,7 @@ description: >-
 Work in this order. Each phase ends with something the user can check. Never publish, push or post
 without the user's explicit yes for that step.
 
-**Hard rule:** this app is free and stands alone. No text, image, video or post may mention any other product,
-a paid edition, "Pro", "Lite" or "coming soon" features of another app.
+**Hard rule:** this app is free and stands alone. No text, image, video or post may mention any other product.
 
 ## 1. Readiness
 

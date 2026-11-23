@@ -55,4 +55,4 @@ Post the video **natively** (upload the file), never as a YouTube link.
 
 Direct and technical. Say what changed and what it fixes, with real numbers only when measured. No "game changer",
 no "revolutionary", no emojis as bullets. Known limitations are fine to mention; they build trust.
-Never mention other products or paid editions.
+Never mention other products.
