@@ -3,7 +3,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import sys
 import tempfile
 
@@ -17,6 +16,7 @@ from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout,
 from qfluentwidgets import (BodyLabel, CaptionLabel, ComboBox, DoubleSpinBox,
                             FluentIcon, ToolButton)
 
+from raven_app import mask_tiles
 from raven_app.i18n import tr
 from raven_app.config import get_app_root, get_config_dir
 from raven_app.mask_resources import (masker_environment, resolve_masker_executable,
@@ -25,7 +25,7 @@ from raven_app.mask_resources import (masker_environment, resolve_masker_executa
                                       resolve_vulkan_executable,
                                       resolve_vulkan_schedule,
                                       resolve_vulkan_shaders_dir)
-from raven_app.person_masks import (apply_mask_exclusions, fisheye_cutoff_radius,
+from raven_app.person_masks import (DEFAULT_THRESHOLD, apply_mask_exclusions, fisheye_cutoff_radius,
                                     normalize_mask_config, static_keep_mask)
 
 
@@ -402,8 +402,11 @@ class MaskSettingsDialog(QDialog):
 
     def __init__(self, dataset_dir, config=None, parent=None, model_path=None,
                  backend='vulkan', insv_path=None, fps=2.0, camera_names=(),
-                 auxiliary_sources=(), secondary_insv_path=None):
+                 auxiliary_sources=(), secondary_insv_path=None, profile=None, profile_name=None):
         super().__init__(parent)
+        self.profile = profile
+        self.profile_name = profile_name or (Path(str(profile)).stem if profile else None)
+        self.saved_to_profile = None
         self.insv_path = Path(insv_path) if insv_path else None
         self.secondary_insv_path = Path(secondary_insv_path) if secondary_insv_path else None
         if self.insv_path:
@@ -605,6 +608,14 @@ class MaskSettingsDialog(QDialog):
         self.save_button.setAccessibleName(tr('Use these masks'))
         self.save_button.clicked.connect(self.accept)
         actions.addWidget(cancel)
+        if self.profile:
+            self.profile_button = ToolButton(FluentIcon.SAVE, self)
+            tip = tr('Use these masks and save them as the default for the rig profile {name}').format(
+                name=self.profile_name)
+            self.profile_button.setToolTip(tip)
+            self.profile_button.setAccessibleName(tip)
+            self.profile_button.clicked.connect(self._save_to_profile)
+            actions.addWidget(self.profile_button)
         actions.addWidget(self.save_button)
         layout.addLayout(actions)
         self._camera_changed(self.camera_combo.currentText())
@@ -1106,12 +1117,17 @@ class MaskSettingsDialog(QDialog):
         parent.mkdir(parents=True, exist_ok=True)
         self._preview_temp = tempfile.TemporaryDirectory(prefix='raven-mask-preview-', dir=parent)
         temporary = Path(self._preview_temp.name)
-        input_dir = temporary / 'images' / camera
-        input_dir.mkdir(parents=True)
+        input_dir = temporary / 'images'
+        input_dir.mkdir()
         (temporary / 'masks').mkdir()
         try:
-            shutil.copy2(source, input_dir / source.name)
-        except OSError as exc:
+            # The same upright tiles as the batch, so the preview shows the masks the run will write.
+            image = mask_tiles.read_image(source)
+            known = self._known_rotation(camera)
+            self._preview_views = image.shape[:2], [
+                (turns, mask_tiles.write_views(image, turns, mask_tiles.LEVELS[self.backend], None, input_dir, str(turns)))
+                for turns in (range(4) if known is None else (known,))]
+        except (OSError, ValueError) as exc:
             self._preview_temp.cleanup()
             self._preview_temp = None
             self.preview_status.setText(tr('Cannot prepare mask preview: {error}').format(error=str(exc)))
@@ -1121,7 +1137,7 @@ class MaskSettingsDialog(QDialog):
         process.finished.connect(lambda code, _status: self._detection_finished(process, key, code))
         process.setProgram(str(executable))
         arguments = ['--input', str(temporary / 'images'), '--output', str(temporary / 'masks'),
-                     '--model', str(inference_model), '--threshold', '0.5', '--margin', '0.03']
+                     '--model', str(inference_model), '--threshold', str(DEFAULT_THRESHOLD), '--margin', '0.03']
         environment = QProcessEnvironment.systemEnvironment()
         if self.backend == 'vulkan':
             arguments.extend(['--shaders', str(shaders)])
@@ -1141,13 +1157,31 @@ class MaskSettingsDialog(QDialog):
             return
         self.preview_status.setText(tr('Showing fixed areas while RF-DETR detects people for this frame...'))
 
+    def _known_rotation(self, camera):
+        """Quarter turns the last mask run used for this camera, or None."""
+        try:
+            manifest = json.loads((Path(self.dataset_dir) / 'masks' / 'manifest.json').read_text(encoding='utf-8'))
+            return int(manifest['camera_rotation_deg'][camera]) // 90 % 4
+        except (OSError, TypeError, ValueError, KeyError):
+            return None
+
+    def _read_preview_mask(self, folder):
+        shape, views = self._preview_views
+        masks = [mask_tiles.read_views(folder, str(turns), shape, turns, boxes) for turns, boxes in views]
+        if len(masks) == 1:
+            return masks[0]
+        return masks[mask_tiles.pick_rotation([mask_tiles.person_blobs(mask) for mask in masks])]
+
     def _detection_finished(self, process, key, code):
         if process is not self._preview_process:
             return
-        camera, source = key
-        path = Path(self._preview_temp.name) / 'masks' / camera / (source.name + '.png')
-        mask = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_GRAYSCALE) if code == 0 and path.is_file() else None
         error = bytes(process.readAllStandardError()).decode(errors='replace').strip()
+        mask = None
+        if code == 0:
+            try:
+                mask = self._read_preview_mask(Path(self._preview_temp.name) / 'masks')
+            except (OSError, ValueError) as exc:
+                error = str(exc)
         self._preview_process = None
         process.deleteLater()
         self._preview_temp.cleanup()
@@ -1194,6 +1228,18 @@ class MaskSettingsDialog(QDialog):
             self.preview_status.setText(tr('Wait for frame extraction to finish before saving mask settings.'))
             return
         super().accept()
+
+    def _save_to_profile(self):
+        if self._frame_extraction_process is not None or self._frame_extraction_timer.isActive():
+            self.preview_status.setText(tr('Wait for frame extraction to finish before saving mask settings.'))
+            return
+        from raven_app.person_masks import save_profile_mask_config
+        try:
+            self.saved_to_profile = save_profile_mask_config(self.profile, self.settings())
+        except (OSError, ValueError) as exc:
+            self.preview_status.setText(tr('Could not save the masks to the profile: {error}').format(error=exc))
+            return
+        self.accept()
 
     def settings(self):
         self.config['fisheye_border_percent_by_camera'][self.camera_combo.currentText()] = self.border_spin.value()

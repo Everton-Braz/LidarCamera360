@@ -1,6 +1,6 @@
-//! LidarCamera360 v0.4.0 release film (1920x1080, 30 fps, ~39 s).
+//! LidarCamera360 v0.4.0 release film (1920x1080, 30 fps, ~46 s).
 //!
-//! Seven scenes, cross-dissolved: Hook, Rig, RsOne, Calib, Clean, Export, EndCard.
+//! Eight scenes, cross-dissolved: Hook, Rig, RsOne, Run, Calib, Clean, Export, EndCard.
 //! UI captures and fonts are embedded from `media/`. Footage the user supplies later is read
 //! at runtime from `footage/` (see README.md); while a file is missing the scene draws a
 //! procedural point cloud instead, so the film always renders.
@@ -34,6 +34,7 @@ const XF: f32 = 0.4;
 const FLYTHROUGH: &str = "3dgs_flythrough.mp4";
 const CLOUD_BEFORE: &str = "cloud_before.png";
 const CLOUD_AFTER: &str = "cloud_after.png";
+const STUDIO_RUN: &str = "studio_run.mp4";
 
 static OUT: LazyLock<AnimationRuntime> = LazyLock::new(|| AnimationRuntime::new(0.5, &Easing::EaseOut));
 static XFADE: LazyLock<AnimationRuntime> = LazyLock::new(|| AnimationRuntime::new(XF, &Easing::EaseInOut));
@@ -220,6 +221,7 @@ pub struct FilmVideo<'a> {
     hook: Hook,
     rig: Rig,
     rsone: RsOne,
+    run: Run,
     calib: Calib,
     clean: Clean,
     export: Export,
@@ -233,6 +235,7 @@ impl<'a> FilmVideo<'a> {
             hook: Hook { street: street(7, 90.0, false) },
             rig: Rig,
             rsone: RsOne,
+            run: Run,
             calib: Calib,
             clean: Clean::new(),
             export: Export,
@@ -268,6 +271,7 @@ impl Video for FilmVideo<'_> {
             &self.hook as &dyn Scene,
             &self.rig,
             &self.rsone,
+            &self.run,
             &self.calib,
             &self.clean,
             &self.export,
@@ -329,8 +333,8 @@ impl Scene for Hook {
             {footage}
             <defs>
                 <linearGradient id="hookShade" x1="0" y1="0" x2="1" y2="0">
-                    <stop offset="0" stop-color={BG} stop-opacity="0.94" />
-                    <stop offset="0.45" stop-color={BG} stop-opacity="0.72" />
+                    <stop offset="0" stop-color={BG} stop-opacity="0.88" />
+                    <stop offset="0.45" stop-color={BG} stop-opacity="0.6" />
                     <stop offset="0.8" stop-color={BG} stop-opacity="0" />
                 </linearGradient>
             </defs>
@@ -441,6 +445,48 @@ impl Scene for RsOne {
                 <rect x="1104" y="720" width="580" height="60" rx="12" fill="#14232a" stroke={BORDER} stroke-width="2" />
                 {mono(1128.0, 760.0, 28, TEXT, "VID_…_10_013.insv")}
             </g>))}
+        </g>))
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 3b. One run: the real Studio progress panel from a ONE RS capture, sped up.
+// ---------------------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct Run;
+
+impl Scene for Run {
+    fn duration(&self) -> Duration<'_> {
+        Duration::Seconds(7.0)
+    }
+
+    fn overlap(&self) -> Overlap {
+        Overlap::Previous(XF)
+    }
+
+    fn render_frame<'a>(&'a self, frame: Frame, ctx: &FFramesContext<'a, '_>) -> Svgr<'a> {
+        let input = SyncVideoFrameInput { start_from: 0.0, looping: false, ..Default::default() };
+        let panel = match frame.get_synced_video_frame(ctx, STUDIO_RUN, &input) {
+            Some(clip) => {
+                let image = clip.into_image();
+                fframes::svgr!(<image href={image.href()} x="0" y="0" width="1920" height="506" />)
+            }
+            None => Svgr::empty(),
+        };
+        let lift = 1.0 - prog(&frame, XF, &SPRING);
+
+        dissolve(&frame, fframes::svgr!(<g>
+            {backdrop()}
+            <g transform={format!("translate(0 {:.2})", 300.0 + 40.0 * lift)}>
+                {panel}
+                <rect x="0" y="0" width="1920" height="506" fill="none" stroke={BORDER} stroke-width="2" />
+            </g>
+            {enter(&frame, XF + 0.1, mono(120.0, 150.0, 28, ACCENT, "ONE CLICK · SEVEN STEPS"))}
+            {enter(&frame, XF + 0.25, sans(116.0, 240.0, 72, 800, TEXT, "From two INSV files to a 3DGS dataset."))}
+            {enter(&frame, XF + 0.5, mono(1480.0, 150.0, 28, MUTED, "SPED UP ~100×"))}
+            {enter(&frame, XF + 0.8, sans(120.0, 900.0, 40, 600, TEXT, "Real ONE RS capture: 160 s of data, done in 10 min 32 s."))}
+            {enter(&frame, XF + 1.0, sans(120.0, 962.0, 34, 500, MUTED, "SLAM, sync, rig calibration, masks, colorization, COLMAP export."))}
         </g>))
     }
 }
@@ -581,8 +627,8 @@ impl Scene for Clean {
                 </g>))}
             </g>
             <g opacity={tag_after}>
-                <rect x="1388" y="96" width="340" height="56" rx="28" fill={BG} fill-opacity="0.85" stroke={ACCENT} stroke-width="2" />
-                {mono(1418.0, 134.0, 28, ACCENT, "--remove-dynamic")}
+                <rect x="1368" y="96" width="360" height="56" rx="28" fill={BG} fill-opacity="0.85" stroke={ACCENT} stroke-width="2" />
+                {mono(1398.0, 134.0, 28, ACCENT, "--remove-dynamic")}
             </g>
             {enter(&frame, XF + 3.3, fframes::svgr!(<g>
                 {card(192.0, 730.0, 720.0, 230.0)}

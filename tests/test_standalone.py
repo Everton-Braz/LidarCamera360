@@ -121,12 +121,14 @@ class GuiTests(unittest.TestCase):
         self.app.processEvents()
 
     def test_workflow_progress_updates_from_stage_and_vulkan_logs(self):
+        import os
         import time
         import tempfile
+        from unittest import mock
         from raven_app.process_runner import ProcessRunner
         from raven_app.views.unified_workflow_view import UnifiedWorkflowView
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'APPDATA': tmp}):
             view = UnifiedWorkflowView(ProcessRunner())
             view._prepare_workflow_progress(tmp, '', '', 'sfm')
             view._workflow_started_at = time.monotonic()
@@ -135,7 +137,7 @@ class GuiTests(unittest.TestCase):
                     f'[STAGE {stage}/7] {stage}'
                 )
             view._update_workflow_progress_from_line('[+] 3624 combined foreground masks ready: masks')
-            self.assertEqual(view.step_progress_bars[4].value(), 99)
+            self.assertEqual(view.step_progress_bars[4].value(), 97)
             view._update_workflow_progress_from_line('[STAGE 6/7] Running Point Cloud Colorization...')
             view._update_workflow_progress_from_line('Vulkan frames 50/100')
             self.assertEqual(view.step_progress_bars[0].value(), 100)
@@ -147,13 +149,15 @@ class GuiTests(unittest.TestCase):
             self.app.processEvents()
 
     def test_skipped_mask_stage_is_not_added_to_timing_history(self):
+        import os
         import time
         import tempfile
+        from unittest import mock
         from raven_app.process_runner import ProcessRunner
         from raven_app.views.unified_workflow_view import UnifiedWorkflowView
         from raven_app.workflow_progress import load_stage_history
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'APPDATA': tmp}):
             view = UnifiedWorkflowView(ProcessRunner())
             view._prepare_workflow_progress(tmp, '', '', 'sfm')
             view._workflow_started_at = time.monotonic()
@@ -161,6 +165,36 @@ class GuiTests(unittest.TestCase):
             view._update_workflow_progress_from_line('[STAGE 6/7] Running Point Cloud Colorization...')
             self.assertEqual(view.step_progress_bars[4].value(), 100)
             self.assertEqual(load_stage_history(tmp)[4], [])
+            view._progress_timer.stop()
+            view.deleteLater()
+            self.app.processEvents()
+
+    def test_colorization_time_is_recorded_after_its_frames_reach_100_percent(self):
+        # The bar used to read 100 % from "Vulkan frames N/N", so step 6 was never timed or learned.
+        import os
+        import time
+        import tempfile
+        from unittest import mock
+        from raven_app.process_runner import ProcessRunner
+        from raven_app.views.unified_workflow_view import UnifiedWorkflowView
+        from raven_app.workflow_progress import (
+            dataset_times_path, load_stage_history, load_stage_ratios, machine_rates_path)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'APPDATA': tmp}):
+            view = UnifiedWorkflowView(ProcessRunner())
+            view._prepare_workflow_progress(tmp, '', '', 'sfm')
+            view._workflow_started_at = time.monotonic()
+            view._update_workflow_progress_from_line('[STAGE 6/7] Running Point Cloud Colorization...')
+            view._stage_started_at = time.monotonic() - 40.0
+            view._update_workflow_progress_from_line('Vulkan frames 100/100')
+            self.assertLess(view.step_progress_bars[5].value(), 100)  # saving and filtering still follow
+            self.assertIn('Estimated left', view.eta_label.text())
+            view._update_workflow_progress_from_line('[STAGE 7/7] Georeferencing and packaging deliverables...')
+            self.assertEqual(view.step_progress_bars[5].value(), 100)
+            self.assertAlmostEqual(load_stage_history(tmp)[5][0], 40.0, delta=2.0)
+            self.assertEqual(len(load_stage_ratios(dataset_times_path(tmp))[5]), 1)
+            self.assertEqual(len(load_stage_ratios(machine_rates_path())[5]), 1)
+            self.assertTrue(str(machine_rates_path()).startswith(tmp))
             view._progress_timer.stop()
             view.deleteLater()
             self.app.processEvents()

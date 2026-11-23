@@ -33,6 +33,7 @@ from scipy.spatial.transform import Rotation as Rot
 from raven_app import __version__
 from raven_app.cli import engine, resources
 from raven_app.bag_io import export_bags
+from raven_app.gravity_level import LEVEL_FILE, level_interrupted, level_slam_output
 from raven_app.slam_source import active_slam_dir
 from raven_app.time_gating import DEFAULT_TIME_WINDOW_S
 from raven_app.video import compute_laplacian_sharpness, extract_insv_frames_pyav, find_partner_insv, normalize_dual_insv_pair, frame_time
@@ -45,6 +46,44 @@ TIMELAPSE_SLAM_PROFILES = {
     'timelapse': {'name': 'raven_timelapse_stable_v1', 'filter_size_surf_m': 0.06, 'voxel_size_m': 0.20},
     'classic': {'name': 'raven_classic_20260927', 'filter_size_surf_m': 0.10, 'voxel_size_m': 0.60, 'max_layer': 2},
 }
+
+#: A recording that starts while the operator walks (a trimmed clip, a chunk) gives FAST-LIVO2 no still period, and the
+#: 0.15 m map voxel of raven.yaml cannot bootstrap its map from moving scans: the filter runs off at its velocity cap.
+#: A 0.5 m map voxel (the eagle.yaml value) starts from motion, and on a full recording it is as crisp as 0.15 m.
+COARSE_MAP_VOXEL_M = 0.5
+#: Mean |gyro| and std of |acc| over the first 3 s. Still starts measured 0.01–0.07 for both; walking starts 0.25–0.61.
+MOVING_START_GYRO_RAD_S = 0.15
+MOVING_START_ACC_STD_M_S2 = 0.15
+#: A diverged LIO filter stays pinned at its velocity cap (67 % of steps on a broken run); a walking operator never is.
+SLAM_RUNAWAY_CAP_SHARE = 0.20
+SLAM_MAP_RETRY_MARKER = 'map_retry.json'
+
+
+def starts_in_motion(motion: Optional[Dict[str, float]]) -> bool:
+    """Whether the IMU activity at the start of a bag (bag_io.imu_motion_at_start) is a walking operator."""
+    return bool(motion) and (motion['gyro_mean_rad_s'] > MOVING_START_GYRO_RAD_S
+                             or motion['acc_std_m_s2'] > MOVING_START_ACC_STD_M_S2)
+
+
+def slam_velocity_cap_share(trajectory_path, max_velocity: Optional[float]) -> Optional[float]:
+    """Share of trajectory steps at 95 % or more of FAST-LIVO2's velocity cap (t x y z ... rows), or None."""
+    if not max_velocity or max_velocity <= 0:
+        return None
+    try:
+        rows = np.loadtxt(trajectory_path, ndmin=2)
+    except (OSError, ValueError):
+        return None
+    if rows.shape[0] < 20 or rows.shape[1] < 4:
+        return None
+    dt = np.diff(rows[:, 0])
+    ok = dt > 1e-6
+    speed = np.linalg.norm(np.diff(rows[:, 1:4], axis=0), axis=1)[ok] / dt[ok]
+    return float(np.mean(speed >= 0.95 * max_velocity)) if speed.size else None
+
+
+def _yaml_number(text: str, key: str) -> Optional[float]:
+    match = re.search(rf'(?m)^\s*{key}:\s*([\d.]+)', text)
+    return float(match.group(1)) if match else None
 
 for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, 'reconfigure'):
@@ -1770,6 +1809,150 @@ def _clear_colmap_image_observations(sparse_dir):
     path.write_text('\n'.join(output) + '\n', encoding='utf-8')
 
 
+UPRIGHT_FILE = 'upright_rotation.json'
+# Parameter indices of (cx, cy) and of the odd distortion terms (tangential, thin prism), whose sign
+# flips when the image turns 180 degrees; radial terms are even and stay.
+_ROTATE_180_PARAMS = {
+    'SIMPLE_PINHOLE': ((1, 2), ()), 'SIMPLE_RADIAL': ((1, 2), ()), 'RADIAL': ((1, 2), ()),
+    'SIMPLE_RADIAL_FISHEYE': ((1, 2), ()), 'RADIAL_FISHEYE': ((1, 2), ()),
+    'PINHOLE': ((2, 3), ()), 'OPENCV_FISHEYE': ((2, 3), ()), 'FOV': ((2, 3), ()),
+    'OPENCV': ((2, 3), (6, 7)), 'FULL_OPENCV': ((2, 3), (6, 7)),
+    'THIN_PRISM_FISHEYE': ((2, 3), (6, 7, 10, 11)),
+}
+
+
+def _colmap_image_rows(sparse_dir):
+    """images.txt as (rows, [(index of the header row, header fields)])."""
+    rows = (Path(sparse_dir) / 'images.txt').read_text(encoding='utf-8').splitlines()
+    headers, index = [], 0
+    while index < len(rows):
+        if rows[index].strip() and not rows[index].lstrip().startswith('#'):
+            headers.append((index, rows[index].split(maxsplit=9)))
+            index += 2
+        else:
+            index += 1
+    return rows, headers
+
+
+def upside_down_cameras(sparse_dir, threshold=-0.5):
+    """COLMAP camera ids whose image up (-y) points down in the world (+z up), by median over images.
+
+    Lenses mounted upside down (the ONE RS, turned 180 degrees about its optical axis against the X4)
+    give upside-down frames; a 3DGS viewer and a person checking the dataset both expect them upright.
+    """
+    _, headers = _colmap_image_rows(sparse_dir)
+    ups = {}
+    for _, fields in headers:
+        qw, qx, qy, qz = (float(v) for v in fields[1:5])
+        rotation_cw = Rot.from_quat([qx, qy, qz, qw]).as_matrix()
+        ups.setdefault(int(fields[8]), []).append(-rotation_cw[1, 2])
+    return sorted(camera_id for camera_id, values in ups.items() if np.median(values) < threshold)
+
+
+def rotate_colmap_cameras_180(sparse_dir, camera_ids):
+    """Turn the model of these cameras 180 degrees about the optical axis, in place (its own inverse).
+
+    Intrinsics: c -> size - c (COLMAP's pixel-corner origin) and the odd distortion terms change sign.
+    Poses: camera axes x, y flip, so R_cw -> diag(-1,-1,1) R_cw and t -> diag(-1,-1,1) t.
+    Observations: (x, y) -> (W - x, H - y). World points are untouched. Binaries are regenerated.
+    """
+    sparse_dir = Path(sparse_dir)
+    camera_ids = {int(c) for c in camera_ids}
+    if not camera_ids:
+        return
+    sizes, lines = {}, []
+    for line in (sparse_dir / 'cameras.txt').read_text(encoding='utf-8').splitlines():
+        parts = line.split()
+        if line.strip() and not line.lstrip().startswith('#') and int(parts[0]) in camera_ids:
+            model, width, height = parts[1], float(parts[2]), float(parts[3])
+            if model not in _ROTATE_180_PARAMS:
+                raise ValueError(f'Cannot turn a {model} camera upright')
+            params = [float(v) for v in parts[4:]]
+            (ix, iy), odd = _ROTATE_180_PARAMS[model]
+            params[ix], params[iy] = width - params[ix], height - params[iy]
+            for i in odd:
+                params[i] = -params[i]
+            sizes[int(parts[0])] = (width, height)
+            line = ' '.join(parts[:4] + [format(v, '.17g') for v in params])
+        lines.append(line)
+    (sparse_dir / 'cameras.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+    flip = np.diag([-1.0, -1.0, 1.0])
+    rows, headers = _colmap_image_rows(sparse_dir)
+    for index, fields in headers:
+        camera_id = int(fields[8])
+        if camera_id not in sizes:
+            continue
+        qw, qx, qy, qz = (float(v) for v in fields[1:5])
+        rotation = flip @ Rot.from_quat([qx, qy, qz, qw]).as_matrix()
+        translation = flip @ np.array([float(v) for v in fields[5:8]])
+        q = Rot.from_matrix(rotation).as_quat()
+        rows[index] = ' '.join([fields[0], *(format(v, '.17g') for v in (q[3], q[0], q[1], q[2])),
+                                *(format(v, '.17g') for v in translation), fields[8], fields[9]])
+        width, height = sizes[camera_id]
+        tokens = rows[index + 1].split() if index + 1 < len(rows) else []
+        for k in range(0, len(tokens) - 2, 3):
+            tokens[k] = format(width - float(tokens[k]), '.17g')
+            tokens[k + 1] = format(height - float(tokens[k + 1]), '.17g')
+        if index + 1 < len(rows):
+            rows[index + 1] = ' '.join(tokens)
+    (sparse_dir / 'images.txt').write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    _sync_colmap_text_binary(sparse_dir)
+
+
+def _rotate_file_180(path, quality=97):
+    """Rewrite an image turned 180 degrees as a new file (the old one may be a hard link to the dataset)."""
+    path = Path(path)
+    image = cv2.imdecode(np.fromfile(str(path), np.uint8), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ValueError(f'Cannot read {path}')
+    params = [cv2.IMWRITE_JPEG_QUALITY, quality] if path.suffix.lower() in ('.jpg', '.jpeg') else []
+    ok, data = cv2.imencode(path.suffix, cv2.rotate(image, cv2.ROTATE_180), params)
+    if not ok:
+        raise ValueError(f'Cannot write {path}')
+    path.unlink()
+    data.tofile(str(path))
+
+
+def make_colmap_export_upright(colmap_dir):
+    """Turn upside-down lenses of a 3DGS export upright: images, masks, intrinsics and poses together.
+
+    Records what was turned in upright_rotation.json, so tools that compare the export with the raw
+    frames (the pose adjustment against the SfM tracks) can turn it back first. Returns camera names.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    colmap_dir = Path(colmap_dir)
+    sparse_dir = colmap_dir / 'sparse' / '0'
+    if (colmap_dir / UPRIGHT_FILE).is_file() or not (sparse_dir / 'images.txt').is_file():
+        return []
+    camera_ids = upside_down_cameras(sparse_dir)
+    if not camera_ids:
+        return []
+    _, headers = _colmap_image_rows(sparse_dir)
+    names = [fields[9] for _, fields in headers if int(fields[8]) in camera_ids]
+    files = [colmap_dir / 'images' / name for name in names]
+    files += [mask for name in names if (mask := colmap_dir / 'masks' / f'{name}.png').is_file()]
+    rotate_colmap_cameras_180(sparse_dir, camera_ids)
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+        list(pool.map(_rotate_file_180, [f for f in files if f.is_file()]))
+    lenses = sorted({name.replace('\\', '/').split('/', 1)[0] for name in names})
+    (colmap_dir / UPRIGHT_FILE).write_text(json.dumps({
+        'schema': 1, 'rotation_deg': 180, 'camera_ids': camera_ids, 'cameras': lenses,
+        'note': 'Images, masks, intrinsics and poses of these cameras are turned 180 degrees '
+                'from the raw frames; the dataset images/ keep the raw orientation.',
+    }, indent=2) + '\n', encoding='utf-8')
+    print(f"  [+] Turned {', '.join(lenses)} upright (mounted upside down): "
+          f"{len(names)} images and their masks, intrinsics and poses")
+    return lenses
+
+
+def _upright_camera_ids(colmap_dir):
+    path = Path(colmap_dir) / UPRIGHT_FILE
+    if not path.is_file():
+        return []
+    return json.loads(path.read_text(encoding='utf-8')).get('camera_ids', [])
+
+
 def refine_colmap_3dgs_poses(colmap_dir: Path, tracks_dir: Path, update_export_report: bool = False,
                              **settings) -> Dict[str, Any]:
     """Bundle-adjust the direct rig poses of a 3DGS export against SfM feature tracks.
@@ -1780,6 +1963,9 @@ def refine_colmap_3dgs_poses(colmap_dir: Path, tracks_dir: Path, update_export_r
     from raven_app.pose_ba import refine_poses, write_report
     colmap_dir = Path(colmap_dir)
     sparse_dir = colmap_dir / 'sparse' / '0'
+    upright = _upright_camera_ids(colmap_dir)
+    # The SfM tracks are in raw frame pixels, and images_direct.txt holds raw poses.
+    rotate_colmap_cameras_180(sparse_dir, upright)
     backup = colmap_dir / 'images_direct.txt'
     if backup.is_file():
         # A rerun starts again from the direct poses, never from an earlier adjustment.
@@ -1799,7 +1985,8 @@ def refine_colmap_3dgs_poses(colmap_dir: Path, tracks_dir: Path, update_export_r
     if report['status'] == 'skipped':
         print(f"  [*] Pose adjustment skipped: {report.get('reason')}")
     write_report(colmap_dir / 'pose_ba_report.json', report)
-    if report['status'] == 'accepted':
+    rotate_colmap_cameras_180(sparse_dir, upright)
+    if report['status'] == 'accepted' or upright:
         _sync_colmap_text_binary(sparse_dir)
         for name in ('images.txt', 'images.bin'):
             # setup_sparse_compatibility's sparse/ copies, when the filesystem refused a hard link
@@ -2340,6 +2527,7 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
                 print(f"  [!] Warning: Failed to inject {camera.camera_name} poses: {e}")
 
     _sync_colmap_text_binary(sparse_out)
+    upright_lenses = make_colmap_export_upright(out_dir)
     from scripts.pipeline_auto_calibrator_and_colorizer import load_colmap_images
     exported_images = load_colmap_images(sparse_out / 'images.bin')
     counts_by_camera = {}
@@ -2355,6 +2543,7 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
                                 if pose_source == 'sfm' else 0),
         'auxiliary_cameras': auxiliary_decisions,
         'lidar_seed_percent': seed_percent,
+        'upright_rotated_cameras': upright_lenses,
     }
     if pose_adjustment is not None:
         report['pose_adjustment'] = {key: pose_adjustment.get(key) for key in
@@ -2834,7 +3023,7 @@ def execute_unified_workflow(
     masks_dir: Path = None,
     mask_model: Path = None,
     mask_backend: str = "vulkan",
-    mask_threshold: float = 0.5,
+    mask_threshold: float = 0.35,
     mask_margin: float = 0.03,
     mask_config: Path = None,
     operator_radius: float = 0.0,
@@ -3082,17 +3271,8 @@ def execute_unified_workflow(
             print("[*] Searching for fallback/hint sync in existing calibration or defaulting to 0.0s for initial pose search...")
             dt_sync = 0.0
             # A dataset made by Trim/Chunks carries the offset that is left between its cut files.
-            trimmed_dt = None
-            bag_dir = Path(bag_path).parent
-            try:
-                if (bag_dir / 'trim_manifest.json').is_file():
-                    trimmed_dt = json.loads((bag_dir / 'trim_manifest.json').read_text(encoding='utf-8')).get('dt_sync_trimmed')
-                elif (bag_dir.parent / 'chunks_manifest.json').is_file():
-                    for ch in json.loads((bag_dir.parent / 'chunks_manifest.json').read_text(encoding='utf-8')).get('chunks', []):
-                        if Path(ch.get('bag_path', '')).name == Path(bag_path).name:
-                            trimmed_dt = ch.get('dt_sync_trimmed')
-            except Exception:
-                trimmed_dt = None
+            from raven_app.dataset_trim import cut_dataset_sync
+            trimmed_dt = cut_dataset_sync(bag_path)
             if trimmed_dt is not None:
                 dt_sync = float(trimmed_dt)
                 print(f"[*] Trimmed dataset: residual offset Δt = {dt_sync:.4f}s from its manifest")
@@ -3146,17 +3326,47 @@ def execute_unified_workflow(
                    'config_sha256': hashlib.sha256(base_config.read_bytes()).hexdigest(),
                    'engine_sha256': hashlib.sha256(native_engine.read_bytes()).hexdigest()
                    if lio and native_engine.is_file() else 'not-used'}
-    if lio:
+
+    def _slam_cache_dir(inputs):
         # A settings-keyed raw cache preserves old datasets and invalidates SLAM
         # when input, sensor topics, engine or estimator configuration changes.
-        key = hashlib.sha256(json.dumps(slam_inputs, sort_keys=True).encode()).hexdigest()[:20]
-        slam_out = output_dir / f'slam_raw_{key}'
-    raw_pcd = slam_out / "pcd" / "all_raw_points.pcd"
-    raw_trj = slam_out / "result" / "Raven_3DMakerPro_Scan.txt"
-    if not raw_trj.is_file() and (slam_out / "result").is_dir():
-        txts = sorted((slam_out / "result").glob("*.txt"))
-        if txts:
-            raw_trj = txts[0]
+        return output_dir / f"slam_raw_{hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:20]}"
+
+    def _slam_outputs(directory):
+        pcd = directory / "pcd" / "all_raw_points.pcd"
+        trj = directory / "result" / "Raven_3DMakerPro_Scan.txt"
+        if not trj.is_file() and (directory / "result").is_dir():
+            txts = sorted((directory / "result").glob("*.txt"))
+            if txts:
+                trj = txts[0]
+        return pcd, trj
+
+    # The map voxel adapts only for the default Raven LIO profile; timelapse profiles and eagle.yaml set their own.
+    base_config_text = base_config.read_text(encoding='utf-8', errors='replace')
+    base_map_voxel = _yaml_number(base_config_text, 'voxel_size')
+    slam_max_velocity = _yaml_number(base_config_text, 'max_velocity')
+    adaptive_map = bool(lio and not is_eagle and not timelapse_raven_profile and slam_dir is None
+                        and base_map_voxel is not None and base_map_voxel < COARSE_MAP_VOXEL_M)
+    coarse_map_reason = None
+    if adaptive_map:
+        from raven_app.bag_io import imu_motion_at_start
+        start_motion = imu_motion_at_start(bag_path, imu_topic)
+        run_record['slam_start_motion'] = start_motion
+        if starts_in_motion(start_motion):
+            coarse_map_reason = 'moving_start'
+            print(f"[*] Recording starts in motion (gyro {start_motion['gyro_mean_rad_s']:.2f} rad/s, acceleration "
+                  f"spread {start_motion['acc_std_m_s2']:.2f} m/s²): SLAM uses a {COARSE_MAP_VOXEL_M:g} m map voxel "
+                  f"so it can start without a still period.")
+        elif (_slam_cache_dir(slam_inputs) / SLAM_MAP_RETRY_MARKER).is_file():
+            coarse_map_reason = 'runaway_retry'
+            print(f"[*] SLAM diverged on this bag with the {base_map_voxel:g} m map voxel before; "
+                  f"using {COARSE_MAP_VOXEL_M:g} m.")
+    if coarse_map_reason:
+        slam_inputs['coarse_map_voxel_m'] = COARSE_MAP_VOXEL_M
+
+    if lio:
+        slam_out = _slam_cache_dir(slam_inputs)
+    raw_pcd, raw_trj = _slam_outputs(slam_out)
 
     profile_marker = slam_out / 'workflow_config.json'
     profile_matches = False
@@ -3176,11 +3386,11 @@ def execute_unified_workflow(
         imported_slam = str(Path(slam_dir).resolve())
         run_record['slam_source'] = {'imported_from': imported_slam, 'directory': slam_out.name}
         print(f"[*] Using the SLAM output imported from {imported_slam} (FAST-LIVO2 not run).")
-    if imported_slam or (raw_pcd.is_file() and raw_trj.is_file() and 'slam' not in rebuild and (
-            not timelapse_raven_profile or profile_matches)):
-        if not imported_slam:
-            print(f"[*] Existing SLAM trajectory ({raw_trj.name}) and PCD found. Re-using output.")
-    else:
+
+    def _run_slam_engine(slam_out):
+        """Run FAST-LIVO2 into slam_out with the current slam_inputs; returns its (pcd, trajectory) paths."""
+        raw_pcd, raw_trj = _slam_outputs(slam_out)
+        profile_marker = slam_out / 'workflow_config.json'
         eng = engine()
         if not eng.is_file():
             raise FileNotFoundError(f"Native engine missing at {eng}; run tools/build_windows.ps1")
@@ -3189,6 +3399,7 @@ def execute_unified_workflow(
         for partial_dir in (slam_out / "pcd", slam_out / "result", slam_out / "Colmap", slam_out / "image"):
             if partial_dir.is_dir():
                 shutil.rmtree(partial_dir, ignore_errors=True)
+        (slam_out / LEVEL_FILE).unlink(missing_ok=True)  # describes the output being replaced
 
         if is_eagle and (resources() / "FAST-LIVO2/config/eagle.yaml").is_file():
             config_path = resources() / "FAST-LIVO2/config/eagle.yaml"
@@ -3222,6 +3433,11 @@ def execute_unified_workflow(
                                              'pcd_save:\n  scan_provenance_en: true', config_text, count=1)
                 if count != 1:
                     raise RuntimeError('SLAM config lacks the required pcd_save section')
+            if slam_inputs.get('coarse_map_voxel_m'):
+                config_text, count = re.subn(r'voxel_size:\s*[\d\.]+',
+                                             f"voxel_size: {slam_inputs['coarse_map_voxel_m']}", config_text, count=1)
+                if count != 1:
+                    raise RuntimeError('SLAM config lacks voxel_size')
             temporary_config = output_dir / f'.raven_timelapse_{time.time_ns()}.yaml'
             temporary_config.write_text(config_text, encoding='utf-8')
             config_path = temporary_config
@@ -3265,8 +3481,16 @@ def execute_unified_workflow(
             cmd.append("--lio")
 
         slam_out.mkdir(parents=True, exist_ok=True)
+        import threading
+        from raven_app.bag_io import inspect_bags
+        from raven_app.slam_engine_output import ENGINE_LOG, forward_engine_output
+        scans = sum(c['messages'] for c in inspect_bags([bag_path])['connections'] if c['topic'] == lidar_topic)
         try:
-            with subprocess.Popen(cmd, stdin=subprocess.PIPE, **hidden_window_options()) as child:
+            with subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  **hidden_window_options()) as child:
+                relay = threading.Thread(target=forward_engine_output, daemon=True,
+                                         args=(child.stdout, slam_out / ENGINE_LOG, scans or None))
+                relay.start()
                 try:
                     export_bags(
                         slam_bags, child.stdin,
@@ -3282,6 +3506,7 @@ def execute_unified_workflow(
                 except (BrokenPipeError, OSError):
                     pass
                 code = child.wait()
+                relay.join(timeout=30)
                 if code != 0:
                     raise RuntimeError(f"FAST-LIVO2 SLAM execution failed with exit code {code}")
             if timelapse_raven_profile and raw_pcd.is_file() and raw_trj.is_file():
@@ -3291,11 +3516,52 @@ def execute_unified_workflow(
         finally:
             if temporary_config is not None:
                 temporary_config.unlink(missing_ok=True)
+        return _slam_outputs(slam_out)
 
-        if not raw_trj.is_file() and (slam_out / "result").is_dir():
-            txts = sorted((slam_out / "result").glob("*.txt"))
-            if txts:
-                raw_trj = txts[0]
+    if not imported_slam and raw_pcd.is_file() and level_interrupted(slam_out):
+        print('[*] The SLAM output was left half-leveled by an interrupted run; recomputing it.')
+    if imported_slam or (raw_pcd.is_file() and raw_trj.is_file() and 'slam' not in rebuild and (
+            not timelapse_raven_profile or profile_matches) and not level_interrupted(slam_out)):
+        if not imported_slam:
+            print(f"[*] Existing SLAM trajectory ({raw_trj.name}) and PCD found. Re-using output.")
+    else:
+        raw_pcd, raw_trj = _run_slam_engine(slam_out)
+
+    if lio and not imported_slam:
+        # A diverged filter runs off at the velocity cap and wrecks every later stage (SfM alignment, Δt, colors).
+        cap_share = slam_velocity_cap_share(raw_trj, slam_max_velocity) if raw_trj.is_file() else None
+        if cap_share is not None and cap_share > SLAM_RUNAWAY_CAP_SHARE and adaptive_map and not coarse_map_reason:
+            print(f"[!] SLAM diverged: {cap_share:.0%} of the trajectory moves at the {slam_max_velocity:g} m/s cap. "
+                  f"Re-running it with a {COARSE_MAP_VOXEL_M:g} m map voxel...", flush=True)
+            (slam_out / SLAM_MAP_RETRY_MARKER).write_text(json.dumps(
+                {'velocity_cap_share': cap_share, 'map_voxel_m': base_map_voxel,
+                 'retry_map_voxel_m': COARSE_MAP_VOXEL_M}, indent=2) + '\n', encoding='utf-8')
+            coarse_map_reason = 'runaway_retry'
+            slam_inputs['coarse_map_voxel_m'] = COARSE_MAP_VOXEL_M
+            slam_out = _slam_cache_dir(slam_inputs)
+            raw_pcd, raw_trj = _slam_outputs(slam_out)
+            if not (raw_pcd.is_file() and raw_trj.is_file()) or 'slam' in rebuild or level_interrupted(slam_out):
+                raw_pcd, raw_trj = _run_slam_engine(slam_out)
+            cap_share = slam_velocity_cap_share(raw_trj, slam_max_velocity) if raw_trj.is_file() else None
+        if cap_share is not None and cap_share > SLAM_RUNAWAY_CAP_SHARE:
+            print(f"[QUALITY WARNING] SLAM looks diverged: {cap_share:.0%} of the trajectory moves at the "
+                  f"{slam_max_velocity:g} m/s velocity cap. The cloud is likely smeared; start the recording "
+                  f"standing still for 3 s, or trim it to begin at a still moment.", flush=True)
+        run_record['slam_map'] = {
+            'map_voxel_m': slam_inputs.get('coarse_map_voxel_m') or (
+                expected_profile['voxel_size_m'] if timelapse_raven_profile else base_map_voxel),
+            'coarse_map_reason': coarse_map_reason, 'velocity_cap_share': cap_share,
+            'max_velocity_m_s': slam_max_velocity, 'directory': slam_out.name}
+        if raw_pcd.is_file() and raw_trj.is_file():
+            # A start in motion tilts the map by the error of FAST-LIVO2's initial gravity estimate.
+            try:
+                run_record['gravity_level'] = level_slam_output(slam_out, raw_pcd, raw_trj,
+                                                                log=lambda message: print(message, flush=True))
+            except Exception as exc:
+                print(f'[!] Warning: could not level the SLAM map to gravity ({exc}); keeping it as computed.',
+                      flush=True)
+                run_record['gravity_level'] = {'status': 'failed', 'reason': str(exc)}
+        _persist_workflow_run(output_dir, run_record)
 
     if lio and revisit_refinement and imported_slam and not (slam_out / 'scan_ranges.csv').is_file():
         run_record['slam_refinement'] = {'status': 'skipped_imported',
@@ -3311,7 +3577,7 @@ def execute_unified_workflow(
             refinement = refine(slam_out, refinement_dir, log=lambda message: print(f'[*] {message}', flush=True))
         except Exception as exc:
             print(f'[!] Warning: Global SLAM refinement failed ({exc}); retaining raw SLAM geometry.', flush=True)
-            refinement = {'status': 'rejected_geometry', 'failure_reason': str(exc)}
+            refinement = {'status': 'rejected_geometry', 'failure_reason': str(exc), 'error': True}
         run_record['slam_refinement'] = refinement
         _persist_workflow_run(output_dir, run_record)
         if refinement.get('status') == 'accepted':
@@ -3321,7 +3587,7 @@ def execute_unified_workflow(
             print('[+] Global SLAM correction accepted by independent geometry validation.')
         elif refinement.get('status') == 'no_supported_revisits':
             print('[*] No validated revisit correction; retaining raw SLAM geometry.')
-        else:
+        elif not refinement.get('error'):  # an error was reported above
             print('[!] Warning: Global SLAM refinement candidate rejected by geometry check; retaining raw SLAM geometry.')
     elif lio:
         run_record['slam_refinement'] = {'status': 'skipped_by_user',

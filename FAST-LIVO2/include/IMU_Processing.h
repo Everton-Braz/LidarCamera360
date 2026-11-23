@@ -77,6 +77,11 @@ private:
   V3D Lid_offset_to_IMU;
   V3D mean_acc;
   V3D mean_gyr;
+  // Initialization: rotation from the first init sample to the newest one (integrated gyro), so a
+  // recording that starts while the operator walks and turns still averages gravity in one frame.
+  M3D init_rot = M3D::Identity();
+  V3D init_last_gyr = V3D::Zero();
+  double init_last_time = -1.0;
   V3D angvel_last;
   V3D acc_s_last;
   double last_prop_end_time;

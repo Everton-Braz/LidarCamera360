@@ -1,6 +1,6 @@
 # LidarCamera360 v0.4.0 release film
 
-A 1920x1080, 30 fps, 39 s video made with [fframes](https://fframes.studio) 1.4.0 and
+A 1920x1080, 30 fps, 46 s video made with [fframes](https://fframes.studio) 1.4.0 and
 rendered with the Skia (Vulkan) backend. It has no narration and no music by default.
 
 | file | what |
@@ -17,6 +17,7 @@ rendered with the Skia (Vulkan) backend. It has no narration and no music by def
 | 1 | Hook | 4 s | "Any rig. Calibrated per capture." over the 3DGS fly-through |
 | 2 | Rig | 6 s | Rig profiles v2 (UI capture, zoom) |
 | 3 | RsOne | 7 s | Insta360 ONE RS: the two-INSV checkbox is clicked in the Studio |
+| 3b | Run | 7 s | the real Studio progress panel of a ONE RS run (`footage/studio_run.mp4`), sped up ~100× |
 | 4 | Calib | 6 s | Self-calibration, 3 cards |
 | 5 | Clean | 7 s | Before/after wipe of `--remove-dynamic` |
 | 6 | Export | 5 s | `project.lc360` → PCD, LAZ/LAS, GeoJSON, GPS track, trajectory |
@@ -62,4 +63,6 @@ cargo run --release -- preview                   # real-time GPU player (space, 
 cargo run --release -- render -o release_v0.4.0.mp4
 ```
 
-Until the footage exists, `inspect` reports the three missing footage files; that is expected.
+The footage is in place (git-ignored, like every mp4 here): the fly-through is 4.3 s of a ONE RS
+street capture where the colored cloud turns into its 3DGS, and the cloud pair is the same capture
+without and with `--remove-dynamic`, same masks and same viewpoint. `inspect` reports no problems.

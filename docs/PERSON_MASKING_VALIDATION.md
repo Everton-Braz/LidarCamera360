@@ -25,7 +25,8 @@ No simultaneous inference job from this task ran during the measured batches.
 | Direct output geometry read-back | 3,783,172 points; all positions belong to the original cloud |
 | Matched positions with a color change exceeding 10/255 in any channel | 15,003 |
 
-Settings: person threshold 0.5, detection-box margin 0.03, no tiling, operator
+Settings at the time: person threshold 0.5, detection-box margin 0.03, no tiling
+(the masker now uses upright tiles and 0.35, see PERSON_MASKING.md), operator
 radius 1 m. Geometry removal requires at least two nearby masked observations
 and a strict majority over clear observations. This is a conservative filter;
 it does not establish that every operator return has been removed. Masks reject

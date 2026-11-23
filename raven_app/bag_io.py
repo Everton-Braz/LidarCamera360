@@ -282,6 +282,39 @@ def export_bags(paths, stream, *, lidar_topic=None, imu_topic=None,
     return {'imu': counts[1], 'scans': counts[2], 'images': counts[3]}
 
 
+def imu_motion_at_start(bag_path: Union[str, Path], imu_topic: str, seconds: float = 3.0) -> Optional[Dict[str, float]]:
+    """Gyro and accelerometer activity over the first seconds of a bag (the SLAM initialization window).
+
+    Returns mean |angular velocity| (rad/s) and the standard deviation of |acceleration| (m/s²),
+    or None when the bag has no readable IMU messages."""
+    from rosbags.highlevel import AnyReader
+    try:
+        with AnyReader([Path(bag_path)]) as reader:
+            conns = [c for c in reader.connections if c.topic == imu_topic]
+            if not conns:
+                return None
+            gyro, acc, t0 = [], [], None
+            for c, _, raw in reader.messages(connections=conns):
+                msg = reader.deserialize(raw, c.msgtype)
+                t = stamp(msg)
+                t0 = t if t0 is None else t0
+                if t - t0 > seconds:
+                    break
+                g, a = msg.angular_velocity, msg.linear_acceleration
+                gyro.append((g.x, g.y, g.z))
+                acc.append((a.x, a.y, a.z))
+    except Exception:
+        return None
+    if len(gyro) < 10:
+        return None
+    gyro, acc = np.asarray(gyro, float), np.asarray(acc, float)
+    acc_norm = np.linalg.norm(acc, axis=1)
+    if np.median(acc_norm) < 3.0:  # acceleration stored in g rather than m/s²
+        acc_norm = acc_norm * 9.80665
+    return {'gyro_mean_rad_s': float(np.linalg.norm(gyro, axis=1).mean()),
+            'acc_std_m_s2': float(acc_norm.std()), 'samples': len(gyro)}
+
+
 def find_adjacent_image_bag(bag_path: Path) -> Optional[Path]:
     """Find candidate IMAGE_*.bag adjacent to a LiDAR bag."""
     if not bag_path:

@@ -17,8 +17,9 @@ from qfluentwidgets import (
 )
 from raven_app.process_runner import ProcessRunner, make_run_log_path
 from raven_app.workflow_progress import (
-    STAGE_NAMES, estimate_stage_seconds, load_stage_history,
-    parse_progress_line, save_stage_history, stage_duration_estimates,
+    STAGE_NAMES, add_stage_ratio, dataset_times_path, estimate_stage_seconds, load_stage_history,
+    load_stage_ratios, machine_rates_path, parse_progress_line, save_stage_history,
+    save_stage_ratios, stage_duration_estimates,
 )
 from raven_app.mask_download import MaskResourceDownload
 from raven_app.mask_resources import resource_status, resources_ready
@@ -63,6 +64,13 @@ class UnifiedWorkflowView(QWidget):
         self._seed_actual_export_percent = None
         self._stage_history = [[] for _ in STAGE_NAMES]
         self._stage_estimates = [60.0] * len(STAGE_NAMES)
+        self._stage_defaults = [60.0] * len(STAGE_NAMES)
+        self._dataset_ratios = [[] for _ in STAGE_NAMES]
+        self._machine_ratios = [[] for _ in STAGE_NAMES]
+        self._estimate_inputs = None
+        self._recorded_stages = set()
+        self._log_fraction = 0.0
+        self._log_fraction_start = None
         self._progress_timer = QTimer(self)
         self._progress_timer.setInterval(1000)
         self._progress_timer.timeout.connect(self._refresh_workflow_progress)
@@ -842,6 +850,36 @@ class UnifiedWorkflowView(QWidget):
                 n=len(configs), name=AUX_CONFIG_NAME),
             parent=self, duration=5000)
 
+    def _turn_off_trim_for_cut_dataset(self, bag_path):
+        """A bag made by Trim/Chunks is already cut; the trim values on screen belong to the source."""
+        from raven_app.dataset_trim import cut_dataset_sync
+        if not self.trim_chk.isChecked() or cut_dataset_sync(bag_path) is None:
+            return
+        self.trim_chk.setChecked(False)
+        InfoBar.info(
+            title=tr("Trim turned off"),
+            content=tr("'{name}' was already cut by Trim/Chunks, so it is processed whole.").format(name=Path(bag_path).name),
+            parent=self, duration=6000)
+
+    def _confirm_trim_of_cut_dataset(self, bag_path):
+        """Cutting a Trim/Chunks output again is allowed, but usually means the old trim values were left on."""
+        from raven_app.dataset_trim import cut_dataset_sync
+        if not self.trim_chk.isChecked() or cut_dataset_sync(bag_path) is None:
+            return True
+        answer = QMessageBox.question(
+            self, tr("Cut this dataset again?"),
+            tr("'{name}' was already cut by Trim/Chunks. 'Trim dataset' is on, so it would be cut again: "
+               "start at {start:.1f}s of the cut files. Yes cuts it again; No processes it whole.").format(
+                name=Path(bag_path).name, start=float(self.trim_start_spin.value())),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.No:
+            self.trim_chk.setChecked(False)
+        return True
+
     def _action_export_trimmed_dataset(self):
         """Export trimmed bag and video directly to disk."""
         bag = self.bag_input.text().strip()
@@ -1000,6 +1038,7 @@ class UnifiedWorkflowView(QWidget):
             self.bag_input.setText(path)
             self._auto_detect_bag(path)
             self._load_cut_dataset_aux_cameras(p.parent)
+            self._turn_off_trim_for_cut_dataset(p)
             cand = find_adjacent_image_bag(p)
             if cand and cand.is_file() and not self.image_bag_input.text().strip():
                 self.image_bag_input.setText(str(cand))
@@ -1416,12 +1455,20 @@ class UnifiedWorkflowView(QWidget):
                                     fps=self.fps_spin.value(),
                                     camera_names=self._configured_aux_camera_names(),
                                     auxiliary_sources=self.third_camera_configs,
-                                    secondary_insv_path=sec_insv)
+                                    secondary_insv_path=sec_insv,
+                                    profile=self.rig_profile_combo.currentData(),
+                                    profile_name=self.rig_profile_combo.currentText())
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.mask_config = dialog.settings()
             self.mask_persons_chk.setChecked(True)
             count = sum(sum(map(len, self.mask_config[key].values())) for key in ('rectangles', 'ellipses', 'polygons'))
             self.mask_settings_btn.setText(tr('Mask settings ({n} shapes)').format(n=count))
+            if dialog.saved_to_profile:
+                InfoBar.success(
+                    title=tr('Masks saved to the rig profile'),
+                    content=tr('Runs with {name} start from these masks. Saved in {path}').format(
+                        name=self.rig_profile_combo.currentText(), path=dialog.saved_to_profile),
+                    position=InfoBarPosition.TOP, parent=self, duration=6000)
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -1477,6 +1524,9 @@ class UnifiedWorkflowView(QWidget):
                 duration=6000,
                 parent=self
             )
+            return
+
+        if not self._confirm_trim_of_cut_dataset(bag):
             return
 
         has_insv = bool(insv and Path(insv).is_file())
@@ -1676,6 +1726,9 @@ class UnifiedWorkflowView(QWidget):
         self._current_stage_skipped = False
         self._stage_fraction = 0.0
         self._stage_fraction_from_log = False
+        self._log_fraction = 0.0
+        self._log_fraction_start = None
+        self._recorded_stages = set()
         for bar in self.step_progress_bars:
             bar.setValue(0)
         self.overall_progress_bar.setValue(0)
@@ -1743,15 +1796,21 @@ class UnifiedWorkflowView(QWidget):
     def _prepare_workflow_progress(self, output_dir, bag_path, insv_path, method):
         self._stage_root = Path(output_dir)
         self._stage_history = load_stage_history(self._stage_root)
-        defaults = estimate_stage_seconds(
-            self._stage_root, bag_path, insv_path,
+        self._dataset_ratios = load_stage_ratios(dataset_times_path(self._stage_root))
+        self._machine_ratios = load_stage_ratios(machine_rates_path())
+        self._estimate_inputs = ((self._stage_root, bag_path, insv_path), dict(
             use_masks=self.mask_persons_chk.isChecked(),
+            mask_backend=self.mask_backend_combo.currentData(),
             use_vulkan=self.vulkan_chk.isChecked(),
             export_colmap=self.chk_colmap.isChecked(),
             method=method,
             recalibrate=self.recalibrate_chk.isChecked(),
-        )
-        self._stage_estimates = stage_duration_estimates(defaults, self._stage_history)
+            fps=self.fps_spin.value(),
+            remove_dynamic=self.remove_dynamic_chk.isChecked(),
+            rig_refine=str(self.rig_refine_combo.currentData() or 'none'),
+        ))
+        self._stage_defaults = [0.0] * len(STAGE_NAMES)
+        self._reestimate_stages(after_stage=0)
         total = sum(self._stage_estimates)
         self.eta_label.setText(tr("Estimated remaining: about {time}").format(
             time=self._format_duration(total)))
@@ -1759,6 +1818,21 @@ class UnifiedWorkflowView(QWidget):
             bar.setValue(0)
             bar.setToolTip(tr("Approximate progress; the estimate improves from saved runs."))
             self.step_progress_labels[index].setText(f"{index + 1}. {tr(STAGE_NAMES[index])}")
+
+    def _reestimate_stages(self, after_stage):
+        """Recompute the stages after ``after_stage`` from what is on disk now (frames, SLAM cloud)."""
+        if not self._estimate_inputs:
+            return
+        args, kwargs = self._estimate_inputs
+        try:
+            defaults = estimate_stage_seconds(*args, **kwargs)
+        except Exception:
+            return
+        estimates = stage_duration_estimates(
+            defaults, self._stage_history, self._dataset_ratios, self._machine_ratios)
+        for index in range(after_stage, len(STAGE_NAMES)):
+            self._stage_defaults[index] = defaults[index]
+            self._stage_estimates[index] = estimates[index]
 
     def _update_workflow_progress_from_line(self, line):
         event = parse_progress_line(line)
@@ -1770,11 +1844,16 @@ class UnifiedWorkflowView(QWidget):
             if self._current_stage and stage > self._current_stage:
                 for finished in range(self._current_stage, stage):
                     self._complete_progress_stage(finished)
+                if self._current_stage <= 3 < stage or self._current_stage <= 1 < stage:
+                    # Frame count and SLAM cloud size are now known: refresh what is left.
+                    self._reestimate_stages(after_stage=stage - 1)
             if stage != self._current_stage:
                 self._current_stage = stage
                 self._stage_started_at = time.monotonic()
                 self._stage_fraction = 0.0
                 self._stage_fraction_from_log = False
+                self._log_fraction = 0.0
+                self._log_fraction_start = None
                 self._current_stage_skipped = (
                     stage == 5 and name.casefold().startswith('skipping'))
             self.current_step_label.setText(tr("Step {current}/{total}: {name}").format(
@@ -1782,10 +1861,15 @@ class UnifiedWorkflowView(QWidget):
             self.status_desc.setText(tr("Current step: {name}").format(name=tr(name)))
         elif event['kind'] == 'stage_fraction' and self._current_stage:
             fraction = event['fraction']
-            self._stage_fraction = max(self._stage_fraction, fraction)
+            if self._log_fraction_start is None or fraction < self._log_fraction:
+                # A new progress loop inside this step (each loop is timed on its own).
+                self._log_fraction_start = (time.monotonic(), fraction)
+            self._log_fraction = fraction
             self._stage_fraction_from_log = True
-        elif event['kind'] == 'masks_ready' and self._current_stage == 5:
-            self._stage_fraction = max(self._stage_fraction, 0.99)
+        elif event['kind'] == 'masks_ready' and self._current_stage == 5 and not (
+                self._estimate_inputs and self._estimate_inputs[1].get('remove_dynamic')):
+            # With moving-object removal on, the long ray-carving pass only starts here.
+            self._log_fraction = max(self._log_fraction, 0.99)
             self._stage_fraction_from_log = True
         elif event['kind'] == 'complete':
             for stage in range(1, len(STAGE_NAMES) + 1):
@@ -1795,19 +1879,25 @@ class UnifiedWorkflowView(QWidget):
 
     def _complete_progress_stage(self, stage):
         index = stage - 1
-        if index < 0 or index >= len(self.step_progress_bars):
+        if index < 0 or index >= len(self.step_progress_bars) or stage in self._recorded_stages:
             return
-        if self.step_progress_bars[index].value() >= 100:
-            return
+        # Recorded once per run. (The bar can already read 100 % from a "frames N/N" line.)
+        self._recorded_stages.add(stage)
         self.step_progress_bars[index].setValue(100)
         if self._current_stage == stage and self._stage_started_at is not None:
             duration = max(0.0, time.monotonic() - self._stage_started_at)
             if not self._current_stage_skipped:
                 self._stage_history[index].append(duration)
                 self._stage_history[index] = self._stage_history[index][-5:]
+                default = self._stage_defaults[index]
+                learned = add_stage_ratio(self._dataset_ratios, index, duration, default)
+                add_stage_ratio(self._machine_ratios, index, duration, default)
                 if self._stage_root is not None:
                     try:
                         save_stage_history(self._stage_root, self._stage_history)
+                        if learned:
+                            save_stage_ratios(dataset_times_path(self._stage_root), self._dataset_ratios)
+                            save_stage_ratios(machine_rates_path(), self._machine_ratios)
                     except OSError:
                         pass
             self._stage_started_at = None
@@ -1815,24 +1905,31 @@ class UnifiedWorkflowView(QWidget):
     def _refresh_workflow_progress(self):
         if self._workflow_started_at is None:
             return
-        elapsed_total = max(0.0, time.monotonic() - self._workflow_started_at)
-        fractions = [bar.value() / 100.0 for bar in self.step_progress_bars]
+        now = time.monotonic()
+        elapsed_total = max(0.0, now - self._workflow_started_at)
+        fractions = [1.0 if index + 1 in self._recorded_stages else bar.value() / 100.0
+                     for index, bar in enumerate(self.step_progress_bars)]
         current_remaining = 0.0
         if self._current_stage:
             index = self._current_stage - 1
-            stage_elapsed = max(0.0, time.monotonic() - (self._stage_started_at or time.monotonic()))
+            stage_elapsed = max(0.0, now - (self._stage_started_at or now))
             estimate = max(1.0, self._stage_estimates[index])
-            if not self._stage_fraction_from_log and stage_elapsed > estimate:
-                estimate = stage_elapsed * 1.25
+            if stage_elapsed > 0.9 * estimate:
+                # Running long: keep a little time in hand instead of showing 0 s.
+                estimate = stage_elapsed / 0.9
                 self._stage_estimates[index] = estimate
-            elapsed_fraction = min(0.95, stage_elapsed / estimate)
-            fraction = max(self._stage_fraction, elapsed_fraction)
+            # A "frames N/N" line is not the end of the step: filtering and saving follow it.
+            log_fraction = min(0.97, self._log_fraction) if self._stage_fraction_from_log else 0.0
+            fraction = max(self._stage_fraction, log_fraction, min(0.95, stage_elapsed / estimate))
             self._stage_fraction = fraction
             fractions[index] = fraction
             current_remaining = estimate * (1.0 - fraction)
-            if self._stage_fraction_from_log and fraction > 0.05:
-                current_remaining = max(current_remaining,
-                                        stage_elapsed * (1.0 - fraction) / fraction)
+            if self._log_fraction_start is not None and self._log_fraction < 1.0:
+                started, start_fraction = self._log_fraction_start
+                progressed = self._log_fraction - start_fraction
+                if progressed > 0.05:
+                    loop_remaining = (now - started) * (1.0 - self._log_fraction) / progressed
+                    current_remaining = max(current_remaining, loop_remaining)
 
         weights = self._stage_estimates
         total_weight = max(1.0, sum(weights))

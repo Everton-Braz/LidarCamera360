@@ -28,9 +28,9 @@ class PersonMaskTests(unittest.TestCase):
 
             def fake_run(command, **options):
                 out = Path(command[command.index('--output') + 1])
-                destination = out / 'cam0' / 'frame.png.png'
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(destination), np.full((32, 32), 255, np.uint8))
+                for view in Path(command[command.index('--input') + 1]).iterdir():
+                    cv2.imwrite(str(out / (view.name + '.png')), np.full((32, 32), 255, np.uint8))
+                return person_masks.subprocess.CompletedProcess(command, 0)
 
             with patch.object(person_masks, 'resolve_masker_executable', return_value=executable), \
                     patch.object(person_masks, 'resolve_model', return_value=model), \

@@ -8,6 +8,13 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### 🧍 Person masks
+- **Passers-by are masked, not only the operator.** The detector now sees every frame upright and in overlapping
+  tiles, so it finds people on cameras mounted upside down and people who are small in a fisheye frame. The rotation
+  is found for each camera. The default person threshold is 0.35 (was 0.5).
+- Existing masks are generated again on the next run. A run takes longer: about 0.3 s per frame with TensorRT and
+  1 s with Vulkan. The mask preview uses the same steps as the run.
+
 ---
 
 ## [v0.4.0] - 2026-11-12

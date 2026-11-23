@@ -895,6 +895,9 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
     MAX_SIM3_RMSE_CM = 40.0
     MAX_ICP_RMSE_CM = 35.0
     MAX_REL_DRIFT_PCT = 6.5
+    # Trimmed ICP keeps its closest 70 % of tie-points, so its RMSE is small almost by construction.
+    # It may confirm a near miss, never a trajectory that is metres off (a diverged SLAM run gave 20 m).
+    MAX_ICP_RESCUE_TRAJECTORY_CM = 100.0
 
     # Compute total trajectory path length to assess relative visual odometry drift
     path_length_m = float(np.sum(np.linalg.norm(np.diff(pos_slam, axis=0), axis=1))) if len(pos_slam) > 1 else 1.0
@@ -907,7 +910,8 @@ def align_colmap_to_lidar(dataset_dir, fps=2.0, dt_hint=None, *,
     is_accepted = bool(
         np.isfinite(s_comp) and (0.001 < s_comp < 1000.0) and (
             (trj_rmse_cm <= MAX_SIM3_RMSE_CM) or
-            (use_icp and icp_rmse_cm <= MAX_ICP_RMSE_CM) or
+            (use_icp and icp_rmse_cm <= MAX_ICP_RMSE_CM
+             and trj_rmse_cm <= MAX_ICP_RESCUE_TRAJECTORY_CM) or
             (rel_drift_pct <= MAX_REL_DRIFT_PCT)
         )
     )

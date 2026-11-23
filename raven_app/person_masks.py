@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import cv2
@@ -22,6 +23,7 @@ from raven_app.mask_resources import (MODEL_SHA256, download_progress, ensure_re
                                       masker_environment, resolve_masker_executable,
                                       resolve_model, resolve_vulkan_executable,
                                       resolve_vulkan_shaders_dir)
+from raven_app import mask_tiles
 
 
 def _file_digest_hex(stream):
@@ -183,8 +185,33 @@ def profile_mask_config(profile=None, is_eagle=False):
     path = resolve_profile(profile, is_eagle=is_eagle)
     if path is None:
         return None
+    saved = profile_mask_path(path)
+    if saved.is_file():
+        return read_mask_config(saved)
     settings = json.loads(Path(path).read_text(encoding='utf-8')).get('mask_settings')
     return normalize_mask_config(settings) if settings else None
+
+
+def profile_mask_path(profile_path):
+    """Where the user's own masks for a profile live: next to the user profiles, kept across updates.
+
+    Kept apart from the profile file so a bundled profile stays read-only and still gets its
+    calibration updates.
+    """
+    from raven_app.rig_profile import user_profiles_dir
+    return user_profiles_dir() / 'masks' / f'{Path(profile_path).stem}.json'
+
+
+def save_profile_mask_config(profile, config):
+    """Save mask settings as the default for a rig profile; returns the file written."""
+    from raven_app.profile_manager import resolve_profile
+    path = resolve_profile(profile)
+    if path is None:
+        raise ValueError('No rig profile selected')
+    target = profile_mask_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(normalize_mask_config(config), indent=2), encoding='utf-8')
+    return target
 
 
 def resolve_mask_config(mask_config=None, profile=None, is_eagle=False):
@@ -427,7 +454,12 @@ def masked_operator_keep(points, views, images_dir, masks_dir, radius, project):
     return ~remove
 
 
-def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03,
+# Low on purpose: a missed person stays in the color and 3DGS training, while a
+# false detection only costs a patch that other frames usually show.
+DEFAULT_THRESHOLD = 0.35
+
+
+def generate_person_masks(dataset, model_path=None, threshold=DEFAULT_THRESHOLD, margin=0.03,
                           mask_config=None, backend='vulkan'):
     if not math.isfinite(threshold) or not 0 < threshold < 1:
         raise ValueError('Person score threshold must be between 0 and 1')
@@ -457,6 +489,7 @@ def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03,
                 'threshold': threshold, 'margin': margin,
                 'polarity': 'white_keep_black_foreground', 'naming': 'image_relative_name_plus_png',
                 'mask_config': config,
+                'inference': {'version': mask_tiles.VERSION, 'levels': [list(v) for v in mask_tiles.LEVELS[backend]]},
                 'sources': {p.relative_to(images).as_posix(): [p.stat().st_size, p.stat().st_mtime_ns] for p in sources}}
     if manifest.is_file():
         previous = json.loads(manifest.read_text(encoding='utf-8'))
@@ -479,43 +512,77 @@ def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03,
     # Vulkan consumes the generated RVK schedule, while TensorRT consumes the
     # ONNX model. The TensorRT runtime directory is supplied through PATH.
     backend_model = inference_model if backend == 'vulkan' else model
-    command = [str(executable), '--input', str(images.resolve()), '--output', str(masks.resolve()),
-               '--model', str(backend_model.resolve()), '--threshold', str(threshold),
-               '--margin', str(margin)]
+    options = ['--model', str(backend_model.resolve()), '--threshold', str(threshold), '--margin', str(margin)]
     if backend == 'tensorrt':
         cache = Path(os.environ['RAVEN_RFDETR_CACHE']) if os.environ.get('RAVEN_RFDETR_CACHE') else (
             get_config_dir() / 'rfdetr-cache' if getattr(sys, 'frozen', False) else root / 'models')
         cache.mkdir(parents=True, exist_ok=True)
-        command.extend(['--cache-dir', str(cache.resolve())])
+        options.extend(['--cache-dir', str(cache.resolve())])
         environment = masker_environment(executable)
     else:
         shaders = resolve_vulkan_shaders_dir(executable)
         if shaders is None:
             raise RuntimeError('RF-DETR Vulkan compiled shaders are missing from this app build')
-        command.extend(['--shaders', str(shaders)])
+        options.extend(['--shaders', str(shaders)])
         environment = os.environ.copy()
-    run_options = {'check': True, 'env': environment}
+    # Captured: the executor prints one line per tile, which would bury the run log.
+    run_options = {'env': environment, 'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT}
     if os.name == 'nt':
-        # The masker is a console-subsystem executable. Keep its stdout/stderr
-        # attached to the headless CLI pipes without opening a separate window.
+        # The masker is a console-subsystem executable; do not open a separate window for it.
         run_options['creationflags'] = subprocess.CREATE_NO_WINDOW
-    subprocess.run(command, **run_options)
+
+    def detect(input_dir, output_dir):
+        result = subprocess.run([str(executable), '--input', str(input_dir), '--output', str(output_dir), *options],
+                                **run_options)
+        if result.returncode:
+            output = (result.stdout or b'').decode('utf-8', 'replace').strip()
+            raise RuntimeError(f'RF-DETR {backend} executor failed ({result.returncode}): {output[-2000:]}')
+
     static_masks = {}
-    for source in sources:
-        mask = load_keep_mask(source, images, masks)
+
+    def camera_of(source):
+        parts = source.relative_to(images).parts
+        return parts[0] if len(parts) > 1 else ''
+
+    def keep_for(shape, source):
+        key = (camera_of(source), tuple(shape))
+        if key not in static_masks:
+            static_masks[key] = static_keep_mask(shape, key[0], config)
+        return static_masks[key]
+
+    def finish(source, mask):
         with Image.open(source) as image:
             dimensions = (image.height, image.width)
-        if mask.shape != dimensions or np.any((mask != 0) & (mask != 255)):
-            raise ValueError(f'Mask dimensions or values invalid for {source}')
-        camera = source.relative_to(images).parts[0]
-        key = (camera, dimensions)
-        if key not in static_masks:
-            static_masks[key] = static_keep_mask(dimensions, camera, config)
-        mask[static_masks[key] == 0] = 0
+        if mask.shape != dimensions:
+            raise ValueError(f'Mask dimensions invalid for {source}')
+        mask[keep_for(dimensions, source) == 0] = 0
         success, encoded = cv2.imencode('.png', mask)
         if not success:
             raise OSError(f'Cannot encode combined mask for {source}')
-        encoded.tofile(mask_path(source, images, masks))
+        target = mask_path(source, images, masks)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        encoded.tofile(target)
+
+    for stale in dataset.glob('.mask-tiles-*'):
+        shutil.rmtree(stale, ignore_errors=True)
+    by_camera = {}
+    for source in sources:
+        by_camera.setdefault(camera_of(source), []).append(source)
+    turns = {}
+    with tempfile.TemporaryDirectory(prefix='.mask-tiles-', dir=dataset.resolve(), ignore_cleanup_errors=True) as work:
+        detector = mask_tiles.TiledDetector(work, detect, mask_tiles.LEVELS[backend], keep_for)
+        for camera, frames in by_camera.items():
+            turns[camera], counts = detector.upright_rotation(frames)
+            if turns[camera]:
+                print(f'[*] {camera}: images are stored turned; detecting people rotated {90 * turns[camera]} deg '
+                      f'({counts[turns[camera]]} people found in the test frames instead of {counts[0]})')
+        detector.passes, done = 0, 0
+        for start in range(0, len(sources), mask_tiles.CHUNK):
+            jobs = [(source, turns[camera_of(source)]) for source in sources[start:start + mask_tiles.CHUNK]]
+            detector.run(jobs, finish)
+            done += len(jobs)
+            print(f'[*] Person masks: {done}/{len(sources)} images '
+                  f'({detector.passes / done:.0f} views each, {time.perf_counter() - started:.0f} s)', flush=True)
     # Schema 2 kept a duplicate person-only PNG tree. Remove it only after
     # every combined mask is valid; schema 3 reconstructs fixed exclusions from
     # the manifest and therefore needs just one PNG per frame.
@@ -526,7 +593,8 @@ def generate_person_masks(dataset, model_path=None, threshold=0.5, margin=0.03,
         if resolved_old == resolved_masks or not resolved_old.is_relative_to(resolved_masks):
             raise ValueError('Refusing to remove person masks outside the mask directory')
         shutil.rmtree(old_person_dir)
-    settings.update(image_count=len(sources), elapsed_seconds=time.perf_counter() - started)
+    settings.update(camera_rotation_deg={camera: 90 * value for camera, value in turns.items()},
+                    image_count=len(sources), elapsed_seconds=time.perf_counter() - started)
     temporary = manifest.with_suffix('.tmp')
     temporary.write_text(json.dumps(settings, indent=2), encoding='utf-8')
     temporary.replace(manifest)

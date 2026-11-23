@@ -31,7 +31,8 @@ def _write_tracks(path, observations):
                 f.write(struct.pack('<ddq', x, y, pid))
 
 
-def test_bundle_adjustment_removes_attitude_noise_and_keeps_the_lidar_frame(tmp_path):
+def _scene(tmp_path, wild=None, noise_deg=0.35, wild_deg=0.5):
+    """40 rig frames with ``noise_deg`` attitude noise; frame ``wild`` gets ``wild_deg`` instead."""
     rng = np.random.default_rng(1)
     points = np.column_stack([rng.uniform(-15, 15, 4000), rng.uniform(-15, 15, 4000), rng.uniform(-1, 6, 4000)])
     rig = {'cam0': Rot.from_euler('xyz', [-90, -30, -90], degrees=True).as_matrix(),
@@ -46,7 +47,9 @@ def test_bundle_adjustment_removes_attitude_noise_and_keeps_the_lidar_frame(tmp_
     for k in range(40):
         body_R = Rot.from_euler('z', 9 * k, degrees=True).as_matrix()
         body_t = np.array([0.4 * k - 8, 0.1 * k, 1.5])
-        noise = Rot.from_rotvec(np.radians(0.35) * rng.normal(size=3) / np.sqrt(3)).as_matrix()
+        noise = Rot.from_rotvec(np.radians(noise_deg) * rng.normal(size=3) / np.sqrt(3)).as_matrix()
+        if k == wild:
+            noise = Rot.from_rotvec(np.radians(wild_deg) * np.array([0.6, 0.0, 0.8])).as_matrix()
         for camera_id, lens in ((1, 'cam0'), (2, 'cam1')):
             name = f'{lens}/frame_{k:06d}.jpg'
             R_wc = body_R @ rig[lens]
@@ -66,7 +69,11 @@ def test_bundle_adjustment_removes_attitude_noise_and_keeps_the_lidar_frame(tmp_
     tracks_dir = tmp_path / 'sfm'
     tracks_dir.mkdir()
     _write_tracks(tracks_dir / 'images.bin', tracks)
+    return sparse, tracks_dir, truth
 
+
+def test_bundle_adjustment_removes_attitude_noise_and_keeps_the_lidar_frame(tmp_path):
+    sparse, tracks_dir, truth = _scene(tmp_path)
     report = refine_poses(sparse, tracks_dir, backup_path=tmp_path / 'images_direct.txt', log=lambda *_: None)
 
     assert report['status'] == 'accepted'
@@ -80,3 +87,22 @@ def test_bundle_adjustment_removes_attitude_noise_and_keeps_the_lidar_frame(tmp_
     assert np.median(errors[:, 0]) < 0.1   # from ~0.35 deg of attitude noise
     assert np.median(errors[:, 1]) < 0.03  # still in the LiDAR frame
     assert (tmp_path / 'images_direct.txt').is_file()
+
+
+def test_one_wild_frame_follows_its_neighbours_and_the_rest_is_adjusted(tmp_path):
+    # scaled down: a frame several degrees off loses its tracks to the pruning and is never moved
+    sparse, tracks_dir, truth = _scene(tmp_path, wild=20, noise_deg=0.08, wild_deg=0.5)
+    direct = {im[4]: im for im in read_images_txt(sparse / 'images.txt')}
+
+    report = refine_poses(sparse, tracks_dir, max_rotation_deg=0.3, log=lambda *_: None)
+
+    assert report['status'] == 'accepted', report.get('reason')
+    assert report['neighbour_corrected_frames'] == ['frame_000020.jpg']
+    for _, R_cw, t_cw, _, name in read_images_txt(sparse / 'images.txt'):
+        R_true, _ = truth[name]
+        error = np.degrees(Rot.from_matrix(R_cw @ R_true.T).magnitude())
+        if 'frame_000020' in name:
+            # its own 0.5 deg correction is dropped; it takes its neighbours' ~0.08 deg one instead
+            assert np.degrees(Rot.from_matrix(R_cw @ direct[name][1].T).magnitude()) < 0.25
+        else:
+            assert error < 0.15

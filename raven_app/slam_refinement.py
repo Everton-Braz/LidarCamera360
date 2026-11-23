@@ -31,7 +31,9 @@ def source_signature(paths):
             for chunk in iter(lambda: stream.read(8*1024*1024), b''):
                 digest.update(chunk)
         signature[name] = {'sha256': digest.hexdigest(), 'bytes': path.stat().st_size}
-    return signature
+    # as stored in refinement_report.json: tuples in PARAMETERS come back as lists, and
+    # (0.03, 0.2) != [0.03, 0.2] made every cached refinement look stale
+    return json.loads(json.dumps(signature))
 
 
 def graph_jacobian(parameters, nodes, edges):

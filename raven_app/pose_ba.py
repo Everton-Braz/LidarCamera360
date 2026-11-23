@@ -125,7 +125,8 @@ def _frame_key(name):
 
 def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_pos_m=0.03,
                  prior_rot_deg=0.5, rig_prior_deg=1.0, huber_px=2.0, max_error_px=4.0,
-                 iterations=25, max_shift_m=0.25, max_rotation_deg=3.0, backup_path=None, log=print):
+                 iterations=25, max_shift_m=0.25, max_rotation_deg=3.0, max_direct_fraction=0.1,
+                 backup_path=None, log=print):
     """Adjust the rig poses of ``sparse_dir/images.txt`` in place against ``tracks_dir``'s tracks.
 
     Returns a report dict; ``report['status'] == 'accepted'`` when images.txt was rewritten.
@@ -342,8 +343,20 @@ def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_
         f"{direct_same['median_px']:.2f} px for the direct poses on the same "
         f"{after['observations']:,} observations")
 
-    # Frames no track reached follow their neighbours' correction.
+    # A frame whose own correction is beyond the limits drops it and, like an untracked frame, follows
+    # its neighbours' correction; one wild frame (5.6 deg out of 160, ONE RS 20-180 s) used to throw
+    # away every other frame's adjustment.
     observed = np.bincount(img_frame[obs_img[active]], minlength=n_frames) >= 20
+    rot0 = np.degrees(np.linalg.norm(Rot.from_matrix(D).as_rotvec(), axis=1))
+    wild = observed & ((rot0 > max_rotation_deg) | (np.linalg.norm(T, axis=1) > max_shift_m))
+    n_observed = int(observed.sum())
+    if wild.any():
+        D[wild], T[wild] = np.eye(3), 0.0
+        observed &= ~wild
+        log(f"  [BA] {int(wild.sum())} frame(s) follow their neighbours (own correction beyond "
+            f"{max_rotation_deg:.1f} deg / {max_shift_m * 100:.0f} cm): "
+            + ', '.join(frames[k] for k in np.flatnonzero(wild)))
+    # Frames no track reached follow their neighbours' correction.
     if observed.any() and not observed.all():
         idx = np.arange(n_frames)
         rv = Rot.from_matrix(D).as_rotvec()
@@ -357,7 +370,8 @@ def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_
     lens_deg = {lens: float(np.degrees(Rot.from_matrix(Q[j]).magnitude())) for j, lens in enumerate(lenses)}
     report.update({
         'before': before, 'after': after, 'direct_same_observations': direct_same,
-        'frames': n_frames, 'frames_with_tracks': int(observed.sum()),
+        'frames': n_frames, 'frames_with_tracks': n_observed,
+        'neighbour_corrected_frames': [frames[k] for k in np.flatnonzero(wild)],
         'pose_shift_cm': {'median': float(np.median(shift_cm)), 'p95': float(np.percentile(shift_cm, 95)),
                           'max': float(shift_cm.max())},
         'pose_rotation_deg': {'median': float(np.median(rot_deg)), 'p95': float(np.percentile(rot_deg, 95)),
@@ -369,6 +383,10 @@ def refine_poses(sparse_dir, tracks_dir, *, rig_cameras=('cam0', 'cam1'), prior_
     reasons = []
     if not after['median_px'] < direct_same['median_px']:
         reasons.append('reprojection did not improve')
+    if wild.sum() > max(1, max_direct_fraction * n_observed):
+        reasons.append(f'{int(wild.sum())} of {n_observed} tracked frames needed a correction beyond the limits')
+    if not observed.any():
+        reasons.append('no tracked frame within the limits')
     if shift_cm.max() > max_shift_m * 100:
         reasons.append(f'a frame moved {shift_cm.max():.1f} cm (limit {max_shift_m * 100:.0f} cm)')
     if rot_deg.max() > max_rotation_deg:

@@ -90,8 +90,8 @@ def add_mask_options(p):
                    help='Reuse existing person masks from this directory')
     p.add_argument('--mask-model', type=Path,
                    help='Optional RF-DETR ONNX/engine model path (otherwise auto-discovered)')
-    p.add_argument('--mask-threshold', type=unit_interval, default=0.5,
-                   help='RF-DETR person confidence threshold (default: 0.5)')
+    p.add_argument('--mask-threshold', type=unit_interval, default=0.35,
+                   help='RF-DETR person confidence threshold (default: 0.35)')
     p.add_argument('--mask-margin', type=ratio, default=0.03,
                    help='Person mask expansion as a fraction of each detection box size (default: 0.03)')
     p.add_argument('--mask-config', type=Path,
@@ -176,7 +176,8 @@ def parse(argv=None):
     masks.add_argument('--dataset', type=Path, required=True)
     masks.add_argument('--model', '--mask-model', dest='model', type=Path,
                        help='Optional RF-DETR ONNX/engine model path (otherwise auto-discovered)')
-    masks.add_argument('--threshold', type=unit_interval, default=0.5)
+    masks.add_argument('--threshold', type=unit_interval, default=0.35,
+                       help='RF-DETR person confidence threshold (default: 0.35)')
     masks.add_argument('--margin', type=ratio, default=0.03)
     masks.add_argument('--mask-config', type=Path,
                        help='JSON mask settings (default: the rig profile mask_settings, if any)')

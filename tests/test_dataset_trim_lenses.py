@@ -98,3 +98,36 @@ def test_slice_video_maps_every_video_stream_as_mp4(tmp_path, monkeypatch):
     dt.slice_video(tmp_path / "a_00_1.insv", tmp_path / "b.insv", 10.0, 5.0)
     cmd = " ".join(seen["cmd"])
     assert "-map 0:v -map 0:a:0?" in cmd and "-f mp4" in cmd and "0:v:1" not in cmd
+
+
+def test_cut_dataset_is_synced_from_its_manifest(tmp_path, fake_cuts, monkeypatch):
+    """A Trim output lost its INSV telemetry; cutting it again uses the offset the trim recorded."""
+    dt, calls = fake_cuts
+    bag, video = _dataset(tmp_path)
+    first = dt.trim_dataset_synchronized(bag, video, tmp_path / "cut", trim_start_sec=20.0,
+                                         end_at_sec=240.0, dt_sync=-1.04)
+    (tmp_path / "cut" / "run_trimmed.bag").write_bytes(b"x")
+    (tmp_path / "cut" / "VID_1_00_012_trimmed.insv").write_bytes(b"x")
+    assert dt.cut_dataset_sync(first["bag_path"]) == pytest.approx(first["dt_sync_trimmed"])
+    assert dt.cut_dataset_sync(bag) is None
+
+    from raven_app import workflow
+
+    def no_telemetry(*a, **k):
+        raise ValueError("Invalid INSV magic footer")
+
+    monkeypatch.setattr(workflow, "auto_sync_imu_gyro", no_telemetry)
+    calls.clear()
+    again = dt.trim_dataset_synchronized(first["bag_path"], first["video_path"], tmp_path / "again",
+                                         trim_start_sec=10.0, end_at_sec=50.0)
+    assert again["dt_sync"] == pytest.approx(first["dt_sync_trimmed"])
+    with pytest.raises(ValueError, match="Manual"):
+        dt.trim_dataset_synchronized(bag, video, tmp_path / "x", trim_start_sec=10.0)
+
+
+def test_chunk_bag_is_synced_from_the_chunks_manifest(tmp_path, fake_cuts):
+    dt, _ = fake_cuts
+    bag, video = _dataset(tmp_path)
+    chunks = dt.split_dataset_into_chunks(bag, video, tmp_path / "chunks", num_chunks=2,
+                                          overlap_sec=30.0, dt_sync=5.0)
+    assert dt.cut_dataset_sync(chunks[1]["bag_path"]) == pytest.approx(chunks[1]["dt_sync_trimmed"])

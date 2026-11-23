@@ -154,5 +154,27 @@ class ProfileMaskSettingsTests(unittest.TestCase):
             self.assertIsNone(profile_mask_config(str(path)))
         self.assertIsNone(profile_mask_defaults('no_such_profile'))
 
+    def test_masks_saved_to_a_profile_are_its_default_and_leave_the_profile_file_alone(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from raven_app.person_masks import profile_mask_config, save_profile_mask_config
+        from raven_app.profile_manager import resolve_profile
+        profile_file = resolve_profile('raven_one_rs')
+        before = profile_file.read_bytes()
+        drawn = normalize_mask_config({
+            'fisheye_border_percent_by_camera': {'cam0': 18.0, 'cam1': 18.0},
+            'polygons': {'cam0': [[[0.1, 0.1], [0.5, 0.05], [0.9, 0.1]]]},
+        })
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'APPDATA': tmp}):
+            self.assertIsNone(profile_mask_config('raven_one_rs'))
+            saved = save_profile_mask_config('raven_one_rs', drawn)
+            self.assertEqual(saved, Path(tmp) / 'LidarCamera360' / 'profiles' / 'masks' / 'raven_one_rs.json')
+            self.assertEqual(profile_mask_config('raven_one_rs'), drawn)
+            self.assertEqual(profile_mask_config(str(profile_file)), drawn)
+            self.assertNotEqual(profile_mask_config('raven_x4_montagem_1'), drawn)
+        self.assertEqual(profile_file.read_bytes(), before)
+
 if __name__ == '__main__':
     unittest.main()

@@ -34,6 +34,19 @@ python raven.py mask-persons --dataset D:\ARQUIVOS_TESTE_2\SMALL-DATASET-TEST --
 python raven.py colorize --dataset D:\ARQUIVOS_TESTE_2\SMALL-DATASET-TEST --mask-persons --mask-backend vulkan --mask-config D:\settings\mask-config.json
 ```
 
+## How people are found
+
+RF-DETR takes a 432 × 432 image and learned from upright photos. Two steps make it find people anywhere in a fisheye frame:
+
+- **Upright frames.** The masker tests six frames of each camera in four rotations and keeps the one that shows clearly more people, so a camera mounted upside down or on its side works without a setting. `masks/manifest.json` records the result as `camera_rotation_deg`. Masks are written in the stored orientation of the images.
+- **Tiles.** Besides the whole frame, the detector looks at overlapping tiles (half and one third of the shorter side with TensorRT, half with Vulkan), so a person across the street is not reduced to a few pixels. The masks of all views are merged.
+
+TensorRT runs about 22 views per frame (about 0.3 s on an RTX GPU) and Vulkan 7 views (about 1 s). TensorRT also finds smaller, more distant people; prefer it for busy places. The default person threshold is `0.35`; a lower `--threshold` finds more people and also masks more mannequins, posters and similar shapes.
+
+Masks made by a version without these steps are generated again on the next run. Masks that an earlier export copied to `colmap_3dgs/masks/` change only when COLMAP is exported again.
+
+## Fixed areas
+
 Fisheye cutoff removes pixels outside a centered circle. Its percentage is the approximate share of the whole image excluded: `0%` removes nothing, `1%` removes roughly 1% of pixels near the corners, and the range is 0–25%. The dialog's mask preview shows the exact result for the current frame. Keep the cutoff small enough that it does not discard useful scene pixels. Draw rig shapes tightly around the mount in each camera; an oversized shape removes valid scene content from every frame of that camera. These are image exclusions for colorization and 3DGS masks. They do not remove LiDAR points from the cloud.
 
 In the desktop app, enable **Generate masks** in Colorization or Unified Workflow, choose a mask backend, then open **Mask settings...** to draw rig shapes or set the fisheye cutoff. **Vulkan (no TensorRT)** is the default: it downloads the verified 139 MB ONNX model and builds a roughly 130 MB Vulkan schedule in `%APPDATA%\RavenCalibrator`; it does not install TensorRT. **TensorRT (NVIDIA)** is optional and may download about 1.3 GB, with up to 3 GB of temporary disk space for extraction. The app asks before starting either setup. These models and runtime files stay outside the portable executable. Headless commands accept `--mask-backend vulkan` or `--mask-backend tensorrt`; `download-mask-resources --backend ...` prepares the selected backend. Mask generation can fetch missing resources when needed, and completed masks can be reused without downloading them again. The dialog saves settings as `mask_settings.json` in the dataset/output folder when processing starts. **Operator removal radius** defaults to `0` (off), and setting it above zero requires person masks. A point near the camera is removed only with repeated person evidence outside the fixed exclusions, a strict majority over clear views, and no local LiDAR plane support. This conservative geometry filter helps preserve doors, walls, and floors, but cannot guarantee every moving-object return is removed. Inspect the result against the raw cloud.

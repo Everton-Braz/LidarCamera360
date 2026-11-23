@@ -15,9 +15,11 @@ Two independent tests, both applied before colorization so every exported cloud
 Time gating (``time_gating``) stays complementary: it limits which points each
 view colours, while this module decides which points exist at all.
 """
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import json
 import math
+import os
 from pathlib import Path
 import time
 
@@ -27,6 +29,9 @@ FILTER_DIR = 'dynamic_filter'
 KEEP_FILE = 'static_keep.npy'
 REPORT_FILE = 'report.json'
 SCHEMA = 1
+# Person-vote worker threads.  Each holds a few hundred MB of per-view arrays on
+# a 5 M point cloud; the speed-up flattens beyond this.
+PERSON_VOTE_WORKERS = 6
 
 
 @dataclass(frozen=True)
@@ -355,7 +360,7 @@ def _wide_groups(points, link, max_extent):
 
 def person_vote_keep(points, views, images_dir, masks_dir, project, max_range=12.0,
                      raster_scale=0.25, occlusion_margin=0.4, persistent_fraction=0.25,
-                     max_person_height=2.2, max_person_extent=2.0, log=print):
+                     max_person_height=2.2, max_person_extent=2.0, workers=None, log=print):
     """Remove points that most unoccluded views label as person (standing people).
 
     ``views`` is a list of ``(image_path, R_cw, C, params)`` in the LiDAR frame,
@@ -409,19 +414,29 @@ def person_vote_keep(points, views, images_dir, masks_dir, project, max_range=12
     log(f'[*] Persistent mask area (operator, fixed regions): '
         + ', '.join(f'{name} {100 * p.mean():.1f}%' for name, p in sorted(persistent.items())))
 
+    # Pass 2: one vote per view.  Views are independent, so they run on worker
+    # threads (numpy releases the GIL); the counts are added in one place.
+    # ``project`` must be thread-safe and must not call BLAS (numpy ``@``/``dot``).
+    # Float32 coordinates relative to the cloud centre keep sub-millimetre
+    # precision for any cloud a 12 m vote radius applies to.
     person = np.zeros(len(points), dtype=np.uint16)
     observed = np.zeros(len(points), dtype=np.uint16)
-    pts32 = points.astype(np.float32)
-    for (image, rotation, center, params), (camera_name, (h, w), packed) in zip(views, reduced):
-        center = np.asarray(center, dtype=np.float32)
+    origin = points.mean(axis=0) if len(points) else np.zeros(3)
+    pts32 = (points - origin).astype(np.float32)
+
+    def vote(view, reduced_view):
+        (image, rotation, center, params), (camera_name, (h, w), packed) = view, reduced_view
+        center = (np.asarray(center, dtype=np.float64) - origin).astype(np.float32)
         near = np.flatnonzero((np.square(pts32 - center).sum(1)) <= max_range * max_range)
         if not len(near):
-            continue
-        cam = (np.asarray(rotation, dtype=np.float64) @ (points[near] - center).T).T
+            return None
+        # Element-wise 3x3 rotation: OpenBLAS (``@``) crashes when called from several threads at once.
+        offset, rot = pts32[near] - center, np.asarray(rotation, dtype=np.float32)
+        cam = offset[:, :1] * rot[:, 0] + offset[:, 1:2] * rot[:, 1] + offset[:, 2:] * rot[:, 2]
         front = cam[:, 2] > .15
         near, cam = near[front], cam[front]
         if not len(near):
-            continue
+            return None
         u, v, _ = project(cam, params)
         valid = np.isfinite(u) & np.isfinite(v) & (u >= 0) & (v >= 0) & (u < w - 1) & (v < h - 1)
         if params[-1] >= -997.0:
@@ -430,7 +445,7 @@ def person_vote_keep(points, views, images_dir, masks_dir, project, max_range=12
             valid &= fixed_keep_samples((h, w), u, v, camera_name, config)
         near, u, v, dist = near[valid], u[valid], v[valid], np.linalg.norm(cam[valid], axis=1)
         if not len(near):
-            continue
+            return None
         zw, zh = max(1, int(w * raster_scale)), max(1, int(h * raster_scale))
         flat = (np.minimum((v * zh / h).astype(np.int64), zh - 1) * zw
                 + np.minimum((u * zw / w).astype(np.int64), zw - 1))
@@ -446,8 +461,20 @@ def person_vote_keep(points, views, images_dir, masks_dir, project, max_range=12
             usable = ~stable[flat]
             near, flat = near[usable], flat[usable]
         masked = np.unpackbits(packed, count=zw * zh).astype(bool)
-        observed[near] += 1
-        person[near[masked[flat]]] += 1
+        return near, near[masked[flat]]
+
+    if workers is None:
+        workers = PERSON_VOTE_WORKERS
+    workers = max(1, min(int(workers), os.cpu_count() or 1, len(views) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # Bounded batches keep at most a few views' index arrays in memory.
+        for start in range(0, len(views), 2 * workers):
+            batch = range(start, min(start + 2 * workers, len(views)))
+            for result in pool.map(lambda i: vote(views[i], reduced[i]), batch):
+                if result is not None:
+                    seen, voted = result
+                    observed[seen] += 1  # indices are unique within a view
+                    person[voted] += 1
     remove = (person >= 2) & (person.astype(np.uint32) * 2 > observed)
     candidates = np.flatnonzero(remove)
     if len(candidates):

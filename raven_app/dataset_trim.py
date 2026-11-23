@@ -35,9 +35,37 @@ class DatasetInterval:
 
 
 
+def cut_dataset_sync(bag_path):
+    """Offset left between a bag and video cut by Trim/Chunks, read from the manifest next to them.
+
+    Cut videos lose the INSV telemetry trailer, so the gyro cannot sync them again; the cut
+    recorded the offset instead. Returns None when the bag is not a Trim/Chunks output.
+    """
+    bag_path = Path(bag_path)
+    folder = bag_path.parent
+    try:
+        trim = folder / "trim_manifest.json"
+        if trim.is_file():
+            data = json.loads(trim.read_text(encoding="utf-8"))
+            if Path(data.get("bag_path", "")).name == bag_path.name and data.get("dt_sync_trimmed") is not None:
+                return float(data["dt_sync_trimmed"])
+        chunks = folder.parent / "chunks_manifest.json"
+        if chunks.is_file():
+            for ch in json.loads(chunks.read_text(encoding="utf-8")).get("chunks", []):
+                if Path(ch.get("bag_path", "")).name == bag_path.name and ch.get("dt_sync_trimmed") is not None:
+                    return float(ch["dt_sync_trimmed"])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def _resolve_time_sync(bag_path, video_path):
     """IMU-gyro offset of the clip inside the LiDAR recording; a guessed offset is never substituted."""
     from .workflow import auto_sync_imu_gyro
+    known = cut_dataset_sync(bag_path)
+    if known is not None:
+        print(f"[*] Already-cut dataset: Δt = {known:.4f}s from its manifest")
+        return known
     try:
         dt_sync = auto_sync_imu_gyro(bag_path, video_path)
     except Exception as e:

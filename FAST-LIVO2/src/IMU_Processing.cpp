@@ -118,6 +118,9 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     const auto &gyr_acc = meas.imu.front()->angular_velocity;
     mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+    init_rot = Eye3d;
+    init_last_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+    init_last_time = meas.imu.front()->header.stamp.toSec();
     // first_lidar_time = meas.lidar_frame_beg_time;
     // cout<<"init acc norm: "<<mean_acc.norm()<<endl;
   }
@@ -129,7 +132,16 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
 
-    mean_acc += (cur_acc - mean_acc) / N;
+    // Average the specific force in the first sample's frame. A plain average of a turning sensor
+    // (80 deg in the 3 s window of a clip trimmed mid-walk) tilts gravity by ~20 deg and shrinks its
+    // norm, which scales every later acceleration up; SLAM then slides at max_velocity.
+    const double t_imu = imu->header.stamp.toSec();
+    const double dt = t_imu - init_last_time;
+    if (init_last_time >= 0.0 && dt > 0.0 && dt < 0.1) init_rot = init_rot * Exp(V3D(0.5 * (init_last_gyr + cur_gyr)), dt);
+    init_last_time = t_imu;
+    init_last_gyr = cur_gyr;
+
+    mean_acc += (init_rot * cur_acc - mean_acc) / N;
     mean_gyr += (cur_gyr - mean_gyr) / N;
 
     // cov_acc = cov_acc * (N - 1.0) / N + (cur_acc -
@@ -142,7 +154,9 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     N++;
   }
   IMU_mean_acc_norm = mean_acc.norm();
-  state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
+  // The world frame starts as the newest sample's frame (rot_end = I), so gravity goes there.
+  const V3D mean_acc_now = init_rot.transpose() * mean_acc;
+  state_inout.gravity = -mean_acc_now / mean_acc_now.norm() * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   state_inout.bias_g = Zero3d; // mean_gyr;
 

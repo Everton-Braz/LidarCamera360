@@ -24,7 +24,7 @@ class PersonMaskCliTests(unittest.TestCase):
         args = parse(["colorize", "--dataset", "dataset", "--masks-dir", "dataset/masks"])
         self.assertFalse(args.mask_persons)
         self.assertEqual(args.masks_dir, Path("dataset/masks"))
-        self.assertEqual(args.mask_threshold, 0.5)
+        self.assertEqual(args.mask_threshold, 0.35)
         self.assertEqual(args.mask_margin, 0.03)
         self.assertEqual(args.operator_radius, 1.0)
 
@@ -37,7 +37,7 @@ class PersonMaskCliTests(unittest.TestCase):
         args = parse(["--headless", "mask-persons", "--dataset", "dataset"])
         self.assertEqual(args.command, "mask-persons")
         self.assertIsNone(args.model)
-        self.assertEqual(args.threshold, 0.5)
+        self.assertEqual(args.threshold, 0.35)
         self.assertEqual(args.margin, 0.03)
         self.assertIsNone(args.mask_config)
         self.assertIsNone(args.profile)

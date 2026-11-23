@@ -15,6 +15,27 @@ def test_refine_handles_solver_failure_gracefully():
         assert True
 
 
+def test_cached_refinement_is_reused_after_a_json_round_trip(tmp_path):
+    # PARAMETERS holds tuples; the report stores lists. Every second run used to fall back to raw SLAM.
+    import json
+    from raven_app.slam_refinement import source_signature
+    slam = tmp_path / 'slam_raw'
+    (slam / 'pcd').mkdir(parents=True)
+    (slam / 'result').mkdir()
+    (slam / 'pcd' / 'all_raw_points.pcd').write_bytes(b'cloud')
+    (slam / 'result' / 'trajectory.txt').write_text('0 0 0 0 0 0 0 1\n')
+    (slam / 'scan_ranges.csv').write_text('scan,start,end\n')
+    paths = {'pcd': slam / 'pcd' / 'all_raw_points.pcd', 'trajectory': slam / 'result' / 'trajectory.txt',
+             'scan_ranges': slam / 'scan_ranges.csv'}
+    out = tmp_path / 'slam_refined'
+    out.mkdir()
+    report = {'status': 'no_supported_revisits', 'source_signature': source_signature(paths)}
+    (out / 'refinement_report.json').write_text(json.dumps(report), encoding='utf-8')
+    messages = []
+    assert refine(slam, out, log=messages.append)['status'] == 'no_supported_revisits'
+    assert messages == ['Reusing SLAM revisit audit: no_supported_revisits.']
+
+
 def _quality(reference_mm, candidate_mm, improved=False, normals=True):
     return {'reference_rmse_mm': reference_mm, 'candidate_rmse_mm': candidate_mm, 'improved': improved,
             'relative_rmse_reduction': (reference_mm - candidate_mm) / reference_mm, 'normals_consistent': normals}

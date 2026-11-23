@@ -143,6 +143,9 @@ def test_person_votes_remove_a_standing_person_but_not_the_wall_behind(tmp_path)
     assert (~keep[is_person]).mean() > 0.8
     assert keep[~is_person].all()
     assert keep[is_operator_background].all()
+    # Views vote on worker threads; the outcome must not depend on how many.
+    serial = person_vote_keep(points, views, images, masks, _pinhole, workers=1, log=lambda *_: None)
+    assert (serial == keep).all()
 
 
 def test_wide_groups_separate_a_facade_from_a_person():
