@@ -2,8 +2,6 @@
 
 # LidarCamera360
 
-Native INSV GPS extraction: see [GPS export and georeferencing requirements](docs/INSV_GPS.md).
-
 **Unified LiDAR-Inertial SLAM, 360° Camera Telemetry, Rig Calibration, and 3D Colorization Suite**
 
 [![Release](https://img.shields.io/badge/Release-v0.4.0-brightgreen.svg)](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.4.0)
@@ -11,7 +9,7 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 [![C++17 MSVC](https://img.shields.io/badge/C%2B%2B-17%20MSVC-orange.svg)](https://visualstudio.microsoft.com/)
 [![Vulkan](https://img.shields.io/badge/GPU-Vulkan%20Compute-red.svg)](https://www.vulkan.org/)
 [![PyQt6 Fluent](https://img.shields.io/badge/UI-PyQt6%20Fluent%20Widgets-teal.svg)](https://github.com/zhiyiYo/PyQt-Fluent-Widgets)
-[![Tests](https://img.shields.io/badge/Tests-270%20passed-success.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-532%20passed-success.svg)](tests/)
 [![License](https://img.shields.io/badge/Source-MIT-green.svg)](LICENSE) [![App](https://img.shields.io/badge/Desktop%20app-GPL--3.0-blue.svg)](THIRD_PARTY_NOTICES.md)
 
 <br/>
@@ -25,12 +23,29 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 </div>
 
 > [!NOTE]
-> **Hardware & Rig Compatibility:**  
-> **LidarCamera360** comes pre-calibrated and out-of-the-box ready for:
-> - **3DMakerPro Raven LiDAR Scanner + Insta360 X4** (+18.5 cm vertical lever arm, `configs/rig_profile.json`, `FAST-LIVO2/config/raven.yaml`)
-> - **3DMakerPro Eagle LiDAR Scanner + Insta360 X6** (Livox CustomMsg protocol, `configs/rig_profile_eagle.json`, `FAST-LIVO2/config/eagle.yaml`)
+> **Hardware & Rig Compatibility:**
+> Bundled rig profiles:
+> - **3DMakerPro Raven + Insta360 X4** (`configs/rig_profile.json`, `configs/profiles/raven_x4_montagem_1.json`, `FAST-LIVO2/config/raven.yaml`)
+> - **3DMakerPro Raven + Insta360 ONE RS** (`configs/profiles/raven_one_rs.json`)
+> - **3DMakerPro Eagle + Insta360 X6** (Livox CustomMsg protocol, `configs/rig_profile_eagle.json`, `FAST-LIVO2/config/eagle.yaml`)
 >
-> Its modular architecture is completely sensor-agnostic: it can be easily adapted to any mobile or handheld scanning setup (e.g., Livox, Ouster, Hesai, Velodyne, RoboSense, or VanJee LiDARs paired with dual-fisheye or perspective camera arrays) by customizing the rigid extrinsic geometry and camera model in [`configs/rig_profile.json`](configs/rig_profile.json) and adjusting topic mappings in [`FAST-LIVO2/config/`](FAST-LIVO2/config/).
+> Other setups: create a profile with the **New rig** wizard (or `profile new`) from a camera model and a measured mount, then run `calibrate --coarse` on a capture. LiDARs other than the Raven and Eagle also need a topic and sensor configuration in [`FAST-LIVO2/config/`](FAST-LIVO2/config/).
+
+---
+
+## 🆕 What's New in v0.4.0
+
+- **Rig profiles v2 and a New rig wizard**: one file describes the scanner and every camera, with model, intrinsics, mount and clock.
+- **Per-capture calibration**: time offset and mount are refined by photometric consistency and used only when held-out frames improve.
+- **Any camera model**: fisheye, pinhole and equirectangular, including phones and auxiliary cameras.
+- **Cleaner clouds**: time-gated colorization, `--remove-dynamic` people removal, and person masks that also find passers-by.
+- **Timelapse captures** work end to end.
+- **SLAM**: sturdier loop closure, gravity leveling for recordings that start while walking, and `--slam-dir` to import an existing SLAM.
+- **3DGS export**: upright images from upside-down cameras, bundle-adjusted poses, and optional RoMa v2 densification (`--densify roma`).
+- **Project folder and `export`**: write PCD, LAZ/LAS, GeoJSON, GPS track and trajectory after the run.
+- **Trim and chunks** also cut the second lens file and auxiliary videos.
+
+Details: [release notes](docs/releases/v0.4.0.md) and [CHANGELOG](CHANGELOG.md).
 
 ---
 
@@ -55,14 +70,19 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
    - Computes Pearson cross-correlation between camera gyro angular velocity norms and LiDAR IMU gyro streams to achieve sub-millisecond clock synchronization ($\Delta t$).
    - Automatic temporal sync adaptation for variable-rate timelapses and custom trajectory windows.
 
-5. **Thin Prism Fisheye Optical Modeling & Multi-Modal Calibration**
+5. **Camera Models, Rig Profiles & Photometric Calibration**
+   - THIN_PRISM_FISHEYE, OPENCV_FISHEYE, PINHOLE, OPENCV and EQUIRECTANGULAR cameras.
+   - Rig profiles v2 with an editor, a New rig wizard, and validation on a real capture.
+   - Per-capture photometric refinement with a held-out check; implausible rigs and calibrations for another frame size are refused.
    - Complete 12-parameter Thin Prism fisheye distortion model ($f_x, f_y, c_x, c_y, k_1..k_4, p_1, p_2, s_{x1}, s_{y1}$).
    - Horn/Umeyama Sim(3) metric scale recovery and robust point-to-plane Trimmed ICP fine registration.
-   - Pre-configured profiles for **Raven + Insta360 X4** and **Eagle + Insta360 X6**.
+   - Bundled profiles for **Raven + Insta360 X4**, **Raven + Insta360 ONE RS** and **Eagle + Insta360 X6**.
 
 6. **Dual-Method High-Resolution 3D Colorization**
    - **Method 1 (Reconstruction / SfM Spirula Consensus)**: Gold standard multi-view consensus projection, resolving occlusion via Z-Buffer and sharpness weighting with Vulkan compute shaders (`vulkan_colorizer.exe` with CPU fallback).
    - **Method 2 (Trajectory / Direct Rigid)**: High-speed projection directly along the SLAM trajectory with optional SfM trajectory drift correction.
+   - **Time gating**: each view colors only LiDAR points scanned close to its capture time.
+   - Motion-blurred frames are left out of colorization and the 3DGS export.
 
 7. **Interactive 3D OBB Clipping Box & Transform Gizmos**
    - Interactive 3D Oriented Bounding Box (OBB) rotation around Z (Yaw), axis pull arrows with anchored opposite face, and horizontal rotation ring.
@@ -74,12 +94,16 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
    - **Faster Training Convergence:** Dense geometric scaffolding accelerates convergence and runs efficiently (~6.5 GiB VRAM on modern GPUs like RTX 5070 Ti) by eliminating iterative densification lag.
    - **Hybrid SfM + LiDAR Fusion:** Automatically merges SfM camera ray tracks with dense metric LiDAR geometry into a unified COLMAP model.
    - **Zero Duplicate Disk Storage:** Employs NTFS hardlinks and directory junctions to export COLMAP datasets in seconds with 0 additional disk space consumption.
+   - **Refined Poses:** 3DGS poses are bundle-adjusted against the SfM tracks while held to the LiDAR trajectory.
+   - **Optional Densification:** RoMa v2 (`--densify roma`) adds dense points only on the LiDAR surface.
 
 9. **Automated Georeferencing, GCPs & GeoTIFF Orthophotos**
    - Automated GNSS/INSV trajectory georeferencing & Ground Control Points (GCP) alignment.
    - High-resolution GeoTIFF orthophoto export with world files (.tfw) and embedded spatial reference.
    - Native INSV GPS extraction and satellite track quality reporting (DOP, fix type, accuracy metrics).
    - Georeferenced LAZ / LAS 1.4 export with Compound CRS (SIRGAS 2000 / UTM).
+   - Imagery-derived north can be wrong even when it passes the quality gates: check the georeferenced result before relying on it.
+   - GPS requirements: [docs/INSV_GPS.md](docs/INSV_GPS.md).
 
 10. **Multi-Camera SLAM Refinement & Geometric Pose Constraints**
     - Joint multi-camera bundle adjustment and trajectory refinement (`slam_refinement.py`, `slam_refinement_geometry.py`).
@@ -87,7 +111,8 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 
 11. **On-Device Vulkan RF-DETR Dynamic Person Masking**
     - GPU-accelerated person & operator detection/masking powered by native SPIR-V compute shaders (`native/vulkan_rfdetr/shaders/`).
-    - Fully offline, deterministic, zero-cloud execution eliminating pedestrians and dynamic artifacts from 3D reconstruction and Gaussian splatting.
+    - Fully offline, deterministic, zero-cloud execution that masks people in 3D reconstruction and Gaussian splatting inputs, including passers-by who are small in the frame.
+    - `--remove-dynamic` removes moving and standing people from exported clouds.
 
 12. **Modern Fluent UI & Multilingual Localization (i18n)**
     - Microsoft WinUI 3 Fluent Design System with Mica and Acrylic materials, dark/light theme switching.
@@ -100,6 +125,10 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
     - Remote release verification and automated staging directly from GitHub Releases (`python lidarcamera360.py update`).
     - Integrated Fluent feedback dialog and CLI bug reporting with packaged diagnostic bundles (`python lidarcamera360.py feedback`).
 
+15. **Project Folder & Export**
+    - Each output folder is a project: a validated `project.json` names its cloud, images, camera poses and trajectory ([contract](spec/SPEC.md)).
+    - `export` writes PCD, LAZ/LAS, GeoJSON, GPS track and trajectory files from it at any time.
+
 ---
 
 ## 🖥️ Application Screenshots
@@ -108,13 +137,13 @@ Native INSV GPS extraction: see [GPS export and georeferencing requirements](doc
 |:---:|:---:|
 | <img src="docs/images/screenshot_unified_studio.png" alt="Unified LiDAR-Camera Studio" width="500"/> | <img src="docs/images/screenshot_slam.png" alt="FAST-LIVO2 SLAM Engine" width="500"/> |
 
-| **Vulkan 3D Point Cloud Colorization** | **LiDAR-Camera Rig Calibration** |
+| **Vulkan 3D Point Cloud Colorization** | **Rig Profiles** |
 |:---:|:---:|
-| <img src="docs/images/screenshot_colorize.png" alt="Point Cloud Colorization Studio" width="500"/> | <img src="docs/images/screenshot_calibration.png" alt="Rig Calibration & Optical Modeling" width="500"/> |
+| <img src="docs/images/screenshot_colorize.png" alt="Point Cloud Colorization Studio" width="500"/> | <img src="docs/images/screenshot_rig_profiles.png" alt="Rig profile editor" width="500"/> |
 
 <p align="center">
-  <b>System Diagnostics & Hardware Acceleration Engine Doctor</b><br/>
-  <img src="docs/images/screenshot_doctor.png" alt="System Diagnostics & Engine Doctor" width="800"/>
+  <b>New Rig Wizard</b><br/>
+  <img src="docs/images/screenshot_new_rig.png" alt="New rig wizard" width="800"/>
 </p>
 
 ---
@@ -139,6 +168,17 @@ python lidarcamera360.py update check
 # Run automated end-to-end processing (Bag + INSV -> SLAM -> Sync -> Colorize -> Deliverables)
 python lidarcamera360.py workflow --bag D:\capture\scan.bag --insv D:\capture\video.insv --output D:\dataset --method direct
 
+# Same run, with people removed from the exported cloud
+python lidarcamera360.py workflow --bag D:\capture\scan.bag --insv D:\capture\video.insv --output D:\dataset --method direct --remove-dynamic
+
+# New rig: list cameras, create a profile, calibrate it on a processed capture
+python lidarcamera360.py profile cameras
+python lidarcamera360.py profile new --name my_rig --camera <camera id> --scanner raven --offset-cm 0 0 17
+python lidarcamera360.py calibrate --dataset D:\dataset --profile my_rig --coarse --save-profile my_rig_calibrated
+
+# Export more formats from a finished project
+python lidarcamera360.py export --project D:\dataset --formats pcd laz gps trajectory
+
 # Launch the desktop graphical interface
 python lidarcamera360.py
 ```
@@ -147,8 +187,9 @@ python lidarcamera360.py
 
 Pre-compiled standalone packages and portable executables are available on [GitHub Releases](https://github.com/Everton-Braz/LidarCamera360/releases/tag/v0.4.0):
 - 📥 **Direct Portable Download:** [LidarCamera360_portable.exe (v0.4.0)](https://github.com/Everton-Braz/LidarCamera360/releases/download/v0.4.0/LidarCamera360_portable.exe)
+- 📦 **Folder bundle:** [LidarCamera360-v0.4.0-windows-x64.zip](https://github.com/Everton-Braz/LidarCamera360/releases/download/v0.4.0/LidarCamera360-v0.4.0-windows-x64.zip)
 
-When using the portable executable or directory bundle:
+From the folder bundle:
 
 ```powershell
 # Check bundled native SLAM and Vulkan engines
@@ -176,8 +217,8 @@ When using the portable executable or directory bundle:
 
 ```powershell
 # Clone repository
-git clone https://github.com/Everton-Braz/Lidar-camera-calibrator.git
-cd Lidar-camera-calibrator
+git clone https://github.com/Everton-Braz/LidarCamera360.git
+cd LidarCamera360
 
 # Create virtual environment and install Python requirements
 python -m venv .venv
@@ -205,6 +246,8 @@ LidarCamera360/
 │   └── app.ico
 ├── configs/                                # Sensor rig configurations & parameters
 │   ├── rig_profile.json                    # Canonical 3DMakerPro Raven + Insta360 X4 profile
+│   ├── rig_profile_eagle.json              # 3DMakerPro Eagle + Insta360 X6 profile
+│   ├── profiles/                           # More bundled rig profiles
 │   ├── camera.yaml                         # Camera intrinsic matrix
 │   └── slam.yaml                           # FAST-LIVO2 LiDAR odometry parameters
 ├── docs/                                   # Architectural guides and technical specs
@@ -228,12 +271,22 @@ LidarCamera360/
 │   ├── auxiliary_pose_support.py           # Auxiliary camera pose estimation & validation
 │   ├── branding.py                         # Application identity & version metadata
 │   ├── cli.py                              # Command-line interface parser
+│   ├── cloud_export.py                     # Point cloud file export
 │   ├── cloud_view.py                       # OpenGL point cloud viewer & 3D gizmos
 │   ├── config.py                           # Settings and tool validation
 │   ├── dataset.py                          # Dataset paths and schema normalization
+│   ├── dataset_trim.py                     # Trim and chunks for bags and videos
+│   ├── dynamic_filter.py                   # People removal from exported clouds
+│   ├── gravity_level.py                    # Gravity leveling of SLAM maps
 │   ├── gui.py                              # Fluent UI main window and navigation
 │   ├── i18n.py                             # Localization runtime translation layer
+│   ├── mask_tiles.py                       # Tiled person detection
+│   ├── person_masks.py                     # Person masks for image datasets
+│   ├── photometric_rig.py                  # Per-capture photometric rig refinement
+│   ├── pose_ba.py                          # Bundle-adjusted 3DGS poses
 │   ├── process_runner.py                   # Async job runner with clean cancellation
+│   ├── profile_manager.py                  # Rig profile library
+│   ├── project.py                          # Project folder (project.json)
 │   ├── slam_refinement.py                  # Multi-camera SLAM trajectory refinement
 │   ├── slam_refinement_geometry.py         # 6-DoF rigid transform geometry & interpolation
 │   ├── slam_refinement_constraints.py      # Geometric & temporal optimization constraints
@@ -244,7 +297,7 @@ LidarCamera360/
 │   ├── workflow.py                         # End-to-end pipeline orchestrator
 │   └── views/                              # WinUI Fluent tab views
 │       ├── add_source_dialog.py            # Multi-camera & auxiliary stream selector
-│       ├── calibration_view.py             # Rig calibration editor
+│       ├── calibration_view.py             # Rig profile editor
 │       ├── colorize_view.py                # Standalone colorization studio
 │       ├── doctor_view.py                  # System diagnostics & engine health
 │       ├── inspect_view.py                 # ROS Bag inspector
@@ -258,8 +311,11 @@ LidarCamera360/
 │   ├── colorize_sfm_spirula_method.py      # SfM consensus colorizer
 │   ├── correlate_imu_gyro.py               # IMU gyro temporal synchronization
 │   ├── parse_insv_telemetry.py             # INSV binary trailer telemetry parser
+│   ├── photometric_rig_calibration.py      # Photometric rig calibration
 │   ├── pipeline_auto_calibrator_and_colorizer.py # Master unified script
 │   └── run_automatic_icp_calibration.py    # Robust point-to-plane ICP fine calibration
+│   ├── time_gated_colorizer.py             # Time-gated colorization
+├── spec/                                   # Project folder contract (SPEC.md) and conformance files
 ├── tests/                                  # Automated unit and integration test suite
 ├── tools/                                  # Build and packaging automation
 │   ├── build_windows.ps1                   # MSVC build script
