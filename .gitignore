@@ -39,3 +39,9 @@ argon_*
 # Conformance fixtures are tiny stubs, keep them despite the data-file rules above
 !spec/conformance/**/*.laz
 !spec/conformance/**/*.ply
+
+# Local only: promo kit, website draft, machine-specific configs
+promo/
+website/
+configs/aux_iate_plaza.json
+.claude/launch.json
