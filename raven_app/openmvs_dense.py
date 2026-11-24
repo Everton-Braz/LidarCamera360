@@ -4,7 +4,7 @@ Runs on the 3DGS export (metric poses, masks, LiDAR seed) and writes only to its
 
     <colmap_3dgs>/dense_openmvs/
         dense_photo.ply     what the photos alone reconstructed
-        dense_fused.ply     every LiDAR point + the photo points where the LiDAR has none (mode 'fused')
+        dense_fused.ply     every photo point + the LiDAR points where the photos have none (mode 'fused')
         report.json         settings, counts, timings, and the accuracy measured against the LiDAR
         work/               images, masks, scene and depth maps (deleted unless keep_work)
 
@@ -325,7 +325,7 @@ def check_binary(binary):
 
 def run_openmvs(binary, work, size, *, neighbors=8, min_views=3, geometric_iters=2, log=print):
     from raven_app.subprocess_utils import run_hidden_stream
-    cmd = [str(binary), '-w', str(work), '-i', 'scene.mvs', '-o', 'dense.mvs', '-m', 'masks',
+    cmd = [str(binary), '-w', str(work), '-i', 'scene.mvs', '-o', 'dense.mvs', '-m', str(work / 'masks'),
            '--ignore-mask-label', '0', '--resolution-level', '0', '--max-resolution', str(size),
            '--min-resolution', '320', '--number-views', str(neighbors), '--number-views-fuse', str(min_views),
            '--geometric-iters', str(geometric_iters), '--estimate-roi', '0', '--crop-to-roi', '0', '--tower-mode', '0',
@@ -365,18 +365,18 @@ def accuracy_vs_lidar(lidar_xyz, dense_xyz, *, sample=200_000, radius=0.10, seed
             'within_5cm': float((dist < 0.05).mean())}
 
 
-def fuse_with_lidar(lidar_xyz, dense_xyz, *, gap_factor=1.5, min_gap_m=0.02, max_gap_m=None, query_voxel_m=0.01):
-    """Indices of the photo points to add to the LiDAR: those farther from it than its own local spacing."""
+def fuse_with_lidar(lidar_xyz, dense_xyz, *, gap_factor=1.5, min_gap_m=0.03, query_voxel_m=0.01):
+    """Indices of the LiDAR points to add to the photo points: those farther from them than their local spacing.
+
+    The photo cloud is the sharper one, so it wins where both see a surface; the LiDAR fills foliage, glass and
+    dark or plain walls, where photo matching finds nothing."""
     from scipy.spatial import cKDTree
-    lidar = lidar_xyz[_voxel_thin(lidar_xyz, query_voxel_m)]
-    tree = cKDTree(lidar)
-    spacing = tree.query(lidar, k=5, workers=-1)[0][:, -1]
-    gap, nearest = tree.query(dense_xyz, k=1, workers=-1)
-    # spacing is capped: an isolated LiDAR point must not keep the photos out of the space around it
-    keep = gap > np.maximum(min_gap_m, gap_factor * np.minimum(spacing[nearest], 0.10))
-    if max_gap_m:
-        keep &= gap <= max_gap_m
-    return np.flatnonzero(keep)
+    photo = dense_xyz[_voxel_thin(dense_xyz, query_voxel_m)]
+    tree = cKDTree(photo)
+    spacing = tree.query(photo, k=min(5, len(photo)), workers=-1)[0].reshape(len(photo), -1)[:, -1]
+    gap, nearest = tree.query(lidar_xyz, k=1, workers=-1)
+    # spacing is capped: an isolated photo point must not keep the LiDAR out of the space around it
+    return np.flatnonzero(gap > np.maximum(min_gap_m, gap_factor * np.minimum(spacing[nearest], 0.10)))
 
 
 def read_dense_ply(path):
@@ -444,6 +444,11 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
     images = [i for i in images if (colmap_dir / 'images' / i[0]).is_file()]
     if len(images) < 3:
         raise ValueError(f'{colmap_dir}: {len(images)} registered photos; dense photogrammetry needs at least 3')
+    # depth 4 + normal 12 + confidence 4 + views 4 bytes per pixel, and the photos themselves
+    need, free = len(images) * size * size * 26, shutil.disk_usage(work).free
+    if need > free:
+        raise RuntimeError(f'dense photogrammetry at {quality} quality needs about {need / 1e9:.0f} GB of disk and '
+                           f'{free / 1e9:.0f} GB are free in {out}; choose a lower quality or free some space')
     masks = prepare_images(colmap_dir, cameras, images, size, work, log=log)
     lap('images')
     seed = find_lidar_seed(colmap_dir)
@@ -474,9 +479,9 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
               'accuracy_vs_lidar': accuracy_vs_lidar(lidar_xyz, dense_xyz)}
     if mode == 'fused':
         keep = fuse_with_lidar(lidar_xyz, dense_xyz)
-        write_ply(out / 'dense_fused.ply', np.vstack([lidar_xyz, dense_xyz[keep]]),
-                  np.vstack([lidar_rgb, dense_rgb[keep]]))
-        report.update(added_to_lidar=int(len(keep)), fused_cloud=str(out / 'dense_fused.ply'))
+        write_ply(out / 'dense_fused.ply', np.vstack([dense_xyz, lidar_xyz[keep]]),
+                  np.vstack([dense_rgb, lidar_rgb[keep]]))
+        report.update(lidar_points_added=int(len(keep)), fused_cloud=str(out / 'dense_fused.ply'))
     lap('fusion')
     report['seconds'] = timing
     (out / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
@@ -484,7 +489,7 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
         shutil.rmtree(work, ignore_errors=True)
     acc = report['accuracy_vs_lidar']
     log(f"[+] Dense photogrammetry: {len(dense_xyz):,} photo points"
-        + (f", {report['added_to_lidar']:,} of them added to the {len(lidar_xyz):,} LiDAR points" if mode == 'fused' else '')
+        + (f", {report['lidar_points_added']:,} of the {len(lidar_xyz):,} LiDAR points added where the photos have none" if mode == 'fused' else '')
         + (f"; median {acc['median_m'] * 100:.1f} cm from the LiDAR surface" if acc.get('compared') else '')
         + f". Saved in {out}")
     return report

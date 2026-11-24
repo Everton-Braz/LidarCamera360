@@ -539,7 +539,7 @@
   "Log:": "Log:",
   "Files in {folder}": "Arquivos em {folder}",
   "{program} was not found on this computer, so nothing was opened.": "{program} não foi encontrado neste computador, então nada foi aberto.",
-  "Adds photo points where the LiDAR has gaps, from each fisheye photo as a whole. Written to colmap_3dgs/dense_openmvs.": "Adiciona pontos das fotos onde o LiDAR tem falhas, usando cada foto fisheye inteira. Gravado em colmap_3dgs/dense_openmvs.",
+  "Builds a dense cloud from each fisheye photo as a whole and fills its gaps with the LiDAR. Written to colmap_3dgs/dense_openmvs.": "Cria uma nuvem densa usando cada foto fisheye inteira e preenche as falhas com o LiDAR. Gravado em colmap_3dgs/dense_openmvs.",
   "OpenMVS (fisheye build) was not found. Set its folder in Settings > Deliverables.": "O OpenMVS (versão fisheye) não foi encontrado. Defina o caminho em Configurações > Entregáveis.",
   "Show \"Open in RealityScan / Metashape\" on the workflow screen": "Mostrar \"Abrir no RealityScan / Metashape\" na tela do fluxo",
   "Choose OpenMVS...": "Escolher OpenMVS...",

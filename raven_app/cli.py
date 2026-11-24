@@ -387,7 +387,7 @@ def parse(argv=None):
     dense.add_argument('--openmvs', type=Path, default=None, help='DensifyPointCloud of the fisheye build (default: Settings)')
     dense.add_argument('--quality', choices=('draft', 'balanced', 'high', 'full'), default='balanced')
     dense.add_argument('--mode', choices=('fused', 'photo'), default='fused',
-                       help='fused: LiDAR plus photo points where the scan has gaps; photo: photo points only')
+                       help='fused: photo points plus LiDAR points where the photos have gaps; photo: photo points only')
     dense.add_argument('--no-lidar', action='store_true', help='Use the scan only to choose neighbour photos, not to guide the depths')
     dense.add_argument('--keep-work', action='store_true', help='Keep the resampled photos and OpenMVS files')
     photo = sub.add_parser('photogrammetry-export',

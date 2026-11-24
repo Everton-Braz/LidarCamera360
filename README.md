@@ -42,6 +42,7 @@
 - **Timelapse captures** work end to end.
 - **SLAM**: sturdier loop closure, gravity leveling for recordings that start while walking, and `--slam-dir` to import an existing SLAM.
 - **3DGS export**: upright images from upside-down cameras, bundle-adjusted poses, and optional RoMa v2 densification (`--densify roma`).
+- **Dense photogrammetry (optional)**: a dense cloud from whole fisheye photos with a patched OpenMVS ([how to build it](third_party/openmvs/README.md)), and exports for RealityScan and Metashape.
 - **Project folder and `export`**: write PCD, LAZ/LAS, GeoJSON, GPS track and trajectory after the run.
 - **Trim and chunks** also cut the second lens file and auxiliary videos.
 

@@ -96,6 +96,15 @@ def test_realityscan_is_opened_with_the_division_lens(tmp_path):
     assert len(pe.open_commands('metashape', Path('metashape.exe'), tmp_path)) == 2
 
 
+def test_fusion_keeps_the_photos_and_adds_lidar_only_in_their_gaps():
+    g = np.arange(0, 1, 0.02)
+    x, y = (a.ravel() for a in np.meshgrid(g, g))
+    photo = np.column_stack([x, y, np.zeros(x.size)])
+    lidar = np.vstack([photo[::7] + [0, 0, 0.015], [[3.0, 3, 0], [0.5, 0.5, 0.2]]])
+    keep = od.fuse_with_lidar(lidar, photo)
+    assert keep.tolist() == [len(lidar) - 2, len(lidar) - 1]
+
+
 def test_stock_openmvs_is_refused(tmp_path):
     stock = tmp_path / 'DensifyPointCloud.exe'
     stock.write_bytes(b'not the fisheye build')

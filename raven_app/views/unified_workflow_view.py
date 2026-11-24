@@ -788,7 +788,7 @@ class UnifiedWorkflowView(QWidget):
         self.chk_dense.setEnabled(enabled and found)
         self.dense_quality_combo.setEnabled(enabled and found)
         self.chk_dense.setToolTip(
-            tr("Adds photo points where the LiDAR has gaps, from each fisheye photo as a whole. Written to colmap_3dgs/dense_openmvs.")
+            tr("Builds a dense cloud from each fisheye photo as a whole and fills its gaps with the LiDAR. Written to colmap_3dgs/dense_openmvs.")
             if found else tr("OpenMVS (fisheye build) was not found. Set its folder in Settings > Deliverables."))
         self._update_seed_point_estimate()
 
