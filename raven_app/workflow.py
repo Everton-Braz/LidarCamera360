@@ -3037,6 +3037,7 @@ def execute_unified_workflow(
     rebuild=(),
     densify: str = 'off',
     densify_preset: str = 'balanced',
+    dense_quality: str = 'balanced',
     slam_profile: str = 'timelapse',
     slam_dir: Optional[Path] = None,
     profile: Optional[str] = None,
@@ -4099,6 +4100,16 @@ def execute_unified_workflow(
             except Exception as exc:
                 run_record['densification'] = {'status': 'failed', 'reason': str(exc)}
                 print(f"[!] RoMa v2 densification failed ({exc}); the LiDAR seed is unchanged.")
+            _persist_workflow_run(output_dir, run_record)
+        elif densify == 'openmvs':
+            from raven_app.config import get_openmvs_bin
+            from raven_app.openmvs_dense import densify_openmvs
+            colmap_dir = Path(colmap_export_dir) if colmap_export_dir else output_dir / 'colmap_3dgs'
+            try:
+                run_record['densification'] = densify_openmvs(colmap_dir, get_openmvs_bin(), quality=dense_quality)
+            except Exception as exc:
+                run_record['densification'] = {'status': 'failed', 'reason': str(exc)}
+                print(f"[!] OpenMVS dense photogrammetry failed ({exc}); the other deliverables are unchanged.")
             _persist_workflow_run(output_dir, run_record)
 
     # One project per dataset, refreshed by every run; the run itself only leaves its deliverables.

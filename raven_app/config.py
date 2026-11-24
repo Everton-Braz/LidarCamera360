@@ -28,7 +28,8 @@ def get_config_path() -> Path:
 
 def load_config() -> dict:
     """Loads persistent settings or returns default configuration."""
-    defaults = {"spirula_path": "", "theme": "dark", "show_extra_formats": False}
+    defaults = {"spirula_path": "", "theme": "dark", "show_extra_formats": False,
+                "show_photogrammetry_export": False, "openmvs_path": "", "realityscan_path": "", "metashape_path": ""}
     try:
         cfg_path = get_config_path()
         if cfg_path.is_file():
@@ -107,6 +108,24 @@ def get_spirula_bin() -> Path:
         return Path(which_path).resolve()
 
     return root / "spirula" / "spirula.exe"
+
+
+def get_openmvs_bin() -> Path:
+    """DensifyPointCloud of the fisheye OpenMVS build: Settings (openmvs_path), LIDARCAMERA360_OPENMVS, openmvs/, PATH.
+
+    OpenMVS is optional and not bundled, so the returned path may not exist."""
+    name = "DensifyPointCloud.exe" if os.name == "nt" else "DensifyPointCloud"
+    for configured in (str(load_config().get("openmvs_path", "") or ""), os.environ.get("LIDARCAMERA360_OPENMVS", "")):
+        path = Path(configured.strip()) if configured.strip() else None
+        if path and path.is_dir():
+            path = path / name
+        if path and path.is_file():
+            return path.resolve()
+    for base in (get_app_root(), Path(sys.executable).resolve().parent, Path.cwd()):
+        if (base / "openmvs" / name).is_file():
+            return (base / "openmvs" / name).resolve()
+    found = shutil.which(name)
+    return Path(found).resolve() if found else get_app_root() / "openmvs" / name
 
 
 def validate_tool(tool_type: str, path_str: str) -> tuple[bool, str]:
