@@ -7,7 +7,8 @@ to the projection the target program models exactly, at the poses, scale and fra
 * RealityScan: the stereographic fisheye, which is its `division` lens with a single coefficient.
 
     <colmap_3dgs>/metashape/    images/ masks/ lidar.ply cameras.json import_metashape.py
-    <colmap_3dgs>/realityscan/  images/*.jpg + .xmp (pose and lens) + .jpg.mask.png, lidar.las
+    <colmap_3dgs>/realityscan/  images/*.jpg + .xmp (pose and lens) + .jpg.mask.png, lidar.las,
+                                 IMPORT_LIDAR.txt
 """
 from __future__ import annotations
 
@@ -145,6 +146,26 @@ def realityscan_xmp(R, C, size, prior='locked', lens_prior='exact', k1=None):
                       position=' '.join(f'{a:.12g}' for a in np.asarray(C)))
 
 
+LIDAR_README = '''Adding lidar.las in RealityScan (Workflow > LiDAR Scan)
+
+  Use camera poses: From camera pose priors
+  Camera cluster:   Cube of six cameras
+  Registration:     Exact
+  Georeferenced:    No
+
+With other settings RealityScan 2.2 can stop with "Unexpected program state". Import it into a project that
+already has the photos, then run Align Images. It writes several GB in a "lidar" folder next to lidar.las:
+keep that folder, the project uses it.
+
+Command line: RealityScan.exe -load project.rsproj -importLaserScan lidar.las lidar_import.xml
+'''
+LIDAR_PARAMS = '''<Configuration id="{00000000-0000-0000-0000-000000000000}">
+  <entry key="lasVcamsCameraPosesMethod" value="0"/>
+  <entry key="lasVcamsCameraClusterGen" value="2"/>
+</Configuration>
+'''
+
+
 def export_realityscan(colmap_dir, size=3072, out_dir=None, log=print):
     colmap_dir = Path(colmap_dir)
     cameras, images, names = _load(colmap_dir)
@@ -161,6 +182,9 @@ def export_realityscan(colmap_dir, size=3072, out_dir=None, log=print):
             from raven_app.cloud_export import _write_las
             from raven_app.cloud_io import load_cloud
             _write_las(load_cloud(seed), out / 'lidar.las')
+            (out / 'lidar_import.xml').write_text(LIDAR_PARAMS, encoding='utf-8')
+            (out / 'IMPORT_LIDAR.txt').write_text(LIDAR_README, encoding='utf-8')
+            log('[*] To add lidar.las in RealityScan, use the settings in IMPORT_LIDAR.txt')
         except Exception as exc:
             log(f'[!] The LiDAR cloud was not written for RealityScan: {exc}')
     log(f'[+] RealityScan export: {out}')

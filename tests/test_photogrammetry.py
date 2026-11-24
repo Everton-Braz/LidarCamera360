@@ -81,6 +81,8 @@ def test_realityscan_export_locks_pose_and_lens(colmap):
     assert '<xcr:Position>1 ' in xmp
     assert (out / 'images' / 'cam0_frame_000002.jpg.mask.png').is_file()
     assert (out / 'lidar.las').is_file()
+    assert 'lasVcamsCameraPosesMethod" value="0"' in (out / 'lidar_import.xml').read_text()
+    assert 'From camera pose priors' in (out / 'IMPORT_LIDAR.txt').read_text()
 
 
 def test_exporting_again_keeps_the_users_project(colmap):
