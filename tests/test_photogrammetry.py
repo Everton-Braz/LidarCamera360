@@ -1,3 +1,4 @@
+import json
 import math
 import struct
 from pathlib import Path
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 
 from raven_app import openmvs_dense as od
+from raven_app import openmvs_mesh as om
 from raven_app import photogrammetry_export as pe
 from raven_app.dense_fusion import write_ply
 
@@ -128,3 +130,110 @@ def test_failed_dense_run_changes_nothing(colmap, tmp_path):
     with pytest.raises(Exception):
         od.densify_openmvs(colmap, tmp_path / 'missing.exe', log=lambda *_: None)
     assert sorted(p.relative_to(colmap) for p in colmap.rglob('*')) == before
+
+
+WALL = np.array([[-1, -1, 2], [1, -1, 2], [1, 1, 2], [-1, 1, 2]], float), np.array([[0, 1, 2], [0, 2, 3]])
+
+
+def test_mesh_ply_round_trip_and_distance_to_the_lidar(tmp_path):
+    om.write_mesh_ply(tmp_path / 'm.ply', *WALL)
+    vertices, faces = om.read_mesh_ply(tmp_path / 'm.ply')
+    np.testing.assert_allclose(vertices, WALL[0])
+    assert faces.tolist() == WALL[1].tolist()
+    points, area = om.sample_surface(vertices, faces, 1000)
+    assert math.isclose(area, 4.0) and np.abs(points[:, :2]).max() <= 1
+    g = np.arange(-1, 1, 0.02)
+    x, y = (a.ravel() for a in np.meshgrid(g, g))
+    report = om.mesh_vs_lidar(np.column_stack([x, y, np.full(x.size, 2.02)]), vertices, faces, sample=20_000)
+    assert math.isclose(report['accuracy_vs_lidar']['median_m'], 0.02, abs_tol=2e-3)
+    assert report['lidar_covered']['within_5cm'] > 0.99
+
+
+def test_long_triangles_are_removed():
+    vertices = np.array([[0, 0, 0], [0.1, 0, 0], [0, 0.1, 0], [5, 5, 0]], float)
+    v, f = om.drop_long_faces(vertices, np.array([[0, 1, 2], [1, 2, 3]]), 0.3)
+    assert f.tolist() == [[0, 1, 2]] and len(v) == 3
+
+
+def test_a_glb_holds_its_own_texture(tmp_path):
+    pixels = b'not really a jpeg'
+    (tmp_path / 't.jpg').write_bytes(pixels)
+    scene = {'asset': {'version': '2.0'}, 'buffers': [{'byteLength': 6}], 'images': [{'uri': 't.jpg'}],
+             'bufferViews': [{'buffer': 0, 'byteLength': 6}]}
+    head = json.dumps(scene).encode()
+    head += b' ' * (-len(head) % 4)
+    glb = tmp_path / 'm.glb'
+    glb.write_bytes(struct.pack('<4sII', b'glTF', 2, 36 + len(head)) + struct.pack('<I4s', len(head), b'JSON') + head
+                    + struct.pack('<I4s', 8, b'BIN' + bytes(1)) + b'123456' + bytes(2))
+    om.pack_glb(glb)
+    data = glb.read_bytes()
+    n = struct.unpack_from('<I', data, 12)[0]
+    scene = json.loads(data[20:20 + n])
+    view = scene['bufferViews'][scene['images'][0]['bufferView']]
+    body = data[28 + n:]
+    assert body[view['byteOffset']:view['byteOffset'] + view['byteLength']] == pixels and body[:6] == b'123456'
+    assert struct.unpack_from('<I', data, 8)[0] == len(data) and scene['buffers'][0]['byteLength'] == len(body)
+    assert not (tmp_path / 't.jpg').exists() and 'uri' not in scene['images'][0]
+    om.pack_glb(glb)
+    assert glb.read_bytes() == data
+
+
+@pytest.fixture
+def openmvs(tmp_path, monkeypatch):
+    """Marked stand-ins for the three programs, and what they would write."""
+    folder = tmp_path / 'openmvs'
+    folder.mkdir()
+    for name in ('DensifyPointCloud', 'ReconstructMesh', 'TextureMesh'):
+        (folder / f'{name}.exe').write_bytes(od.PATCH_MARK)
+
+    def dense(binary, work, size, **_):
+        return work
+
+    def read(work):
+        g = np.arange(-0.9, 0.9, 0.03)
+        x, y = (a.ravel() for a in np.meshgrid(g, g))
+        return (np.column_stack([x, y, np.full(x.size, 2.0)]), np.full((x.size, 3), 90, np.uint8),
+                np.tile([0, 1, 2], (x.size, 1)))
+
+    def step(program, work, args, output, log):
+        if program.stem == 'ReconstructMesh':
+            om.write_mesh_ply(output, *WALL)
+        else:
+            output.write_bytes(b'')
+            assert '--ignore-mask-label' in args
+
+    monkeypatch.setattr(od, 'run_openmvs', dense)
+    monkeypatch.setattr(od, 'read_dense_ply', read)
+    monkeypatch.setattr(om, 'run_step', step)
+    monkeypatch.setattr(om, 'pack_glb', lambda path: None)
+    monkeypatch.setattr(om, 'MAX_EDGE_M', 10.0)
+    monkeypatch.setitem(od.QUALITY, 'draft', 256)
+    return folder / 'DensifyPointCloud.exe'
+
+
+def test_dense_run_also_writes_the_mesh(colmap, openmvs):
+    report = od.densify_openmvs(colmap, openmvs, quality='draft', mesh='glb', log=lambda *_: None)
+    out = colmap / 'dense_openmvs'
+    assert report['mesh']['faces'] == 2 and (out / 'mesh.ply').is_file() and (out / 'mesh_textured.glb').is_file()
+    assert json.loads((out / 'report.json').read_text())['mesh']['faces'] == 2 and not (out / 'work').exists()
+
+
+def test_a_failed_mesh_keeps_the_dense_cloud(colmap, openmvs, monkeypatch):
+    def broken(*_):
+        raise RuntimeError('out of memory')
+    monkeypatch.setattr(om, 'run_step', broken)
+    report = od.densify_openmvs(colmap, openmvs, quality='draft', mesh='ply', log=lambda *_: None)
+    assert 'out of memory' in report['mesh']['error'] and (colmap / 'dense_openmvs' / 'dense_fused.ply').is_file()
+
+
+def test_a_mesh_without_its_programs_stops_before_the_long_run(colmap, openmvs):
+    openmvs.with_name('TextureMesh.exe').unlink()
+    assert not om.has_programs(openmvs)
+    with pytest.raises(FileNotFoundError, match='TextureMesh'):
+        od.densify_openmvs(colmap, openmvs, quality='draft', mesh='glb', log=lambda *_: None)
+    assert not (colmap / 'dense_openmvs').exists()
+    assert om.check_programs(openmvs, 'ply')[1] is None
+
+
+def test_views_of_two_clouds_are_stacked():
+    assert od.stack_views(np.array([[1, 2]]), np.array([[3, -1, -1]])).tolist() == [[1, 2, -1], [3, -1, -1]]

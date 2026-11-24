@@ -3038,6 +3038,7 @@ def execute_unified_workflow(
     densify: str = 'off',
     densify_preset: str = 'balanced',
     dense_quality: str = 'balanced',
+    dense_mesh: str | None = None,
     slam_profile: str = 'timelapse',
     slam_dir: Optional[Path] = None,
     profile: Optional[str] = None,
@@ -4106,7 +4107,8 @@ def execute_unified_workflow(
             from raven_app.openmvs_dense import densify_openmvs
             colmap_dir = Path(colmap_export_dir) if colmap_export_dir else output_dir / 'colmap_3dgs'
             try:
-                run_record['densification'] = densify_openmvs(colmap_dir, get_openmvs_bin(), quality=dense_quality)
+                run_record['densification'] = densify_openmvs(colmap_dir, get_openmvs_bin(), quality=dense_quality,
+                                                                  mesh=dense_mesh)
             except Exception as exc:
                 run_record['densification'] = {'status': 'failed', 'reason': str(exc)}
                 print(f"[!] OpenMVS dense photogrammetry failed ({exc}); the other deliverables are unchanged.")

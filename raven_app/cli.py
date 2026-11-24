@@ -323,6 +323,8 @@ def parse(argv=None):
     wf.add_argument('--densify-preset',choices=('fast','balanced','high'),default='balanced')
     wf.add_argument('--dense-quality',choices=('draft','balanced','high','full'),default='balanced',
                     help='Photo size of --densify openmvs: 1024, 1664, 2496 or 3328 px')
+    wf.add_argument('--dense-mesh',choices=('glb','obj','ply'),default=None,
+                    help='with --densify openmvs: also build a surface mesh. glb/obj: textured from the fisheye photos; ply: without texture')
     wf.add_argument('--slam-profile',choices=('timelapse','classic'),default='timelapse',
                     help='FAST-LIVO2 settings for Raven timelapse captures: timelapse = surface 0.06 m / map 0.20 m; '
                          'classic = 0.10 m / 0.60 m / 2 layers (the 27/09/2026 CASA 374 settings)')
@@ -388,6 +390,8 @@ def parse(argv=None):
     dense.add_argument('--quality', choices=('draft', 'balanced', 'high', 'full'), default='balanced')
     dense.add_argument('--mode', choices=('fused', 'photo'), default='fused',
                        help='fused: photo points plus LiDAR points where the photos have gaps; photo: photo points only')
+    dense.add_argument('--mesh', choices=('glb', 'obj', 'ply'), default=None,
+                       help='Also build a surface mesh. glb/obj: textured from the fisheye photos; ply: without texture')
     dense.add_argument('--no-lidar', action='store_true', help='Use the scan only to choose neighbour photos, not to guide the depths')
     dense.add_argument('--keep-work', action='store_true', help='Keep the resampled photos and OpenMVS files')
     photo = sub.add_parser('photogrammetry-export',
@@ -885,6 +889,7 @@ def run(a):
             densify=getattr(a, 'densify', 'off'),
             densify_preset=getattr(a, 'densify_preset', 'balanced'),
             dense_quality=getattr(a, 'dense_quality', 'balanced'),
+            dense_mesh=getattr(a, 'dense_mesh', None),
             slam_profile=getattr(a, 'slam_profile', 'timelapse'),
             slam_dir=getattr(a, 'slam_dir', None),
             profile=a.profile,
@@ -896,7 +901,7 @@ def run(a):
         from raven_app.config import get_openmvs_bin
         from raven_app.openmvs_dense import densify_openmvs
         report = densify_openmvs(a.colmap.resolve(), a.openmvs or get_openmvs_bin(), out_dir=a.output, quality=a.quality,
-                                 mode=a.mode, use_lidar=not a.no_lidar, keep_work=a.keep_work)
+                                 mode=a.mode, use_lidar=not a.no_lidar, mesh=a.mesh, keep_work=a.keep_work)
         print(json.dumps(report, indent=2))
         return 0
     if a.command == 'photogrammetry-export':

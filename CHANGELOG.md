@@ -12,6 +12,11 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Dense point cloud from the fisheye photos** with OpenMVS, at the LiDAR poses. Photos are not split into pinhole
   faces: each is resampled once to an ideal fisheye. The output is a photo cloud and a cloud that fills its gaps with
   the LiDAR, plus a report with the distance to the LiDAR. Nothing in the 3DGS export is changed.
+- **Textured mesh** of that dense cloud (`--mesh glb`, or the *Textured mesh* box): OpenMVS turns the photo points
+  and the LiDAR points that fill their gaps into a surface, and copies its texture from the fisheye photos. The
+  report gives its distance to the LiDAR. `mesh.ply` and a self-contained `mesh_textured.glb` are written.
+  On the test walk, at the default quality: 4.0 million triangles, median 1.0 cm from the LiDAR and 93 % of the
+  LiDAR within 10 cm of the surface (79 % of the LiDAR points hidden from the run), for about 9 more minutes.
 - It needs an NVIDIA GPU and a patched OpenMVS that you build yourself (`third_party/openmvs`). It is not bundled.
 - **Open in RealityScan / Metashape:** optional exports of the photos, masks, poses and LiDAR for people who own those
   programs. Opening RealityScan selects its Division lens, which RealityScan may keep as its own setting.

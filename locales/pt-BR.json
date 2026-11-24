@@ -545,5 +545,8 @@
   "Choose OpenMVS...": "Escolher OpenMVS...",
   "OpenMVS (dense photogrammetry, optional): {path}": "OpenMVS (fotogrametria densa, opcional): {path}",
   "DensifyPointCloud of the OpenMVS fisheye build": "DensifyPointCloud da versão fisheye do OpenMVS",
-  "OpenMVS was not accepted": "O OpenMVS não foi aceito"
+  "OpenMVS was not accepted": "O OpenMVS não foi aceito",
+  "Textured mesh (GLB)": "Malha texturizada (GLB)",
+  "Also turns the dense cloud into a surface, with its texture copied from the fisheye photos. Passers-by masked out of the photos leave no texture.": "Também transforma a nuvem densa em uma superfície, com a textura copiada das fotos fisheye. Os pedestres mascarados nas fotos não entram na textura.",
+  "Needs ReconstructMesh and TextureMesh of the OpenMVS fisheye build, beside DensifyPointCloud.": "Precisa do ReconstructMesh e do TextureMesh da versão fisheye do OpenMVS, ao lado do DensifyPointCloud."
 }

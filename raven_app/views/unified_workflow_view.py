@@ -27,6 +27,7 @@ from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag, find_ad
 from raven_app.seed_export import dataset_seed_point_count, seed_point_count
 from raven_app.i18n import tr, tr_button
 from raven_app.config import DEFAULT_OPERATOR_RADIUS_M, get_openmvs_bin, load_config
+from raven_app.openmvs_mesh import has_programs
 
 RIG_REFINE_CHOICES = (
     ("Photometric (recommended)", "photometric"),
@@ -575,6 +576,9 @@ class UnifiedWorkflowView(QWidget):
         self.dense_quality_combo.setCurrentIndex(1)
         dense_layout.addWidget(self.chk_dense)
         dense_layout.addWidget(self.dense_quality_combo)
+        self.chk_dense_mesh = CheckBox(tr("Textured mesh (GLB)"))
+        self.chk_dense_mesh.setChecked(False)
+        dense_layout.addWidget(self.chk_dense_mesh)
         dense_layout.addStretch()
         output_layout.addLayout(dense_layout)
 
@@ -776,6 +780,7 @@ class UnifiedWorkflowView(QWidget):
         self.seed_percent_spin.valueChanged.connect(self._update_seed_point_estimate)
         self.out_input.textChanged.connect(self._refresh_seed_point_estimate)
         self.chk_colmap.stateChanged.connect(self._toggle_seed_export_controls)
+        self.chk_dense.stateChanged.connect(self._toggle_seed_export_controls)
         self._toggle_seed_export_controls()
         self._refresh_seed_point_estimate()
 
@@ -784,9 +789,15 @@ class UnifiedWorkflowView(QWidget):
         self.seed_percent_label.setEnabled(enabled)
         self.seed_percent_slider.setEnabled(enabled)
         self.seed_percent_spin.setEnabled(enabled)
-        found = get_openmvs_bin().is_file()
+        openmvs = get_openmvs_bin()
+        found = openmvs.is_file()
+        can_mesh = has_programs(openmvs) if found else False
         self.chk_dense.setEnabled(enabled and found)
         self.dense_quality_combo.setEnabled(enabled and found)
+        self.chk_dense_mesh.setEnabled(enabled and can_mesh and self.chk_dense.isChecked())
+        self.chk_dense_mesh.setToolTip(
+            tr("Also turns the dense cloud into a surface, with its texture copied from the fisheye photos. Passers-by masked out of the photos leave no texture.")
+            if can_mesh else tr("Needs ReconstructMesh and TextureMesh of the OpenMVS fisheye build, beside DensifyPointCloud."))
         self.chk_dense.setToolTip(
             tr("Builds a dense cloud from each fisheye photo as a whole and fills its gaps with the LiDAR. Written to colmap_3dgs/dense_openmvs.")
             if found else tr("OpenMVS (fisheye build) was not found. Set its folder in Settings > Deliverables."))
@@ -1762,6 +1773,8 @@ class UnifiedWorkflowView(QWidget):
             args.extend(["--seed-percent", str(self.seed_percent_spin.value())])
             if self.chk_dense.isEnabled() and self.chk_dense.isChecked():
                 args.extend(["--densify", "openmvs", "--dense-quality", self.dense_quality_combo.currentData()])
+                if self.chk_dense_mesh.isChecked() and self.chk_dense_mesh.isEnabled():
+                    args.extend(["--dense-mesh", "glb"])
 
         if self.process_gps_chk.isChecked():
             args.append("--process-gps")
@@ -2142,6 +2155,7 @@ class UnifiedWorkflowView(QWidget):
         self.chk_dense.setText(tr("Dense photogrammetry from the fisheye photos (OpenMVS, optional)"))
         for index, (label, _) in enumerate(DENSE_QUALITY_CHOICES):
             self.dense_quality_combo.setItemText(index, tr(label))
+        self.chk_dense_mesh.setText(tr("Textured mesh (GLB)"))
         for program, name in (('realityscan', 'RealityScan'), ('metashape', 'Metashape')):
             self._photogrammetry_buttons[program].setText(tr("Open in {program}...", program=name))
         self._toggle_seed_export_controls()

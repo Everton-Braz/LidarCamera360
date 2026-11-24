@@ -92,3 +92,42 @@ def test_workflow_passes_seed_percentage_only_when_3dgs_export_is_enabled(tmp_pa
         assert "--seed-percent" not in args
     finally:
         view.close()
+
+
+def test_textured_mesh_is_passed_only_with_the_dense_cloud(tmp_path, monkeypatch):
+    from raven_app.openmvs_dense import PATCH_MARK
+    from raven_app.views import unified_workflow_view
+
+    for name in ("DensifyPointCloud", "ReconstructMesh"):
+        (tmp_path / f"{name}.exe").write_bytes(PATCH_MARK)
+    monkeypatch.setattr(unified_workflow_view, "get_openmvs_bin", lambda: tmp_path / "DensifyPointCloud.exe")
+    for name in ("scan.bag", "camera.insv"):
+        (tmp_path / name).touch()
+
+    runner = ProcessRunner()
+    runner.start_job = Mock(return_value=True)
+    view = UnifiedWorkflowView(runner)
+    try:
+        view.bag_input.setText(str(tmp_path / "scan.bag"))
+        view.insv_input.setText(str(tmp_path / "camera.insv"))
+        view.out_input.setText(str(tmp_path / "output"))
+        view.chk_dense.setChecked(True)
+        assert not view.chk_dense_mesh.isEnabled() and "ReconstructMesh" in view.chk_dense_mesh.toolTip()
+
+        (tmp_path / "TextureMesh.exe").write_bytes(PATCH_MARK)
+        view._toggle_seed_export_controls()
+        assert view.chk_dense_mesh.isEnabled()
+        view._start_workflow()
+        assert "--dense-mesh" not in runner.start_job.call_args.args[0]
+
+        view.chk_dense_mesh.setChecked(True)
+        view._start_workflow()
+        args = runner.start_job.call_args.args[0]
+        assert args[args.index("--dense-mesh") + 1] == "glb" and "--densify" in args
+
+        view.chk_dense.setChecked(False)
+        assert not view.chk_dense_mesh.isEnabled()
+        view._start_workflow()
+        assert "--dense-mesh" not in runner.start_job.call_args.args[0]
+    finally:
+        view.close()

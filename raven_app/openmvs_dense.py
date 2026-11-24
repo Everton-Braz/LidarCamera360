@@ -35,6 +35,7 @@ PATCH_MARK = b'LC360-FISHEYE-3.5'  # string the patched DensifyPointCloud carrie
 MAX_THETA = 1.5                    # rays farther from the axis are masked: the rim is blurred and flared
 QUALITY = {'draft': 1024, 'balanced': 1664, 'high': 2496, 'full': 3328}   # fisheye image width
 MODES = ('fused', 'photo')
+MESH_LIDAR_VIEWS = 8               # photos kept per LiDAR point that fills a gap of the mesh
 
 
 # --- COLMAP cameras -------------------------------------------------------------------------------
@@ -269,6 +270,12 @@ def lidar_views(xyz, images, masks, occluder_xyz=None, max_views=24, max_range=6
     return np.take_along_axis(best_i, order, axis=1)
 
 
+def stack_views(*views):
+    """Padded view arrays of several clouds, one under the other."""
+    width = max(v.shape[1] for v in views)
+    return np.vstack([np.pad(v, ((0, 0), (0, width - v.shape[1])), constant_values=-1) for v in views])
+
+
 # --- OpenMVS scene --------------------------------------------------------------------------------
 def write_mvs(path, size, images, xyz, rgb, views):
     """OpenMVS interface file (version 8): one fisheye camera, the photos' poses, the seed with its views."""
@@ -294,7 +301,7 @@ def write_mvs(path, size, images, xyz, rgb, views):
             out.write(doubles(R) + doubles(C))
         out.write(struct.pack('<Q', len(images)))
         for i in range(len(images)):
-            out.write(text(f'images/{i:05d}.jpg') + text('') + struct.pack('<IIII', 0, 0, i, i))
+            out.write(text(f'images/{i:05d}.jpg') + text(f'masks/{i:05d}.mask.png') + struct.pack('<IIII', 0, 0, i, i))
             out.write(struct.pack('<fff', 0, 0, 0) + struct.pack('<Q', 0))
         out.write(struct.pack('<B', 0))
         out.write(struct.pack('<Q', len(order)))
@@ -312,11 +319,12 @@ def write_mvs(path, size, images, xyz, rgb, views):
     return len(order)
 
 
-def check_binary(binary):
-    """The path, if it is the patched DensifyPointCloud; a stock one would misread the fisheye scene."""
+def check_binary(binary, name='DensifyPointCloud'):
+    """The path, if it is the patched program; a stock one would misread the fisheye scene."""
     binary = Path(binary) if binary else None
     if binary is None or not binary.is_file():
-        raise FileNotFoundError('DensifyPointCloud (OpenMVS, fisheye build) was not found; set its path in Settings. '
+        where = f' at {binary}.' if binary else '; set its path in Settings.'
+        raise FileNotFoundError(f'{name} (OpenMVS, fisheye build) was not found{where} '
                                 'third_party/openmvs/README.md explains how to build it.')
     if PATCH_MARK not in binary.read_bytes():
         raise RuntimeError(f'{binary} is not the fisheye build of OpenMVS (third_party/openmvs/README.md).')
@@ -325,7 +333,7 @@ def check_binary(binary):
 
 def run_openmvs(binary, work, size, *, neighbors=8, min_views=3, geometric_iters=2, log=print):
     from raven_app.subprocess_utils import run_hidden_stream
-    cmd = [str(binary), '-w', str(work), '-i', 'scene.mvs', '-o', 'dense.mvs', '-m', str(work / 'masks'),
+    cmd = [str(binary), '-w', str(work), '-i', 'scene.mvs', '-o', 'dense.mvs',
            '--ignore-mask-label', '0', '--resolution-level', '0', '--max-resolution', str(size),
            '--min-resolution', '320', '--number-views', str(neighbors), '--number-views-fuse', str(min_views),
            '--geometric-iters', str(geometric_iters), '--estimate-roi', '0', '--crop-to-roi', '0', '--tower-mode', '0',
@@ -380,14 +388,9 @@ def fuse_with_lidar(lidar_xyz, dense_xyz, *, gap_factor=1.5, min_gap_m=0.03, que
 
 
 def read_dense_ply(path):
-    """xyz, rgb of OpenMVS's dense.ply, whose vertices may carry per-vertex lists (views)."""
-    try:
-        return read_ply(path)
-    except ValueError:
-        return _read_ply_with_lists(path)
+    """(xyz, rgb, views) of OpenMVS's dense.ply; views is (N, V) photo indices, -1 padded, or None.
 
-
-def _read_ply_with_lists(path):
+    Its vertices carry lists (the photos that see each point), so the rows have no fixed size."""
     from raven_app.dense_fusion import _PLY_TYPES
     data = Path(path).read_bytes()
     end = data.index(b'end_header\n') + len(b'end_header\n')
@@ -399,26 +402,54 @@ def _read_ply_with_lists(path):
             count = int(t[2]) if inside else count
         elif t[:1] == ['property'] and inside:
             if t[1] == 'list':
-                lists.append((np.dtype(_PLY_TYPES[t[2]]), np.dtype(_PLY_TYPES[t[3]])))
+                lists.append((t[4], np.dtype(_PLY_TYPES[t[2]]), np.dtype(_PLY_TYPES[t[3]])))
             elif lists:
                 raise ValueError(f'{path}: scalar after a list is not supported')
             else:
                 scalars.append((t[2], _PLY_TYPES[t[1]]))
     head = np.dtype(scalars)
-    rows, pos = np.empty(count, head), end
-    for i in range(count):
-        rows[i] = np.frombuffer(data, head, 1, pos)[0]
-        pos += head.itemsize
-        for n_type, v_type in lists:
-            pos += n_type.itemsize + int(np.frombuffer(data, n_type, 1, pos)[0]) * v_type.itemsize
+    starts = np.empty((len(lists) + 1, count), np.int64)     # of the scalars, then of each list's values
+    if lists:
+        sizes = [(n.itemsize, v.itemsize) for _, n, v in lists]
+        pos, whole, step = end, int.from_bytes, head.itemsize
+        for i in range(count):
+            starts[0, i] = pos
+            pos += step
+            for k, (n_size, v_size) in enumerate(sizes, 1):
+                n = data[pos] if n_size == 1 else whole(data[pos:pos + n_size], 'little')
+                pos += n_size
+                starts[k, i] = pos
+                pos += n * v_size
+    else:
+        starts[0] = end + head.itemsize * np.arange(count)
+    raw = np.frombuffer(data, np.uint8)
+
+    def gather(offsets, size):
+        rows = np.empty((len(offsets), size), np.uint8)
+        for c in range(0, len(offsets), 1_000_000):
+            rows[c:c + 1_000_000] = raw[offsets[c:c + 1_000_000, None] + np.arange(size)]
+        return rows
+
+    rows = gather(starts[0], head.itemsize).view(head)[:, 0] if count else np.empty(0, head)
     xyz = np.column_stack([rows[a] for a in 'xyz']).astype(np.float64)
     rgb = np.column_stack([rows[a] for a in ('red', 'green', 'blue')]) if 'red' in head.names else None
-    return xyz, rgb
+    views = None
+    for k, (name, n_type, v_type) in enumerate(lists, 1):
+        if name == 'view_indices' and count:
+            n = gather(starts[k] - n_type.itemsize, n_type.itemsize).view(n_type)[:, 0].astype(np.int64)
+            views = np.full((count, max(1, int(n.max()))), -1, np.int32)
+            for m in np.unique(n[n > 0]):
+                at = np.flatnonzero(n == m)
+                views[at, :m] = gather(starts[k][at], m * v_type.itemsize).view(v_type)
+    return xyz, rgb, views
 
 
 def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mode='fused', use_lidar=True,
-                    seed_voxel_m=0.06, keep_work=False, log=print):
+                    mesh=None, seed_voxel_m=0.06, keep_work=False, log=print):
     """Dense photogrammetry of a 3DGS export. Never changes the export's own files. Returns the report.
+
+    `mesh` ('glb', 'obj', or 'ply' for a surface without texture) also meshes the cloud (openmvs_mesh); a mesh
+    that fails is reported and leaves the clouds in place.
 
     use_lidar=False still needs the LiDAR poses but gives OpenMVS only a coarse seed (0.5 m), enough to
     choose the neighbour photos: the depths then come from the photos alone.
@@ -428,6 +459,9 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
     if mode not in MODES:
         raise ValueError(f'mode must be one of {", ".join(MODES)}')
     binary = check_binary(binary)
+    if mesh:
+        from raven_app import openmvs_mesh
+        openmvs_mesh.check_programs(binary, mesh)            # before the long run, not after it
     colmap_dir = Path(colmap_dir)
     out = Path(out_dir) if out_dir else colmap_dir / 'dense_openmvs'
     work = out / 'work'
@@ -465,7 +499,7 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
     if not seeded:
         raise RuntimeError('no LiDAR point is seen by two photos; check the poses and masks of the export')
     lap('lidar_guidance')
-    dense_xyz, dense_rgb = read_dense_ply(run_openmvs(binary, work, size, log=log))
+    dense_xyz, dense_rgb, dense_views = read_dense_ply(run_openmvs(binary, work, size, log=log))
     lap('openmvs')
     if not len(dense_xyz):
         raise RuntimeError('OpenMVS reconstructed no point')
@@ -477,14 +511,26 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
               'lidar_points': int(len(lidar_xyz)), 'photo_points': int(len(dense_xyz)),
               'photo_cloud': str(out / 'dense_photo.ply'),
               'accuracy_vs_lidar': accuracy_vs_lidar(lidar_xyz, dense_xyz)}
+    keep = fuse_with_lidar(lidar_xyz, dense_xyz) if mode == 'fused' else np.zeros(0, np.int64)
     if mode == 'fused':
-        keep = fuse_with_lidar(lidar_xyz, dense_xyz)
         write_ply(out / 'dense_fused.ply', np.vstack([dense_xyz, lidar_xyz[keep]]),
                   np.vstack([dense_rgb, lidar_rgb[keep]]))
         report.update(lidar_points_added=int(len(keep)), fused_cloud=str(out / 'dense_fused.ply'))
     lap('fusion')
     report['seconds'] = timing
     (out / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+    if mesh:
+        try:
+            gap_views = lidar_views(lidar_xyz[keep], images, masks, occluder, max_views=MESH_LIDAR_VIEWS, log=log)
+            report['mesh'] = openmvs_mesh.build_mesh(
+                binary, work, out, size, images, np.vstack([dense_xyz, lidar_xyz[keep]]),
+                np.vstack([dense_rgb, lidar_rgb[keep]]), stack_views(dense_views, gap_views), fmt=mesh,
+                lidar_xyz=lidar_xyz, log=log)
+        except Exception as exc:
+            report['mesh'] = {'error': str(exc)}
+            log(f'[!] The mesh was not built: {exc}')
+        lap('mesh')
+        (out / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     if not keep_work:
         shutil.rmtree(work, ignore_errors=True)
     acc = report['accuracy_vs_lidar']
@@ -492,4 +538,6 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
         + (f", {report['lidar_points_added']:,} of the {len(lidar_xyz):,} LiDAR points added where the photos have none" if mode == 'fused' else '')
         + (f"; median {acc['median_m'] * 100:.1f} cm from the LiDAR surface" if acc.get('compared') else '')
         + f". Saved in {out}")
+    if report.get('mesh', {}).get('faces'):
+        log(f"[+] Mesh: {report['mesh']['faces']:,} triangles, {report['mesh']['area_m2']:,.0f} m2")
     return report
