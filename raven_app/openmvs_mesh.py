@@ -26,6 +26,7 @@ TEXTURE_SIZE = 8192
 POINT_SPACING = 1.5 / 1024          # of the photo width: closer points share a vertex, a few cm on a facade
 SPURIOUS = 5                       # drops triangles longer than 5x the 95th percentile edge, and small loose parts
 MAX_EDGE_M = 1.0                   # longer triangles bridge openings and the sky line
+MIN_PART = 100                     # triangles; smaller loose parts float in the air
 EMPTY_COLOR = 0x808080             # triangles no photo shows
 MAX_FACES = 8_000_000              # a larger mesh is simplified before it is textured, which flips a few thin triangles
 
@@ -99,11 +100,18 @@ def write_mesh_ply(path, vertices, faces):
         f.write(block.tobytes())
 
 
-def drop_long_faces(vertices, faces, max_edge):
-    """The mesh without its triangles longer than `max_edge` m and without the vertices only they used."""
+def clean_mesh(vertices, faces, max_edge, min_part=1):
+    """The mesh without its triangles longer than `max_edge` m and then without its loose parts of fewer than
+    `min_part` triangles; vertices no triangle uses go too."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
     longest = np.max([np.linalg.norm(vertices[faces[:, a]] - vertices[faces[:, b]], axis=1)
                       for a, b in ((0, 1), (1, 2), (2, 0))], axis=0)
     faces = faces[longest <= max_edge]
+    edges = np.vstack([faces[:, :2], faces[:, 1:]])
+    part = connected_components(coo_matrix((np.ones(len(edges), bool), (edges[:, 0], edges[:, 1])),
+                                           shape=(len(vertices), len(vertices))), directed=False)[1][faces[:, 0]]
+    faces = faces[np.bincount(part, minlength=1)[part] >= min_part]
     used, index = np.unique(faces, return_inverse=True)
     return vertices[used], index.reshape(-1, 3)
 
@@ -180,7 +188,7 @@ def build_mesh(binary, work, out, size, images, xyz, rgb, views, *, fmt='glb', m
     run_step(reconstruct, work, ['-i', 'mesh_scene.mvs', '-o', 'mesh.ply', '--export-type', 'ply',
                                  '--min-point-distance', f'{POINT_SPACING * size:.2f}', '--max-edge-scale', '0',
                                  '--remove-spurious', SPURIOUS], surface, log)
-    vertices, faces = drop_long_faces(*read_mesh_ply(surface), MAX_EDGE_M)
+    vertices, faces = clean_mesh(*read_mesh_ply(surface), MAX_EDGE_M, MIN_PART)
     if not len(faces):
         raise RuntimeError('OpenMVS reconstructed no surface')
     write_mesh_ply(surface, vertices, faces)

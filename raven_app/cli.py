@@ -393,6 +393,10 @@ def parse(argv=None):
     dense.add_argument('--mesh', choices=('glb', 'obj', 'ply'), default=None,
                        help='Also build a surface mesh. glb/obj: textured from the fisheye photos; ply: without texture')
     dense.add_argument('--no-lidar', action='store_true', help='Use the scan only to choose neighbour photos, not to guide the depths')
+    dense.add_argument('--no-refine', action='store_true',
+                       help="Use the export's poses and lenses as they are; do not align the photos and remove their rolling shutter first")
+    dense.add_argument('--run', type=Path, default=None,
+                       help='Run folder with the feature tracks and the trajectory (default: the folder that holds --colmap)')
     dense.add_argument('--keep-work', action='store_true', help='Keep the resampled photos and OpenMVS files')
     photo = sub.add_parser('photogrammetry-export',
                            help='Export the fisheye photos, masks, poses and LiDAR for RealityScan or Metashape (optional, not bundled)')
@@ -901,7 +905,8 @@ def run(a):
         from raven_app.config import get_openmvs_bin
         from raven_app.openmvs_dense import densify_openmvs
         report = densify_openmvs(a.colmap.resolve(), a.openmvs or get_openmvs_bin(), out_dir=a.output, quality=a.quality,
-                                 mode=a.mode, use_lidar=not a.no_lidar, mesh=a.mesh, keep_work=a.keep_work)
+                                 mode=a.mode, use_lidar=not a.no_lidar, mesh=a.mesh, refine=not a.no_refine,
+                                 run_dir=a.run, keep_work=a.keep_work)
         print(json.dumps(report, indent=2))
         return 0
     if a.command == 'photogrammetry-export':

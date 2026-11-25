@@ -15,8 +15,15 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Textured mesh** of that dense cloud (`--mesh glb`, or the *Textured mesh* box): OpenMVS turns the photo points
   and the LiDAR points that fill their gaps into a surface, and copies its texture from the fisheye photos. The
   report gives its distance to the LiDAR. `mesh.ply` and a self-contained `mesh_textured.glb` are written.
-  On the test walk, at the default quality: 4.0 million triangles, median 1.0 cm from the LiDAR and 93 % of the
-  LiDAR within 10 cm of the surface (79 % of the LiDAR points hidden from the run), for about 9 more minutes.
+  On the test walk (278 photos), at the default quality: 6.5 million triangles, median 0.3 cm from the LiDAR and 94 %
+  of the LiDAR within 10 cm of the surface. The whole run takes about 32 minutes, 16 of them for the mesh.
+- **The photos are aligned before they are matched:** the rolling shutter of each lens is measured and removed, and
+  the poses, lenses and lever arms are adjusted to the feature tracks and the LiDAR planes. It is used only if tracks
+  kept out of it fit better (test walk: 1.73 to 0.73 px, rolling shutter 28.9 and 28.5 ms, one more minute). The photo
+  cloud went from 12 to 42 million points, and from 0.9 to 0.2 cm (median) from the LiDAR. The alignment also uses that
+  LiDAR, so only the track error is an independent check. `--no-refine` turns it off. The 3DGS export keeps its poses.
+- **The sky is masked** in the photos of the dense cloud and the mesh, so it no longer fills rooflines or bleeds into
+  facades, and loose mesh parts of fewer than 100 triangles are removed.
 - It needs an NVIDIA GPU and a patched OpenMVS that you build yourself (`third_party/openmvs`). It is not bundled.
 - **Open in RealityScan / Metashape:** optional exports of the photos, masks, poses and LiDAR for people who own those
   programs. Opening RealityScan selects its Division lens, which RealityScan may keep as its own setting.

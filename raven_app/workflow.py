@@ -4108,7 +4108,7 @@ def execute_unified_workflow(
             colmap_dir = Path(colmap_export_dir) if colmap_export_dir else output_dir / 'colmap_3dgs'
             try:
                 run_record['densification'] = densify_openmvs(colmap_dir, get_openmvs_bin(), quality=dense_quality,
-                                                                  mesh=dense_mesh)
+                                                                  mesh=dense_mesh, run_dir=output_dir)
             except Exception as exc:
                 run_record['densification'] = {'status': 'failed', 'reason': str(exc)}
                 print(f"[!] OpenMVS dense photogrammetry failed ({exc}); the other deliverables are unchanged.")

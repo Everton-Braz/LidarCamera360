@@ -30,6 +30,7 @@ import numpy as np
 
 from raven_app.dense_fusion import _voxel_thin, read_ply, write_ply
 
+SKY_SIZE = 416                                   # px of the working copy in which the sky is searched
 FISHEYE_FOV = 3.5                  # radians across the image width; the same constant is in the patch
 PATCH_MARK = b'LC360-FISHEYE-3.5'  # string the patched DensifyPointCloud carries
 MAX_THETA = 1.5                    # rays farther from the axis are masked: the rim is blurred and flared
@@ -177,22 +178,79 @@ def find_mask(colmap_dir, name):
     return None
 
 
+def sky_mask(photo, R, C, surface, rays, theta):
+    """Sky pixels of a fisheye photo (n,n,3): bright, colourless or blue, above the horizon and where no LiDAR return
+    lies, connected to a patch far from every return. Left in, it fills the gaps of rooflines and bleeds into walls.
+
+    `rays`, `theta` are equidistant_rays(SKY_SIZE); `surface` are LiDAR points with z up."""
+    import cv2
+    n, s = photo.shape[0], SKY_SIZE
+    none = np.zeros((n, n), bool)
+    d = surface - C
+    px, angle = equidistant_project(d[:, 0:1] * R[:, 0] + d[:, 1:2] * R[:, 1] + d[:, 2:3] * R[:, 2], s)
+    q = np.rint(px).astype(np.int64)
+    ok = (angle < MAX_THETA + 0.1) & (q >= 0).all(axis=1) & (q < s).all(axis=1)
+    hit = np.zeros((s, s), np.uint8)
+    hit[q[ok, 1], q[ok, 0]] = 1
+    hit = cv2.morphologyEx(hit, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    up = (rays[:, 0] * R[0, 2] + rays[:, 1] * R[1, 2] + rays[:, 2] * R[2, 2]).reshape(s, s)
+    inside = theta < MAX_THETA
+    far = inside & (up > 0.25) & (cv2.dilate(hit, np.ones((15, 15), np.uint8)) == 0)
+    if not ok.any() or far.sum() < 50:
+        return none
+    small = cv2.resize(photo, (s, s), interpolation=cv2.INTER_AREA).astype(np.int16)
+    bright = 0.6 * np.median(small.max(axis=2)[far])
+
+    def skyish(image):
+        b, g, r = (image[..., k].astype(np.int16) for k in range(3))
+        return (np.maximum(np.maximum(b, g), r) > bright) & (b >= r - 8) & (b >= g - 12)
+
+    luma, looks = small.astype(np.float32).mean(axis=2), skyish(small)
+    smooth = np.hypot(cv2.Sobel(luma, cv2.CV_32F, 1, 0, scale=0.25), cv2.Sobel(luma, cv2.CV_32F, 0, 1, scale=0.25)) < 12
+
+    def connected(allowed, seeds):
+        count, label = cv2.connectedComponents(allowed.astype(np.uint8), connectivity=4)
+        use = np.zeros(count, bool)
+        use[np.unique(label[seeds & allowed])] = True
+        return use[label] & allowed
+
+    above = inside & (up > 0.05) & looks
+    sky = connected(above & (hit == 0), far & smooth)
+    if not sky.any():
+        return none
+    # stray returns (reflections in glass) also lie in front of the sky: next to it, smooth blue is sky
+    blue = above & smooth & (small[..., 0] > small[..., 2] + 30)
+    sky = connected(sky | (blue & (cv2.dilate(sky.astype(np.uint8), np.ones((31, 31), np.uint8)) > 0)), sky)
+    # one coarse pixel wider, then cut at the real edge of the roof
+    wide = cv2.dilate(sky.astype(np.uint8), np.ones((3, 3), np.uint8))
+    return (cv2.resize(wide, (n, n), interpolation=cv2.INTER_NEAREST) > 0) & skyish(photo)
+
+
 def prepare_images(colmap_dir, cameras, images, size, work, threads=8, log=print, *, rays_of=equidistant_rays,
-                   focal=None, names=None, mask_dir='masks', mask_name='{}.mask.png'):
+                   focal=None, names=None, mask_dir='masks', mask_name='{}.mask.png', shutter=None, surface=None):
     """Write work/images/NNNNN.jpg + work/masks/NNNNN.mask.png (255 = use, 0 = ignore).
 
+    With `surface` (LiDAR points) the sky is masked too (equidistant photos only), and `shutter` (photo_refine)
+    also removes the rolling shutter, for a scene at those points.
     Returns the masks at VIS_SIZE, for lidar_views."""
-    names = names or [f'{i:05d}' for i in range(len(images))]
     import cv2
+    from raven_app import photo_refine
+    names = names or [f'{i:05d}' for i in range(len(images))]
     (work / 'images').mkdir(parents=True, exist_ok=True)
     (work / mask_dir).mkdir(parents=True, exist_ok=True)
     maps = {cid: build_remap(*cameras[cid], size, rays_of) for cid in {i[1] for i in images}}
     # photos finer than the working size are shrunk first, or the resampling would skip pixels
     shrink = {cid: min(1.0, (focal or size / FISHEYE_FOV) / cameras[cid][3][0]) for cid in maps}
+    sky_rays = equidistant_rays(SKY_SIZE) if surface is not None and rays_of is equidistant_rays else None
+
+    skies = np.zeros(len(images))
 
     def one(index):
         name, cid, _, _ = images[index]
         mx, my, inside = maps[cid]
+        if shutter is not None and shutter[index] is not None:
+            mx, my, inside = photo_refine.shutter_maps(cameras[cid], size, rays_of, maps[cid], shutter[index],
+                                                       photo_refine.inverse_range(surface, *images[index][2:]))
         photo, s = _read_image(colmap_dir / 'images' / name, cv2.IMREAD_COLOR), shrink[cid]
         h, w = photo.shape[:2]
         if (w, h) != (cameras[cid][1], cameras[cid][2]):
@@ -209,6 +267,10 @@ def prepare_images(colmap_dir, cameras, images, size, work, threads=8, log=print
             if mask.shape != (h, w):
                 mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
             keep = keep & (cv2.remap(mask, mx, my, cv2.INTER_NEAREST, borderValue=0) > 127)
+        if sky_rays is not None:
+            sky = sky_mask(out, *images[index][2:], surface, *sky_rays)
+            keep = keep & ~sky
+            skies[index] = sky.sum() / max(1, inside.sum())
         # the matching window must not straddle a person and the wall behind it
         keep = cv2.erode(keep.astype(np.uint8), np.ones((5, 5), np.uint8), borderValue=0)
         out[~inside] = 0
@@ -218,7 +280,8 @@ def prepare_images(colmap_dir, cameras, images, size, work, threads=8, log=print
 
     with ThreadPoolExecutor(threads) as pool:
         masks = list(pool.map(one, range(len(images))))
-    log(f'[+] {len(images)} fisheye photos prepared at {size}x{size} px (one resampling, no pinhole faces)')
+    log(f'[+] {len(images)} fisheye photos prepared at {size}x{size} px (one resampling, no pinhole faces)'
+        + (f'; {100 * skies.mean():.0f} % of them is sky, left out' if skies.any() else ''))
     return masks
 
 
@@ -445,8 +508,11 @@ def read_dense_ply(path):
 
 
 def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mode='fused', use_lidar=True,
-                    mesh=None, seed_voxel_m=0.06, keep_work=False, log=print):
+                    refine=True, run_dir=None, mesh=None, seed_voxel_m=0.06, keep_work=False, log=print):
     """Dense photogrammetry of a 3DGS export. Never changes the export's own files. Returns the report.
+
+    `refine` first aligns the photos to a fraction of a pixel and removes their rolling shutter (photo_refine);
+    it reads the feature tracks and the trajectory of the run in `run_dir` (the export's parent folder).
 
     `mesh` ('glb', 'obj', or 'ply' for a surface without texture) also meshes the cloud (openmvs_mesh); a mesh
     that fails is reported and leaves the clouds in place.
@@ -483,16 +549,22 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
     if need > free:
         raise RuntimeError(f'dense photogrammetry at {quality} quality needs about {need / 1e9:.0f} GB of disk and '
                            f'{free / 1e9:.0f} GB are free in {out}; choose a lower quality or free some space')
-    masks = prepare_images(colmap_dir, cameras, images, size, work, log=log)
-    lap('images')
     seed = find_lidar_seed(colmap_dir)
     if seed is None:
         raise FileNotFoundError(f'{colmap_dir} has no LiDAR seed (points3D.ply)')
     lidar_xyz, lidar_rgb = read_ply(seed)
     if lidar_rgb is None:
         lidar_rgb = np.full((len(lidar_xyz), 3), 128, np.uint8)
-    pick = _voxel_thin(lidar_xyz, seed_voxel_m if use_lidar else 0.5)
     occluder = lidar_xyz[_voxel_thin(lidar_xyz, 0.04)]
+    shutter = alignment = None
+    if refine:
+        from raven_app.photo_refine import refine_photos
+        cameras, images, shutter, alignment = refine_photos(colmap_dir, cameras, images, run_dir=run_dir,
+                                                            lidar_xyz=lidar_xyz, log=log)
+        lap('photo_alignment')
+    masks = prepare_images(colmap_dir, cameras, images, size, work, log=log, shutter=shutter, surface=occluder)
+    lap('images')
+    pick = _voxel_thin(lidar_xyz, seed_voxel_m if use_lidar else 0.5)
     views = lidar_views(lidar_xyz[pick], images, masks, occluder, log=log)
     seeded = write_mvs(work / 'scene.mvs', size, images, lidar_xyz[pick], lidar_rgb[pick], views)
     log(f'[+] LiDAR guidance: {seeded:,} points seen by 2 or more photos')
@@ -509,7 +581,7 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
     report = {'engine': 'OpenMVS (fisheye build)', 'quality': quality, 'image_width': size, 'mode': mode,
               'lidar_guided': bool(use_lidar), 'photos': len(images), 'seed_points': seeded,
               'lidar_points': int(len(lidar_xyz)), 'photo_points': int(len(dense_xyz)),
-              'photo_cloud': str(out / 'dense_photo.ply'),
+              'photo_cloud': str(out / 'dense_photo.ply'), 'photo_alignment': alignment or {'status': 'off'},
               'accuracy_vs_lidar': accuracy_vs_lidar(lidar_xyz, dense_xyz)}
     keep = fuse_with_lidar(lidar_xyz, dense_xyz) if mode == 'fused' else np.zeros(0, np.int64)
     if mode == 'fused':

@@ -149,10 +149,14 @@ def test_mesh_ply_round_trip_and_distance_to_the_lidar(tmp_path):
     assert report['lidar_covered']['within_5cm'] > 0.99
 
 
-def test_long_triangles_are_removed():
-    vertices = np.array([[0, 0, 0], [0.1, 0, 0], [0, 0.1, 0], [5, 5, 0]], float)
-    v, f = om.drop_long_faces(vertices, np.array([[0, 1, 2], [1, 2, 3]]), 0.3)
-    assert f.tolist() == [[0, 1, 2]] and len(v) == 3
+def test_long_triangles_and_small_loose_parts_are_removed():
+    vertices = np.array([[0, 0, 0], [0.1, 0, 0], [0, 0.1, 0], [5, 5, 0], [0.1, 0.1, 0], [3, 3, 0], [3.1, 3, 0], [3, 3.1, 0]])
+    faces = np.array([[0, 1, 2], [1, 2, 3], [1, 4, 2], [5, 6, 7]])
+    v, f = om.clean_mesh(vertices, faces, 0.3)
+    assert len(f) == 3 and len(v) == 7
+    v, f = om.clean_mesh(vertices, faces, 0.3, min_part=2)
+    assert f.tolist() == [[0, 1, 2], [1, 3, 2]] and len(v) == 4
+    assert all(len(a) == 0 for a in om.clean_mesh(vertices, faces, 0.01, min_part=2))
 
 
 def test_a_glb_holds_its_own_texture(tmp_path):
@@ -183,6 +187,7 @@ def openmvs(tmp_path, monkeypatch):
     """Marked stand-ins for the three programs, and what they would write."""
     folder = tmp_path / 'openmvs'
     folder.mkdir()
+    monkeypatch.setattr(om, 'MIN_PART', 1)       # WALL has two triangles
     for name in ('DensifyPointCloud', 'ReconstructMesh', 'TextureMesh'):
         (folder / f'{name}.exe').write_bytes(od.PATCH_MARK)
 
@@ -218,6 +223,36 @@ def test_dense_run_also_writes_the_mesh(colmap, openmvs):
     assert json.loads((out / 'report.json').read_text())['mesh']['faces'] == 2 and not (out / 'work').exists()
 
 
+def test_the_aligned_photos_go_to_the_matching_without_their_shutter(colmap, openmvs, monkeypatch):
+    from raven_app import photo_refine
+    before = {p: p.read_bytes() for p in (colmap / 'sparse').rglob('*') if p.is_file()}
+    motion = (np.array([0.0, 0.03]), np.array([0.0, 2.0, 0.0]), np.zeros(3))
+    seen = {}
+
+    def aligned(folder, cameras, images, *, run_dir, lidar_xyz, log):
+        seen.update(run_dir=run_dir, points=len(lidar_xyz))
+        moved = [(n, c, R, C + [0, 0, 0.01]) for n, c, R, C in images]
+        return cameras, moved, [motion] * len(images), {'status': 'accepted'}
+
+    def scene(path, size, images, *args):
+        seen['centre'] = images[1][3]
+        return write(path, size, images, *args)
+
+    write = od.write_mvs
+    monkeypatch.setattr(photo_refine, 'refine_photos', aligned)
+    monkeypatch.setattr(od, 'write_mvs', scene)
+    report = od.densify_openmvs(colmap, openmvs, quality='draft', run_dir=colmap / 'run', keep_work=True, log=lambda *_: None)
+    assert report['photo_alignment'] == {'status': 'accepted'}
+    assert seen['run_dir'] == colmap / 'run' and seen['points'] == 1600
+    np.testing.assert_allclose(seen['centre'], [0.5, 0, 0.01])
+    moved = cv2.imread(str(colmap / 'dense_openmvs' / 'work' / 'masks' / '00000.mask.png'), 0)
+    report = od.densify_openmvs(colmap, openmvs, quality='draft', refine=False, keep_work=True, log=lambda *_: None)
+    assert report['photo_alignment'] == {'status': 'off'}
+    still = cv2.imread(str(colmap / 'dense_openmvs' / 'work' / 'masks' / '00000.mask.png'), 0)
+    assert (moved != still).any()             # the mask moves with its photo
+    assert before == {p: p.read_bytes() for p in (colmap / 'sparse').rglob('*') if p.is_file()}
+
+
 def test_a_failed_mesh_keeps_the_dense_cloud(colmap, openmvs, monkeypatch):
     def broken(*_):
         raise RuntimeError('out of memory')
@@ -237,3 +272,37 @@ def test_a_mesh_without_its_programs_stops_before_the_long_run(colmap, openmvs):
 
 def test_views_of_two_clouds_are_stacked():
     assert od.stack_views(np.array([[1, 2]]), np.array([[3, -1, -1]])).tolist() == [[1, 2, -1], [3, -1, -1]]
+
+
+def _street(size=600, wall=(235, 235, 235)):
+    """A fisheye photo of a pale wall under a blue sky, and the wall's LiDAR points (camera level, z up)."""
+    R = np.array([[1.0, 0, 0], [0, 0, -1], [0, 1, 0]])       # looks along +y
+    rays = od.equidistant_rays(size)[0] @ R
+    t = 5 / np.maximum(rays[:, 1], 1e-6)
+    built = ((rays * t[:, None])[:, 2] < 3) & (rays[:, 1] > 0.02)
+    ground = rays[:, 2] < 0
+    photo = np.full((size * size, 3), (250, 210, 160), np.uint8)
+    photo[built] = wall
+    photo[ground] = (90, 95, 100)
+    x, z = (a.ravel() for a in np.meshgrid(np.arange(-40, 40, 0.06), np.arange(-1.5, 3, 0.06)))
+    return photo.reshape(size, size, 3), built.reshape(size, size), R, np.column_stack([x, np.full(x.size, 5.0), z])
+
+
+def test_the_sky_is_masked_and_a_pale_wall_is_not():
+    photo, built, R, surface = _street()
+    rays, theta = od.equidistant_rays(od.SKY_SIZE)
+    sky = od.sky_mask(photo, R, np.zeros(3), surface, rays, theta)
+    inside = od.equidistant_rays(600)[1] < 1.35
+    up = (od.equidistant_rays(600)[0] @ R)[:, 2].reshape(600, 600)
+    open_sky = inside & ~built & (up > 0.1)
+    assert sky[open_sky].mean() > 0.97 and sky[inside & built].mean() < 0.02
+    assert not sky[up < 0].any()
+
+
+def test_no_sky_is_claimed_where_the_lidar_sees_everything_or_nothing():
+    photo, _, R, surface = _street()
+    rays, theta = od.equidistant_rays(od.SKY_SIZE)
+    x, y = (a.ravel() for a in np.meshgrid(np.arange(-20, 20, 0.05), np.arange(-20, 20, 0.05)))
+    ceiling = np.column_stack([x, y, np.full(x.size, 2.0)])
+    assert not od.sky_mask(photo, R, np.zeros(3), np.vstack([surface, ceiling]), rays, theta).any()
+    assert not od.sky_mask(photo, R, np.zeros(3), np.zeros((0, 3)), rays, theta).any()
