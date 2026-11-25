@@ -8,6 +8,18 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### 🎯 Photo alignment for the colours and the 3DGS export
+- **The fisheye photos are aligned and their rolling shutter is removed before the cloud is coloured and before the
+  3DGS export.** The poses, lenses, lever arms and rolling shutter of the photos are adjusted to the SfM tracks and the
+  LiDAR planes. It is used only if tracks kept out of it fit better; otherwise the run goes on as before. On the test
+  walk (278 photos) the tracks went from 2.84 to 0.73 px, for about two more minutes.
+- **3DGS:** after 7000 steps, the held-out photos of the test walk went from 19.6 to 23.7 dB (SSIM 0.53 to 0.74,
+  people masked out), against the bundle-adjusted export. The export is already aligned, so *Dense photogrammetry*
+  does not align it again.
+- **Coloured cloud:** the photos agree better on the points (62 % of the variance of the detail is the point's, was
+  28 %), and signs are easier to read. The number of points and their place do not change.
+- `--no-photo-alignment` (workflow) turns it off; `colorize --photo-alignment` turns it on for that command.
+
 ### 📷 Dense photogrammetry (optional)
 - **Dense point cloud from the fisheye photos** with OpenMVS, at the LiDAR poses. Photos are not split into pinhole
   faces: each is resampled once to an ideal fisheye. The output is a photo cloud and a cloud that fills its gaps with
@@ -21,7 +33,11 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   the poses, lenses and lever arms are adjusted to the feature tracks and the LiDAR planes. It is used only if tracks
   kept out of it fit better (test walk: 1.73 to 0.73 px, rolling shutter 28.9 and 28.5 ms, one more minute). The photo
   cloud went from 12 to 42 million points, and from 0.9 to 0.2 cm (median) from the LiDAR. The alignment also uses that
-  LiDAR, so only the track error is an independent check. `--no-refine` turns it off. The 3DGS export keeps its poses.
+  LiDAR, so only the track error is an independent check. `--no-refine` turns it off.
+- **Normal maps smooth the mesh** when the photos have them, as Spirula Studio writes them with MoGe2 (`--normals`, by
+  default the `normals` folder of the export; `--no-normals` turns it off). Where three or more photos agree, triangles
+  turn to the normal and no point of the surface moves more than 1 cm: on the test walk the surface went from 2.5 to
+  1.2 degrees (median) from the LiDAR planes, at the same distance to the LiDAR. It takes about four more minutes.
 - **The sky is masked** in the photos of the dense cloud and the mesh, so it no longer fills rooflines or bleeds into
   facades, and loose mesh parts of fewer than 100 triangles are removed.
 - It needs an NVIDIA GPU and a patched OpenMVS that you build yourself (`third_party/openmvs`). It is not bundled.

@@ -223,6 +223,42 @@ def test_dense_run_also_writes_the_mesh(colmap, openmvs):
     assert json.loads((out / 'report.json').read_text())['mesh']['faces'] == 2 and not (out / 'work').exists()
 
 
+@pytest.mark.parametrize('normals, uses', [(None, 'normals'), (False, None), ('mine', 'mine')])
+def test_the_mesh_uses_the_normal_maps_of_the_photos(colmap, openmvs, monkeypatch, normals, uses):
+    from raven_app import mesh_normals
+    for folder in ('normals', 'mine'):
+        for image in od.read_colmap_text(colmap / 'sparse' / '0')[1]:
+            path = mesh_normals.normal_map_path(colmap / folder, image[0])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'')
+    given = []
+
+    def smooth(vertices, faces, cameras, images, masks, folder, *, log):
+        given.append(folder)
+        assert len(masks) == len(images) and masks[0].shape == (od.VIS_SIZE, od.VIS_SIZE)
+        return vertices + [0, 0, 0.001], {'guided_share': 1.0}
+
+    monkeypatch.setattr(mesh_normals, 'smooth_by_normals', smooth)
+    report = od.densify_openmvs(colmap, openmvs, quality='draft', mesh='ply', log=lambda *_: None,
+                                normals=colmap / normals if normals else normals)
+    assert given == ([colmap / uses] if uses else [])
+    vertices = om.read_mesh_ply(colmap / 'dense_openmvs' / 'mesh.ply')[0]
+    assert np.allclose(vertices[:, 2], WALL[0][:, 2] + (0.001 if uses else 0))
+    assert ('normal_maps' in report['mesh']) == bool(uses)
+
+
+def test_a_failed_smoothing_keeps_the_mesh(colmap, openmvs, monkeypatch):
+    from raven_app import mesh_normals
+
+    def fail(*_, **__):
+        raise MemoryError('no room')
+
+    monkeypatch.setattr(mesh_normals, 'find_normals', lambda *_: colmap)
+    monkeypatch.setattr(mesh_normals, 'smooth_by_normals', fail)
+    report = od.densify_openmvs(colmap, openmvs, quality='draft', mesh='ply', log=lambda *_: None)
+    assert report['mesh']['faces'] == 2 and report['mesh']['normal_maps'] == {'error': 'no room'}
+
+
 def test_the_aligned_photos_go_to_the_matching_without_their_shutter(colmap, openmvs, monkeypatch):
     from raven_app import photo_refine
     before = {p: p.read_bytes() for p in (colmap / 'sparse').rglob('*') if p.is_file()}
@@ -250,6 +286,10 @@ def test_the_aligned_photos_go_to_the_matching_without_their_shutter(colmap, ope
     assert report['photo_alignment'] == {'status': 'off'}
     still = cv2.imread(str(colmap / 'dense_openmvs' / 'work' / 'masks' / '00000.mask.png'), 0)
     assert (moved != still).any()             # the mask moves with its photo
+    (colmap / 'colmap_export_report.json').write_text(json.dumps({'pose_source': 'aligned', 'photo_alignment': {'held_out_px': 0.7}}))
+    monkeypatch.setattr(photo_refine, 'refine_photos', lambda *a, **k: pytest.fail('aligned twice'))
+    report = od.densify_openmvs(colmap, openmvs, quality='draft', log=lambda *_: None)
+    assert report['photo_alignment'] == {'held_out_px': 0.7}
     assert before == {p: p.read_bytes() for p in (colmap / 'sparse').rglob('*') if p.is_file()}
 
 

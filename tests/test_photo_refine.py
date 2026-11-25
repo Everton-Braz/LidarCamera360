@@ -34,13 +34,18 @@ def see(points, when, lens):
     return px, (angle < 1.4) & (px > 0).all(axis=1) & (px < SIZE).all(axis=1)
 
 
-@pytest.fixture(scope='module')
-def run(tmp_path_factory):
-    root = tmp_path_factory.mktemp('run')
-    rng = np.random.default_rng(1)
+def room(rng):
+    """Points on two walls and the floor."""
     points = rng.uniform([-9, -5, 0], [9, 5, 4], (900, 3))
     wall = rng.integers(0, 3, len(points))
     points[wall == 0, 1], points[wall == 1, 1], points[wall == 2, 2] = 5, -5, 0
+    return points
+
+
+def make_run(root, upside_down=True):
+    """Tracks, photo times and trajectory of a run with a rolling shutter. Returns the photos (name, camera, R, C)."""
+    rng = np.random.default_rng(1)
+    points = room(rng)
     images, blob, times = [], b'', {}
     for k, when in enumerate(np.arange(1.0, 25.0, 1.0)):
         turn, pos = rig(when)
@@ -48,7 +53,7 @@ def run(tmp_path_factory):
             name = f'cam{lens}/frame_{k:06d}.jpg'
             px, ok = see(points, when, lens)
             px = px[ok] + rng.normal(0, 0.1, (ok.sum(), 2))
-            if lens == 1:                     # this lens is mounted upside down; the tracks are not turned
+            if lens == 1 and upside_down:     # this lens is mounted upside down; the tracks are not turned
                 px = SIZE - px
             rows = np.zeros(ok.sum(), np.dtype([('x', '<f8'), ('y', '<f8'), ('id', '<i8')]))
             rows['x'], rows['y'], rows['id'] = px[:, 0], px[:, 1], np.flatnonzero(ok)
@@ -65,6 +70,13 @@ def run(tmp_path_factory):
     turn, pos = rig(t)
     (root / 'slam_raw_1' / 'result').mkdir(parents=True)
     np.savetxt(root / 'slam_raw_1' / 'result' / 'scan.txt', np.column_stack([t + 1.79e9, pos, turn.as_quat()]), fmt='%.9f')
+    return images
+
+
+@pytest.fixture(scope='module')
+def run(tmp_path_factory):
+    root = tmp_path_factory.mktemp('run')
+    images = make_run(root)
     colmap = root / 'colmap_3dgs'
     colmap.mkdir()
     (colmap / 'colmap_export_report.json').write_text(json.dumps({'dt_sync_seconds': -0.7}))

@@ -508,14 +508,16 @@ def read_dense_ply(path):
 
 
 def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mode='fused', use_lidar=True,
-                    refine=True, run_dir=None, mesh=None, seed_voxel_m=0.06, keep_work=False, log=print):
+                    refine=True, run_dir=None, mesh=None, normals=None, seed_voxel_m=0.06, keep_work=False,
+                    log=print):
     """Dense photogrammetry of a 3DGS export. Never changes the export's own files. Returns the report.
 
     `refine` first aligns the photos to a fraction of a pixel and removes their rolling shutter (photo_refine);
     it reads the feature tracks and the trajectory of the run in `run_dir` (the export's parent folder).
 
     `mesh` ('glb', 'obj', or 'ply' for a surface without texture) also meshes the cloud (openmvs_mesh); a mesh
-    that fails is reported and leaves the clouds in place.
+    that fails is reported and leaves the clouds in place. Normal maps of the photos smooth it (mesh_normals):
+    `normals` is their folder, by default <colmap_dir>/normals when it exists; False uses none.
 
     use_lidar=False still needs the LiDAR poses but gives OpenMVS only a coarse seed (0.5 m), enough to
     choose the neighbour photos: the depths then come from the photos alone.
@@ -544,6 +546,15 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
     images = [i for i in images if (colmap_dir / 'images' / i[0]).is_file()]
     if len(images) < 3:
         raise ValueError(f'{colmap_dir}: {len(images)} registered photos; dense photogrammetry needs at least 3')
+    smooth = None
+    if mesh and normals is not False:
+        from raven_app import mesh_normals
+        maps = mesh_normals.find_normals(colmap_dir, images, normals)
+        if maps is None and normals:
+            raise FileNotFoundError(f'{normals} has no normal maps of the photos of {colmap_dir}')
+        if maps is not None:
+            def smooth(vertices, faces):
+                return mesh_normals.smooth_by_normals(vertices, faces, cameras, images, masks, maps, log=log)
     # depth 4 + normal 12 + confidence 4 + views 4 bytes per pixel, and the photos themselves
     need, free = len(images) * size * size * 26, shutil.disk_usage(work).free
     if need > free:
@@ -557,7 +568,11 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
         lidar_rgb = np.full((len(lidar_xyz), 3), 128, np.uint8)
     occluder = lidar_xyz[_voxel_thin(lidar_xyz, 0.04)]
     shutter = alignment = None
-    if refine:
+    from raven_app.workflow import read_export_report
+    exported = read_export_report(colmap_dir)
+    if exported.get('pose_source') == 'aligned':   # its photos are adjusted and still already
+        alignment = exported.get('photo_alignment')
+    elif refine:
         from raven_app.photo_refine import refine_photos
         cameras, images, shutter, alignment = refine_photos(colmap_dir, cameras, images, run_dir=run_dir,
                                                             lidar_xyz=lidar_xyz, log=log)
@@ -597,7 +612,7 @@ def densify_openmvs(colmap_dir, binary, *, out_dir=None, quality='balanced', mod
             report['mesh'] = openmvs_mesh.build_mesh(
                 binary, work, out, size, images, np.vstack([dense_xyz, lidar_xyz[keep]]),
                 np.vstack([dense_rgb, lidar_rgb[keep]]), stack_views(dense_views, gap_views), fmt=mesh,
-                lidar_xyz=lidar_xyz, log=log)
+                lidar_xyz=lidar_xyz, smooth=smooth, log=log)
         except Exception as exc:
             report['mesh'] = {'error': str(exc)}
             log(f'[!] The mesh was not built: {exc}')

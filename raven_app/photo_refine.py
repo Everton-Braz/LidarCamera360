@@ -11,7 +11,8 @@ per photo can agree with the neighbours. Dense matching turns that into bumpy wa
     the rolling shutter   how late each row (and column) is read; the motion comes from the SLAM trajectory
 
 Part of the tracks never enters the adjustment. The result is used only when those fit better with it, and it is
-never written over the export: `openmvs_dense` resamples its own photos with it (`shutter_maps`).
+never written over the originals: `openmvs_dense` resamples its own photos with it (`shutter_maps`), and
+`photo_alignment` the photos of the point cloud colours and of the 3DGS export (`lens_shutter_maps`).
 Cameras other than fisheyes keep their poses.
 """
 from __future__ import annotations
@@ -111,15 +112,17 @@ def thin_prism_params(model, params):
     return None
 
 
-def photo_motion(run_dir, colmap_dir, names, centres):
+def photo_motion(run_dir, colmap_dir, names, centres, when=None):
     """Angular (rad/s, world axes) and linear (m/s) velocity of each photo's camera, and which photos have one.
 
-    None when the run keeps no photo times or trajectory, or when the trajectory is in another frame."""
+    `when`: {name: seconds after the trajectory's start}; without it, the run's photo times and the export's report
+    give them. None when the run keeps no photo times or trajectory, or when the trajectory is in another frame."""
     from raven_app.project import find_trajectory
     try:
-        times = json.loads((Path(run_dir) / 'images' / 'frames.json').read_text(encoding='utf-8'))['timestamps']
-        report = json.loads((Path(colmap_dir) / 'colmap_export_report.json').read_text(encoding='utf-8'))
-        dt_sync = float(report['dt_sync_seconds'])
+        if when is None:
+            times = json.loads((Path(run_dir) / 'images' / 'frames.json').read_text(encoding='utf-8'))['timestamps']
+            report = json.loads((Path(colmap_dir) / 'colmap_export_report.json').read_text(encoding='utf-8'))
+            when = {n: float(times[n]) - float(report['dt_sync_seconds']) for n in names if n in times}
         rows = np.loadtxt(find_trajectory(Path(run_dir)), ndmin=2)
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -129,7 +132,7 @@ def photo_motion(run_dir, colmap_dir, names, centres):
     keep = np.r_[True, np.diff(t) > 0]
     t, rows = t[keep], rows[keep]
     h = SPEED_STEP_S
-    when = np.array([float(times.get(n, np.nan)) - dt_sync for n in names])
+    when = np.array([when.get(n, np.nan) for n in names], float)
     known = np.isfinite(when) & (when >= t[0] - 1) & (when <= t[-1] + 1)
     if known.sum() < 3:
         return None
@@ -320,21 +323,22 @@ def _tracks(run_dir):
     return {}
 
 
-def refine_photos(colmap_dir, cameras, images, *, run_dir=None, lidar_xyz=None, log=print):
+def refine_photos(colmap_dir, cameras, images, *, run_dir=None, lidar_xyz=None, when=None, log=print):
     """Adjust cameras and poses of a 3DGS export (as `read_colmap_text` gives them) for dense matching.
 
     Returns (cameras, images, shutter, report). `shutter` is None, or for each photo (readout (2,) in seconds
-    over the image height, angular velocity, velocity), both velocities in camera axes. When nothing can be
+    over the image height, angular velocity, velocity), both velocities in camera axes. `when` as for
+    `photo_motion`; without a `colmap_dir` the photos are the run's own, not turned upright. When nothing can be
     adjusted or the held-out tracks do not fit better, the inputs come back with shutter None."""
     try:
-        return _refine(Path(colmap_dir), cameras, images, Path(run_dir) if run_dir else Path(colmap_dir).parent,
-                       lidar_xyz, log)
+        colmap_dir = Path(colmap_dir) if colmap_dir else None
+        return _refine(colmap_dir, cameras, images, Path(run_dir) if run_dir else colmap_dir.parent, lidar_xyz, when, log)
     except Exception as exc:               # an optional improvement: the export's own poses always work
         log(f'[!] Photo alignment failed, the poses of the export are used: {exc}')
         return cameras, images, None, {'status': 'failed', 'reason': str(exc)}
 
 
-def _refine(colmap_dir, cameras, images, run_dir, lidar_xyz, log):
+def _refine(colmap_dir, cameras, images, run_dir, lidar_xyz, when, log):
     def skip(reason):
         log(f'[*] Photo alignment skipped: {reason}')
         return cameras, images, None, {'status': 'skipped', 'reason': reason}
@@ -344,8 +348,8 @@ def _refine(colmap_dir, cameras, images, run_dir, lidar_xyz, log):
     rig = [k for k, i in enumerate(images) if i[1] in lens_ids]
     if not any(images[k][0] in tracks for k in rig):
         return skip('the run keeps no feature tracks of these photos')
-    upright = colmap_dir / 'upright_rotation.json'
-    turned = json.loads(upright.read_text(encoding='utf-8')).get('camera_ids', []) if upright.is_file() else []
+    upright = colmap_dir / 'upright_rotation.json' if colmap_dir else None
+    turned = json.loads(upright.read_text(encoding='utf-8')).get('camera_ids', []) if upright and upright.is_file() else []
     names = [images[k][0] for k in rig]
     R, C = np.array([images[k][2] for k in rig]), np.array([images[k][3] for k in rig])
     lens = np.array([lens_ids.index(images[k][1]) for k in rig])
@@ -364,7 +368,7 @@ def _refine(colmap_dir, cameras, images, run_dir, lidar_xyz, log):
     judge = kept[op] % HOLDOUT == 0
     if len(oi) < 2000 or (~judge).sum() < 1000:
         return skip(f'only {len(oi)} track observations')
-    motion = photo_motion(run_dir, colmap_dir, names, C)
+    motion = photo_motion(run_dir, colmap_dir, names, C, when)
     if motion is None:
         log('[*] No photo times or trajectory: the lens and the poses are adjusted without the rolling shutter')
     w, v = motion[:2] if motion else (np.zeros_like(C), np.zeros_like(C))

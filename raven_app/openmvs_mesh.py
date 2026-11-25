@@ -7,7 +7,8 @@ photos and their masks) and every dense point's photos, which carve the empty sp
     <dense_openmvs>/mesh_textured.glb     the same surface with the photos' texture (or .obj, .mtl, .jpg)
 
 Like the dense step, this needs the patched OpenMVS programs (third_party/openmvs); no photo is cut into
-pinhole faces. The texture of each triangle is copied from one fisheye photo.
+pinhole faces. The texture of each triangle is copied from one fisheye photo. Normal maps of the photos, when
+there are any, smooth the surface first (mesh_normals).
 """
 from __future__ import annotations
 
@@ -177,8 +178,11 @@ def pack_glb(path):
 
 
 def build_mesh(binary, work, out, size, images, xyz, rgb, views, *, fmt='glb', max_faces=MAX_FACES,
-               lidar_xyz=None, log=print):
-    """Mesh points that know their photos; `work` holds images/ and masks/. Returns the report."""
+               lidar_xyz=None, smooth=None, log=print):
+    """Mesh points that know their photos; `work` holds images/ and masks/. Returns the report.
+
+    `smooth(vertices, faces)` returns the vertices to texture and a report of it; if it fails, the mesh stays as it
+    is."""
     reconstruct, texturer = check_programs(binary, fmt)
     work, out, t0 = Path(work), Path(out), time.time()
     used = od.write_mvs(work / 'mesh_scene.mvs', size, images, xyz, rgb, views)
@@ -191,9 +195,17 @@ def build_mesh(binary, work, out, size, images, xyz, rgb, views, *, fmt='glb', m
     vertices, faces = clean_mesh(*read_mesh_ply(surface), MAX_EDGE_M, MIN_PART)
     if not len(faces):
         raise RuntimeError('OpenMVS reconstructed no surface')
-    write_mesh_ply(surface, vertices, faces)
     log(f'[+] Surface: {len(faces):,} triangles')
     report = {'points': int(used), 'seconds': {'surface': round(time.time() - t0, 1)}}
+    if smooth is not None:
+        t0 = time.time()
+        try:
+            vertices, report['normal_maps'] = smooth(vertices, faces)
+        except Exception as exc:
+            report['normal_maps'] = {'error': str(exc)}
+            log(f'[!] The mesh was not smoothed with the normal maps: {exc}')
+        report['seconds']['normal_maps'] = round(time.time() - t0, 1)
+    write_mesh_ply(surface, vertices, faces)
     if lidar_xyz is not None:
         report.update(mesh_vs_lidar(lidar_xyz, vertices, faces))
     shutil.copyfile(surface, out / 'mesh.ply')
