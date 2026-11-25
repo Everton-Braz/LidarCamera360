@@ -16,6 +16,7 @@ from raven_app.georeference import (
     georeference_colmap,
     georeference_pointcloud,
     parse_colmap_images_txt,
+    recorded_dt_sync,
     run_georeference,
 )
 from raven_app.insv_gps import GPS_RECORD, MAGIC
@@ -183,6 +184,39 @@ class GeoReferenceTests(unittest.TestCase):
             without_north = run_georeference(insv, root / "unknown", cloud=cloud, allow_network=False)
             self.assertEqual(without_north["status"], "location_only")
             self.assertEqual(without_north["transform"]["north_status"], "unresolved")
+
+    def test_sync_recorded_with_the_scan_is_found(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cloud = root / "deliverables" / "cloud.ply"
+            trajectory = root / "slam_raw_1" / "result" / "track.txt"
+            find = lambda name="walk.insv": recorded_dt_sync((trajectory, cloud, None), root / name)
+            self.assertIsNone(find())
+            (root / "project.json").write_text(json.dumps({"dt_sync_seconds": 0.0, "runs": []}))
+            self.assertIsNone(find())
+            (root / "rig_calibration.json").write_text(json.dumps({"dt_sync_seconds": -7.5}))
+            self.assertEqual(find(), -7.5)
+            (root / "project.json").write_text(json.dumps(
+                {"dt_sync_seconds": 3.1, "runs": [{"run_id": "a"}], "capture": {"insv": "D:\\x\\Walk.insv"}}))
+            self.assertEqual(find(), 3.1)
+            self.assertIsNone(find("walk_before_trim.insv"))
+
+    def test_run_georeference_times_the_fixes_with_the_recorded_sync(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            local = np.c_[np.arange(12) * 4.0, np.zeros(12), np.zeros(12)]
+            inv = pyproj.Transformer.from_crs('EPSG:32724', 'EPSG:4326', always_xy=True)
+            lon, lat = inv.transform(local[:, 1] + 500000., local[:, 0] + 9590000.)
+            write_insv(root / "walk.insv", make_fixes(range(1000, 1012), zip(lon, lat)))
+            trajectory = root / "slam_raw_1" / "result" / "track.txt"
+            trajectory.parent.mkdir(parents=True)
+            np.savetxt(trajectory, np.c_[np.arange(12) + 48.0, local, np.zeros((12, 3)), np.ones(12)])
+            kwargs = dict(trajectory=trajectory, allow_network=False)
+            unsynced = run_georeference(root / "walk.insv", root / "before", **kwargs)
+            self.assertEqual(unsynced["status"], "review_required")
+            (root / "colmap_to_lidar_alignment.json").write_text(json.dumps({"dt_sync_seconds": 0.0}))
+            synced = run_georeference(root / "walk.insv", root / "after", **kwargs)
+            self.assertEqual((synced["status"], synced["dt_sync_seconds"]), ("accepted", 0.0))
 
     def test_georeference_cli(self):
         with tempfile.TemporaryDirectory() as d:

@@ -44,10 +44,19 @@ North comes from the strongest evidence the capture offers:
 | --- | --- | --- |
 | `--yaw-deg` | Known rotation from local XY to grid E/N, counter-clockwise | `resolved` |
 | `--street-bearing` | True bearing of a street or long wall, measured on a map, matched to the scan's wall directions | `resolved` |
-| GPS fixes matched by time | Needs `--dt-sync`, at least 6 fixes and 10 m of baseline | `resolved` |
+| GPS fixes matched by time | Needs the sync, at least 6 fixes, a walk of 10 m and a heading good to 10° | `resolved` |
+| The same, heading good to 10-20° | The walk is short for the noise of the fixes | `needs_review` |
 | Aerial imagery | The scan's walls registered against Esri World Imagery | `needs_review` |
 | Imagery and GPS within 10° | Both of the above, independently | `resolved` |
 | None of these | The scan is placed on the GPS anchor, its rotation arbitrary | `unresolved` |
+
+The sync (`t_video = t_lidar + dt`) is read from the project around the trajectory or
+cloud when `--dt-sync` is not given, as long as that project was made from the same
+INSV. Fixes a few seconds apart share their error, so a short capture is reported as
+less certain: one fix counts as 5 m, and 60 s must pass
+before another counts as independent. When no fix falls inside the scan, the nearest one
+within 60 s places its start or end. A street bearing resolves the heading only when a
+good GPS track or accepted imagery says which way round the scan is.
 
 Imagery cannot certify itself. In a negative control on `trimtest`, the same walls
 were registered against imagery of 12 wrong places 250-1800 m away, and 7 passed the

@@ -205,7 +205,7 @@ def parse(argv=None):
     geo.add_argument('--crs', help='Projected target CRS (e.g. EPSG:31984, EPSG:32724; default auto-detected UTM/SIRGAS 2000)')
     geo.add_argument('--yaw-deg', type=float, help='Known rotation from local XY to grid E/N, counter-clockwise, in degrees (default: solved from the capture)')
     geo.add_argument('--street-bearing', type=float, help='True bearing of a street or long wall in the scan, measured on a map, in degrees clockwise from north; confirms the heading')
-    geo.add_argument('--dt-sync', type=float, help='Time offset of this dataset, t_video = t_lidar + dt; lets GPS fixes be matched to the trajectory')
+    geo.add_argument('--dt-sync', type=float, help='Time offset of this dataset, t_video = t_lidar + dt; lets GPS fixes be matched to the trajectory (default: what the project around the scan recorded)')
     geo.add_argument('--capture-origin', type=float, help='Seconds into the original capture where a trimmed video starts, when --insv is the untrimmed file (see the .timelapse.json beside the trimmed video)')
     geo.add_argument('--offline', action='store_true', help='Do not download aerial imagery (the request reveals the site location to the imagery provider)')
     geo.add_argument('--shift-e', type=float, default=0.0, help='Delta Easting shift in meters')

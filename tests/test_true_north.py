@@ -109,6 +109,12 @@ class TimeMatchingTests(unittest.TestCase):
         gps['records'] = [{}, {}]
         self.assertEqual(match_fixes_to_trajectory(gps, walk_case()[1], dt_sync=0.0), [])
 
+    def test_a_position_repeated_to_the_last_digit_counts_once(self):
+        gps, trajectory = walk_case()
+        gps['utm_coords'][9] = gps['utm_coords'][2]
+        matches = match_fixes_to_trajectory(gps, trajectory, 0.0)
+        self.assertEqual([m['t'] for m in matches], [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11])
+
     def test_timed_trajectory_reader(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'trajectory.txt'
@@ -138,6 +144,52 @@ class SolveNorthTests(unittest.TestCase):
         self.assertEqual((north['status'], north['method']), ('resolved', 'gps_time_matched_rigid_fit'))
         self.assertLess(angle_diff_deg(north['yaw_grid_deg'], YAW), 0.01)
         self.assertTrue(np.allclose(rotation_2d(north['yaw_grid_deg']) @ [0, 0] + north['translation_en'], ORIGIN))
+
+    def placed(self, north, local):
+        return rotation_2d(north['yaw_grid_deg']) @ local + north['translation_en']
+
+    def test_scan_lies_on_its_fixes_when_the_walk_turns_a_corner(self):
+        # Medians of each frame on their own land off the walk; the fit must not.
+        times = np.arange(60, dtype=np.float64)
+        local = np.where((times < 20)[:, None], np.c_[times * 2.0, times * 0], np.c_[times * 0 + 40, (times - 20) * 2.0])
+        gps = gps_info(local @ rotation_2d(YAW).T + ORIGIN)
+        north = self.solve(gps, trajectory=np.c_[times + 500.0, local, times * 0], dt_sync=0.0)
+        self.assertEqual(north['status'], 'resolved')
+        self.assertTrue(np.allclose(self.placed(north, local[-1]), gps['utm_coords'][-1, :2], atol=1e-6))
+
+    def test_a_manual_heading_keeps_the_scan_centred_on_its_fixes(self):
+        gps, trajectory = walk_case()
+        north = self.solve(gps, trajectory=trajectory, dt_sync=0.0, manual_yaw_deg=YAW + 40.0)
+        self.assertTrue(np.allclose(self.placed(north, trajectory[:, 1:3].mean(axis=0)),
+                                    gps['utm_coords'][:, :2].mean(axis=0), atol=1e-6))
+
+    def test_fixes_seconds_apart_do_not_shrink_the_position_error(self):
+        rng = np.random.default_rng(3)
+        gps, trajectory = walk_case(noise=rng.normal(0, 0.3, (12, 2)))
+        self.assertGreater(self.solve(gps, trajectory=trajectory, dt_sync=0.0)['position_sigma_m'], 4.0)
+
+    def test_a_walk_too_short_for_its_noise_asks_for_review(self):
+        rng = np.random.default_rng(5)
+        gps, trajectory = walk_case(count=30, step_m=0.7, noise=rng.normal(0, 1.0, (30, 2)))
+        north = self.solve(gps, trajectory=trajectory, dt_sync=0.0)
+        self.assertEqual((north['status'], north['method']), ('needs_review', 'gps_time_matched_rigid_fit'))
+        self.assertGreater(north['yaw_sigma_deg'], 10.0)
+        json.dumps(north, allow_nan=False)
+
+    def test_fix_spread_from_noise_is_not_taken_for_a_walk(self):
+        rng = np.random.default_rng(7)
+        gps, trajectory = walk_case(count=40, step_m=0.05, noise=rng.normal(0, 6.0, (40, 2)))
+        self.assertEqual(self.solve(gps, trajectory=trajectory, dt_sync=0.0)['status'], 'unresolved')
+
+    def test_a_fix_just_before_the_scan_places_its_start(self):
+        _, trajectory = walk_case()
+        gps = gps_info([ORIGIN, ORIGIN + 400.0], [1000.0, 1900.0])
+        north = self.solve(gps, trajectory=trajectory, dt_sync=20.0)
+        self.assertEqual(north['evidence']['position'], 'nearest_fix_in_time')
+        self.assertTrue(np.allclose(self.placed(north, trajectory[0, 1:3]), ORIGIN))
+        self.assertGreater(north['position_sigma_m'], 10.0)
+        far = self.solve(gps, trajectory=trajectory, dt_sync=300.0)
+        self.assertEqual(far['evidence']['position'], 'untimed_centroids')
 
     def test_gps_track_without_a_time_sync_asks_for_review(self):
         gps, trajectory = walk_case()
@@ -171,6 +223,16 @@ class SolveNorthTests(unittest.TestCase):
                            street_bearing_deg=street + 1.0)
         self.assertEqual((north['status'], north['method']), ('resolved', 'street_bearing_and_wall_axis'))
         self.assertLess(angle_diff_deg(north['yaw_grid_deg'], YAW - 1.0), 0.5)
+
+    def test_street_bearing_with_only_a_vague_track_asks_for_review(self):
+        gps, trajectory = walk_case(count=4, step_m=1.5)
+        axis = true_bearing_of_axis(0.0, YAW, grid_convergence_deg(-3.77, -38.63, 'EPSG:31984'))
+        kwargs = dict(points=scan_points(), street_bearing_deg=axis, dt_sync=0.0)
+        self.assertEqual(self.solve(gps, trajectory=trajectory, **kwargs)['status'], 'needs_review')
+        gps, trajectory = walk_case()
+        north = self.solve(gps, trajectory=trajectory, **kwargs)
+        self.assertEqual(north['status'], 'resolved')
+        self.assertLess(angle_diff_deg(north['yaw_grid_deg'], YAW), 1.5)
 
     def test_review_image_is_written(self):
         with tempfile.TemporaryDirectory() as d:

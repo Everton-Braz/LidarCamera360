@@ -4,7 +4,7 @@ import struct
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from raven_app.insv_gps import GPS_RECORD, MAGIC, export_gps, extract_gps
+from raven_app.insv_gps import GPS_RECORD, MAGIC, _info_fields, drop_stale_start, export_gps, extract_gps
 
 
 def fix(epoch=1788370677, lat=3.69549376, lon=38.59972568, status=b'A'):
@@ -78,6 +78,19 @@ class InsvGpsTests(unittest.TestCase):
         report = extract_gps(self.path)[2]
         self.assertTrue(report['has_candidate_trajectory'])
         self.assertEqual(report['georeferencing_status'], 'requires_time_sync_and_alignment_validation')
+
+    def test_a_fix_left_from_before_the_recording_is_dropped(self):
+        track = [{'timestamp_epoch': t} for t in (991.0, 1000.0, 1050.0, 1100.0)]
+        self.assertEqual([f['timestamp_epoch'] for f in drop_stale_start(track, 1000.0, 100.0)], [1000.0, 1050.0, 1100.0])
+        # A camera clock that runs ahead makes every fix look early; the track still fits the recording.
+        self.assertEqual(drop_stale_start(track[1:], 1020.0, 100.0), track[1:])
+        self.assertEqual(drop_stale_start(track, None, 100.0), track)
+        self.assertEqual(drop_stale_start(track, 1000.0, None), track)
+
+    def test_info_fields_skip_what_they_do_not_need_and_survive_damage(self):
+        payload = bytes([8, 7]) + bytes([18, 2, 1, 2]) + bytes([0xA0, 2, 0x96, 1]) + bytes([29, 0, 0, 0, 0]) + bytes([80, 5])
+        self.assertEqual(_info_fields(payload, (10, 36)), {36: 150, 10: 5})
+        self.assertEqual(_info_fields(payload[:-1], (10, 36)), {36: 150})
 
 
 if __name__ == '__main__':

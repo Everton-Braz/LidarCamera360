@@ -14,6 +14,8 @@ from pathlib import Path
 import struct
 import xml.etree.ElementTree as ET
 
+from raven_app.insv_telemetry import trailer_record
+
 MAGIC = b"8db42d694ccc418790edff439fe026bf"
 GPS_SIDECAR_SUFFIX = ".gps.json"
 GPS_RECORD = struct.Struct("<IIHcdcdcddd")
@@ -127,6 +129,73 @@ def extract_gps(path):
     return rows, fixes, report
 
 
+def _info_fields(payload, wanted):
+    """Integer fields of the trailer's info record (protobuf); whatever was read before damage is kept."""
+    def varint(i):
+        value = shift = 0
+        while True:
+            byte = payload[i]
+            i += 1
+            value |= (byte & 127) << shift
+            shift += 7
+            if byte < 128:
+                return value, i
+    found, i = {}, 0
+    try:
+        while i < len(payload):
+            key, i = varint(i)
+            field, wire = key >> 3, key & 7
+            if wire == 0:
+                value, i = varint(i)
+                if field in wanted:
+                    found[field] = value
+            elif wire == 2:
+                size, i = varint(i)
+                i += size
+            elif wire in (1, 5):
+                i += 8 if wire == 1 else 4
+            else:
+                break
+    except IndexError:
+        pass
+    return found
+
+
+def capture_clock(path):
+    """(camera epoch at which the recording was created, seconds captured); None for what the INSV does not say."""
+    try:
+        info = trailer_record(path, 1)
+        fields = _info_fields(info, (10, 36, 93)) if info else {}
+        stamps = trailer_record(path, 6)  # a timelapse plays faster than it was captured
+    except (OSError, ValueError):
+        return None, None
+    span = fields[93] / 1000.0 if fields.get(93) else float(fields.get(10, 0))
+    if stamps and len(stamps) >= 16 and len(stamps) % 8 == 0:
+        first, last = struct.unpack('<Q', stamps[:8])[0], struct.unpack('<Q', stamps[-8:])[0]
+        span = (last - first) / 1e6
+    return (fields[36] / 1000.0 if fields.get(36) else None), (span if span > 0 else None)
+
+
+def drop_stale_start(fixes, created_epoch, span_s):
+    """Fixes without the ones the app kept from before this recording.
+
+    The first fix marks the start of the capture, so a leftover one shifts every later fix in time. The
+    GPS and camera clocks can disagree by tens of seconds, hence both signs are needed: a fix from before
+    the recording was created, in a track that lasts longer than the recording itself.
+    """
+    if created_epoch is None or span_s is None:
+        return fixes
+    while (len(fixes) > 1 and fixes[0]['timestamp_epoch'] < created_epoch - 1.0
+           and fixes[-1]['timestamp_epoch'] - fixes[0]['timestamp_epoch'] > span_s + 2.0):
+        fixes = fixes[1:]
+    return fixes
+
+
+def capture_fixes(path):
+    """Fixes of the capture itself, oldest first, from an INSV that still has its trailer."""
+    return drop_stale_start(extract_gps(path)[1], *capture_clock(path))
+
+
 def export_gps(path, output, formats=None):
     """Export selected metadata formats; never infer a cloud transform or clock offset."""
     selected = set(('csv', 'gpx') if formats is None else formats)
@@ -208,7 +277,7 @@ def write_gps_sidecar(source_video: str | Path, output_video: str | Path, start_
     Trimming drops the INSV trailer. A source without GPS is ordinary, so it just leaves no sidecar.
     """
     try:
-        fixes, origin = read_gps_sidecar(source_video) or (extract_gps(source_video)[1], 0.0)
+        fixes, origin = read_gps_sidecar(source_video) or (capture_fixes(source_video), 0.0)
     except (OSError, ValueError):
         return None
     if not fixes:

@@ -52,10 +52,21 @@ PLATEAU_FRACTION = 0.9
 # GPS alone needs this much baseline to mean anything for heading.
 MIN_GPS_INLIERS = 6
 MIN_GPS_EXTENT_M = 10.0
+# A GPS heading this uncertain may still back up another one; only below the second value does it stand alone.
+MAX_GPS_SUPPORT_SIGMA_DEG = 20.0
+MAX_GPS_ALONE_SIGMA_DEG = 10.0
+# Phone-grade GPS errors drift slowly, so fixes a second apart are not separate measurements.
+GPS_FIX_SIGMA_M = 5.0
+GPS_RELATIVE_SIGMA_M = 2.0
+GPS_CORRELATION_S = 60.0
+MIN_POSITION_SIGMA_M = 3.0
 # Two independent headings this close confirm each other.
 GPS_AGREEMENT_DEG = 10.0
 # Position uncertainty when the fixes cannot be paired with the scan by time.
 UNTIMED_ANCHOR_SIGMA_M = 15.0
+# A fix this close in time to the scan's start or end still places it; the operator walks meanwhile.
+MAX_FIX_GAP_S = 60.0
+WALK_DRIFT_MPS = 0.7
 
 
 def wrap_deg(angle: float) -> float:
@@ -95,12 +106,12 @@ def load_timed_trajectory(path: Any) -> Optional[np.ndarray]:
     return rows[:, :4] if rows.shape[1] >= 4 and len(rows) else None
 
 
-def match_fixes_to_trajectory(gps_info: Dict[str, Any], trajectory: np.ndarray, dt_sync: float,
-                              capture_origin_s: float = 0.0) -> List[Dict[str, Any]]:
-    """Pair each GPS fix with the scan position at that moment.
+def _timed_fixes(gps_info: Dict[str, Any], dt_sync: float,
+                 capture_origin_s: float) -> List[Tuple[float, np.ndarray]]:
+    """(seconds since the trajectory's first pose, E,N) of every fix that is a measurement of its own.
 
-    ``t_video = t_lidar + dt_sync`` is the dataset's sync, and the first GPS record
-    is the start of the capture. Fixes outside the trajectory are dropped.
+    ``t_video = t_lidar + dt_sync`` is the dataset's sync, and the first GPS record is the start of the
+    capture. A position repeated to the last digit is the receiver's previous answer, not a new one.
     """
     records = gps_info.get('records') or []
     utm = np.asarray(gps_info.get('utm_coords', []), dtype=np.float64)
@@ -108,16 +119,39 @@ def match_fixes_to_trajectory(gps_info: Dict[str, Any], trajectory: np.ndarray, 
         return []
     epochs = np.array([r['timestamp_epoch'] for r in records], dtype=np.float64)
     origin = float(epochs.min())
+    seen, fixes = set(), []
+    for i in np.argsort(epochs, kind='stable'):
+        position = tuple(utm[i].tolist())
+        if position not in seen:
+            seen.add(position)
+            fixes.append((float(epochs[i] - origin - capture_origin_s - dt_sync), utm[i, :2]))
+    return fixes
+
+
+def match_fixes_to_trajectory(gps_info: Dict[str, Any], trajectory: np.ndarray, dt_sync: float,
+                              capture_origin_s: float = 0.0) -> List[Dict[str, Any]]:
+    """Pair each GPS fix with the scan position at that moment; fixes outside the trajectory are dropped."""
     times = trajectory[:, 0] - trajectory[0, 0]
     matches = []
-    for epoch, fix in zip(epochs, utm):
-        t = float(epoch - origin - capture_origin_s - dt_sync)
+    for t, en in _timed_fixes(gps_info, dt_sync, capture_origin_s):
         if t < -FIX_TIME_MARGIN_S or t > times[-1] + FIX_TIME_MARGIN_S:
             continue
         clamped = min(max(t, 0.0), float(times[-1]))
         local = [float(np.interp(clamped, times, trajectory[:, axis])) for axis in (1, 2)]
-        matches.append({'t': t, 'local_xy': local, 'utm_en': fix[:2].tolist()})
+        matches.append({'t': t, 'local_xy': local, 'utm_en': en.tolist()})
     return matches
+
+
+def _nearest_outside_fix(gps_info: Dict[str, Any], trajectory: np.ndarray, dt_sync: float,
+                         capture_origin_s: float) -> Optional[Dict[str, Any]]:
+    """The fix closest in time before or after the scan, paired with the end of the scan it is next to."""
+    end = float(trajectory[-1, 0] - trajectory[0, 0])
+    best = None
+    for t, en in _timed_fixes(gps_info, dt_sync, capture_origin_s):
+        gap = -t if t < 0 else t - end
+        if best is None or gap < best['gap_s']:
+            best = {'gap_s': float(gap), 'local': trajectory[0 if t < 0 else -1, 1:3].copy(), 'en': en.copy()}
+    return best if best is not None and best['gap_s'] <= MAX_FIX_GAP_S else None
 
 
 def wall_points(points: np.ndarray, *, cell_m: float = 5.0, band_m: Tuple[float, float] = (1.0, 3.0),
@@ -193,6 +227,17 @@ def wall_axes(xy: np.ndarray, *, count: int = 4, trials: int = 3000, inlier_m: f
     return axes
 
 
+def _independent_fixes(matches: List[Dict[str, Any]], keep: np.ndarray) -> float:
+    """How many separate measurements the kept fixes amount to, given how slowly GPS errors drift."""
+    times = np.array([m['t'] for m in matches], dtype=np.float64)[keep]
+    return min(float(len(times)), 1.0 + float(np.ptp(times)) / GPS_CORRELATION_S)
+
+
+def _extent(points: np.ndarray) -> float:
+    """Length of the points' longest direction (four standard deviations)."""
+    return float(4.0 * np.sqrt(max(np.linalg.eigvalsh(np.cov(points.T))[1], 0.0))) if len(points) > 1 else 0.0
+
+
 def _yaw_from_gps_matches(matches: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Rigid 2D fit of matched fixes, kept only when the fixes can determine heading."""
     if len(matches) < 2:
@@ -213,12 +258,16 @@ def _yaw_from_gps_matches(matches: List[Dict[str, Any]]) -> Optional[Dict[str, A
         residual = np.linalg.norm(local @ rot.T + offset - target, axis=1)
         limit = max(3.0 * 1.4826 * float(np.median(np.abs(residual - np.median(residual)))), 2.0)
         inliers = residual <= limit
-    span = target[inliers] - target[inliers].mean(axis=0)
-    extent = float(2.0 * np.sqrt(np.linalg.eigvalsh(np.cov(span.T))[1])) * 2.0 if len(span) > 1 else 0.0
+    # The scan says how far the operator really walked; the fixes also spread by their own noise.
+    extent = min(_extent(local[inliers]), _extent(target[inliers]))
     rms = float(np.sqrt(np.mean(residual[inliers] ** 2)))
+    radius = float(np.sqrt(np.mean(((local[inliers] - local[inliers].mean(axis=0)) ** 2).sum(axis=1))))
+    noise = max(rms, GPS_RELATIVE_SIGMA_M) / math.sqrt(_independent_fixes(matches, inliers))
+    sigma = float(min(math.degrees(noise / max(radius, 0.1)), 180.0))
     return {'yaw_grid_deg': yaw, 'inliers': int(inliers.sum()), 'fixes': len(matches), 'extent_m': extent,
-            'rms_m': rms, 'sigma_deg': float(math.degrees(rms / max(extent, 0.1))),
-            'qualifies': bool(inliers.sum() >= MIN_GPS_INLIERS and extent >= MIN_GPS_EXTENT_M)}
+            'rms_m': rms, 'sigma_deg': sigma,
+            'qualifies': bool(inliers.sum() >= MIN_GPS_INLIERS and extent >= MIN_GPS_EXTENT_M
+                              and sigma <= MAX_GPS_SUPPORT_SIGMA_DEG)}
 
 
 @dataclass
@@ -415,16 +464,37 @@ def write_review_image(path: Path, edges: EdgeMap, walls_xy: np.ndarray, rotatio
     return str(path)
 
 
+def _matched_anchor(matches: List[Dict[str, Any]], yaw_deg: Optional[float]) -> Dict[str, Any]:
+    """Anchor from time-matched fixes; with a heading, outliers are judged against the scan it places.
+
+    Both sides average the same fixes, so the pair holds whatever the heading. A median taken in each
+    frame on its own would join two different moments of the walk.
+    """
+    local = np.array([m['local_xy'] for m in matches], dtype=np.float64)
+    target = np.array([m['utm_en'] for m in matches], dtype=np.float64)
+    offsets = target if yaw_deg is None else target - local @ rotation_2d(yaw_deg).T
+    center = np.median(offsets, axis=0)
+    for _ in range(3):
+        residual = np.linalg.norm(offsets - center, axis=1)
+        middle = float(np.median(residual))
+        keep = residual <= max(middle + 3.0 * 1.4826 * float(np.median(np.abs(residual - middle))), 2.0)
+        center = offsets[keep].mean(axis=0)
+    scatter = float(np.sqrt(np.mean(((offsets[keep] - center) ** 2).sum(axis=1))))
+    sigma = max(scatter, GPS_FIX_SIGMA_M) / math.sqrt(_independent_fixes(matches, keep))
+    return {'local': local[keep].mean(axis=0), 'en': target[keep].mean(axis=0), 'method': 'time_matched_fixes',
+            'fixes': int(keep.sum()), 'sigma_m': float(max(sigma, MIN_POSITION_SIGMA_M))}
+
+
 def _anchor(gps_info: Dict[str, Any], trajectory: Optional[np.ndarray], local_xy: Optional[np.ndarray],
-            matches: List[Dict[str, Any]]) -> Dict[str, Any]:
+            matches: List[Dict[str, Any]], yaw_deg: Optional[float] = None,
+            nearest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One point known in both frames: where the GPS and the scan agree the rig was."""
     utm = np.asarray(gps_info['utm_coords'], dtype=np.float64)[:, :2]
     if matches:
-        local = np.array([m['local_xy'] for m in matches], dtype=np.float64)
-        target = np.array([m['utm_en'] for m in matches], dtype=np.float64)
-        spread = np.linalg.norm(target - np.median(target, axis=0), axis=1)
-        return {'local': np.median(local, axis=0), 'en': np.median(target, axis=0), 'method': 'time_matched_fixes',
-                'fixes': len(matches), 'sigma_m': float(max(np.sqrt(np.mean(spread ** 2)), 3.0))}
+        return _matched_anchor(matches, yaw_deg)
+    if nearest is not None:
+        return {'local': nearest['local'], 'en': nearest['en'], 'method': 'nearest_fix_in_time', 'fixes': 1,
+                'sigma_m': float(math.hypot(GPS_FIX_SIGMA_M, WALK_DRIFT_MPS * nearest['gap_s']))}
     if trajectory is not None and len(trajectory):
         local = trajectory[:, 1:3]
     elif local_xy is not None and len(local_xy):
@@ -435,6 +505,10 @@ def _anchor(gps_info: Dict[str, Any], trajectory: Optional[np.ndarray], local_xy
     # Untimed: the fixes and the scan cover different spans, so this is a rough anchor.
     return {'local': local.mean(axis=0), 'en': np.median(utm, axis=0), 'method': 'untimed_centroids',
             'fixes': len(utm), 'sigma_m': UNTIMED_ANCHOR_SIGMA_M}
+
+
+def _plain(anchor: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in anchor.items()}
 
 
 def solve_north(gps_info: Dict[str, Any], *, points: Optional[np.ndarray] = None,
@@ -456,10 +530,17 @@ def solve_north(gps_info: Dict[str, Any], *, points: Optional[np.ndarray] = None
     origin = gps_info.get('capture_origin_s', 0.0) if capture_origin_s is None else capture_origin_s
     matches = (match_fixes_to_trajectory(gps_info, trajectory, float(dt_sync or 0.0), origin)
                if trajectory is not None else [])
-    anchor = _anchor(gps_info, trajectory, local_xy, matches if synced else [])
     gps_fit = _yaw_from_gps_matches(matches)
+    nearest = (_nearest_outside_fix(gps_info, trajectory, float(dt_sync), origin)
+               if synced and trajectory is not None and not matches else None)
+
+    def place(yaw_deg: Optional[float]) -> Dict[str, Any]:
+        return _anchor(gps_info, trajectory, local_xy, matches if synced else [], yaw_deg, nearest)
+
+    # Before a heading is chosen, the track's own fit is the best there is for telling outlier fixes apart.
+    anchor = place(gps_fit['yaw_grid_deg'] if gps_fit and gps_fit['fixes'] >= 3 else None)
     walls = wall_points(points) if points is not None and len(points) else None
-    evidence: Dict[str, Any] = {'anchor': {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in anchor.items()},
+    evidence: Dict[str, Any] = {'anchor': _plain(anchor),
                                 'matched_fixes': len(matches), 'time_synchronized': synced, 'gps_fit': gps_fit}
 
     registration = None
@@ -487,12 +568,19 @@ def solve_north(gps_info: Dict[str, Any], *, points: Optional[np.ndarray] = None
             f"+/-{registration['sigma_along_m']:.1f} m along bearing {registration['along_bearing_deg']:.0f}, "
             f"{'accepted' if registration['accepted'] else 'rejected'}.")
 
+    gps_qualifies = bool(gps_fit and gps_fit['qualifies'])
+    gps_alone = gps_qualifies and gps_fit['sigma_deg'] <= MAX_GPS_ALONE_SIGMA_DEG
+    coarse_reliable = False
     yaw, method, sigma = None, None, None
     translation = None
     if manual_yaw_deg is not None:
         yaw, method, sigma = wrap_deg(manual_yaw_deg), 'manual_user_specified', None
     if yaw is None and street_bearing_deg is not None and walls is not None and len(walls) >= 200:
-        coarse = registration['yaw_grid_deg'] if registration else gps_fit['yaw_grid_deg'] if gps_fit else None
+        track_reliable = gps_qualifies and synced
+        imagery_reliable = bool(registration and registration['accepted'])
+        coarse_reliable = track_reliable or imagery_reliable
+        coarse = (registration['yaw_grid_deg'] if registration and (imagery_reliable or not track_reliable)
+                  else gps_fit['yaw_grid_deg'] if gps_fit else None)
         axes = wall_axes(walls)
         evidence['wall_axes'] = axes
         if coarse is not None and axes:
@@ -503,8 +591,7 @@ def solve_north(gps_info: Dict[str, Any], *, points: Optional[np.ndarray] = None
             method, sigma = 'street_bearing_and_wall_axis', 1.0
         else:
             evidence['street_bearing'] = 'needs a coarse heading to pick the wall'
-    gps_qualifies = bool(gps_fit and gps_fit['qualifies'])
-    if yaw is None and gps_qualifies and synced:
+    if yaw is None and gps_alone and synced:
         yaw, method, sigma = gps_fit['yaw_grid_deg'], 'gps_time_matched_rigid_fit', gps_fit['sigma_deg']
     if registration and registration['accepted']:
         if yaw is None:
@@ -515,11 +602,20 @@ def solve_north(gps_info: Dict[str, Any], *, points: Optional[np.ndarray] = None
             translation = placed - rotation_2d(yaw) @ anchor['local']
             evidence['position'] = 'aerial_imagery_registration'
     if yaw is None and gps_qualifies:
-        yaw, method, sigma = gps_fit['yaw_grid_deg'], 'gps_assumed_sync_rigid_fit', gps_fit['sigma_deg']
+        method = 'gps_time_matched_rigid_fit' if synced else 'gps_assumed_sync_rigid_fit'
+        yaw, sigma = gps_fit['yaw_grid_deg'], gps_fit['sigma_deg']
 
     status = 'resolved' if yaw is not None else 'unresolved'
     if method == 'gps_assumed_sync_rigid_fit':
         status = 'needs_review'
+    elif method == 'gps_time_matched_rigid_fit' and not gps_alone:
+        status = 'needs_review'
+        log(f'[north] The GPS track is too short for a firm heading (+/-{sigma:.0f} deg). Check it on the map, or '
+            'confirm it with a street bearing measured on a map.')
+    elif method == 'street_bearing_and_wall_axis' and not coarse_reliable:
+        status = 'needs_review'
+        log('[north] The street bearing was matched to a wall, but nothing says firmly which of the four ways '
+            'round the scan is. Check it on the map.')
     elif method == 'aerial_imagery_registration':
         confirmed = gps_qualifies and angle_diff_deg(yaw, gps_fit['yaw_grid_deg']) <= GPS_AGREEMENT_DEG
         evidence['confirmed_by_gps'] = confirmed
@@ -531,6 +627,9 @@ def solve_north(gps_info: Dict[str, Any], *, points: Optional[np.ndarray] = None
         yaw, method = 0.0, 'unresolved'
         log('[north] North could not be determined; the scan is placed on the GPS anchor without a heading.')
     if translation is None:
+        if method != 'unresolved':
+            anchor = place(yaw)
+            evidence['anchor'] = _plain(anchor)
         translation = anchor['en'] - rotation_2d(yaw) @ anchor['local']
         evidence['position'] = anchor['method']
 
