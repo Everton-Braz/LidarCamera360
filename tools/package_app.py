@@ -72,12 +72,10 @@ def main():
     (stage / 'source-manifest.json').write_text(json.dumps(snapshots, indent=2))
 
     cmd = [
-        sys.executable, '-m', 'PyInstaller', '--noconfirm',
+        sys.executable, '-m', 'PyInstaller.utils.cliutils.makespec',
         '--name', APP_NAME,
         '--onefile' if a.onefile else '--onedir',
         '--windowed',
-        '--distpath', str(dist_root / 'single-file' if a.onefile else dist_root),
-        '--workpath', str(ROOT / 'build/pyinstaller'),
         '--specpath', str(ROOT / 'build'),
         '--paths', str(ROOT),
         '--collect-submodules', 'rosbags',
@@ -102,8 +100,6 @@ def main():
         cmd += ['--add-data', f'{ROOT / "configs"};configs']
     if (ROOT / 'locales').is_dir():
         cmd += ['--add-data', f'{ROOT / "locales"};locales']
-    if not a.incremental:
-        cmd.append('--clean')
     # Conda-based Python keeps the stdlib SQLite and zstd runtimes outside its DLLs folder.
     sqlite = Path(sys.base_prefix) / 'Library/bin/sqlite3.dll'
     if sqlite.is_file():
@@ -245,6 +241,20 @@ def main():
         existing = env.get('PATH', '')
         env['PATH'] = os.pathsep.join([p for p in paths if Path(p).is_dir()] + ([existing] if existing else []))
     subprocess.run(cmd, check=True, cwd=ROOT, env=env)
+    spec = ROOT / 'build' / f'{APP_NAME}.spec'
+    openmvs = ROOT / 'openmvs'
+    if (openmvs / 'DensifyPointCloud.exe').is_file():
+        # As a plain tree: given as data, its DLLs would be copied again among the app's own.
+        text = spec.read_text(encoding='utf-8')
+        if text.count('    a.datas,\n') != 1:
+            raise SystemExit(f'Unexpected PyInstaller spec, OpenMVS cannot be added: {spec}')
+        spec.write_text(text.replace('    a.datas,\n', f"    a.datas,\n    Tree({str(openmvs)!r}, prefix='openmvs'),\n"),
+                        encoding='utf-8')
+    else:
+        print('[!] openmvs/ is missing: the package will not make dense clouds and meshes (see tools/stage_openmvs.py)')
+    subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm', *([] if a.incremental else ['--clean']),
+                    '--distpath', str(dist_root / 'single-file' if a.onefile else dist_root),
+                    '--workpath', str(ROOT / 'build/pyinstaller'), str(spec)], check=True, cwd=ROOT, env=env)
 
     output = dist_root / 'single-file' if a.onefile else dist_root / APP_NAME
     output.mkdir(parents=True, exist_ok=True)

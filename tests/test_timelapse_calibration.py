@@ -209,6 +209,20 @@ class TimelapseCalibrationTests(unittest.TestCase):
         self.assertEqual(sum(fold['baseline']['count'] for fold in result['folds']),
                          sum(fold['candidate']['count'] for fold in result['folds']))
 
+    def test_one_photo_per_second_is_enough_to_refine_the_lever_arm(self):
+        for count in (60, 105):
+            (centers, rcw, tc, ts, positions, rotations,
+             prior, _, _) = self._lever_dataset(count=count)
+            result = validate_lever_refinement(
+                centers, rcw, tc, ts, positions, rotations,
+                initial_arm=prior, dt_hint=3.2)
+            self.assertTrue(result['accepted'])
+            self.assertLess(result['candidate_untrimmed_rmse_cm'], 1.)
+        with self.assertRaisesRegex(ValueError, 'at least 60'):
+            validate_lever_refinement(
+                centers[:59], rcw[:59], tc[:59], ts, positions, rotations,
+                initial_arm=prior, dt_hint=3.2)
+
 
 if __name__ == '__main__':
     unittest.main()

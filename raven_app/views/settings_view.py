@@ -142,6 +142,19 @@ class SettingsView(QWidget):
             "later from the project (Workflow > Export from project)."))
         self.export_desc.setWordWrap(True)
         export_layout.addWidget(self.export_desc)
+        self.photogrammetry_chk = CheckBox(tr("Show \"Open in RealityScan / Metashape\" on the workflow screen"))
+        self.photogrammetry_chk.setChecked(bool(self.cfg.get("show_photogrammetry_export", False)))
+        self.photogrammetry_chk.stateChanged.connect(self._on_photogrammetry_export_changed)
+        export_layout.addWidget(self.photogrammetry_chk)
+        openmvs_row = QHBoxLayout()
+        self.openmvs_label = BodyLabel("")
+        self.openmvs_label.setWordWrap(True)
+        self.openmvs_btn = PushButton(tr("Choose OpenMVS..."))
+        self.openmvs_btn.clicked.connect(self._on_choose_openmvs)
+        openmvs_row.addWidget(self.openmvs_label, 1)
+        openmvs_row.addWidget(self.openmvs_btn)
+        export_layout.addLayout(openmvs_row)
+        self._refresh_openmvs_label()
         layout.addWidget(self.export_card)
 
         # 3. Embedded Engines & Capabilities Card
@@ -279,6 +292,37 @@ class SettingsView(QWidget):
     def _on_extra_formats_changed(self, state=None):
         self.cfg["show_extra_formats"] = self.extra_formats_chk.isChecked()
         save_config(self.cfg)
+        InfoBar.info(title=tr("Saved"), content=tr("Takes effect the next time the workflow screen is opened."),
+                     position=InfoBarPosition.TOP, parent=self, duration=3000)
+
+    def _on_photogrammetry_export_changed(self, state=None):
+        self.cfg["show_photogrammetry_export"] = self.photogrammetry_chk.isChecked()
+        save_config(self.cfg)
+        InfoBar.info(title=tr("Saved"), content=tr("Takes effect the next time the workflow screen is opened."),
+                     position=InfoBarPosition.TOP, parent=self, duration=3000)
+
+    def _refresh_openmvs_label(self):
+        from raven_app.config import get_openmvs_bin
+        path = get_openmvs_bin()
+        self.openmvs_label.setText(tr("OpenMVS (dense photogrammetry, optional): {path}",
+                                      path=str(path) if path.is_file() else tr("Not found")))
+
+    def _on_choose_openmvs(self):
+        from PyQt6.QtWidgets import QFileDialog
+        from raven_app.openmvs_dense import check_binary
+        path, _ = QFileDialog.getOpenFileName(self, tr("DensifyPointCloud of the OpenMVS fisheye build"), "",
+                                              "DensifyPointCloud (DensifyPointCloud*)")
+        if not path:
+            return
+        try:
+            check_binary(path)
+        except Exception as exc:
+            InfoBar.error(title=tr("OpenMVS was not accepted"), content=str(exc),
+                          position=InfoBarPosition.TOP, parent=self, duration=8000)
+            return
+        self.cfg["openmvs_path"] = path
+        save_config(self.cfg)
+        self._refresh_openmvs_label()
         InfoBar.info(title=tr("Saved"), content=tr("Takes effect the next time the workflow screen is opened."),
                      position=InfoBarPosition.TOP, parent=self, duration=3000)
 
@@ -427,6 +471,10 @@ class SettingsView(QWidget):
         self.theme_combo.addItems([tr("Dark Theme"), tr("Light Theme"), tr("Follow Windows System")])
         self.theme_combo.setCurrentIndex(cur_theme_idx)
         self.theme_combo.blockSignals(False)
+
+        self.photogrammetry_chk.setText(tr("Show \"Open in RealityScan / Metashape\" on the workflow screen"))
+        self.openmvs_btn.setText(tr("Choose OpenMVS..."))
+        self._refresh_openmvs_label()
 
         # Engines status card
         self.engines_title.setText(tr("Embedded Processing Engines"))

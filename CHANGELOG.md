@@ -6,6 +6,50 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [Unreleased]
+
+### 🎯 Photo alignment for the colours and the 3DGS export
+- **The fisheye photos are aligned and their rolling shutter is removed before the cloud is coloured and before the
+  3DGS export.** The poses, lenses, lever arms and rolling shutter of the photos are adjusted to the SfM tracks and the
+  LiDAR planes. It is used only if tracks kept out of it fit better; otherwise the run goes on as before. On the test
+  walk (278 photos) the tracks went from 2.84 to 0.73 px, for about two more minutes.
+- **3DGS:** after 7000 steps, the held-out photos of the test walk went from 19.6 to 23.7 dB (SSIM 0.53 to 0.74,
+  people masked out), against the bundle-adjusted export. The export is already aligned, so *Dense photogrammetry*
+  does not align it again.
+- **Coloured cloud:** the photos agree better on the points (62 % of the variance of the detail is the point's, was
+  28 %), and signs are easier to read. The number of points and their place do not change.
+- `--no-photo-alignment` (workflow) turns it off; `colorize --photo-alignment` turns it on for that command.
+- **Short captures get the lever arm refinement too.** It asked for 150 photos per lens and gave up below that, so a
+  100-second walk at 1 photo per second kept a 6.2 cm camera-to-trajectory error. It now needs 60, still checked on
+  blocks of photos kept out of the fit: on that walk the error is 0.8 cm.
+
+### 📷 Dense photogrammetry (optional)
+- **Dense point cloud from the fisheye photos** with OpenMVS, at the LiDAR poses. Photos are not split into pinhole
+  faces: each is resampled once to an ideal fisheye. The output is a photo cloud and a cloud that fills its gaps with
+  the LiDAR, plus a report with the distance to the LiDAR. Nothing in the 3DGS export is changed.
+- **Textured mesh** of that dense cloud (`--mesh glb`, or the *Textured mesh* box): OpenMVS turns the photo points
+  and the LiDAR points that fill their gaps into a surface, and copies its texture from the fisheye photos. The
+  report gives its distance to the LiDAR. `mesh.ply` and a self-contained `mesh_textured.glb` are written.
+  On the test walk (278 photos), at the default quality: 6.5 million triangles, median 0.3 cm from the LiDAR and 94 %
+  of the LiDAR within 10 cm of the surface. The whole run takes about 32 minutes, 16 of them for the mesh.
+- **The photos are aligned before they are matched:** the rolling shutter of each lens is measured and removed, and
+  the poses, lenses and lever arms are adjusted to the feature tracks and the LiDAR planes. It is used only if tracks
+  kept out of it fit better (test walk: 1.73 to 0.73 px, rolling shutter 28.9 and 28.5 ms, one more minute). The photo
+  cloud went from 12 to 42 million points, and from 0.9 to 0.2 cm (median) from the LiDAR. The alignment also uses that
+  LiDAR, so only the track error is an independent check. `--no-refine` turns it off.
+- **Normal maps smooth the mesh** when the photos have them, as Spirula Studio writes them with MoGe2 (`--normals`, by
+  default the `normals` folder of the export; `--no-normals` turns it off). Where three or more photos agree, triangles
+  turn to the normal and no point of the surface moves more than 1 cm: on the test walk the surface went from 2.5 to
+  1.2 degrees (median) from the LiDAR planes, at the same distance to the LiDAR. It takes about four more minutes.
+- **The sky is masked** in the photos of the dense cloud and the mesh, so it no longer fills rooflines or bleeds into
+  facades, and loose mesh parts of fewer than 100 triangles are removed.
+- The patched OpenMVS comes with the app (`openmvs` folder, AGPL-3.0, source attached to the release). It needs an
+  NVIDIA GPU (GTX 16xx, RTX or newer) with driver 580 or newer; everything else works without one.
+- **Open in RealityScan / Metashape:** optional exports of the photos, masks, poses and LiDAR for people who own those
+  programs. Opening RealityScan selects its Division lens, which RealityScan may keep as its own setting.
+
+---
+
 ## [v0.4.0] - 2026-11-23
 
 ### 🧍 Person masks

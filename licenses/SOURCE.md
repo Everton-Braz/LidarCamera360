@@ -11,6 +11,7 @@ the package:
 | `bin/fastlivo2.exe` | `native/main.cpp`, `native/CMakeLists.txt`, `native/prepare_sources.py`, `FAST-LIVO2/` |
 | `bin/rfdetr-masker.exe` | `native/rfdetr_masker/` |
 | `bin/spirula.exe` | Unmodified upstream binary; see `Spirula-Studio-SOURCE.md` |
+| `openmvs/*.exe` (AGPL-3.0) | `third_party/openmvs/`; see `OpenMVS-SOURCE.md` |
 
 Build instructions are in `docs/BUILD.md`. If a tag is ever unavailable, write to the maintainer
 through the repository's issue tracker and the source will be provided for at least three years

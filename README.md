@@ -42,6 +42,8 @@
 - **Timelapse captures** work end to end.
 - **SLAM**: sturdier loop closure, gravity leveling for recordings that start while walking, and `--slam-dir` to import an existing SLAM.
 - **3DGS export**: upright images from upside-down cameras, bundle-adjusted poses, and optional RoMa v2 densification (`--densify roma`).
+- **Photo alignment**: the fisheye photos are aligned to the SfM tracks and the scan, and their rolling shutter is removed, before the cloud is coloured and before the 3DGS export.
+- **Dense photogrammetry (optional)**: a dense cloud, and a textured mesh of it, from whole fisheye photos with their rolling shutter removed, with a patched OpenMVS (bundled; needs an NVIDIA GPU and driver 580 or newer; [source and build](third_party/openmvs/README.md)), and exports for RealityScan and Metashape. Normal maps of the photos, when there are any, smooth the mesh.
 - **Project folder and `export`**: write PCD, LAZ/LAS, GeoJSON, GPS track and trajectory after the run.
 - **Trim and chunks** also cut the second lens file and auxiliary videos.
 
@@ -340,6 +342,7 @@ Two layers, each with its own terms:
 | `bin/fastlivo2.exe`, built from the vendored [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2) source | **GPL-2.0-only** (a separate program; the app runs it as a subprocess) |
 | `bin/spirula.exe` ([Spirula Studio](https://github.com/harry7557558/spirula-studio)) | **GPL-3.0** (a separate program) |
 | `bin/rfdetr-masker.exe` | **GPL-3.0**, see `native/rfdetr_masker/LICENSE` |
+| `openmvs/*.exe` ([OpenMVS](https://github.com/cdcseacave/openMVS) with [a fisheye patch](third_party/openmvs)) | **AGPL-3.0** (separate programs) |
 
 The release package is an aggregate of these programs: each keeps its own license, and the
 licenses and source locations ship in its `licenses/` folder. Contributions are accepted under

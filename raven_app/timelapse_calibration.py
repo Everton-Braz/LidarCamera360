@@ -9,6 +9,8 @@ from scipy.spatial.transform import Rotation, Slerp
 
 VERSION = 3
 CAMERA_LEVER_LENGTH_M = 0.185
+# One photo per second for about a minute: each of the five training sets keeps the 30 poses a fit needs.
+MIN_REFINEMENT_POSES = 60
 
 
 def similarity(x, y):
@@ -318,8 +320,8 @@ def validate_lever_refinement(centers, world_to_camera, capture_times,
     c = np.asarray(centers, dtype=float)
     rcw = np.asarray(world_to_camera, dtype=float)
     tc = np.asarray(capture_times, dtype=float)
-    if len(c) < max(100, folds * 30) or len(c) != len(tc):
-        raise ValueError('Blocked validation requires at least 100 matched poses')
+    if len(c) < MIN_REFINEMENT_POSES or len(c) != len(tc):
+        raise ValueError(f'Blocked validation requires at least {MIN_REFINEMENT_POSES} matched poses')
     if initial_arm is None:
         initial_arm = rotations[0].inv().apply([0., 0., CAMERA_LEVER_LENGTH_M])
     order = np.argsort(tc, kind='stable')
@@ -433,7 +435,7 @@ def align_dataset(dataset_dir, dt_hint=None, output_path=None, validate_refineme
     rcw = np.array([im['R_cw'] for im in front])
     initial_arm = rotations[0].inv().apply([0., 0., CAMERA_LEVER_LENGTH_M])
     refinement = None
-    if validate_refinement and len(centers) >= 100:
+    if validate_refinement and len(centers) >= MIN_REFINEMENT_POSES:
         try:
             refinement = validate_lever_refinement(
                 centers, rcw, times, ts, positions, rotations,

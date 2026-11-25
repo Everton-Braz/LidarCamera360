@@ -53,7 +53,9 @@ def active_slam_dir(project_dir: Path) -> Path | None:
     except (OSError, ValueError):
         pass
     found = sorted(project_dir.glob('slam_raw_*'), key=lambda p: p.stat().st_mtime, reverse=True)
-    return found[0] if found else None
+    if found:
+        return found[0]
+    return project_dir / 'slam_out' if (project_dir / 'slam_out').is_dir() else None
 
 
 def find_trajectory(project_dir: Path) -> Path | None:

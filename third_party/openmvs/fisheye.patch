@@ -1,0 +1,647 @@
+diff --git a/apps/CMakeLists.txt b/apps/CMakeLists.txt
+index 354772f..e1b7a3a 100644
+--- a/apps/CMakeLists.txt
++++ b/apps/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ # Add applications
+-ADD_SUBDIRECTORY(CreateStructure)
+-ADD_SUBDIRECTORY(ExtractKeyframes)
++if(OpenMVS_USE_CERES)
++	ADD_SUBDIRECTORY(CreateStructure)
++	ADD_SUBDIRECTORY(ExtractKeyframes)
++endif()
+ ADD_SUBDIRECTORY(InterfaceCOLMAP)
+ ADD_SUBDIRECTORY(InterfaceMetashape)
+ ADD_SUBDIRECTORY(InterfaceMVSNet)
+diff --git a/apps/DensifyPointCloud/DensifyPointCloud.cpp b/apps/DensifyPointCloud/DensifyPointCloud.cpp
+index 5e1bb4a..cb9ee88 100644
+--- a/apps/DensifyPointCloud/DensifyPointCloud.cpp
++++ b/apps/DensifyPointCloud/DensifyPointCloud.cpp
+@@ -102,7 +102,7 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
+ 	// group of options allowed only on command line
+ 	boost::program_options::options_description generic("Generic options");
+ 	generic.add_options()
+-		("help,h", "produce this help message")
++		("help,h", "produce this help message (LC360-FISHEYE-3.5 build: SPHERICAL cameras are equidistant fisheyes)")
+ 		("working-folder,w", boost::program_options::value<std::string>(&WORKING_FOLDER), "working directory (default current directory)")
+ 		("config-file,c", boost::program_options::value<std::string>(&OPT::strConfigFileName)->default_value(APPNAME _T(".cfg")), "file name containing program options")
+ 		("archive-type", boost::program_options::value(&OPT::nArchiveType)->default_value(ARCHIVE_MVS), "project archive type: -1-interface, 0-text, 1-binary, 2-compressed binary")
+diff --git a/apps/ReconstructMesh/ReconstructMesh.cpp b/apps/ReconstructMesh/ReconstructMesh.cpp
+index dcf3946..577a303 100644
+--- a/apps/ReconstructMesh/ReconstructMesh.cpp
++++ b/apps/ReconstructMesh/ReconstructMesh.cpp
+@@ -99,7 +99,7 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
+ 	// group of options allowed only on command line
+ 	boost::program_options::options_description generic("Generic options");
+ 	generic.add_options()
+-		("help,h", "produce this help message")
++		("help,h", "produce this help message (LC360-FISHEYE-3.5 build: SPHERICAL cameras are equidistant fisheyes)")
+ 		("working-folder,w", boost::program_options::value<std::string>(&WORKING_FOLDER), "working directory (default current directory)")
+ 		("config-file,c", boost::program_options::value<std::string>(&OPT::strConfigFileName)->default_value(APPNAME _T(".cfg")), "file name containing program options")
+ 		("export-type", boost::program_options::value<std::string>(&OPT::strExportType)->default_value(_T("ply")), "file type used to export the 3D scene (ply or obj)")
+@@ -495,8 +495,6 @@ int main(int argc, LPCTSTR* argv)
+ 
+ 		// remove the surface no camera ever observed
+ 		if (OPT::nRemoveUnseenFaces > 0 && !scene.mesh.IsEmpty()) {
+-			if (!scene.CheckPinholeOnly(_T("the removal of the unseen faces")))
+-				return EXIT_FAILURE;
+ 			scene.RemoveUnseenMeshFaces(OPT::nRemoveUnseenFaces);
+ 		}
+ 
+diff --git a/apps/TextureMesh/TextureMesh.cpp b/apps/TextureMesh/TextureMesh.cpp
+index d9318ed..68826d7 100644
+--- a/apps/TextureMesh/TextureMesh.cpp
++++ b/apps/TextureMesh/TextureMesh.cpp
+@@ -95,7 +95,7 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
+ 	// group of options allowed only on command line
+ 	boost::program_options::options_description generic("Generic options");
+ 	generic.add_options()
+-		("help,h", "produce this help message")
++		("help,h", "produce this help message (LC360-FISHEYE-3.5 build: SPHERICAL cameras are equidistant fisheyes)")
+ 		("working-folder,w", boost::program_options::value<std::string>(&WORKING_FOLDER), "working directory (default current directory)")
+ 		("config-file,c", boost::program_options::value<std::string>(&OPT::strConfigFileName)->default_value(APPNAME _T(".cfg")), "file name containing program options")
+ 		("export-type", boost::program_options::value<std::string>(&OPT::strExportType)->default_value(_T("ply")), "file type used to export the 3D scene (ply, obj, glb or gltf)")
+@@ -315,8 +315,6 @@ int main(int argc, LPCTSTR* argv)
+ 	}
+ 	// remove the surface no camera ever observed
+ 	if (OPT::nRemoveUnseenFaces > 0 && !scene.mesh.IsEmpty()) {
+-		if (!scene.CheckPinholeOnly(_T("the removal of the unseen faces")))
+-			return EXIT_FAILURE;
+ 		scene.RemoveUnseenMeshFaces(OPT::nRemoveUnseenFaces, OPT::nResolutionLevel, OPT::nMinResolution);
+ 		#if TD_VERBOSE != TD_VERBOSE_OFF
+ 		if (VERBOSITY_LEVEL > 3)
+diff --git a/libs/CMakeLists.txt b/libs/CMakeLists.txt
+index c46a1e8..66ead24 100644
+--- a/libs/CMakeLists.txt
++++ b/libs/CMakeLists.txt
+@@ -2,7 +2,9 @@
+ ADD_SUBDIRECTORY(Common)
+ ADD_SUBDIRECTORY(Math)
+ ADD_SUBDIRECTORY(IO)
+-ADD_SUBDIRECTORY(SFM)
++if(OpenMVS_USE_CERES)
++	ADD_SUBDIRECTORY(SFM)
++endif()
+ ADD_SUBDIRECTORY(MVS)
+ 
+ # Install
+diff --git a/libs/MVS/ConfidenceCUDA.cu b/libs/MVS/ConfidenceCUDA.cu
+index 2647761..5eaf6e1 100644
+--- a/libs/MVS/ConfidenceCUDA.cu
++++ b/libs/MVS/ConfidenceCUDA.cu
+@@ -229,7 +229,7 @@ __global__ void SweepKernel(RefAcc ref, const float* priorMap, MODEL camera, con
+ 			if (qz <= 0.f) continue;
+ 			Point2 x;
+ 			const SphericalModel sphere{np.K[0], np.K[1], np.K[2], np.K[3]};
+-			sphere.ProjectFast(q, x);
++			if (!sphere.ProjectFast(q, x)) continue;
+ 			px = x.x(); py = x.y();
+ 		} else {
+ 			px = qx/qz; py = qy/qz;
+diff --git a/libs/MVS/DepthMap.cpp b/libs/MVS/DepthMap.cpp
+index df1fa62..3d5a181 100644
+--- a/libs/MVS/DepthMap.cpp
++++ b/libs/MVS/DepthMap.cpp
+@@ -509,7 +509,7 @@ DepthEstimatorT<MODEL>::DepthEstimatorT(
+ {
+ 	ASSERT(_depthData0.images.size() >= 1);
+ 	// an equirectangular reference spans 360x180 degrees on its grid, so its columns wrap
+-	ASSERT(!bSphericalRef || (ISEQUAL(camera0.fx*REAL(TWO_PI), REAL(size.width)) && ISEQUAL(camera0.fy*REAL(PI), REAL(size.height)) &&
++	ASSERT(!bSphericalRef || (ISEQUAL(camera0.fx*REAL(FISHEYE_FOV), REAL(size.width)) && ISEQUAL(camera0.fy*REAL(FISHEYE_FOV), REAL(size.height)) &&
+ 		ISEQUAL(camera0.cx, REAL(size.width-1)/2) && ISEQUAL(camera0.cy, REAL(size.height-1)/2)));
+ 	ASSERT(bSphericalRef == image0.IsSpherical());
+ 	if constexpr (bSphericalRef) {
+diff --git a/libs/MVS/DepthMap.h b/libs/MVS/DepthMap.h
+index d8eeda0..0387144 100644
+--- a/libs/MVS/DepthMap.h
++++ b/libs/MVS/DepthMap.h
+@@ -381,9 +381,9 @@ typedef CLISTDEFIDX(DepthData,IIndex) DepthDataArr;
+ template<typename SINCOS>
+ inline void ComputeSphericalTrig(const Spherical<double>& camera, const cv::Size& size, SINCOS* lonSinCos, SINCOS* elSinCos) {
+ 	static_assert(sizeof(SINCOS) == 2*sizeof(float), "SINCOS holds two floats: sin, cos");
+-	ASSERT(ISEQUAL(camera.fx*TWO_PI, (double)size.width) && ISEQUAL(camera.fy*PI, (double)size.height));
++	// fisheye: the normalized pixel (see Spherical), in the slot of the sine
+ 	const auto Store = [](double angle, SINCOS& sinCos) {
+-		const float sc[2] = {(float)std::sin(angle), (float)std::cos(angle)};
++		const float sc[2] = {(float)angle, 0.f};
+ 		memcpy((void*)&sinCos, sc, sizeof(sc));
+ 	};
+ 	for (int c=0; c<size.width; ++c)
+diff --git a/libs/MVS/Image.cpp b/libs/MVS/Image.cpp
+index 74fd437..0ba3475 100644
+--- a/libs/MVS/Image.cpp
++++ b/libs/MVS/Image.cpp
+@@ -64,7 +64,7 @@ cv::Size Image::ComputeResize(const cv::Size& size, REAL scale, bool bSpherical)
+ 		return Image8U::computeResize(size, scale);
+ 	ASSERT(size.width >= size.height && scale > 0);
+ 	const int width(2*MAXF(ROUND2INT((REAL)size.width*scale/2), 1));
+-	return Image8U::computeResize(size, (REAL)width/size.width);
++	return cv::Size(width, width); // the fisheye image is square
+ } // ComputeResize
+ /*----------------------------------------------------------------*/
+ 
+diff --git a/libs/MVS/Mesh.h b/libs/MVS/Mesh.h
+index 90083ec..b9940a0 100644
+--- a/libs/MVS/Mesh.h
++++ b/libs/MVS/Mesh.h
+@@ -375,7 +375,7 @@ struct TRasterMeshBase {
+ 
+ 	// the triangles are rasterized straight, interpolating the depth z: pinhole cameras only
+ 	TRasterMeshBase(const Camera& _camera, DepthMap& _depthMap)
+-		: camera(_camera), depthMap(_depthMap) { ASSERT(!camera.IsSpherical()); }
++		: camera(_camera), depthMap(_depthMap) {}
+ 
+ 	inline void Clear() {
+ 		depthMap.memset(0);
+@@ -384,9 +384,25 @@ struct TRasterMeshBase {
+ 		return depthMap.size();
+ 	}
+ 
++	// project a vertex in front of the camera; a fisheye uses the range for the z, like its depth-maps
++	inline bool ProjectVertexC(const Point3f& pt, int v, Triangle& t) const {
++		Point3& X = t.ptc[v];
++		X = camera.TransformPointW2C(Cast<REAL>(pt));
++		if (!camera.IsSpherical()) {
++			if (X.z <= 0)
++				return false;
++			t.pti[v] = camera.TransformPointC2I(X);
++			return true;
++		}
++		const REAL range(norm(X));
++		if (X.z < range*REAL(0.0707372)) // 1.5 rad off the axis, the end of the fisheye's photo
++			return false;
++		t.pti[v] = std::get<0>(camera.ProjectPointC(X));
++		X.z = range;
++		return true;
++	}
+ 	inline bool ProjectVertex(const Point3f& pt, int v, Triangle& t) {
+-		return (t.ptc[v] = camera.TransformPointW2C(Cast<REAL>(pt))).z > 0 &&
+-			depthMap.isInsideWithBorder<float,3>(t.pti[v] = camera.TransformPointC2I(t.ptc[v]));
++		return ProjectVertexC(pt, v, t) && depthMap.isInsideWithBorder<float,3>(t.pti[v]);
+ 	}
+ 
+ 	inline Point3f PerspectiveCorrectBarycentricCoordinates(const Triangle& t, const Point3f& bary) {
+diff --git a/libs/MVS/PatchMatchCUDA.cpp b/libs/MVS/PatchMatchCUDA.cpp
+index 48d552f..a061ccc 100644
+--- a/libs/MVS/PatchMatchCUDA.cpp
++++ b/libs/MVS/PatchMatchCUDA.cpp
+@@ -360,7 +360,7 @@ void PatchMatch::EstimateDepthMap(const PlatformArr& platforms, DepthData& depth
+ 			const Image32F image = view.image;
+ 			const bool bSpherical = view.IsSpherical();
+ 			// an equirectangular camera keeps its angular K on the grid of every level (fx=W/2pi, fy=H/pi)
+-			ASSERT(!bSpherical || (ISEQUAL(view.camera.K(0,0)*REAL(TWO_PI), REAL(image.cols)) && ISEQUAL(view.camera.K(1,1)*REAL(PI), REAL(image.rows))));
++			ASSERT(!bSpherical || (ISEQUAL(view.camera.K(0,0)*REAL(FISHEYE_FOV), REAL(image.cols)) && ISEQUAL(view.camera.K(1,1)*REAL(FISHEYE_FOV), REAL(image.rows))));
+ 			const Camera camera(
+ 				SEACAVE::Matrix3x3f(view.camera.K),
+ 				SEACAVE::Matrix3x3f(view.camera.R),
+diff --git a/libs/MVS/PatchMatchCUDA.cu b/libs/MVS/PatchMatchCUDA.cu
+index 196a8ec..8a510eb 100644
+--- a/libs/MVS/PatchMatchCUDA.cu
++++ b/libs/MVS/PatchMatchCUDA.cu
+@@ -469,13 +469,14 @@ __device__ __forceinline__ float ScorePlane(const RefPatchCache& cache, RefPixel
+ 	PatchSums sums;
+ 	if (MODEL != MODEL_PINHOLE && IsBitSet(g_params.sphericalViews, imgId)) {
+ 		const SphericalModel trg(trgCamera.Model<SphericalModel>());
+-		if (Square(q0.y()) > g_params.fSinSqWarpMaxElevation * q0.squaredNorm()) {
++		if (false) { // the fisheye has no pole in its field of view: always the tangent-plane warp
+ 			if (!SampleExactPatch(cache, ref, trgImage, trg, view, normal, nX, p, sums))
+ 				return fBadCost;
+ 		} else {
+ 			const float rho = sqrtf(q0.x() * q0.x() + q0.z() * q0.z());
+ 			Point2 xc;
+-			trg.ProjectFast(q0, xc, rho);
++			if (!trg.ProjectFast(q0, xc, rho))
++				return fBadCost; // outside the fisheye field of view
+ 			Matrix3 M = trg.PixelHomography(q0, xc, rho) * HF;
+ 			M.row(0) *= view.texScale.x();
+ 			M.row(1) *= view.texScale.y();
+@@ -521,7 +522,8 @@ __device__ __forceinline__ float GeometricConsistencyWeight(const ImagePixels de
+ 	Point2 x1;
+ 	float depth1Expected;
+ 	if (MODEL != MODEL_PINHOLE && IsBitSet(g_params.sphericalViews, imgId)) {
+-		g_cameras[imgId].Model<SphericalModel>().ProjectFast(X1, x1);
++		if (!g_cameras[imgId].Model<SphericalModel>().ProjectFast(X1, x1))
++			return maxDist;
+ 		depth1Expected = SphericalModel::Depth(X1);
+ 	} else {
+ 		if (!g_cameras[imgId].Model<PinholeModel>().Project(X1, x1))
+diff --git a/libs/MVS/SceneDensify.cpp b/libs/MVS/SceneDensify.cpp
+index d25c88e..8ae9799 100644
+--- a/libs/MVS/SceneDensify.cpp
++++ b/libs/MVS/SceneDensify.cpp
+@@ -1637,7 +1637,7 @@ static bool BuildConfNeighborHosts(const DepthData& depthDataRef, std::vector<Co
+ 		d.K[0]=np.sphere.fx; d.K[1]=np.sphere.fy; d.K[2]=np.sphere.cx; d.K[3]=np.sphere.cy;
+ 		d.spherical = np.bSpherical ? 1 : 0;
+ 		// the kernels project into a spherical neighbor through K, the angular camera of its map
+-		ASSERT(!np.bSpherical || (ISEQUAL(viewN.cameraDepthMap.K(0,0)*REAL(TWO_PI), REAL(viewN.depthMap.cols)) && ISEQUAL(viewN.cameraDepthMap.K(1,1)*REAL(PI), REAL(viewN.depthMap.rows))));
++		ASSERT(!np.bSpherical || (ISEQUAL(viewN.cameraDepthMap.K(0,0)*REAL(FISHEYE_FOV), REAL(viewN.depthMap.cols)) && ISEQUAL(viewN.cameraDepthMap.K(1,1)*REAL(FISHEYE_FOV), REAL(viewN.depthMap.rows))));
+ 		d.depth = viewN.depthMap.ptr<float>();
+ 		d.conf = viewN.confMap.empty() ? NULL : viewN.confMap.ptr<float>();
+ 		d.normal = viewN.normalMap.empty() ? NULL : viewN.normalMap.ptr<float>();
+diff --git a/libs/MVS/SceneNeighbors.cpp b/libs/MVS/SceneNeighbors.cpp
+index 601f1b1..4c8550c 100644
+--- a/libs/MVS/SceneNeighbors.cpp
++++ b/libs/MVS/SceneNeighbors.cpp
+@@ -224,7 +224,7 @@ bool Scene::EstimateNeighborViewsPointCloud(unsigned maxResolution)
+ 		const Camera& camera(imageData.camera), &camera2(imageData2.camera);
+ 		const REAL depth(norm(imageData.camera.C - imageData2.camera.C) / (2*TAN(D2R(REAL(OPTDENSE::fOptimAngle))/2)));
+ 		const REAL logMinDepth(LOGN(depth*REAL(0.1))), logMaxDepth(LOGN(depth*REAL(10)));
+-		const unsigned rows(imageData.IsSpherical() ? maxResolution/2 : maxResolution);
++		const unsigned rows(maxResolution);
+ 		const float stepW((float)imageData.width / maxResolution);
+ 		const float stepH((float)imageData.height / rows);
+ 		for (unsigned r = 0; r < rows; ++r) {
+diff --git a/libs/MVS/SceneReconstruct.cpp b/libs/MVS/SceneReconstruct.cpp
+index 9e876fb..17bba3a 100644
+--- a/libs/MVS/SceneReconstruct.cpp
++++ b/libs/MVS/SceneReconstruct.cpp
+@@ -323,8 +323,9 @@ void fetchCellFacets(const delaunay_t& Tr, const std::vector<facet_t>& hullFacet
+ 	// find all facets on the convex-hull in camera's view
+ 	// create the 4 frustum planes
+ 	ASSERT(facets.empty());
+-	ASSERT(!imageData.camera.IsSpherical());
+-	const TFrustum<REAL,4> frustum(imageData.camera.P, imageData.width, imageData.height, 0, 1);
++	// a fisheye sees more than a half-space, which no frustum bounds: keep every facet facing it
++	const bool bFisheye(imageData.camera.IsSpherical());
++	const TFrustum<REAL,4> frustum(bFisheye ? TFrustum<REAL,4>() : TFrustum<REAL,4>(imageData.camera.P, imageData.width, imageData.height, 0, 1));
+ 	// loop over all cells
+ 	// the orientation test runs in the working space, which is the whole point of the rescale,
+ 	// while the frustum keeps the camera's own space and the facet bounds are mapped back into
+@@ -335,6 +336,10 @@ void fetchCellFacets(const delaunay_t& Tr, const std::vector<facet_t>& hullFacet
+ 		const triangle_t verts(Tr.triangle(face));
+ 		if (orientation(verts[0], verts[1], verts[2], ptOrigin) != FacetOrientation)
+ 			continue;
++		if (bFisheye) {
++			facets.push_back(face);
++			continue;
++		}
+ 		AABB3 ab(CGAL2MVS<REAL>(rescale.ToWorld(verts[0])));
+ 		for (int i=1; i<3; ++i)
+ 			ab.Insert(CGAL2MVS<REAL>(rescale.ToWorld(verts[i])));
+@@ -738,8 +743,6 @@ bool Scene::ReconstructMesh(const ReconstructMeshParams& params)
+ {
+ 	using namespace DELAUNAY;
+ 	ASSERT(pointcloud.IsValid());
+-	if (!CheckPinholeOnly(_T("the mesh reconstruction")))
+-		return false;
+ 	mesh.Release();
+ 	const float distInsert(params.distInsert);
+ 	const bool bUseFreeSpaceSupport(params.bUseFreeSpaceSupport);
+@@ -845,9 +848,9 @@ bool Scene::ReconstructMesh(const ReconstructMeshParams& params)
+ 					// check if point is far enough to all existing points
+ 					FOREACHPTR(pViewID, views) {
+ 						const Image& imageData = images[*pViewID];
+-						const Point3f pn(imageData.camera.ProjectPointP3(point));
+-						const Point3f pe(imageData.camera.ProjectPointP3(CGAL2MVS<float>(nearest->point())));
+-						if (!IsDepthSimilar(pn.z, pe.z) || normSq(Point2f(pn)-Point2f(pe)) > distInsertSq) {
++						const auto [pn, depthn] = imageData.camera.ProjectPointP(point);
++						const auto [pe, depthe] = imageData.camera.ProjectPointP(CGAL2MVS<float>(nearest->point()));
++						if (!IsDepthSimilar(depthn, depthe) || normSq(pn-pe) > distInsertSq) {
+ 							// point far enough to an existing point,
+ 							// insert as a new point
+ 							hint = delaunay.insert(p, lt, c, li, lj);
+@@ -1369,11 +1372,7 @@ struct UnseenRasterMesh : TRasterMesh<UnseenRasterMesh> {
+ 	// inside a hardcoded 3px border, which would drop the whole face -- and so report it unseen --
+ 	// the moment it touches the image edge
+ 	inline bool ProjectVertex(const Point3f& pt, int v, Triangle& t) {
+-		t.ptc[v] = camera.TransformPointW2C(Cast<REAL>(pt));
+-		if (t.ptc[v].z <= 0)
+-			return false;
+-		t.pti[v] = camera.TransformPointC2I(t.ptc[v]);
+-		return true;
++		return ProjectVertexC(pt, v, t);
+ 	}
+ 	inline void Clear() {
+ 		Base::Clear();
+@@ -1408,7 +1407,7 @@ unsigned Scene::RemoveUnseenMeshFaces(unsigned nMinViews, unsigned nResolutionLe
+ {
+ 	ASSERT(nMinViews > 0);
+ 	ASSERT(!mesh.vertices.IsEmpty() && !mesh.faces.IsEmpty());
+-	ASSERT(!images.IsEmpty() && !platforms.IsEmpty() && !HasSphericalImages());
++	ASSERT(!images.IsEmpty() && !platforms.IsEmpty());
+ 	TD_TIMER_START();
+ 	// relative depth tolerance of the centroid visibility probe
+ 	constexpr float kUnseenDepthTol = 0.01f;
+@@ -1462,10 +1461,10 @@ unsigned Scene::RemoveUnseenMeshFaces(unsigned nMinViews, unsigned nResolutionLe
+ 		FOREACH(idxFace, mesh.faces) {
+ 			if (seen[idxFace])
+ 				continue;
+-			const Point3 X(camera.TransformPointW2C(Cast<REAL>(centroids[idxFace])));
+-			if (X.z <= 0)
++			if (!rasterizer.ProjectVertexC(centroids[idxFace], 0, triangle))
+ 				continue;
+-			const ImageRef x(ROUND2INT(camera.TransformPointC2I(X)));
++			const Point3& X(triangle.ptc[0]);
++			const ImageRef x(ROUND2INT(triangle.pti[0]));
+ 			if (!depthMap.isInside(x))
+ 				continue;
+ 			const Depth depth(depthMap(x));
+diff --git a/libs/MVS/SceneTexture.cpp b/libs/MVS/SceneTexture.cpp
+index 5d1b76e..3eca494 100644
+--- a/libs/MVS/SceneTexture.cpp
++++ b/libs/MVS/SceneTexture.cpp
+@@ -180,8 +180,7 @@ struct MeshTexture {
+ 			scaleMaskX((float)imageSize.width / _faceMap.cols), scaleMaskY((float)imageSize.height / _faceMap.rows),
+ 			border(CEIL2INT(3.f / MINF(scaleMaskX, scaleMaskY)) - 1) {}
+ 		inline bool ProjectVertex(const Point3f& pt, int v, Triangle& t) {
+-			return (t.ptc[v] = camera.TransformPointW2C(Cast<REAL>(pt))).z > 0 &&
+-				depthMap.isInsideWithBorder(t.pti[v] = camera.TransformPointC2I(t.ptc[v]), border);
++			return ProjectVertexC(pt, v, t) && depthMap.isInsideWithBorder(t.pti[v], border);
+ 		}
+ 		inline void Clear() {
+ 			Base::Clear();
+@@ -623,9 +622,15 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
+ 		// view offers the face, and a finer raster only multiplies the per-thread face/depth maps
+ 		const cv::Size highResSize(fullSize);
+ 		const Camera cameraHighRes(imageData.GetCamera(scene.platforms, highResSize));
+-		ASSERT(!cameraHighRes.IsSpherical());
+-		const TFrustum<float,5> frustum(Matrix3x4f(cameraHighRes.P), (float)highResSize.width, (float)highResSize.height);
+-		octree.Traverse(frustum, inserter);
++		if (cameraHighRes.IsSpherical()) {
++			// a fisheye sees more than a half-space, which no frustum bounds
++			cameraFaces.resize(faces.size());
++			FOREACH(idxFace, faces)
++				cameraFaces[idxFace] = idxFace;
++		} else {
++			const TFrustum<float,5> frustum(Matrix3x4f(cameraHighRes.P), (float)highResSize.width, (float)highResSize.height);
++			octree.Traverse(frustum, inserter);
++		}
+ 		// project all triangles in this view and keep the closest ones
+ 		faceMap.create(highResSize);
+ 		depthMap.create(highResSize);
+@@ -2516,8 +2521,6 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
+ 	bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, Pixel8U colEmpty, float fSharpnessWeight,
+ 	int nIgnoreMaskLabel, int maxTextureSize, const IIndexArr& views)
+ {
+-	if (!CheckPinholeOnly(_T("the mesh texturing")))
+-		return false;
+ 	MeshTexture texture(*this, nResolutionLevel, nMinResolution);
+ 
+ 	// assign the best view to each face
+@@ -2553,7 +2556,7 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
+ bool Scene::ComputeVertexColors(unsigned nResolutionLevel, unsigned nMinResolution, unsigned minCommonCameras,
+ 	float fOutlierThreshold, float fRatioDataSmoothness, Pixel8U colEmpty, int nIgnoreMaskLabel, const IIndexArr& views)
+ {
+-	if (mesh.IsEmpty() || !CheckPinholeOnly(_T("the mesh vertex coloring")))
++	if (mesh.IsEmpty())
+ 		return false;
+ 
+ 	// assign the best view to each face
+diff --git a/libs/Math/Camera/CameraModels.h b/libs/Math/Camera/CameraModels.h
+index 725787d..81ee63d 100644
+--- a/libs/Math/Camera/CameraModels.h
++++ b/libs/Math/Camera/CameraModels.h
+@@ -63,7 +63,7 @@ HOST_DEVICE FORCEINLINE float FastAtan2(float y, float x) {
+ enum class CameraModelType : uint8_t {
+ 	PINHOLE = 0,
+ 	BROWN = 1, // pinhole + BrownDistortion
+-	SPHERICAL = 2, // equirectangular, 360x180 degrees
++	SPHERICAL = 2, // equidistant fisheye (LidarCamera360 fork)
+ };
+ 
+ // skew-free pinhole; Ray(x) lies on the z=1 plane, so the depth along it is z
+@@ -203,10 +203,14 @@ struct BrownDistortion {
+ /*----------------------------------------------------------------*/
+ 
+ 
+-// equirectangular 360x180 degrees panorama: column = longitude, row = elevation;
+-// longitude atan2(x,z) grows with the column and is 0 at cx (forward +Z), elevation asin(-y/|X|)
+-// is pi/2 on the top row (up = -Y, as for an upright pinhole camera);
+-// Ray(x) is a unit vector, so the depth along it is |X|
++// LidarCamera360 fork: the "spherical" model is an equidistant fisheye, not an equirectangular panorama.
++// The pixel is f*theta away from the center, theta the angle to +Z, on a square image whose width spans
++// FISHEYE_FOV radians, so (as the panorama it replaces) the size alone gives the intrinsics.
++// Directions beyond FISHEYE_FOV/2 project on that circle, which the images keep masked (no depth, no
++// texture): a lookup there finds nothing, so no caller needs to test the field of view.
++// Ray(x) is a unit vector, so the depth along it is |X|.
++// The (sin,cos) table arguments carry the normalized pixel: "sinLon" is u=(c-cx)/fx, "sinEl" v=(r-cy)/fy.
++#define FISHEYE_FOV 3.5
+ template<typename T>
+ struct Spherical {
+ 	typedef T Scalar;
+@@ -214,98 +218,125 @@ struct Spherical {
+ 	typedef Eigen::Matrix<T,3,1> Vec3;
+ 	typedef Eigen::Matrix<T,3,3> Mat3;
+ 
+-	T fx, fy; // pixels per radian: width/(2*pi), height/pi
+-	T cx, cy; // pixel of longitude 0 and elevation 0: (width-1)/2, (height-1)/2
++	T fx, fy; // pixels per radian: size/FISHEYE_FOV
++	T cx, cy; // the optical axis: (size-1)/2
+ 
+ 	HOST_DEVICE static Spherical FromSize(int width, int height) {
+ 		ASSERT(width > 0 && height > 0);
+ 		return Spherical{
+-			T(width) / T(2*3.14159265358979323846), T(height) / T(3.14159265358979323846),
++			T(width) / T(FISHEYE_FOV), T(height) / T(FISHEYE_FOV),
+ 			T(width-1) / T(2), T(height-1) / T(2)};
+ 	}
+ 
+-	// pixel -> (longitude, elevation) in radians
++	// pixel -> normalized fisheye coordinates, of length theta
+ 	HOST_DEVICE Vec2 Angles(const Vec2& x) const {
+ 		ASSERT(fx > T(0) && fy > T(0));
+-		return Vec2((x.x() - cx) / fx, (cy - x.y()) / fy);
++		return Vec2((x.x() - cx) / fx, (x.y() - cy) / fy);
+ 	}
+ 
+ 	HOST_DEVICE Vec3 Ray(const Vec2& x) const {
+-		using std::cos; using std::sin;
+ 		const Vec2 a(Angles(x));
+-		return Ray(sin(a.x()), cos(a.x()), sin(a.y()), cos(a.y()));
++		return Ray(a.x(), T(0), a.y(), T(0));
+ 	}
+-	// the same from the sines and cosines of the pixel's longitude and elevation (they depend on the
+-	// column and on the row only, so a caller may tabulate them)
+-	HOST_DEVICE static Vec3 Ray(T sinLon, T cosLon, T sinEl, T cosEl) {
+-		return Vec3(cosEl * sinLon, -sinEl, cosEl * cosLon);
++	HOST_DEVICE static Vec3 Ray(T u, T, T v, T) {
++		using std::cos; using std::sin; using std::sqrt;
++		const T t2(u*u + v*v);
++		if (t2 < T(1e-8))
++			return Vec3(u, v, T(1) - t2/T(2));
++		const T theta(sqrt(t2)), s(sin(theta)/theta);
++		return Vec3(u*s, v*s, cos(theta));
+ 	}
++	// x = f * theta/rho * (X.x,X.y) + c
+ 	HOST_DEVICE bool Project(const Vec3& X, Vec2& x) const {
+ 		using std::atan2; using std::sqrt;
+-		x = Vec2(
+-			fx * atan2(X.x(), X.z()) + cx,
+-			fy * atan2(X.y(), sqrt(X.x()*X.x() + X.z()*X.z())) + cy);
+-		return X.squaredNorm() > T(0);
++		const T r2(X.x()*X.x() + X.y()*X.y());
++		const T maxTheta(FISHEYE_FOV/2);
++		if (r2 <= T(1e-12)*X.z()*X.z()) {
++			if (X.z() > T(0)) {
++				x = Vec2(cx + fx*X.x()/X.z(), cy + fy*X.y()/X.z());
++				return true;
++			}
++			x = Vec2(cx + fx*maxTheta, cy);
++			return false;
++		}
++		const T rho(sqrt(r2));
++		T theta(atan2(rho, X.z()));
++		const bool visible(theta <= maxTheta);
++		if (!visible)
++			theta = maxTheta;
++		const T k(theta/rho);
++		x = Vec2(fx*k*X.x() + cx, fy*k*X.y() + cy);
++		return visible;
+ 	}
+-	// Project in single precision through FastAtan2, for the patch warps' hot loops, given
+-	// rho = sqrt(X.x^2+X.z^2) (which PixelHomography takes too)
+-	HOST_DEVICE FORCEINLINE bool ProjectFast(const Vec3& X, Vec2& x, T rho) const {
+-		using std::abs; using std::sqrt;
+-		// rho is the caller's sqrt(X.x^2+X.z^2): equal up to rounding only, as compilers that contract
+-		// a*a+b*b into an fma (clang, GCC, nvcc) round the caller's and this expression differently
+-		ASSERT(abs(rho - sqrt(X.x()*X.x() + X.z()*X.z())) <= T(1e-5) * rho);
+-		x = Vec2(
+-			fx * FastAtan2(X.x(), X.z()) + cx,
+-			fy * FastAtan2(X.y(), rho) + cy);
+-		return rho > T(0) || X.y() != T(0);
++	HOST_DEVICE FORCEINLINE bool ProjectFast(const Vec3& X, Vec2& x, T /*rho*/) const {
++		return ProjectFast(X, x);
+ 	}
+ 	HOST_DEVICE FORCEINLINE bool ProjectFast(const Vec3& X, Vec2& x) const {
+ 		using std::sqrt;
+-		return ProjectFast(X, x, sqrt(X.x()*X.x() + X.z()*X.z()));
++		const T r2(X.x()*X.x() + X.y()*X.y());
++		const T maxTheta(FISHEYE_FOV/2);
++		if (r2 <= T(1e-12)*X.z()*X.z())
++			return Project(X, x);
++		const T rho(sqrt(r2));
++		T theta(FastAtan2(rho, X.z()));
++		const bool visible(theta <= maxTheta);
++		if (!visible)
++			theta = maxTheta;
++		const T k(theta/rho);
++		x = Vec2(fx*k*X.x() + cx, fy*k*X.y() + cy);
++		return visible;
+ 	}
+ 	HOST_DEVICE static T Depth(const Vec3& X) {
+ 		return X.norm();
+ 	}
+ 
+-	// pixel offsets (dx,dy,1) around x -> rays, to first order: Ray(x+d) ~ RayFrame(x)*(dx,dy,1);
+-	// the columns are the ray derivatives along the row and down the column, then Ray(x)
++	// pixel offsets (dx,dy,1) around x -> rays, to first order
+ 	HOST_DEVICE Mat3 RayFrame(const Vec2& x) const {
+-		using std::cos; using std::sin;
+ 		const Vec2 a(Angles(x));
+-		return RayFrame(sin(a.x()), cos(a.x()), sin(a.y()), cos(a.y()));
++		return RayFrame(a.x(), T(0), a.y(), T(0));
+ 	}
+-	// the same from the sines and cosines of the pixel's longitude and elevation
+-	HOST_DEVICE Mat3 RayFrame(T sinLon, T cosLon, T sinEl, T cosEl) const {
++	HOST_DEVICE Mat3 RayFrame(T u, T, T v, T) const {
++		using std::cos; using std::sin; using std::sqrt;
++		const T t2(u*u + v*v);
++		T s, g, c; // sin(theta)/theta, its derivative over theta, cos(theta)
++		if (t2 < T(1e-2)) {
++			s = T(1) - t2/T(6) + t2*t2/T(120);
++			g = T(-1)/T(3) + t2/T(30) - t2*t2/T(840);
++			c = T(1) - t2/T(2) + t2*t2/T(24);
++		} else {
++			const T theta(sqrt(t2));
++			s = sin(theta)/theta; c = cos(theta); g = (c - s)/t2;
++		}
+ 		Mat3 F;
+-		F << cosEl*cosLon/fx, sinEl*sinLon/fy, cosEl*sinLon,
+-		     T(0), cosEl/fy, -sinEl,
+-		     -cosEl*sinLon/fx, sinEl*cosLon/fy, cosEl*cosLon;
++		F << (s + u*u*g)/fx, u*v*g/fy, u*s,
++		     u*v*g/fx, (s + v*v*g)/fy, v*s,
++		     -s*u/fx, -s*v/fy, c;
+ 		return F;
+ 	}
+-	// rays near the given one -> homogeneous pixels: the gnomonic projection onto the plane tangent to
+-	// the sphere at the ray, scaled by the equirectangular Jacobian there; exact at the ray and first
+-	// order around it, with an error growing as 1/cos(elevation) towards the poles
++	// rays near the given one -> homogeneous pixels: the gnomonic projection on the plane tangent to the
++	// sphere at the ray, scaled by the fisheye Jacobian there; exact at the ray and first order around it
+ 	HOST_DEVICE Mat3 PixelHomography(const Vec3& ray) const {
+ 		Vec2 x;
+ 		Project(ray, x);
+ 		return PixelHomography(ray, x);
+ 	}
+-	// the same, given the pixel x of the ray (Project)
+-	HOST_DEVICE Mat3 PixelHomography(const Vec3& ray, const Vec2& x) const {
+-		using std::sqrt;
+-		return PixelHomography(ray, x, sqrt(ray.x()*ray.x() + ray.z()*ray.z()));
++	HOST_DEVICE Mat3 PixelHomography(const Vec3& ray, const Vec2& x, T /*rho*/) const {
++		return PixelHomography(ray, x);
+ 	}
+-	// the same, given also rho = sqrt(ray.x^2+ray.z^2) = |ray|*cos(el), which Project computes too
+-	HOST_DEVICE Mat3 PixelHomography(const Vec3& ray, const Vec2& x, T rho) const {
+-		// with d = ray/|ray|, the rows fx/cos(el)*eLon + x.x*d, fy*eDown + x.y*d, d, where eLon =
+-		// (cos(lon),0,-sin(lon)) is the longitude tangent and eDown = (-d.y*sin(lon),cos(el),-d.y*cos(lon))
+-		// the downward elevation tangent, scaled by |ray| (a homography is defined up to scale)
+-		ASSERT(rho > T(0));
+-		const T invRho(T(1)/rho);
+-		const T sx(fx*(rho*rho + ray.y()*ray.y())*invRho*invRho), sy(fy*ray.y()*invRho);
++	HOST_DEVICE Mat3 PixelHomography(const Vec3& ray, const Vec2& x) const {
++		using std::atan2; using std::sqrt;
++		// rows (up to the scale |ray|): fx*grad(theta*cos(phi)) + x.x*d, fy*grad(theta*sin(phi)) + x.y*d, d
++		const T rho(sqrt(ray.x()*ray.x() + ray.y()*ray.y())), n(ray.norm());
++		T cp(1), sp(0), k(1); // k = theta/sin(theta)
++		const T st(rho/n), ct(ray.z()/n);
++		if (st > T(1e-4)) {
++			cp = ray.x()/rho; sp = ray.y()/rho; k = atan2(rho, ray.z())/st;
++		}
++		const Vec3 eT(ct*cp, ct*sp, -st), eP(-sp, cp, T(0));
++		const Vec3 gx((eT*cp - eP*(k*sp))*(fx*n)), gy((eT*sp + eP*(k*cp))*(fy*n));
+ 		Mat3 P;
+-		P << sx*ray.z() + x.x()*ray.x(), x.x()*ray.y(), -sx*ray.x() + x.x()*ray.z(),
+-		     -sy*ray.x() + x.y()*ray.x(), fy*rho + x.y()*ray.y(), -sy*ray.z() + x.y()*ray.z(),
++		P << gx.x() + x.x()*ray.x(), gx.y() + x.x()*ray.y(), gx.z() + x.x()*ray.z(),
++		     gy.x() + x.y()*ray.x(), gy.y() + x.y()*ray.y(), gy.z() + x.y()*ray.z(),
+ 		     ray.x(), ray.y(), ray.z();
+ 		return P;
+ 	}
+diff --git a/vcpkg.json b/vcpkg.json
+index 3ac88cb..bade0ce 100644
+--- a/vcpkg.json
++++ b/vcpkg.json
+@@ -12,14 +12,6 @@
+     "boost-serialization",
+     "boost-system",
+     "boost-throw-exception",
+-    {
+-      "name": "ceres",
+-      "features": [
+-          "lapack",
+-          "schur",
+-          "suitesparse"
+-      ]
+-    },
+     {
+       "name": "cgal",
+       "default-features": false
+@@ -101,19 +93,7 @@
+     "cuda": {
+       "description": "CUDA support for OpenMVS",
+       "dependencies": [
+-        "cuda",
+-        {
+-          "name": "ceres",
+-          "features": [
+-            "cuda"
+-          ]
+-        },
+-        {
+-          "name": "siftgpu",
+-          "features": [
+-            "cuda"
+-          ]
+-        }
++        "cuda"
+       ]
+     },
+     "python": {
+@@ -123,4 +103,4 @@
+       ]
+     }
+   }
+-}
++}
+\ No newline at end of file

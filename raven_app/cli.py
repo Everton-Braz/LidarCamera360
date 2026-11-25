@@ -290,6 +290,9 @@ def parse(argv=None):
     color.add_argument('--fps',type=positive,default=2.)
     color.add_argument('--calib','--calib-json',type=Path)
     color.add_argument('--dt',type=finite)
+    color.add_argument('--photo-alignment',action='store_true',
+                       help='direct method: first align the fisheye photos on the SfM tracks and the scan and remove their '
+                            'rolling shutter')
     color.add_argument('--run-spirula',action='store_true')
     color.add_argument('--recalibrate-from-sfm',action='store_true')
     add_mask_options(color)
@@ -318,9 +321,16 @@ def parse(argv=None):
     wf.add_argument('--no-revisit-refinement',action='store_false',dest='revisit_refinement')
     wf.add_argument('--rebuild',nargs='+',choices=('slam','sfm'),default=(),
                     help='Recompute these stages even when cached outputs exist (extracted frames are always reused)')
-    wf.add_argument('--densify',choices=('off','roma'),default='off',
-                    help='roma: RoMa v2 dense matching on the 3DGS export, added to its seed only in LiDAR gaps (colmap_3dgs/densify)')
+    wf.add_argument('--no-photo-alignment',action='store_false',dest='photo_alignment',
+                    help='Color the cloud and export the 3DGS dataset from the photos, poses and lenses as calibrated, without '
+                         'aligning the fisheye photos on the SfM tracks and the scan and removing their rolling shutter first')
+    wf.add_argument('--densify',choices=('off','roma','openmvs'),default='off',
+                    help='openmvs: dense photogrammetry on the fisheye photos, guided by the LiDAR (colmap_3dgs/dense_openmvs; needs the optional OpenMVS fisheye build). roma: RoMa v2 dense matching on the 3DGS export, added to its seed only in LiDAR gaps (colmap_3dgs/densify)')
     wf.add_argument('--densify-preset',choices=('fast','balanced','high'),default='balanced')
+    wf.add_argument('--dense-quality',choices=('draft','balanced','high','full'),default='balanced',
+                    help='Photo size of --densify openmvs: 1024, 1664, 2496 or 3328 px')
+    wf.add_argument('--dense-mesh',choices=('glb','obj','ply'),default=None,
+                    help='with --densify openmvs: also build a surface mesh. glb/obj: textured from the fisheye photos; ply: without texture')
     wf.add_argument('--slam-profile',choices=('timelapse','classic'),default='timelapse',
                     help='FAST-LIVO2 settings for Raven timelapse captures: timelapse = surface 0.06 m / map 0.20 m; '
                          'classic = 0.10 m / 0.60 m / 2 layers (the 27/09/2026 CASA 374 settings)')
@@ -379,6 +389,30 @@ def parse(argv=None):
     exp.add_argument('--project', type=Path, required=True, help='Output folder of a workflow run (contains project.json)')
     exp.add_argument('--formats', nargs='+', required=True, help='pcd laz las georef gps trajectory')
     exp.add_argument('--dest', type=Path, default=None, help='Destination folder (default: <project>/exports)')
+    dense = sub.add_parser('dense', help='Dense photogrammetry (OpenMVS, fisheye photos, LiDAR-guided) of a 3DGS/COLMAP export')
+    dense.add_argument('--colmap', type=Path, required=True, help='The colmap_3dgs folder of a run')
+    dense.add_argument('--output', type=Path, default=None, help='Default: <colmap>/dense_openmvs')
+    dense.add_argument('--openmvs', type=Path, default=None, help='DensifyPointCloud of the fisheye build (default: Settings)')
+    dense.add_argument('--quality', choices=('draft', 'balanced', 'high', 'full'), default='balanced')
+    dense.add_argument('--mode', choices=('fused', 'photo'), default='fused',
+                       help='fused: photo points plus LiDAR points where the photos have gaps; photo: photo points only')
+    dense.add_argument('--mesh', choices=('glb', 'obj', 'ply'), default=None,
+                       help='Also build a surface mesh. glb/obj: textured from the fisheye photos; ply: without texture')
+    dense.add_argument('--normals', type=Path, default=None,
+                       help='Normal maps of the photos (as Spirula Studio writes them) that smooth the mesh; default: <colmap>/normals, if any')
+    dense.add_argument('--no-normals', action='store_true', help='Do not smooth the mesh with normal maps')
+    dense.add_argument('--no-lidar', action='store_true', help='Use the scan only to choose neighbour photos, not to guide the depths')
+    dense.add_argument('--no-refine', action='store_true',
+                       help="Use the export's poses and lenses as they are; do not align the photos and remove their rolling shutter first")
+    dense.add_argument('--run', type=Path, default=None,
+                       help='Run folder with the feature tracks and the trajectory (default: the folder that holds --colmap)')
+    dense.add_argument('--keep-work', action='store_true', help='Keep the resampled photos and OpenMVS files')
+    photo = sub.add_parser('photogrammetry-export',
+                           help='Export the fisheye photos, masks, poses and LiDAR for RealityScan or Metashape (optional, not bundled)')
+    photo.add_argument('--program', choices=('realityscan', 'metashape'), required=True)
+    photo.add_argument('--colmap', type=Path, required=True, help='The colmap_3dgs folder of a run')
+    photo.add_argument('--output', type=Path, default=None, help='Default: <colmap>/<program>')
+    photo.add_argument('--open', action='store_true', help='Open the result in the installed program')
     trim = sub.add_parser('trim', help='Trim synchronized ROS bag and 360 video from start and end')
     trim.add_argument('--bag', type=Path, required=True, help='Path to input ROS bag (.bag)')
     trim.add_argument('--insv', '--video', dest='insv', type=Path, required=True, help='Path to input 360 video (.insv / .mp4)')
@@ -797,13 +831,17 @@ def run(a):
                         third_cfgs = [by_name.get(camera.camera_name, camera) for camera in third_cfgs]
                         from raven_app.third_camera import save_third_camera_config
                         save_third_camera_config(third_cfgs, dataset / 'third_camera_calibrated.json')
+            aligned = None
+            if a.photo_alignment:
+                from raven_app.photo_alignment import align_photos
+                aligned = align_photos(dataset, calib, a.fps, dt, masks_dir)
             pipeline.colorize_via_direct_rigid(
                 dataset, calib, fps=a.fps, dt_override=dt,
                 use_vulkan=not a.no_vulkan, masks_dir=masks_dir,
                 operator_radius=a.operator_radius,
                 photometric=a.photometric, photometric_params=a.photometric_params,
                 third_camera=third_cfgs, time_window=a.time_window,
-                remove_dynamic=a.remove_dynamic
+                remove_dynamic=a.remove_dynamic, aligned=aligned
             )
         return 0
     if a.command=='workflow':
@@ -867,6 +905,9 @@ def run(a):
             rebuild=tuple(getattr(a, 'rebuild', ()) or ()),
             densify=getattr(a, 'densify', 'off'),
             densify_preset=getattr(a, 'densify_preset', 'balanced'),
+            dense_quality=getattr(a, 'dense_quality', 'balanced'),
+            dense_mesh=getattr(a, 'dense_mesh', None),
+            photo_alignment=getattr(a, 'photo_alignment', True),
             slam_profile=getattr(a, 'slam_profile', 'timelapse'),
             slam_dir=getattr(a, 'slam_dir', None),
             profile=a.profile,
@@ -874,6 +915,21 @@ def run(a):
             remove_dynamic=a.remove_dynamic,
             rig_refine=a.rig_refine,
         )
+    if a.command == 'dense':
+        from raven_app.config import get_openmvs_bin
+        from raven_app.openmvs_dense import densify_openmvs
+        report = densify_openmvs(a.colmap.resolve(), a.openmvs or get_openmvs_bin(), out_dir=a.output, quality=a.quality,
+                                 mode=a.mode, use_lidar=not a.no_lidar, mesh=a.mesh, refine=not a.no_refine,
+                                 run_dir=a.run, normals=False if a.no_normals else a.normals, keep_work=a.keep_work)
+        print(json.dumps(report, indent=2))
+        return 0
+    if a.command == 'photogrammetry-export':
+        from raven_app.config import load_config
+        from raven_app.photogrammetry_export import export_for, open_in
+        folder = export_for(a.program, a.colmap.resolve(), out_dir=a.output)
+        if a.open:
+            open_in(a.program, folder, str(load_config().get(f'{a.program}_path', '') or ''))
+        return 0
     if a.command == 'mcp':
         from raven_app.mcp_server import LidarCameraMcpServer
         server = LidarCameraMcpServer()

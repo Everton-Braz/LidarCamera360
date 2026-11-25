@@ -26,12 +26,20 @@ from raven_app.mask_resources import resource_status, resources_ready
 from raven_app.bag_io import detect_bag_topics, find_adjacent_image_bag, find_adjacent_lidar_bag
 from raven_app.seed_export import dataset_seed_point_count, seed_point_count
 from raven_app.i18n import tr, tr_button
-from raven_app.config import DEFAULT_OPERATOR_RADIUS_M, load_config
+from raven_app.config import DEFAULT_OPERATOR_RADIUS_M, get_openmvs_bin, load_config
+from raven_app.openmvs_mesh import has_programs
 
 RIG_REFINE_CHOICES = (
     ("Photometric (recommended)", "photometric"),
     ("Time offset only", "dt"),
     ("Off", "none"),
+)
+
+DENSE_QUALITY_CHOICES = (
+    ("Draft (1024 px)", "draft"),
+    ("Balanced (1664 px)", "balanced"),
+    ("High (2496 px)", "high"),
+    ("Full (3328 px)", "full"),
 )
 
 
@@ -559,6 +567,21 @@ class UnifiedWorkflowView(QWidget):
         self.chk_colmap.setChecked(True)
         output_layout.addWidget(self.chk_colmap)
 
+        dense_layout = QHBoxLayout()
+        self.chk_dense = CheckBox(tr("Dense photogrammetry from the fisheye photos (OpenMVS, optional)"))
+        self.chk_dense.setChecked(False)
+        self.dense_quality_combo = ComboBox()
+        for label, value in DENSE_QUALITY_CHOICES:
+            self.dense_quality_combo.addItem(tr(label), userData=value)
+        self.dense_quality_combo.setCurrentIndex(1)
+        dense_layout.addWidget(self.chk_dense)
+        dense_layout.addWidget(self.dense_quality_combo)
+        self.chk_dense_mesh = CheckBox(tr("Textured mesh (GLB)"))
+        self.chk_dense_mesh.setChecked(False)
+        dense_layout.addWidget(self.chk_dense_mesh)
+        dense_layout.addStretch()
+        output_layout.addLayout(dense_layout)
+
         seed_layout = QGridLayout()
         seed_layout.setColumnStretch(1, 1)
         self.seed_percent_label = BodyLabel(tr("3DGS LiDAR seed export:"))
@@ -623,6 +646,21 @@ class UnifiedWorkflowView(QWidget):
         self.btn_export_project.setToolTip(tr("Write PCD, LAZ/LAS, georeferenced cloud, GPS track or trajectory from an existing project."))
         self.btn_export_project.clicked.connect(self._action_export_from_project)
         output_layout.addWidget(self.btn_export_project)
+
+        # Optional (Settings > Deliverables): hand-off to programs the user owns
+        self._photogrammetry_runner = ProcessRunner(self)
+        self._photogrammetry_runner.finished.connect(self._on_photogrammetry_finished)
+        self._photogrammetry_buttons = {}
+        photogrammetry_row = QHBoxLayout()
+        for program, name in (('realityscan', 'RealityScan'), ('metashape', 'Metashape')):
+            button = PushButton(tr("Open in {program}...", program=name), icon=FluentIcon.SHARE)
+            button.setToolTip(tr("Export the fisheye photos, masks, poses and LiDAR of a 3DGS dataset, and open them if the program is installed."))
+            button.clicked.connect(lambda _=False, p=program: self._action_open_photogrammetry(p))
+            button.setVisible(bool(load_config().get("show_photogrammetry_export", False)))
+            self._photogrammetry_buttons[program] = button
+            photogrammetry_row.addWidget(button)
+        photogrammetry_row.addStretch()
+        output_layout.addLayout(photogrammetry_row)
 
         layout.addWidget(output_card)
 
@@ -742,6 +780,7 @@ class UnifiedWorkflowView(QWidget):
         self.seed_percent_spin.valueChanged.connect(self._update_seed_point_estimate)
         self.out_input.textChanged.connect(self._refresh_seed_point_estimate)
         self.chk_colmap.stateChanged.connect(self._toggle_seed_export_controls)
+        self.chk_dense.stateChanged.connect(self._toggle_seed_export_controls)
         self._toggle_seed_export_controls()
         self._refresh_seed_point_estimate()
 
@@ -750,6 +789,18 @@ class UnifiedWorkflowView(QWidget):
         self.seed_percent_label.setEnabled(enabled)
         self.seed_percent_slider.setEnabled(enabled)
         self.seed_percent_spin.setEnabled(enabled)
+        openmvs = get_openmvs_bin()
+        found = openmvs.is_file()
+        can_mesh = has_programs(openmvs) if found else False
+        self.chk_dense.setEnabled(enabled and found)
+        self.dense_quality_combo.setEnabled(enabled and found)
+        self.chk_dense_mesh.setEnabled(enabled and can_mesh and self.chk_dense.isChecked())
+        self.chk_dense_mesh.setToolTip(
+            tr("Also turns the dense cloud into a surface, with its texture copied from the fisheye photos. Passers-by masked out of the photos leave no texture.")
+            if can_mesh else tr("Needs ReconstructMesh and TextureMesh of the OpenMVS fisheye build, beside DensifyPointCloud."))
+        self.chk_dense.setToolTip(
+            tr("Builds a dense cloud from each fisheye photo as a whole and fills its gaps with the LiDAR. Written to colmap_3dgs/dense_openmvs.")
+            if found else tr("OpenMVS (fisheye build) was not found. Set its folder in Settings > Deliverables."))
         self._update_seed_point_estimate()
 
     def _refresh_seed_point_estimate(self, text=None):
@@ -991,6 +1042,43 @@ class UnifiedWorkflowView(QWidget):
         else:
             InfoBar.success(title=tr("Export finished"), content=f"{written} " + tr("file(s) in") + f" {dest}",
                             parent=self, duration=6000)
+
+    def _action_open_photogrammetry(self, program):
+        from PyQt6.QtWidgets import QFileDialog
+        from raven_app.photogrammetry_export import PROGRAMS, find_program
+        if self._photogrammetry_runner.is_busy:
+            return
+        output = self.out_input.text().strip()
+        default = Path(output) / 'colmap_3dgs' if output else None
+        folder = QFileDialog.getExistingDirectory(self, tr("3DGS dataset folder (colmap_3dgs)"),
+                                                  str(default) if default and default.is_dir() else "")
+        if not folder:
+            return
+        if not (Path(folder) / 'sparse' / '0' / 'images.txt').is_file():
+            InfoBar.error(title=tr("Not a 3DGS dataset"), content=tr("sparse/0/images.txt was not found in that folder."),
+                          parent=self, duration=5000)
+            return
+        installed = find_program(program, str(load_config().get(f'{program}_path', '') or '')) is not None
+        args = ['photogrammetry-export', '--program', program, '--colmap', folder] + (['--open'] if installed else [])
+        self._photogrammetry_job = (PROGRAMS[program], Path(folder) / program, installed)
+        if self._photogrammetry_runner.start_job(args, log_path=make_run_log_path(folder, f'{program}_export')):
+            for button in self._photogrammetry_buttons.values():
+                button.setEnabled(False)
+            InfoBar.info(title=tr("Exporting for {program}", program=PROGRAMS[program]),
+                         content=tr("The photos are being prepared; this takes a few minutes."), parent=self, duration=6000)
+
+    def _on_photogrammetry_finished(self, code: int):
+        for button in self._photogrammetry_buttons.values():
+            button.setEnabled(True)
+        name, folder, installed = self._photogrammetry_job
+        if code:
+            InfoBar.error(title=tr("Export for {program} failed", program=name),
+                          content=f"{tr('Log:')} {self._photogrammetry_runner.log_path}", parent=self, duration=10000)
+        else:
+            text = tr("Files in {folder}", folder=str(folder))
+            if not installed:
+                text += "\n" + tr("{program} was not found on this computer, so nothing was opened.", program=name)
+            InfoBar.success(title=tr("Export finished"), content=text, parent=self, duration=8000)
 
     def _toggle_gps_formats(self, state=None):
         enabled = self.process_gps_chk.isChecked()
@@ -1683,6 +1771,10 @@ class UnifiedWorkflowView(QWidget):
         if self.chk_colmap.isChecked():
             args.append("--export-colmap")
             args.extend(["--seed-percent", str(self.seed_percent_spin.value())])
+            if self.chk_dense.isEnabled() and self.chk_dense.isChecked():
+                args.extend(["--densify", "openmvs", "--dense-quality", self.dense_quality_combo.currentData()])
+                if self.chk_dense_mesh.isChecked() and self.chk_dense_mesh.isEnabled():
+                    args.extend(["--dense-mesh", "glb"])
 
         if self.process_gps_chk.isChecked():
             args.append("--process-gps")
@@ -2060,6 +2152,13 @@ class UnifiedWorkflowView(QWidget):
         self.chk_ply.setText(tr("Export Colored Point Cloud (.PLY)"))
         self.chk_pcd.setText(tr("Export Colored Point Cloud (.PCD)"))
         self.chk_colmap.setText(tr("Metric-Scaled 3DGS COLMAP Dataset"))
+        self.chk_dense.setText(tr("Dense photogrammetry from the fisheye photos (OpenMVS, optional)"))
+        for index, (label, _) in enumerate(DENSE_QUALITY_CHOICES):
+            self.dense_quality_combo.setItemText(index, tr(label))
+        self.chk_dense_mesh.setText(tr("Textured mesh (GLB)"))
+        for program, name in (('realityscan', 'RealityScan'), ('metashape', 'Metashape')):
+            self._photogrammetry_buttons[program].setText(tr("Open in {program}...", program=name))
+        self._toggle_seed_export_controls()
         self.seed_percent_label.setText(tr("3DGS LiDAR seed export:"))
         self.seed_percent_slider.setToolTip(tr("Choose the percentage of LiDAR points to include in the 3DGS seed."))
         self.seed_percent_spin.setToolTip(tr("Type the percentage of LiDAR points to include in the 3DGS seed."))

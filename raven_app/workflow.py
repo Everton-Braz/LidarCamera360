@@ -1953,6 +1953,14 @@ def _upright_camera_ids(colmap_dir):
     return json.loads(path.read_text(encoding='utf-8')).get('camera_ids', [])
 
 
+def read_export_report(colmap_dir) -> Dict[str, Any]:
+    """The report of a 3DGS export; empty when it has none."""
+    try:
+        return dict(json.loads((Path(colmap_dir) / 'colmap_export_report.json').read_text(encoding='utf-8')))
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 def refine_colmap_3dgs_poses(colmap_dir: Path, tracks_dir: Path, update_export_report: bool = False,
                              **settings) -> Dict[str, Any]:
     """Bundle-adjust the direct rig poses of a 3DGS export against SfM feature tracks.
@@ -1962,6 +1970,8 @@ def refine_colmap_3dgs_poses(colmap_dir: Path, tracks_dir: Path, update_export_r
     """
     from raven_app.pose_ba import refine_poses, write_report
     colmap_dir = Path(colmap_dir)
+    if read_export_report(colmap_dir).get('pose_source') == 'aligned':
+        return {'status': 'skipped', 'reason': 'the photo alignment of this export already adjusted its poses'}
     sparse_dir = colmap_dir / 'sparse' / '0'
     upright = _upright_camera_ids(colmap_dir)
     # The SfM tracks are in raw frame pixels, and images_direct.txt holds raw poses.
@@ -2047,8 +2057,11 @@ def _replace_dir(source, target, attempts=8, first_delay_s=0.5):
 def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt_sync: float = 0.0,
                        max_points: Optional[int] = None, masks_dir: Optional[Path] = None,
                        third_camera: Optional[Any] = None, seed_percent: float = 100.0,
-                       pose_source: str = 'auto', export_path: Optional[Path] = None) -> Path:
-    """Build a clean COLMAP export, preserving any prior export as a recoverable backup."""
+                       pose_source: str = 'auto', export_path: Optional[Path] = None, aligned=None) -> Path:
+    """Build a clean COLMAP export, preserving any prior export as a recoverable backup.
+
+    `aligned` (photo_alignment.AlignedPhotos) replaces the photos, poses and lenses of a 'ba' export.
+    """
     dataset_dir = Path(dataset_dir)
     target_dir = Path(export_path) if export_path is not None else dataset_dir / 'colmap_3dgs'
     if export_path is not None and target_dir.exists():
@@ -2058,7 +2071,7 @@ def export_colmap_3dgs(dataset_dir: Path, calib_path: Path, fps: float = 2.0, dt
     try:
         _build_colmap_3dgs_dataset(
             dataset_dir, calib_path, fps, dt_sync, max_points, masks_dir, third_camera,
-            seed_percent, pose_source, stage_dir,
+            seed_percent, pose_source, stage_dir, aligned,
         )
         backup_dir = None
         if target_dir.exists():
@@ -2114,7 +2127,7 @@ def timelapse_alignment_dt(dataset_dir, alignment=None):
 
 
 def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points,
-                              masks_dir, third_camera, seed_percent, pose_source, out_dir):
+                              masks_dir, third_camera, seed_percent, pose_source, out_dir, aligned=None):
     """Generate a complete COLMAP dataset configured for 3D Gaussian Splatting (3DGS) training.
 
     Transforms camera poses into the LiDAR metric coordinate frame and seeds the model with
@@ -2377,13 +2390,25 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
         allowed_names -= blurred
         print(f"  [*] Left out {len(blurred)} motion-blurred image(s) (sharpness < half of their neighbours')")
 
+    if aligned is not None:
+        if pose_source != 'ba':
+            aligned = None
+        elif (any(n not in aligned.poses for n, _ in selected_images if n.startswith(('cam0/', 'cam1/')))
+                or any(not (aligned.images_dir / n).is_file() for n, _ in selected_images)
+                or (masks_dir is not None and aligned.masks_dir is None)):
+            print('  [!] Photo alignment not used: it does not cover every photo of the export')
+            aligned = None
+    if aligned is not None:
+        selected_images = [(n, aligned.images_dir / n) for n, _ in selected_images]
+
     camera_files = []
     for name, source in selected_images:
         target = images_out / Path(name)
         _link_or_copy(source, target)
         camera_files.append(source)
     if masks_dir is not None:
-        _copy_person_masks(dataset_dir, masks_dir, out_dir, camera_files)
+        _copy_person_masks(dataset_dir if aligned is None else aligned.images_dir.parent,
+                           masks_dir if aligned is None else aligned.masks_dir, out_dir, camera_files)
 
     poses_ready = False
     if pose_source == 'sfm':
@@ -2429,8 +2454,11 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
             f.write("# Camera list with one line of data per camera:\n")
             f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
             for camera_id, intrinsics in primary_cams_to_write:
-                model, width, height, params = _colmap_model_parameters(
-                    intrinsics, calib.get('lens_model'), camera_id)
+                if aligned is not None and f'cam{camera_id - 1}' in aligned.cameras:
+                    model, width, height, params = aligned.cameras[f'cam{camera_id - 1}']
+                else:
+                    model, width, height, params = _colmap_model_parameters(
+                        intrinsics, calib.get('lens_model'), camera_id)
                 f.write(f"{camera_id} {model} {width} {height} "
                         f"{' '.join(format(value, '.17g') for value in params)}\n")
         print("  [+] Written cameras.txt")
@@ -2455,6 +2483,8 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
                     p_cam = p_lidar + R_lidar @ translation_lc
                     R_world_cam = R_lidar @ rotation_lc
                     R_cw = R_world_cam.T
+                    if aligned is not None:
+                        R_cw, p_cam = aligned.poses[name]
                     t_cw = -R_cw @ p_cam
                     q_cw = Rot.from_matrix(R_cw).as_quat()
                     f.write(
@@ -2462,8 +2492,8 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
                         f"{t_cw[0]:.17g} {t_cw[1]:.17g} {t_cw[2]:.17g} {camera_id} {name}\n\n"
                     )
                     image_id += 1
-        print(f"  [+] Written direct images.txt with {image_id - 1} camera poses")
-        if pose_source == 'ba':
+        print(f"  [+] Written {'direct' if aligned is None else 'aligned'} images.txt with {image_id - 1} camera poses")
+        if pose_source == 'ba' and aligned is None:
             pose_adjustment = refine_colmap_3dgs_poses(out_dir, sfm_sparse)
 
     # Seed 3DGS point cloud exclusively with true metric LiDAR points (full raw points)
@@ -2535,7 +2565,7 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
         camera_name = image['name'].replace('\\', '/').split('/', 1)[0]
         counts_by_camera[camera_name] = counts_by_camera.get(camera_name, 0) + 1
     report = {
-        'pose_source': pose_source,
+        'pose_source': pose_source if aligned is None else 'aligned',
         'dt_sync_seconds': sync_for_export,
         'slam_duration_seconds': slam_duration,
         'exported_images_by_camera': counts_by_camera,
@@ -2545,6 +2575,8 @@ def _build_colmap_3dgs_dataset(dataset_dir, calib_path, fps, dt_sync, max_points
         'lidar_seed_percent': seed_percent,
         'upright_rotated_cameras': upright_lenses,
     }
+    if aligned is not None:
+        report['photo_alignment'] = aligned.report
     if pose_adjustment is not None:
         report['pose_adjustment'] = {key: pose_adjustment.get(key) for key in
                                      ('status', 'reason', 'before', 'after', 'pose_shift_cm',
@@ -3037,6 +3069,9 @@ def execute_unified_workflow(
     rebuild=(),
     densify: str = 'off',
     densify_preset: str = 'balanced',
+    dense_quality: str = 'balanced',
+    dense_mesh: str | None = None,
+    photo_alignment: bool = True,
     slam_profile: str = 'timelapse',
     slam_dir: Optional[Path] = None,
     profile: Optional[str] = None,
@@ -3981,16 +4016,28 @@ def execute_unified_workflow(
     elif method in ("sfm", "all"):
         alignment_valid = False
 
+    def aligned_photos():
+        """The photos of this run, aligned with each other and the scan; None: as they are."""
+        if not photo_alignment or method == 'direct':
+            return None
+        from raven_app.photo_alignment import align_photos
+        result = align_photos(output_dir, calib, fps, dt_sync, active_masks_dir)
+        run_record['photo_alignment'] = {'status': 'not_used'} if result is None else result.report
+        _persist_workflow_run(output_dir, run_record)
+        return result
+
+    aligned = None
     sfm_done = False
     # SfM projection serves the 360 rig; bag cameras without one are colorized by their
     # calibrated rigid mount, which the per-image SfM poses (Sim3-aligned) cannot beat.
     if method in ("sfm", "all") and sparse_bin.is_file() and alignment_valid and has_insv:
         try:
+            aligned = aligned_photos()
             pipeline.colorize_via_spirula_sfm(
                 output_dir, fps=fps, use_vulkan=use_vulkan,
                 masks_dir=active_masks_dir, operator_radius=operator_radius,
                 photometric=photometric, photometric_params=photometric_params,
-                time_window=time_window, remove_dynamic=remove_dynamic
+                time_window=time_window, remove_dynamic=remove_dynamic, aligned=aligned
             )
             sfm_done = True
         except Exception as e:
@@ -4027,12 +4074,13 @@ def execute_unified_workflow(
                 'stage': 'auxiliary_camera_calibration', 'reason': message})
             _persist_workflow_run(output_dir, run_record)
             raise RuntimeError(message)
+        aligned = aligned_photos()
         pipeline.colorize_via_direct_rigid(
             output_dir, calib, fps=fps, dt_override=dt_sync, use_vulkan=use_vulkan,
             masks_dir=active_masks_dir, operator_radius=operator_radius,
             photometric=photometric, photometric_params=photometric_params,
             third_camera=calibrated_cameras, time_window=time_window,
-            remove_dynamic=remove_dynamic
+            remove_dynamic=remove_dynamic, aligned=aligned
         )
 
     # --------------------------------------------------------------------------
@@ -4089,7 +4137,7 @@ def execute_unified_workflow(
                            masks_dir=active_masks_dir, third_camera=third_cfgs,
                            seed_percent=seed_percent,
                            pose_source='direct' if method == 'direct' else 'ba',
-                           export_path=colmap_export_dir)
+                           export_path=colmap_export_dir, aligned=aligned)
         if densify == 'roma':
             from raven_app.config import get_spirula_bin
             from raven_app.dense_fusion import densify_colmap_export
@@ -4099,6 +4147,17 @@ def execute_unified_workflow(
             except Exception as exc:
                 run_record['densification'] = {'status': 'failed', 'reason': str(exc)}
                 print(f"[!] RoMa v2 densification failed ({exc}); the LiDAR seed is unchanged.")
+            _persist_workflow_run(output_dir, run_record)
+        elif densify == 'openmvs':
+            from raven_app.config import get_openmvs_bin
+            from raven_app.openmvs_dense import densify_openmvs
+            colmap_dir = Path(colmap_export_dir) if colmap_export_dir else output_dir / 'colmap_3dgs'
+            try:
+                run_record['densification'] = densify_openmvs(colmap_dir, get_openmvs_bin(), quality=dense_quality,
+                                                                  mesh=dense_mesh, run_dir=output_dir)
+            except Exception as exc:
+                run_record['densification'] = {'status': 'failed', 'reason': str(exc)}
+                print(f"[!] OpenMVS dense photogrammetry failed ({exc}); the other deliverables are unchanged.")
             _persist_workflow_run(output_dir, run_record)
 
     # One project per dataset, refreshed by every run; the run itself only leaves its deliverables.
