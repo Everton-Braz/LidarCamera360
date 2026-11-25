@@ -113,7 +113,7 @@ def get_spirula_bin() -> Path:
 def get_openmvs_bin() -> Path:
     """DensifyPointCloud of the fisheye OpenMVS build: Settings (openmvs_path), LIDARCAMERA360_OPENMVS, openmvs/, PATH.
 
-    OpenMVS is optional and not bundled, so the returned path may not exist."""
+    OpenMVS is optional (a source checkout has none), so the returned path may not exist."""
     name = "DensifyPointCloud.exe" if os.name == "nt" else "DensifyPointCloud"
     for configured in (str(load_config().get("openmvs_path", "") or ""), os.environ.get("LIDARCAMERA360_OPENMVS", "")):
         path = Path(configured.strip()) if configured.strip() else None

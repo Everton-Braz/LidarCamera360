@@ -19,6 +19,9 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Coloured cloud:** the photos agree better on the points (62 % of the variance of the detail is the point's, was
   28 %), and signs are easier to read. The number of points and their place do not change.
 - `--no-photo-alignment` (workflow) turns it off; `colorize --photo-alignment` turns it on for that command.
+- **Short captures get the lever arm refinement too.** It asked for 150 photos per lens and gave up below that, so a
+  100-second walk at 1 photo per second kept a 6.2 cm camera-to-trajectory error. It now needs 60, still checked on
+  blocks of photos kept out of the fit: on that walk the error is 0.8 cm.
 
 ### 📷 Dense photogrammetry (optional)
 - **Dense point cloud from the fisheye photos** with OpenMVS, at the LiDAR poses. Photos are not split into pinhole
@@ -40,7 +43,8 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   1.2 degrees (median) from the LiDAR planes, at the same distance to the LiDAR. It takes about four more minutes.
 - **The sky is masked** in the photos of the dense cloud and the mesh, so it no longer fills rooflines or bleeds into
   facades, and loose mesh parts of fewer than 100 triangles are removed.
-- It needs an NVIDIA GPU and a patched OpenMVS that you build yourself (`third_party/openmvs`). It is not bundled.
+- The patched OpenMVS comes with the app (`openmvs` folder, AGPL-3.0, source attached to the release). It needs an
+  NVIDIA GPU (GTX 16xx, RTX or newer) with driver 580 or newer; everything else works without one.
 - **Open in RealityScan / Metashape:** optional exports of the photos, masks, poses and LiDAR for people who own those
   programs. Opening RealityScan selects its Division lens, which RealityScan may keep as its own setting.
 

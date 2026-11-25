@@ -1,7 +1,7 @@
-# OpenMVS, fisheye build (optional)
+# OpenMVS, fisheye build
 
 The dense photogrammetry stage runs OpenMVS `DensifyPointCloud` as a separate program, and its optional mesh
-runs `ReconstructMesh` and `TextureMesh`. None of them is bundled.
+runs `ReconstructMesh` and `TextureMesh`. The portable release has them in `openmvs\`; a source checkout does not.
 OpenMVS is AGPL-3.0; `fisheye.patch` in this folder modifies it and is under the same AGPL-3.0 license
 (modified by the LidarCamera360 project in November 2026). The rest of this repository only exchanges files
 with the programs.
@@ -27,9 +27,14 @@ git clone https://github.com/cdcseacave/openMVS src
 git -C src checkout d235f83275a29a22e3c8ef0d91b6e15448c94aa5
 git -C src apply <this folder>\fisheye.patch
 mkdir triplets; copy <this folder>\x64-windows-rel.cmake triplets
-cmake -S src -B make -G "Visual Studio 17 2022" -A x64 -T "v143,cuda=<your CUDA version>" "-DCMAKE_TOOLCHAIN_FILE=$PWD\vcpkg\scripts\buildsystems\vcpkg.cmake" "-DVCPKG_OVERLAY_TRIPLETS=$PWD\triplets" -DVCPKG_TARGET_TRIPLET=x64-windows-rel -DVCPKG_HOST_TRIPLET=x64-windows-rel -DOpenMVS_BUILD_VIEWER=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_USE_SIFTGPU=OFF -DOpenMVS_USE_CERES=OFF -DOpenMVS_ENABLE_TESTS=OFF -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=<120 for RTX 50xx, 89 for 40xx, 86 for 30xx>
+cmake -S src -B make -G "Visual Studio 17 2022" -A x64 -T "v143,cuda=<your CUDA version>" "-DCMAKE_TOOLCHAIN_FILE=$PWD\vcpkg\scripts\buildsystems\vcpkg.cmake" "-DVCPKG_OVERLAY_TRIPLETS=$PWD\triplets" -DVCPKG_TARGET_TRIPLET=x64-windows-rel -DVCPKG_HOST_TRIPLET=x64-windows-rel -DOpenMVS_BUILD_VIEWER=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_USE_SIFTGPU=OFF -DOpenMVS_USE_CERES=OFF -DOpenMVS_ENABLE_TESTS=OFF -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_USE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=75;80-real;120-real"
 cmake --build make --config Release --target DensifyPointCloud ReconstructMesh TextureMesh --parallel 4
 ```
 
+These architectures cover GTX 16xx and every RTX; for your own card alone, its number is enough and builds faster
+(120 for RTX 50xx, 89 for 40xx, 86 for 30xx). CUDA 13 programs need NVIDIA driver 580 or newer.
+
 The program is `make\bin\vc17\x64\Release\DensifyPointCloud.exe`; keep the other two programs and the DLLs
-beside it. Choose it in Settings, or set `LIDARCAMERA360_OPENMVS`, or put that folder's files in `openmvs\` next to the app.
+beside it. Choose it in Settings, or set `LIDARCAMERA360_OPENMVS`, or put that folder's files in `openmvs\` next to the app:
+`python tools/stage_openmvs.py <this build folder>` does that, with the licence texts and the Visual C++ runtime, and
+zips the source that must go with the programs when they are given to others.

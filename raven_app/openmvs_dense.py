@@ -388,7 +388,7 @@ def check_binary(binary, name='DensifyPointCloud'):
     if binary is None or not binary.is_file():
         where = f' at {binary}.' if binary else '; set its path in Settings.'
         raise FileNotFoundError(f'{name} (OpenMVS, fisheye build) was not found{where} '
-                                'third_party/openmvs/README.md explains how to build it.')
+                                'The portable release has it in openmvs; third_party/openmvs/README.md explains how to build it.')
     if PATCH_MARK not in binary.read_bytes():
         raise RuntimeError(f'{binary} is not the fisheye build of OpenMVS (third_party/openmvs/README.md).')
     return binary

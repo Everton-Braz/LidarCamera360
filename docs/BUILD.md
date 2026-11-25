@@ -12,4 +12,9 @@ Sophus is pinned to `a621ff2e56c56c839a6c40418d42c3c254424b5c` and Vikit to `6c8
 
 Native targets use C++17, PCL, Eigen, OpenCV, yaml-cpp, OpenMP, and Vulkan for GPU colorization. Release builds use portable x64 settings without machine-specific AVX requirements.
 
+To bundle OpenMVS, build it as [third_party/openmvs](../third_party/openmvs/README.md) says, then run
+`python tools/stage_openmvs.py <that folder>` before packaging. It fills `openmvs/` and writes
+`dist/OpenMVS-fisheye-source.zip`, which must be attached to the same release. Without `openmvs/` the package is made
+without it.
+
 Run the checks listed in [the validation report](IMPLEMENTATION_VALIDATION.md). Inspect `_internal/licenses/` and update [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) whenever dependency versions or bundled binaries change. A redistributable FAST-LIVO2 build must include corresponding source and GPL-2.0-only materials. A Spirula binary needs a matching upstream license, source/provenance record, and notices before publication.
