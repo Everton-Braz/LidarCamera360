@@ -44,6 +44,9 @@ North comes from the strongest evidence the capture offers:
 | --- | --- | --- |
 | `--yaw-deg` | Known rotation from local XY to grid E/N, counter-clockwise | `resolved` |
 | `--street-bearing` | True bearing of a street or long wall, measured on a map, matched to the scan's wall directions | `resolved` |
+| Solar compass + aerial imagery | Unoccluded sun disks in calibrated 360° frames bound the heading so Esri World Imagery locks both north and XY shift | `resolved` |
+| Solar compass + GPS | Astronomical sun direction agrees with a synced GPS track | `resolved` |
+| Solar compass alone | Strong multi-frame unoccluded sun match (`--offline` or without walls); weak solar matches request review | `resolved` / `needs_review` |
 | GPS fixes matched by time | Needs the sync, at least 6 fixes, a walk of 10 m and a heading good to 10° | `resolved` |
 | The same, heading good to 10-20° | The walk is short for the noise of the fixes | `needs_review` |
 | Aerial imagery | The scan's walls registered against Esri World Imagery | `needs_review` |
@@ -52,11 +55,13 @@ North comes from the strongest evidence the capture offers:
 
 The sync (`t_video = t_lidar + dt`) is read from the project around the trajectory or
 cloud when `--dt-sync` is not given, as long as that project was made from the same
-INSV. Fixes a few seconds apart share their error, so a short capture is reported as
-less certain: one fix counts as 5 m, and 60 s must pass
-before another counts as independent. When no fix falls inside the scan, the nearest one
-within 60 s places its start or end. A street bearing resolves the heading only when a
-good GPS track or accepted imagery says which way round the scan is.
+INSV. Calibrated 360° frames (`colmap_3dgs` or `rig_calibration.json` + `images/`) are
+also discovered automatically around the scan for the offline solar compass. Fixes a few
+seconds apart share their error, so a short capture is reported as less certain: one fix
+counts as 5 m, and 60 s must pass before another counts as independent. When no fix falls
+inside the scan, the nearest one within 60 s places its start or end. A street bearing
+resolves the heading only when a good GPS track, solar compass, or accepted imagery says
+which way round the scan is.
 
 Imagery cannot certify itself. In a negative control on `trimtest`, the same walls
 were registered against imagery of 12 wrong places 250-1800 m away, and 7 passed the

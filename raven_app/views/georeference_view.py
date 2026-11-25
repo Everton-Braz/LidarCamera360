@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import pyproj
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 from qfluentwidgets import (
     CardWidget, TitleLabel, CaptionLabel, BodyLabel, SubtitleLabel,
     LineEdit, PrimaryPushButton, PushButton, CheckBox, PlainTextEdit,
-    FluentIcon, InfoBar, InfoBarPosition, ProgressBar, ComboBox, ToolButton,
+    FluentIcon, InfoBar, ProgressBar, ComboBox,
 )
 
 from raven_app.georeference import (REPORT_STATUS, run_georeference, apply_transform_adjustment, export_geojson,
@@ -24,6 +24,101 @@ from raven_app.georeference import (REPORT_STATUS, run_georeference, apply_trans
 from raven_app.orthophoto import generate_orthophoto
 from raven_app.views.map_widget import TileMapWidget
 from raven_app.i18n import tr, tr_button
+
+
+def review_required_message(report: dict) -> str:
+    """Explain why a georeferencing heading requires manual review before use."""
+    report = report or {}
+    north = report.get("north") or {}
+    transform = report.get("transform") or {}
+    evidence = north.get("evidence") or {}
+    method = str(north.get("method") or transform.get("yaw_estimation_method") or "")
+    has_review_img = bool(
+        north.get("review_image")
+        or (report.get("deliverables") or {}).get("review_image")
+    )
+    conflict = evidence.get("sensor_conflict")
+    if isinstance(conflict, dict):
+        solar_deg = float(conflict.get("solar_yaw_deg") or 0.0)
+        gps_deg = float(conflict.get("gps_yaw_deg") or 0.0)
+        diff_deg = float(conflict.get("diff_deg") or 0.0)
+        if has_review_img:
+            return tr(
+                "Solar compass ({solar:.1f}°) and synced GPS ({gps:.1f}°) disagree by {diff:.1f}°. "
+                "Open north_alignment_review.jpg or check the alignment on the map, then correct it here "
+                "or run again with a street bearing.",
+                solar=solar_deg,
+                gps=gps_deg,
+                diff=diff_deg,
+            )
+        return tr(
+            "Solar compass ({solar:.1f}°) and synced GPS ({gps:.1f}°) disagree by {diff:.1f}°. "
+            "Check the alignment on the map, then correct it here or run again with a street bearing.",
+            solar=solar_deg,
+            gps=gps_deg,
+            diff=diff_deg,
+        )
+    if method == "solar_compass":
+        return tr(
+            "The heading comes from a weak solar compass match without imagery or GPS confirmation. "
+            "Check the alignment on the map, then correct it here or run again with a street bearing."
+        )
+    if method == "solar_and_aerial_imagery":
+        if has_review_img:
+            return tr(
+                "The heading rests on a weak solar compass match and a moderate aerial imagery peak. "
+                "Open north_alignment_review.jpg in the output folder, then correct it here or run again "
+                "with a street bearing."
+            )
+        return tr(
+            "The heading rests on a weak solar compass match and a moderate aerial imagery peak. "
+            "Check the alignment on the map, then correct it here or run again with a street bearing."
+        )
+    if method == "gps_and_aerial_imagery":
+        if has_review_img:
+            return tr(
+                "The heading rests on a short GPS track and a moderate aerial imagery peak. "
+                "Open north_alignment_review.jpg in the output folder, then correct it here or run again "
+                "with a street bearing."
+            )
+        return tr(
+            "The heading rests on a short GPS track and a moderate aerial imagery peak. "
+            "Check the alignment on the map, then correct it here or run again with a street bearing."
+        )
+    if method == "gps_assumed_sync_rigid_fit":
+        return tr(
+            "The GPS track was fitted without a recorded camera/LiDAR time sync. "
+            "Check the alignment on the map, then correct it here or run again with a street bearing."
+        )
+    if method == "gps_time_matched_rigid_fit":
+        return tr(
+            "The GPS track is too short for a firm heading. "
+            "Check the alignment on the map, then correct it here or run again with a street bearing."
+        )
+    if method == "street_bearing_and_wall_axis":
+        return tr(
+            "The street bearing was matched to a wall, but its 90° orientation could not be confirmed automatically. "
+            "Check the alignment on the map and correct the yaw here if rotated."
+        )
+    if method == "aerial_imagery_registration":
+        if has_review_img:
+            return tr(
+                "The heading comes from aerial imagery alone. Open north_alignment_review.jpg in the output "
+                "folder, then correct it here or run again with a street bearing."
+            )
+        return tr(
+            "The heading comes from aerial imagery alone. Check the alignment on the map, then correct it "
+            "here or run again with a street bearing."
+        )
+    if has_review_img:
+        return tr(
+            "This heading could not be confirmed automatically. Open north_alignment_review.jpg in the output "
+            "folder or check the alignment on the map before using it."
+        )
+    return tr(
+        "This heading could not be confirmed automatically. Check the alignment on the map, then correct it "
+        "here or run again with a street bearing."
+    )
 
 
 class GeoreferenceWorker(QThread):
@@ -658,8 +753,6 @@ class GeoreferenceView(QWidget):
         self._latest_report = report
         tf = report.get("transform", {})
         self._latest_transform = tf
-        gps_sum = report.get("gps_summary", {})
-        ref = gps_sum.get("reference_origin_wgs84", {})
         deliv = report.get("deliverables", {})
 
         yaw_val = float(tf.get("yaw_heading_deg", 0.0))
@@ -704,8 +797,7 @@ class GeoreferenceView(QWidget):
         if status == "review_required":
             InfoBar.warning(
                 title=tr("Check the north before using this result"),
-                content=tr("The heading comes from aerial imagery alone. Open north_alignment_review.jpg in the output "
-                           "folder, then correct it here or run again with a street bearing."),
+                content=review_required_message(report),
                 duration=-1,
                 parent=self,
             )
