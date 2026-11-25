@@ -108,6 +108,31 @@ class GeoreferenceViewTests(unittest.TestCase):
             saved = json.loads((Path(d) / 'georeference_report.json').read_text(encoding='utf-8'))
             self.assertEqual(saved['transform']['north_status'], 'resolved')
 
+    def test_review_required_infobar_reflects_actual_north_reason(self):
+        from unittest import mock
+
+        rep_conflict = report(transform())
+        rep_conflict['north'] = {
+            'status': 'needs_review',
+            'method': 'gps_time_matched_rigid_fit',
+            'evidence': {'sensor_conflict': {'solar_yaw_deg': 185.0, 'gps_yaw_deg': 120.0, 'diff_deg': 65.0}},
+        }
+        with mock.patch('raven_app.views.georeference_view.InfoBar.warning') as warn:
+            self.view._on_result(rep_conflict)
+        self.assertEqual(warn.call_count, 1)
+        content = warn.call_args.kwargs['content']
+        self.assertIn('disagree', content)
+        self.assertNotIn('aerial imagery alone', content)
+
+        rep_solar = report(transform())
+        rep_solar['north'] = {'status': 'needs_review', 'method': 'solar_compass', 'evidence': {}}
+        with mock.patch('raven_app.views.georeference_view.InfoBar.warning') as warn:
+            self.view._on_result(rep_solar)
+        self.assertEqual(warn.call_count, 1)
+        content = warn.call_args.kwargs['content']
+        self.assertIn('solar compass', content)
+        self.assertNotIn('north_alignment_review.jpg', content)
+
 
 if __name__ == '__main__':
     unittest.main()

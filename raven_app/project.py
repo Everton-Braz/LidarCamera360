@@ -258,11 +258,11 @@ def export_from_project(project_dir, formats, dest=None, log=print) -> dict:
         if cloud is None:
             raise ValueError('the project has no coloured cloud to georeference')
         from raven_app.automatic_georeference import automatic_georeference
-        from raven_app.georeference import calculate_insv_gps
+        from raven_app.georeference import calculate_insv_gps, recorded_dt_sync
         out = dest / 'georeferenced'
         automatic_georeference(insv, out, candidate_clouds=[cloud], formats=('laz', 'geojson'),
                                trajectory_path=find_trajectory(root), gps_info=calculate_insv_gps(insv),
-                               dt_sync=manifest.get('dt_sync_seconds'))
+                               dt_sync=recorded_dt_sync([root], insv))
         made['georef'] = [str(p) for p in out.rglob('*') if p.is_file()]
         log(f'[+] Georeferenced outputs in {out}')
     return made

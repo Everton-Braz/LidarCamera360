@@ -12,9 +12,7 @@ import csv
 from datetime import datetime, timezone
 import json
 import math
-import os
-from pathlib import Path
-import subprocess
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -22,7 +20,7 @@ import pyproj
 from scipy.spatial.transform import Rotation as R
 
 from raven_app.cloud_io import load_cloud
-from raven_app.insv_gps import extract_gps, read_gps_sidecar
+from raven_app.insv_gps import capture_fixes, read_gps_sidecar
 from raven_app.true_north import load_timed_trajectory, rotation_2d, solve_north, true_bearing_of_axis
 
 try:
@@ -73,7 +71,7 @@ def calculate_insv_gps(insv_path: str | Path, target_crs: Optional[str] = None) 
     if trimmed:
         fixes, capture_origin_s = trimmed
     else:
-        _, fixes, _ = extract_gps(path)
+        fixes = capture_fixes(path)
     if not fixes:
         raise ValueError(f"No valid GPS fixes could be extracted from: {path.name}")
 
@@ -796,6 +794,67 @@ def georeference_colmap(
     }
 
 
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _same_video_recording(recorded: str, insv: str | Path) -> bool:
+    """True when ``recorded`` and ``insv`` identify the same capture (including same-stem stitched .mp4/.insv)."""
+    rec_p = PureWindowsPath(recorded)
+    insv_p = PureWindowsPath(str(insv))
+    if rec_p.name.casefold() == insv_p.name.casefold():
+        return True
+    exts = {rec_p.suffix.casefold(), insv_p.suffix.casefold()}
+    return exts == {".mp4", ".insv"} and rec_p.stem.casefold() == insv_p.stem.casefold()
+
+
+def recorded_dt_sync(paths: Any, insv: Optional[str | Path]) -> Optional[float]:
+    """The sync that the project around these files (trajectory, cloud, ...) recorded for this INSV, or None.
+
+    A trimmed video has a clock of its own, so a project made from another INSV says nothing about this one.
+    Pass None for ``insv`` when the caller already accounts for the trim.
+    """
+    for path in filter(None, paths):
+        start = Path(path).resolve()
+        for folder in (start, *start.parents)[:5]:
+            project = _read_json(folder / "project.json")
+            used = (project.get("capture") or {}).get("insv")
+            if used and insv and not _same_video_recording(used, insv):
+                print(f"[georef] The project in {folder} was made from {PureWindowsPath(used).name}; "
+                      "its sync does not apply to this video.")
+                return None
+            wf = _read_json(folder / "workflow_config.json")
+            runs = wf.get("runs")
+            wf_last = runs[-1] if isinstance(runs, list) and runs and isinstance(runs[-1], dict) else {}
+            wf_insv = ((wf_last.get("paths") or {}).get("insv") or {}).get("path")
+            if wf_insv and insv and not _same_video_recording(wf_insv, insv):
+                print(f"[georef] The workflow in {folder} was made from {PureWindowsPath(wf_insv).name}; "
+                      "its sync does not apply to this video.")
+                return None
+            for name in ("project.json", "rig_calibration_photometric.json", "rig_calibration.json",
+                         "colmap_to_lidar_alignment.json", "workflow_config.json"):
+                if name == "project.json":
+                    data = project
+                elif name == "workflow_config.json":
+                    data = wf
+                else:
+                    data = _read_json(folder / name)
+                if name == "rig_calibration_photometric.json" and data.get("valid") is False:
+                    continue
+                value = wf_last.get("resolved_dt_sync_seconds") if name == "workflow_config.json" else data.get("dt_sync_seconds")
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    continue
+                # A project written before any run holds 0.0 as "not known yet".
+                if name == "project.json" and value == 0.0 and not data.get("runs"):
+                    continue
+                return float(value)
+    return None
+
+
 def run_georeference(
     insv: str | Path,
     output: str | Path,
@@ -839,11 +898,27 @@ def run_georeference(
 
     # 3. Establish north and position from everything the capture offers
     timed_trajectory = load_timed_trajectory(trajectory)
+    if dt_sync is None and timed_trajectory is not None:
+        dt_sync = recorded_dt_sync((trajectory, cloud, colmap_dir), insv if capture_origin_s is None else None)
+        if dt_sync is not None:
+            print(f"[georef] Using the sync recorded with the scan: {dt_sync:+.3f} s.")
     local_xy = np.array([cf["xyz"][:2] for cf in colmap_frames]) if colmap_frames else None
     scan_points = load_cloud(cloud).points if cloud and Path(cloud).is_file() else None
-    north = solve_north(gps_info, points=scan_points, trajectory=timed_trajectory, local_xy=local_xy,
-                        dt_sync=dt_sync, capture_origin_s=capture_origin_s, manual_yaw_deg=yaw_deg,
-                        street_bearing_deg=street_bearing_deg, allow_network=allow_network, output_dir=out_dir)
+    north = solve_north(
+        gps_info,
+        points=scan_points,
+        trajectory=timed_trajectory,
+        local_xy=local_xy,
+        dt_sync=dt_sync,
+        capture_origin_s=capture_origin_s,
+        manual_yaw_deg=yaw_deg,
+        street_bearing_deg=street_bearing_deg,
+        allow_network=allow_network,
+        output_dir=out_dir,
+        colmap_dir=Path(colmap_dir) if colmap_dir else None,
+        search_paths=(trajectory, cloud, colmap_dir),
+        trajectory_path=Path(trajectory) if trajectory else None,
+    )
     del scan_points
 
     # 4. Fit Georeferencing Transformation
@@ -945,6 +1020,7 @@ def run_georeference(
             "reference_origin_wgs84": gps_info["mean_wgs84"],
             "crs_info": gps_info["crs_info"],
         },
+        "dt_sync_seconds": dt_sync,
         "transform": transform_dict,
         "north": north,
         "deliverables": {

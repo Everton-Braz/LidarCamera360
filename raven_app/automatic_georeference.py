@@ -50,10 +50,19 @@ def automatic_georeference(insv_path, deliverables_dir, candidate_clouds=None,
         return report
     sources = [Path(p) for p in (candidate_clouds or [])]
     sources = [p for p in sources if p.is_file() and p.suffix.lower() in {'.las', '.laz', '.ply', '.pcd'}]
-    north = solve_north(gps, points=_largest_cloud_points(sources), trajectory=load_timed_trajectory(trajectory_path),
-                        local_xy=None if trajectory_xyz is None else np.asarray(trajectory_xyz)[:, :2],
-                        dt_sync=dt_sync, capture_origin_s=capture_origin_s, street_bearing_deg=street_bearing_deg,
-                        allow_network=allow_network, output_dir=out)
+    north = solve_north(
+        gps,
+        points=_largest_cloud_points(sources),
+        trajectory=load_timed_trajectory(trajectory_path),
+        local_xy=None if trajectory_xyz is None else np.asarray(trajectory_xyz)[:, :2],
+        dt_sync=dt_sync,
+        capture_origin_s=capture_origin_s,
+        street_bearing_deg=street_bearing_deg,
+        allow_network=allow_network,
+        output_dir=out,
+        search_paths=(trajectory_path, out, *(sources[:1])),
+        trajectory_path=Path(trajectory_path) if trajectory_path else None,
+    )
     transform = build_automatic_transform(gps, north=north)
     R = np.asarray(transform['matrix_4x4'], dtype=np.float64)[:3, :3]
     t = np.asarray(transform['matrix_4x4'], dtype=np.float64)[:3, 3]

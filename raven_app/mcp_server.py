@@ -149,7 +149,7 @@ class LidarCameraMcpServer:
                         "crs": {"type": "string", "description": "Target projected CRS (e.g. EPSG:31984, EPSG:32724)."},
                         "yaw_deg": {"type": "number", "description": "Known rotation from local XY to grid E/N, counter-clockwise, in degrees."},
                         "street_bearing_deg": {"type": "number", "description": "True bearing of a street or long wall in the scan, measured on a map."},
-                        "dt_sync": {"type": "number", "description": "Time offset, t_video = t_lidar + dt; lets GPS fixes be matched to the trajectory."},
+                        "dt_sync": {"type": "number", "description": "Time offset, t_video = t_lidar + dt; lets GPS fixes be matched to the trajectory. Read from the project around the scan when omitted."},
                         "offline": {"type": "boolean", "default": False, "description": "Do not download aerial imagery."},
                         "orthophoto": {"type": "boolean", "default": False, "description": "Generate high-resolution georeferenced orthophoto."}
                     },
